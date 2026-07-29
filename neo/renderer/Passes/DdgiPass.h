@@ -61,17 +61,33 @@ public:
 		return rayTracingSupported;
 	}
 
-	// Per-frame entry point. No-op in M0. Later: refit TLAS, trace probe rays,
-	// integrate + temporally blend the irradiance/distance atlases.
+	// Per-frame entry point. Rebuilds the acceleration structures and, once RT
+	// is available, traces the probe rays. Later: integrate + blend atlases.
 	void			Render( nvrhi::ICommandList* commandList, const viewDef_t* viewDef );
 
 private:
+	// Build the probe trace compute pipeline + ray-radiance buffer (M2).
+	void			CreateTracePass();
+	// Fill the constants for a camera-centred probe volume and dispatch the trace.
+	void			DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewDef_t* viewDef );
+
 	nvrhi::DeviceHandle		m_Device;
 	CommonRenderPasses*		m_CommonPasses;
 
 	nvrhi::BufferHandle		m_ConstantBuffer;
 
 	DdgiAccelStructures		m_AccelStructs;
+
+	// probe trace compute pass (M2)
+	nvrhi::BufferHandle				m_RayRadianceBuffer;
+	nvrhi::ShaderHandle				m_TraceShader;
+	nvrhi::BindingLayoutHandle		m_TraceBindingLayout;
+	nvrhi::BindingSetHandle			m_TraceBindingSet;
+	nvrhi::ComputePipelineHandle	m_TracePipeline;
+	nvrhi::rt::IAccelStruct*		m_TraceBoundTlas;		// TLAS the binding set was built against
+
+	int						m_ProbeCounts[3];
+	int						m_FrameIndex;
 
 	bool					rayTracingSupported;
 	bool					loggedFirstBuild;
