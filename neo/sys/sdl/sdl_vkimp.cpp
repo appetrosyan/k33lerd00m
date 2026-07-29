@@ -106,6 +106,14 @@ bool DeviceManager::CreateWindowDeviceAndSwapChain( const glimpParms_t& parms, c
 	m_DeviceParams.backBufferSampleCount = parms.multiSamples;
 	m_DeviceParams.vsyncEnabled = m_RequestedVSync;
 
+	// DDGI (M1): request the Vulkan ray tracing device extensions
+	// (VK_KHR_acceleration_structure / ray_query / deferred_host_operations) so
+	// NVRHI reports RayQuery support. They are only actually enabled when the
+	// physical device advertises them. Set at startup via "+set r_useDDGI 1";
+	// toggling later needs a vid_restart to recreate the device.
+	extern idCVar r_useDDGI;
+	m_DeviceParams.enableRayTracingExtensions = r_useDDGI.GetBool();
+
 	if( !CreateDeviceAndSwapChain() )
 	{
 		return false;

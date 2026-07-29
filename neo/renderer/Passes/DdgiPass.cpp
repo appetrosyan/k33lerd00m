@@ -43,7 +43,9 @@ DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
 	, m_CommonPasses( commonPasses )
 	, rayTracingSupported( false )
+	, loggedFirstBuild( false )
 {
+	m_AccelStructs.Init( device );
 	// DDGI traces probe rays with inline ray queries from a compute shader, so
 	// it needs both RayQuery and acceleration-structure support. Everything the
 	// later milestones create (accel structs, RT binding sets) is gated on this.
@@ -71,19 +73,27 @@ DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 
 DdgiPass::~DdgiPass()
 {
+	m_AccelStructs.Shutdown();
 }
 
 void DdgiPass::Render( nvrhi::ICommandList* commandList, const viewDef_t* viewDef )
 {
-	if( !r_useDDGI.GetBool() || !rayTracingSupported )
+	if( !r_useDDGI.GetBool() || !rayTracingSupported || viewDef == NULL )
 	{
 		return;
 	}
 
-	// M0 scaffold: no acceleration structures or ray dispatch yet.
-	//
-	// M1: refit TLAS from the visible surface list (vertex cache geometry).
-	// M2: trace r_ddgiRaysPerProbe rays/probe via inline ray query.
+	// M1: (re)build the ray tracing acceleration structures from the visible
+	// static world geometry. The TLAS is what the probe trace (M2) rays against.
+	const bool tlasReady = m_AccelStructs.RebuildFromView( commandList, viewDef );
+
+	if( tlasReady && !loggedFirstBuild )
+	{
+		common->Printf( "DdgiPass: built TLAS with %i static instances.\n", m_AccelStructs.NumInstances() );
+		loggedFirstBuild = true;
+	}
+
+	// M2: trace r_ddgiRaysPerProbe rays/probe via inline ray query against the TLAS.
 	// M3: integrate rays into the octahedral irradiance + distance atlases and
 	//     temporally blend with r_ddgiHysteresis.
 }

@@ -39,6 +39,7 @@ extern idVertexCache vertexCache;
 #include <stddef.h>
 
 extern idCVar r_showBuffers;
+extern idCVar r_useDDGI;
 
 extern DeviceManager* deviceManager;
 
@@ -207,6 +208,15 @@ bool idVertexBuffer::AllocBufferObject( const void* data, int allocSize, bufferU
 	{
 		vertexBufferDesc.keepInitialState = true;
 		vertexBufferDesc.debugName = "Static idDrawVert vertex buffer";
+	}
+
+	// DDGI (M1): static geometry must be usable as ray tracing acceleration
+	// structure build input. Gated on r_useDDGI so the extra buffer usage is
+	// only paid for when DDGI is on; toggling it requires a map reload so the
+	// static vertex cache is reallocated with this capability.
+	if( usage == BU_STATIC && r_useDDGI.GetBool() )
+	{
+		vertexBufferDesc.isAccelStructBuildInput = true;
 	}
 
 #if defined( USE_AMD_ALLOCATOR )
@@ -475,6 +485,12 @@ bool idIndexBuffer::AllocBufferObject( const void* data, int allocSize, bufferUs
 	{
 		indexBufferDesc.cpuAccess = nvrhi::CpuAccessMode::Write;
 		indexBufferDesc.debugName = "VertexCache Mapped Index Buffer";
+	}
+
+	// DDGI (M1): see idVertexBuffer::AllocBufferObject above.
+	if( _usage == BU_STATIC && r_useDDGI.GetBool() )
+	{
+		indexBufferDesc.isAccelStructBuildInput = true;
 	}
 
 #if defined( USE_AMD_ALLOCATOR )

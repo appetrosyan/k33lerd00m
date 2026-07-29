@@ -25,6 +25,8 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 #ifndef RENDERER_PASSES_DDGIPASS_H_
 #define RENDERER_PASSES_DDGIPASS_H_
 
+#include "DdgiAccelStructures.h"
+
 /*
 ================================================================================
 
@@ -69,7 +71,10 @@ private:
 
 	nvrhi::BufferHandle		m_ConstantBuffer;
 
+	DdgiAccelStructures		m_AccelStructs;
+
 	bool					rayTracingSupported;
+	bool					loggedFirstBuild;
 };
 
 #endif

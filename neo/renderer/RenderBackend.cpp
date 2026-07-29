@@ -5774,6 +5774,17 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	}
 
 	//-------------------------------------------------
+	// DDGI: rebuild ray tracing acceleration structures from the static world
+	// geometry before ambient lighting so the probe trace has a TLAS to use
+	//-------------------------------------------------
+	if( is3D && ddgiPass )
+	{
+		OPTICK_GPU_EVENT( "Render_DDGI" );
+
+		ddgiPass->Render( commandList, _viewDef );
+	}
+
+	//-------------------------------------------------
 	// FIXME, OPTIMIZE: merge this with FillDepthBufferFast like in a light prepass deferred renderer
 	//
 	// fill the geometric buffer with normals and roughness
