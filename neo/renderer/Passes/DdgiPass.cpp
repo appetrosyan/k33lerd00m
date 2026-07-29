@@ -50,9 +50,9 @@ DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	, rayTracingSupported( false )
 	, loggedFirstBuild( false )
 {
-	m_ProbeCounts[0] = 32;
+	m_ProbeCounts[0] = 16;
 	m_ProbeCounts[1] = 8;
-	m_ProbeCounts[2] = 32;
+	m_ProbeCounts[2] = 16;
 
 	m_AccelStructs.Init( device );
 	// DDGI traces probe rays with inline ray queries from a compute shader, so
@@ -74,6 +74,10 @@ DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	{
 		common->Printf( "DdgiPass: ray tracing supported, dynamic diffuse GI available.\n" );
 		CreateTracePass();
+		if( rayTracingSupported )
+		{
+			CreateIntegratePass();
+		}
 	}
 	else
 	{
@@ -128,10 +132,79 @@ void DdgiPass::CreateTracePass()
 	bufferDesc.byteSize = ( uint64_t )maxProbes * DDGI_MAX_RAYS * sizeof( float ) * 4;
 	bufferDesc.structStride = sizeof( float ) * 4;			// float4 per (probe, ray)
 	bufferDesc.canHaveUAVs = true;
+	// state-tracked (not keepInitialState) so nvrhi auto-inserts the UAV->SRV
+	// barrier between the trace (writes it) and the integrate pass (reads it).
 	bufferDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
-	bufferDesc.keepInitialState = true;
 	bufferDesc.debugName = "DDGI/RayRadiance";
 	m_RayRadianceBuffer = m_Device->createBuffer( bufferDesc );
+}
+
+/*
+========================
+DdgiPass::CreateIntegratePass
+
+Creates the octahedral irradiance + distance atlases and the compute pipeline
+that folds the per-ray radiance buffer into them (with temporal blending).
+========================
+*/
+void DdgiPass::CreateIntegratePass()
+{
+	const int probeSize = LIGHTGRID_IRRADIANCE_SIZE;
+	const int atlasCols = m_ProbeCounts[0] * m_ProbeCounts[2];	// tile = (px + pz*countX, py)
+	const int atlasRows = m_ProbeCounts[1];
+
+	nvrhi::TextureDesc irrDesc;
+	irrDesc.width = atlasCols * probeSize;
+	irrDesc.height = atlasRows * probeSize;
+	irrDesc.format = nvrhi::Format::RGBA16_FLOAT;
+	irrDesc.dimension = nvrhi::TextureDimension::Texture2D;
+	irrDesc.isUAV = true;
+	irrDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
+	irrDesc.keepInitialState = true;
+	irrDesc.debugName = "DDGI/IrradianceAtlas";
+	m_IrradianceAtlas = m_Device->createTexture( irrDesc );
+
+	nvrhi::TextureDesc distDesc = irrDesc;
+	distDesc.format = nvrhi::Format::RG16_FLOAT;
+	distDesc.debugName = "DDGI/DistanceAtlas";
+	m_DistanceAtlas = m_Device->createTexture( distDesc );
+
+	idList<shaderMacro_t> macros;
+	const int shaderIdx = renderProgManager.FindShader( "builtin/ddgi/probe_integrate", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT );
+	m_IntegrateShader = renderProgManager.GetShader( shaderIdx );
+
+	if( m_IntegrateShader == nullptr )
+	{
+		common->Warning( "DdgiPass: probe_integrate compute shader failed to load (idx %i) - DDGI disabled.", shaderIdx );
+		rayTracingSupported = false;
+		return;
+	}
+
+	nvrhi::BindingLayoutDesc layoutDesc;
+	layoutDesc.visibility = nvrhi::ShaderType::Compute;
+	layoutDesc.bindings =
+	{
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 0 ),	// t0 : per-ray radiance
+		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : DdgiConstants
+		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : irradiance atlas
+		nvrhi::BindingLayoutItem::Texture_UAV( 1 ),			// u1 : distance atlas
+	};
+	m_IntegrateBindingLayout = m_Device->createBindingLayout( layoutDesc );
+
+	nvrhi::ComputePipelineDesc pipelineDesc;
+	pipelineDesc.bindingLayouts = { m_IntegrateBindingLayout };
+	pipelineDesc.CS = m_IntegrateShader;
+	m_IntegratePipeline = m_Device->createComputePipeline( pipelineDesc );
+
+	nvrhi::BindingSetDesc setDesc;
+	setDesc.bindings =
+	{
+		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_RayRadianceBuffer ),
+		nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
+		nvrhi::BindingSetItem::Texture_UAV( 0, m_IrradianceAtlas ),
+		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceAtlas ),
+	};
+	m_IntegrateBindingSet = m_Device->createBindingSet( setDesc, m_IntegrateBindingLayout );
 }
 
 /*
@@ -206,6 +279,20 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 	// one thread per ray (x), one row per probe (y)
 	const int groupsX = ( raysPerProbe + 31 ) / 32;
 	commandList->dispatch( groupsX, totalProbes, 1 );
+
+	// M3: integrate the per-ray radiance into the octahedral irradiance/distance
+	// atlases, temporally blended. nvrhi transitions the ray-radiance buffer from
+	// UAV to SRV automatically (it is state-tracked).
+	if( m_IntegratePipeline != nullptr )
+	{
+		nvrhi::ComputeState integrateState;
+		integrateState.pipeline = m_IntegratePipeline;
+		integrateState.bindings = { m_IntegrateBindingSet };
+		commandList->setComputeState( integrateState );
+
+		const int probeSize = LIGHTGRID_IRRADIANCE_SIZE;
+		commandList->dispatch( ( probeSize + 7 ) / 8, ( probeSize + 7 ) / 8, totalProbes );
+	}
 }
 
 void DdgiPass::Render( nvrhi::ICommandList* commandList, const viewDef_t* viewDef )

@@ -68,6 +68,8 @@ public:
 private:
 	// Build the probe trace compute pipeline + ray-radiance buffer (M2).
 	void			CreateTracePass();
+	// Build the octahedral irradiance/distance atlases + integrate pipeline (M3).
+	void			CreateIntegratePass();
 	// Fill the constants for a camera-centred probe volume and dispatch the trace.
 	void			DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewDef_t* viewDef );
 
@@ -85,6 +87,14 @@ private:
 	nvrhi::BindingSetHandle			m_TraceBindingSet;
 	nvrhi::ComputePipelineHandle	m_TracePipeline;
 	nvrhi::rt::IAccelStruct*		m_TraceBoundTlas;		// TLAS the binding set was built against
+
+	// probe integrate pass (M3): octahedral atlases the trace radiance folds into
+	nvrhi::TextureHandle			m_IrradianceAtlas;		// rgb irradiance per probe texel
+	nvrhi::TextureHandle			m_DistanceAtlas;		// mean, mean^2 distance
+	nvrhi::ShaderHandle				m_IntegrateShader;
+	nvrhi::BindingLayoutHandle		m_IntegrateBindingLayout;
+	nvrhi::BindingSetHandle			m_IntegrateBindingSet;
+	nvrhi::ComputePipelineHandle	m_IntegratePipeline;
 
 	int						m_ProbeCounts[3];
 	int						m_FrameIndex;
