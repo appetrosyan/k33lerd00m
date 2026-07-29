@@ -37,6 +37,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Passes/CommonPasses.h"
 #include "Passes/MipMapGenPass.h"
 #include "Passes/SsaoPass.h"
+#include "Passes/DdgiPass.h"
 #include "Passes/TonemapPass.h"
 #include "Passes/TemporalAntiAliasingPass.h"
 
@@ -381,6 +382,7 @@ private:
 	nvrhi::CommandListHandle		commandList;
 	CommonRenderPasses				commonPasses;
 	SsaoPass*						ssaoPass;
+	DdgiPass*						ddgiPass;
 	MipMapGenPass*					hiZGenPass;
 	TonemapPass*					toneMapPass;
 	TemporalAntiAliasingPass*		taaPass;

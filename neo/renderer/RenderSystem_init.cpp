@@ -290,6 +290,8 @@ idCVar r_showLightGrid( "r_showLightGrid", "0", CVAR_RENDERER | CVAR_INTEGER | C
 
 idCVar r_useLightGrid( "r_useLightGrid", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "" );
 
+idCVar r_useDDGI( "r_useDDGI", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "ray-traced dynamic diffuse global illumination probes (replaces the baked light grid; requires ray query support)" );
+
 idCVar r_exposure( "r_exposure", "0.5", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "HDR exposure or LDR brightness [-4.0 .. 4.0]", -4.0f, 4.0f );
 
 idCVar r_useSSR( "r_useSSR", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "" );

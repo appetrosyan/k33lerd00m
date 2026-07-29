@@ -200,6 +200,7 @@ void idRenderBackend::Init()
 	commonPasses.Init( deviceManager->GetDevice() );
 	hiZGenPass = nullptr;
 	ssaoPass = nullptr;
+	ddgiPass = nullptr;
 
 	// Maximum resolution of one tile within tiled shadow map. Resolution must be power of two and
 	// square, since quad-tree for managing tiles will not work correctly otherwise. Furthermore
@@ -2015,6 +2016,13 @@ void idRenderBackend::GL_StartFrame()
 			globalImages->ambientOcclusionImage[0]->GetTextureHandle() );
 	}
 
+	extern idCVar r_useDDGI;
+
+	if( !ddgiPass && r_useDDGI.GetBool() )
+	{
+		ddgiPass = new DdgiPass( deviceManager->GetDevice(), &commonPasses );
+	}
+
 	if( ( globalImages->hierarchicalZbufferImage->GetTextureID() != textureId || !hiZGenPass ) && R_UseHiZ() )
 	{
 		if( hiZGenPass )
@@ -2352,6 +2360,12 @@ void idRenderBackend::ClearCaches()
 		ssaoPass = nullptr;
 	}
 
+	if( ddgiPass )
+	{
+		delete ddgiPass;
+		ddgiPass = nullptr;
+	}
+
 	if( toneMapPass )
 	{
 		delete toneMapPass;
@@ -2470,6 +2484,7 @@ idRenderBackend::idRenderBackend()
 {
 	hiZGenPass = nullptr;
 	ssaoPass = nullptr;
+	ddgiPass = nullptr;
 
 	memset( &glConfig, 0, sizeof( glConfig ) );
 
