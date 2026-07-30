@@ -100,6 +100,15 @@ public:
 private:
 	nvrhi::rt::IAccelStruct*	GetOrBuildBottomLevel( nvrhi::ICommandList* commandList, const drawSurf_t* surf );
 
+	// Skinned/animated actors: GPU-skin the posed positions into a pooled buffer and
+	// build a per-surface BLAS from them each frame, so animated actors reflect in
+	// their current pose instead of the bind pose. Appends instances for every
+	// GPU-skinned surface in the view; no-op until the skinning pipeline is built.
+	void			BuildSkinnedInstances( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
+										   std::vector<nvrhi::rt::InstanceDesc>& instances,
+										   std::vector<DdgiInstanceData>& instanceData );
+	void			EnsureSkinPipeline();
+
 	nvrhi::DeviceHandle				m_Device;
 	nvrhi::rt::AccelStructHandle	m_Tlas;
 	size_t							m_TlasCapacity;
@@ -110,6 +119,21 @@ private:
 
 	// BLAS cache keyed by the static ambientCache handle (unique per surface).
 	std::unordered_map<vertCacheHandle_t, nvrhi::rt::AccelStructHandle> m_BlasCache;
+
+	// --- skinned actors ---
+	nvrhi::ShaderHandle				m_SkinShader;
+	nvrhi::BindingLayoutHandle		m_SkinBindingLayout;
+	nvrhi::BindingSetHandle			m_SkinBindingSet;
+	nvrhi::ComputePipelineHandle	m_SkinPipeline;
+	nvrhi::BufferHandle				m_SkinConstantBuffer;
+	nvrhi::IBuffer*					m_SkinBoundJoints;		// joint buffer the set was built against
+	nvrhi::IBuffer*					m_SkinBoundVertex;		// vertex buffer the set was built against
+	bool							m_SkinPipelineTried;
+
+	// posed-position pool (RWByteAddressBuffer, RGB32 per vertex) + per-frame BLAS pool
+	nvrhi::BufferHandle				m_PosedBuffer;
+	size_t							m_PosedCapacityVerts;
+	std::vector<nvrhi::rt::AccelStructHandle> m_SkinnedBlas;
 };
 
 #endif
