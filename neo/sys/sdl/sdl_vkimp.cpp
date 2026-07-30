@@ -112,7 +112,8 @@ bool DeviceManager::CreateWindowDeviceAndSwapChain( const glimpParms_t& parms, c
 	// physical device advertises them. Set at startup via "+set r_useDDGI 1";
 	// toggling later needs a vid_restart to recreate the device.
 	extern idCVar r_useDDGI;
-	m_DeviceParams.enableRayTracingExtensions = r_useDDGI.GetBool();
+	extern idCVar r_useRTReflections;
+	m_DeviceParams.enableRayTracingExtensions = r_useDDGI.GetBool() || r_useRTReflections.GetBool();
 
 	if( !CreateDeviceAndSwapChain() )
 	{
