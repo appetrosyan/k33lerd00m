@@ -59,6 +59,7 @@ idCVar r_ddgiRaysPerProbe( "r_ddgiRaysPerProbe", "128", CVAR_RENDERER | CVAR_INT
 idCVar r_ddgiHysteresis( "r_ddgiHysteresis", "0.97", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "temporal blend weight for probe history [0..1]", 0.0f, 1.0f );
 idCVar r_ddgiNormalBias( "r_ddgiNormalBias", "0.25", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "probe sampling normal bias in world units" );
 idCVar r_ddgiDebug( "r_ddgiDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "overlay DDGI probe atlas: 1 = irradiance atlas", 0, 1 );
+idCVar r_ddgiBounceGain( "r_ddgiBounceGain", "0.95", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "DDGI multi-bounce feedback gain (0 = single bounce)", 0.0f, 2.0f );
 
 DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
@@ -139,10 +140,19 @@ void DdgiPass::CreateTracePass()
 		nvrhi::BindingLayoutItem::RawBuffer_SRV( 2 ),			// t2 : static vertex cache
 		nvrhi::BindingLayoutItem::RawBuffer_SRV( 3 ),			// t3 : static index cache
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 4 ),	// t4 : projected lights
+		nvrhi::BindingLayoutItem::Texture_SRV( 5 ),			// t5 : prev irradiance atlas (multi-bounce)
+		nvrhi::BindingLayoutItem::Texture_SRV( 6 ),			// t6 : prev distance atlas (Chebyshev)
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : DdgiConstants
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : per-ray radiance
+		nvrhi::BindingLayoutItem::Sampler( 0 ),				// s0 : linear-clamp atlas sampler
 	};
 	m_TraceBindingLayout = m_Device->createBindingLayout( layoutDesc );
+
+	// linear-clamp sampler for reading the octahedral atlases back for bounce
+	nvrhi::SamplerDesc samplerDesc;
+	samplerDesc.setAllFilters( true );
+	samplerDesc.setAllAddressModes( nvrhi::SamplerAddressMode::Clamp );
+	m_LinearSampler = m_Device->createSampler( samplerDesc );
 
 	nvrhi::ComputePipelineDesc pipelineDesc;
 	pipelineDesc.bindingLayouts = { m_TraceBindingLayout };
@@ -240,6 +250,40 @@ void DdgiPass::CreateIntegratePass()
 		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceAtlas ),
 	};
 	m_IntegrateBindingSet = m_Device->createBindingSet( setDesc, m_IntegrateBindingLayout );
+
+	// octahedral border copy pass: shares the atlas UAV layout, no ray radiance
+	const int borderIdx = renderProgManager.FindShader( "builtin/ddgi/probe_border", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT );
+	m_BorderShader = renderProgManager.GetShader( borderIdx );
+	if( m_BorderShader == nullptr )
+	{
+		common->Warning( "DdgiPass: probe_border compute shader failed to load (idx %i) - DDGI disabled.", borderIdx );
+		rayTracingSupported = false;
+		return;
+	}
+
+	nvrhi::BindingLayoutDesc borderLayoutDesc;
+	borderLayoutDesc.visibility = nvrhi::ShaderType::Compute;
+	borderLayoutDesc.bindings =
+	{
+		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : DdgiConstants
+		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : irradiance atlas
+		nvrhi::BindingLayoutItem::Texture_UAV( 1 ),			// u1 : distance atlas
+	};
+	m_BorderBindingLayout = m_Device->createBindingLayout( borderLayoutDesc );
+
+	nvrhi::ComputePipelineDesc borderPipelineDesc;
+	borderPipelineDesc.bindingLayouts = { m_BorderBindingLayout };
+	borderPipelineDesc.CS = m_BorderShader;
+	m_BorderPipeline = m_Device->createComputePipeline( borderPipelineDesc );
+
+	nvrhi::BindingSetDesc borderSetDesc;
+	borderSetDesc.bindings =
+	{
+		nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
+		nvrhi::BindingSetItem::Texture_UAV( 0, m_IrradianceAtlas ),
+		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceAtlas ),
+	};
+	m_BorderBindingSet = m_Device->createBindingSet( borderSetDesc, m_BorderBindingLayout );
 }
 
 /*
@@ -287,6 +331,7 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 	constants.viewBias = 0.1f;
 	constants.rayRotation = idVec4( 0.0f, 0.0f, 0.0f, 1.0f );	// identity for M2; jittered later
 	constants.frameIndex = m_FrameIndex++;
+	constants.bounceGain = r_ddgiBounceGain.GetFloat();
 
 	// Gather visible projected lights for hit shading (M4 stage 2). Mirrors the
 	// interaction pass: colour = sum over light-shader stages of lightScale *
@@ -365,8 +410,11 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 			nvrhi::BindingSetItem::RawBuffer_SRV( 2, m_AccelStructs.GetStaticVertexBuffer() ),
 			nvrhi::BindingSetItem::RawBuffer_SRV( 3, m_AccelStructs.GetStaticIndexBuffer() ),
 			nvrhi::BindingSetItem::StructuredBuffer_SRV( 4, m_LightBuffer ),
+			nvrhi::BindingSetItem::Texture_SRV( 5, m_IrradianceAtlas ),
+			nvrhi::BindingSetItem::Texture_SRV( 6, m_DistanceAtlas ),
 			nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_RayRadianceBuffer ),
+			nvrhi::BindingSetItem::Sampler( 0, m_LinearSampler ),
 		};
 		m_TraceBindingSet = m_Device->createBindingSet( setDesc, m_TraceBindingLayout );
 		m_TraceBoundTlas = tlas;
@@ -394,6 +442,17 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 
 		const int probeSize = LIGHTGRID_IRRADIANCE_SIZE;
 		commandList->dispatch( ( probeSize + 7 ) / 8, ( probeSize + 7 ) / 8, totalProbes );
+
+		// M4 stage 3: octahedral border copy so the atlases sample seamlessly with
+		// bilinear filtering. nvrhi inserts the UAV barrier after the integrate pass.
+		if( m_BorderPipeline != nullptr )
+		{
+			nvrhi::ComputeState borderState;
+			borderState.pipeline = m_BorderPipeline;
+			borderState.bindings = { m_BorderBindingSet };
+			commandList->setComputeState( borderState );
+			commandList->dispatch( ( probeSize + 7 ) / 8, ( probeSize + 7 ) / 8, totalProbes );
+		}
 	}
 }
 

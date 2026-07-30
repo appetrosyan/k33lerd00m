@@ -46,7 +46,7 @@ struct DdgiConstants
 
 	int		frameIndex;
 	int		numLights;				// active projected lights in t_Lights
-	int		pad1;
+	float	bounceGain;				// multi-bounce feedback gain
 	int		pad2;
 };
 
@@ -79,7 +79,10 @@ StructuredBuffer<DdgiInstanceData>	t_InstanceData	: register(t1);
 ByteAddressBuffer					t_Vertex		: register(t2);	// static idDrawVert cache
 ByteAddressBuffer					t_Index			: register(t3);	// static R16 index cache
 StructuredBuffer<DdgiLight>			t_Lights		: register(t4);	// projected lights
+Texture2D<float4>					t_IrradianceAtlas	: register(t5);	// prev-frame irradiance
+Texture2D<float2>					t_DistanceAtlas		: register(t6);	// prev-frame distance moments
 RWStructuredBuffer<float4>			u_RayRadiance	: register(u0);
+SamplerState						s_LinearClamp	: register(s0);
 
 cbuffer c_Ddgi : register(b1)
 {
@@ -182,6 +185,102 @@ float3 DdgiShadeHit( float3 P, float3 N )
 	return lit;
 }
 
+// Octahedral encode: unit direction -> [-1,1]^2 (inverse of the integrate decode).
+float2 OctEncode( float3 n )
+{
+	float l1 = abs( n.x ) + abs( n.y ) + abs( n.z );
+	float2 res = n.xy / max( l1, 1e-6f );
+	if( n.z < 0.0f )
+	{
+		float2 s = float2( ( res.x >= 0.0f ) ? 1.0f : -1.0f, ( res.y >= 0.0f ) ? 1.0f : -1.0f );
+		res = ( 1.0f - abs( res.yx ) ) * s;
+	}
+	return res;
+}
+
+// Atlas UV for probe (px,py,pz) sampling octahedral direction `dir`. Matches the
+// tile layout written by probe_integrate; relies on the border copy for seamless
+// bilinear across tile edges.
+float2 DdgiProbeAtlasUV( int px, int py, int pz, float3 dir, int probeSize, int cx, int cy, int cz )
+{
+	const int border = 1;
+	const int interior = probeSize - 2 * border;
+	const float2 octUV = OctEncode( dir ) * 0.5f + 0.5f;	// [0,1]
+	const int2 tile = int2( px + pz * cx, py );
+	const float2 texel = float2( tile ) * probeSize + border + octUV * interior;
+	const float2 atlasDim = float2( ( cx * cz ) * probeSize, cy * probeSize );
+	return texel / atlasDim;
+}
+
+// Sample the previous frame's probe field at a world point, Chebyshev-weighted
+// (leak control) and trilinearly blended over the 8 surrounding probes.
+float3 DdgiSampleIrradiance( float3 P, float3 N )
+{
+	const int cx = g_Ddgi.probeGridCountsXY.x;
+	const int cy = g_Ddgi.probeGridCountsXY.y;
+	const int cz = g_Ddgi.probeGridCountZ_total.x;
+	const int probeSize = g_Ddgi.irradianceProbe.x;
+	const float3 origin = g_Ddgi.probeGridOrigin.xyz;
+	const float3 spacing = g_Ddgi.probeGridSpacing.xyz;
+
+	// bias toward the normal to reduce self-occlusion / leaking
+	const float3 biasedP = P + N * g_Ddgi.normalBias;
+	const float3 gridF = ( biasedP - origin ) / spacing;
+	const int3 baseCoord = int3( floor( gridF ) );
+	const float3 frac = saturate( gridF - float3( baseCoord ) );
+
+	float3 sumIrr = float3( 0.0f, 0.0f, 0.0f );
+	float sumW = 0.0f;
+
+	for( int i = 0; i < 8; i++ )
+	{
+		const int3 off = int3( i & 1, ( i >> 1 ) & 1, ( i >> 2 ) & 1 );
+		const int3 c = baseCoord + off;
+		if( c.x < 0 || c.y < 0 || c.z < 0 || c.x >= cx || c.y >= cy || c.z >= cz )
+		{
+			continue;
+		}
+
+		const float3 probePos = origin + float3( c ) * spacing;
+		const float3 trilinear = lerp( 1.0f - frac, frac, float3( off ) );
+		float weight = trilinear.x * trilinear.y * trilinear.z;
+
+		const float3 toProbe = probePos - P;
+		const float distToProbe = length( toProbe );
+		const float3 dirToProbe = ( distToProbe > 1e-5f ) ? ( toProbe / distToProbe ) : N;
+
+		// smooth backface weight
+		const float wrap = ( dot( dirToProbe, N ) + 1.0f ) * 0.5f;
+		weight *= wrap * wrap + 0.2f;
+
+		// Chebyshev visibility using the distance moments in the probe->point dir
+		const float2 dUV = DdgiProbeAtlasUV( c.x, c.y, c.z, -dirToProbe, probeSize, cx, cy, cz );
+		const float2 moments = t_DistanceAtlas.SampleLevel( s_LinearClamp, dUV, 0 );
+		const float meanDist = moments.x;
+		if( distToProbe > meanDist )
+		{
+			const float variance = abs( meanDist * meanDist - moments.y );
+			const float d = distToProbe - meanDist;
+			float cheb = variance / ( variance + d * d );
+			cheb = max( cheb * cheb * cheb, 0.0f );
+			weight *= cheb;
+		}
+
+		if( weight < 1e-4f )
+		{
+			continue;
+		}
+
+		const float2 iUV = DdgiProbeAtlasUV( c.x, c.y, c.z, N, probeSize, cx, cy, cz );
+		const float3 irr = t_IrradianceAtlas.SampleLevel( s_LinearClamp, iUV, 0 ).rgb;
+
+		sumIrr += irr * weight;
+		sumW += weight;
+	}
+
+	return ( sumW > 0.0f ) ? ( sumIrr / sumW ) : float3( 0.0f, 0.0f, 0.0f );
+}
+
 [numthreads( 32, 1, 1 )]
 void main( uint3 dispatchID : SV_DispatchThreadID )
 {
@@ -246,7 +345,16 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 
 		// STAGE 2: shade the hit with the real projected lights (shadowed).
 		const float3 hitPos = ray.Origin + dir * hitDistance;
-		radiance = inst.albedo.rgb * DdgiShadeHit( hitPos, N );
+		float3 shade = DdgiShadeHit( hitPos, N );
+
+		// STAGE 3: add the previous frame's irradiance at the hit for multi-bounce
+		// (infinite bounce via the temporal feedback), Chebyshev-weighted.
+		if( g_Ddgi.frameIndex > 0 && g_Ddgi.bounceGain > 0.0f )
+		{
+			shade += g_Ddgi.bounceGain * DdgiSampleIrradiance( hitPos, N );
+		}
+
+		radiance = inst.albedo.rgb * shade;
 	}
 	else
 	{

@@ -52,6 +52,6 @@ struct DdgiConstants
 
 	int			frameIndex;
 	int			numLights;				// active projected lights in the light buffer
-	int			pad1;
+	float		bounceGain;				// multi-bounce feedback gain (r_ddgiBounceGain)
 	int			pad2;
 };

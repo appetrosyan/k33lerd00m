@@ -93,6 +93,10 @@ private:
 	nvrhi::BufferHandle				m_LightBuffer;
 	int								m_LightCapacity;
 
+	// linear-clamp sampler for reading the irradiance/distance atlases back into
+	// the trace pass for multi-bounce (M4 stage 3)
+	nvrhi::SamplerHandle			m_LinearSampler;
+
 public:
 	// Debug: the octahedral irradiance atlas, for r_ddgiDebug on-screen overlay.
 	nvrhi::ITexture*	GetIrradianceAtlas() const
@@ -108,6 +112,12 @@ private:
 	nvrhi::BindingLayoutHandle		m_IntegrateBindingLayout;
 	nvrhi::BindingSetHandle			m_IntegrateBindingSet;
 	nvrhi::ComputePipelineHandle	m_IntegratePipeline;
+
+	// octahedral border copy pass (M4 stage 3): seamless bilinear across tile edges
+	nvrhi::ShaderHandle				m_BorderShader;
+	nvrhi::BindingLayoutHandle		m_BorderBindingLayout;
+	nvrhi::BindingSetHandle			m_BorderBindingSet;
+	nvrhi::ComputePipelineHandle	m_BorderPipeline;
 
 	int						m_ProbeCounts[3];
 	int						m_FrameIndex;
