@@ -58,7 +58,7 @@ idCVar r_ddgiProbeSpacing( "r_ddgiProbeSpacing", "64", CVAR_RENDERER | CVAR_FLOA
 idCVar r_ddgiRaysPerProbe( "r_ddgiRaysPerProbe", "128", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "rays traced per probe per frame", 32, 256 );
 idCVar r_ddgiHysteresis( "r_ddgiHysteresis", "0.97", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "temporal blend weight for probe history [0..1]", 0.0f, 1.0f );
 idCVar r_ddgiNormalBias( "r_ddgiNormalBias", "0.25", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "probe sampling normal bias in world units" );
-idCVar r_ddgiDebug( "r_ddgiDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "overlay DDGI probe atlas: 1 = irradiance atlas", 0, 1 );
+idCVar r_ddgiDebug( "r_ddgiDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "DDGI debug: 1 = overlay irradiance atlas, 2 = isolate ambient (direct light off) to see the DDGI term", 0, 2 );
 idCVar r_ddgiBounceGain( "r_ddgiBounceGain", "0.95", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "DDGI multi-bounce feedback gain (0 = single bounce)", 0.0f, 2.0f );
 idCVar r_ddgiUpdateScope( "r_ddgiUpdateScope", "1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "which probes trace each frame: 0 = visible only, 1 = visible + neighbours, 2 = full", 0, 2 );
 

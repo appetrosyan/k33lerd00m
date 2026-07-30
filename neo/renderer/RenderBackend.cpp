@@ -3861,7 +3861,9 @@ idRenderBackend::DrawInteractions
 */
 void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 {
-	if( r_skipInteractions.GetBool() || viewDef->viewLights == NULL )
+	// r_ddgiDebug 2 isolates the ambient term: skip direct lighting so the DDGI
+	// (or baked) indirect contribution is what fills the screen.
+	if( r_skipInteractions.GetBool() || r_ddgiDebug.GetInteger() >= 2 || viewDef->viewLights == NULL )
 	{
 		return;
 	}
