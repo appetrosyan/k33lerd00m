@@ -9,6 +9,7 @@ file(GLOB lighting "builtin/lighting/*hlsl")
 file(GLOB post "builtin/post/*hlsl")
 file(GLOB ssao "builtin/SSAO/*hlsl")
 file(GLOB ddgi "builtin/ddgi/*hlsl")
+file(GLOB reflections "builtin/reflections/*hlsl")
 file(GLOB ssgi "builtin/SSGI/*hlsl")
 file(GLOB video "builtin/video/*hlsl")
 file(GLOB vr "builtin/VR/*hlsl")
@@ -26,6 +27,7 @@ source_group("builtin/lighting" FILES ${lighting})
 source_group("builtin/post" FILES ${post})
 source_group("builtin/SSAO" FILES ${ssao})
 source_group("builtin/ddgi" FILES ${ddgi})
+source_group("builtin/reflections" FILES ${reflections})
 source_group("builtin/SSGI" FILES ${ssgi})
 source_group("builtin/video" FILES ${video})
 source_group("builtin/VR" FILES ${vr})
@@ -67,7 +69,7 @@ endif()
 
 add_custom_target(ShadersRT
     DEPENDS ShaderMake
-    SOURCES ${ddgi}
+    SOURCES ${ddgi} ${reflections}
 )
 
 if(USE_VULKAN)

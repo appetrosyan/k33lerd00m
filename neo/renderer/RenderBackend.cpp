@@ -57,6 +57,7 @@ idCVar r_useLightStencilSelect( "r_useLightStencilSelect", "0", CVAR_RENDERER | 
 extern idCVar stereoRender_swapEyes;
 extern idCVar r_ddgiDebug;			// DDGI probe atlas overlay (Passes/DdgiPass.cpp)
 extern idCVar r_useDDGI;			// runtime DDGI toggle (RenderSystem_init.cpp)
+extern idCVar r_useRTReflections;	// runtime RT reflections toggle (RenderSystem_init.cpp)
 
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
 bool drawView3D;
@@ -5865,9 +5866,9 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	DrawInteractions( _viewDef );
 
 	//-------------------------------------------------
-	// resolve the screen for SSR
+	// resolve the screen for SSR / RT reflections (both sample the lit scene colour)
 	//-------------------------------------------------
-	if( is3D && r_useSSR.GetBool() && R_UseHiZ() )
+	if( is3D && ( ( r_useSSR.GetBool() && R_UseHiZ() ) || r_useRTReflections.GetBool() ) )
 	{
 		OPTICK_GPU_EVENT( "Resolve_Screen4SSR" );
 
@@ -5890,6 +5891,24 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 		}
 
 		renderLog.CloseBlock();
+	}
+
+	//-------------------------------------------------
+	// RT reflections: trace mirror reflections against the world TLAS and composite
+	// them into the resolved HDR scene, then blit the result back over the scene target
+	//-------------------------------------------------
+	if( is3D && reflectionsPass && r_useRTReflections.GetBool() )
+	{
+		OPTICK_GPU_EVENT( "Render_RTReflections" );
+
+		if( reflectionsPass->Render( commandList, _viewDef ) )
+		{
+			BlitParameters blitParms;
+			blitParms.sourceTexture = reflectionsPass->GetReflectionImage()->GetTextureHandle();
+			blitParms.targetFramebuffer = globalFramebuffers.hdrFBO->GetApiObject();
+			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth(), renderSystem->GetHeight() );
+			commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
+		}
 	}
 
 	//-------------------------------------------------
