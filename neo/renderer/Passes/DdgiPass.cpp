@@ -66,13 +66,19 @@ DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	, m_CommonPasses( commonPasses )
 	, m_TraceBoundTlas( nullptr )
 	, m_TraceBoundInstanceData( nullptr )
+	, m_IrradianceImage( nullptr )
+	, m_DistanceImage( nullptr )
 	, m_FrameIndex( 0 )
 	, rayTracingSupported( false )
 	, loggedFirstBuild( false )
 {
+	// Camera-anchored volume. X*Z folds into the atlas width (countX*countZ*SIZE),
+	// which is texture-dimension limited (~16384) - not memory - so keep X*Z within
+	// ~1024. countY is cheap. r_ddgiUpdateScope culls which probes trace per frame.
 	m_ProbeCounts[0] = 16;
 	m_ProbeCounts[1] = 8;
 	m_ProbeCounts[2] = 16;
+	m_VolumeSpacing = 64.0f;
 
 	m_AccelStructs.Init( device );
 	// DDGI traces probe rays with inline ray queries from a compute shader, so
@@ -197,22 +203,17 @@ void DdgiPass::CreateIntegratePass()
 	const int probeSize = LIGHTGRID_IRRADIANCE_SIZE;
 	const int atlasCols = m_ProbeCounts[0] * m_ProbeCounts[2];	// tile = (px + pz*countX, py)
 	const int atlasRows = m_ProbeCounts[1];
+	const int atlasW = atlasCols * probeSize;
+	const int atlasH = atlasRows * probeSize;
 
-	nvrhi::TextureDesc irrDesc;
-	irrDesc.width = atlasCols * probeSize;
-	irrDesc.height = atlasRows * probeSize;
-	irrDesc.format = nvrhi::Format::RGBA16_FLOAT;
-	irrDesc.dimension = nvrhi::TextureDimension::Texture2D;
-	irrDesc.isUAV = true;
-	irrDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
-	irrDesc.keepInitialState = true;
-	irrDesc.debugName = "DDGI/IrradianceAtlas";
-	m_IrradianceAtlas = m_Device->createTexture( irrDesc );
+	// idImages (RT+UAV, linear-clamp, keepInitialState) so the ambient pass can
+	// Bind() them in place of the baked grid. Same compute-write + sample pattern
+	// as the SSAO image. TF_LINEAR gives the bilinear read the border copy needs.
+	m_IrradianceImage = globalImages->AllocStandaloneImage( "_ddgiIrradianceAtlas" );
+	m_IrradianceImage->GenerateImage( NULL, atlasW, atlasH, TF_LINEAR, TR_CLAMP, TD_RGBA16F, nullptr, true, true );
 
-	nvrhi::TextureDesc distDesc = irrDesc;
-	distDesc.format = nvrhi::Format::RG16_FLOAT;
-	distDesc.debugName = "DDGI/DistanceAtlas";
-	m_DistanceAtlas = m_Device->createTexture( distDesc );
+	m_DistanceImage = globalImages->AllocStandaloneImage( "_ddgiDistanceAtlas" );
+	m_DistanceImage->GenerateImage( NULL, atlasW, atlasH, TF_LINEAR, TR_CLAMP, TD_RG16F, nullptr, true, true );
 
 	idList<shaderMacro_t> macros;
 	const int shaderIdx = renderProgManager.FindShader( "builtin/ddgi/probe_integrate", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT );
@@ -246,8 +247,8 @@ void DdgiPass::CreateIntegratePass()
 	{
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_RayRadianceBuffer ),
 		nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
-		nvrhi::BindingSetItem::Texture_UAV( 0, m_IrradianceAtlas ),
-		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceAtlas ),
+		nvrhi::BindingSetItem::Texture_UAV( 0, m_IrradianceImage->GetTextureHandle() ),
+		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceImage->GetTextureHandle() ),
 	};
 	m_IntegrateBindingSet = m_Device->createBindingSet( setDesc, m_IntegrateBindingLayout );
 
@@ -280,8 +281,8 @@ void DdgiPass::CreateIntegratePass()
 	borderSetDesc.bindings =
 	{
 		nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
-		nvrhi::BindingSetItem::Texture_UAV( 0, m_IrradianceAtlas ),
-		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceAtlas ),
+		nvrhi::BindingSetItem::Texture_UAV( 0, m_IrradianceImage->GetTextureHandle() ),
+		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceImage->GetTextureHandle() ),
 	};
 	m_BorderBindingSet = m_Device->createBindingSet( borderSetDesc, m_BorderBindingLayout );
 }
@@ -316,6 +317,10 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 		const float half = m_ProbeCounts[i] * spacing * 0.5f;
 		origin[i] = idMath::Floor( ( viewOrg[i] - half ) / spacing ) * spacing;
 	}
+
+	// publish the volume so the ambient pass can sample this frame's atlas
+	m_VolumeOrigin = origin;
+	m_VolumeSpacing = spacing;
 
 	DdgiConstants constants;
 	memset( &constants, 0, sizeof( constants ) );
@@ -410,8 +415,8 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 			nvrhi::BindingSetItem::RawBuffer_SRV( 2, m_AccelStructs.GetStaticVertexBuffer() ),
 			nvrhi::BindingSetItem::RawBuffer_SRV( 3, m_AccelStructs.GetStaticIndexBuffer() ),
 			nvrhi::BindingSetItem::StructuredBuffer_SRV( 4, m_LightBuffer ),
-			nvrhi::BindingSetItem::Texture_SRV( 5, m_IrradianceAtlas ),
-			nvrhi::BindingSetItem::Texture_SRV( 6, m_DistanceAtlas ),
+			nvrhi::BindingSetItem::Texture_SRV( 5, m_IrradianceImage->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_SRV( 6, m_DistanceImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_RayRadianceBuffer ),
 			nvrhi::BindingSetItem::Sampler( 0, m_LinearSampler ),

@@ -56,6 +56,7 @@ idCVar r_useLightStencilSelect( "r_useLightStencilSelect", "0", CVAR_RENDERER | 
 
 extern idCVar stereoRender_swapEyes;
 extern idCVar r_ddgiDebug;			// DDGI probe atlas overlay (Passes/DdgiPass.cpp)
+extern idCVar r_useDDGI;			// runtime DDGI toggle (RenderSystem_init.cpp)
 
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
 bool drawView3D;
@@ -1275,6 +1276,36 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		idVec4 textureSize( res.x, res.y, 1.0f / res.x, 1.0f / res.y );
 
 		renderProgManager.SetUniformValue( RENDERPARM_CASCADEDISTANCES, textureSize.ToFloatPtr() );
+
+		// M4 stage 4: replace the baked light-grid diffuse ambient with the runtime
+		// DDGI volume. Same octahedral atlas layout, so only the volume params +
+		// bound image change; the specular/env-probe reflections above stay baked.
+		if( r_useDDGI.GetBool() && ddgiPass && ddgiPass->GetIrradianceImage() )
+		{
+			const idVec3 o = ddgiPass->GetVolumeOrigin();
+			const float sp = ddgiPass->GetVolumeSpacing();
+			idVec4 ddgiOrigin( o.x, o.y, o.z, 1.0f );
+			idVec4 ddgiSize( sp, sp, sp, 1.0f );
+			idVec4 ddgiBounds( ddgiPass->GetProbeCount( 0 ), ddgiPass->GetProbeCount( 1 ), ddgiPass->GetProbeCount( 2 ), 1.0f );
+			renderProgManager.SetUniformValue( RENDERPARM_GLOBALLIGHTORIGIN, ddgiOrigin.ToFloatPtr() );
+			renderProgManager.SetUniformValue( RENDERPARM_JITTERTEXSCALE, ddgiSize.ToFloatPtr() );
+			renderProgManager.SetUniformValue( RENDERPARM_JITTERTEXOFFSET, ddgiBounds.ToFloatPtr() );
+
+			idVec4 ddgiProbeSize;
+			ddgiProbeSize[0] = LIGHTGRID_IRRADIANCE_SIZE - LIGHTGRID_IRRADIANCE_BORDER_SIZE;
+			ddgiProbeSize[1] = LIGHTGRID_IRRADIANCE_SIZE;
+			ddgiProbeSize[2] = LIGHTGRID_IRRADIANCE_BORDER_SIZE;
+			ddgiProbeSize[3] = float( LIGHTGRID_IRRADIANCE_SIZE - LIGHTGRID_IRRADIANCE_BORDER_SIZE ) / LIGHTGRID_IRRADIANCE_SIZE;
+			renderProgManager.SetUniformValue( RENDERPARM_SCREENCORRECTIONFACTOR, ddgiProbeSize.ToFloatPtr() );
+
+			idImage* ddgiImg = ddgiPass->GetIrradianceImage();
+			GL_SelectTexture( INTERACTION_TEXUNIT_AMBIENT_CUBE1 );
+			ddgiImg->Bind();
+
+			idVec2i dres = ddgiImg->GetUploadResolution();
+			idVec4 dsize( dres.x, dres.y, 1.0f / dres.x, 1.0f / dres.y );
+			renderProgManager.SetUniformValue( RENDERPARM_CASCADEDISTANCES, dsize.ToFloatPtr() );
+		}
 
 		GL_SelectTexture( INTERACTION_TEXUNIT_SPECULAR_CUBE1 );
 		viewDef->radianceImages[0]->Bind();
@@ -6089,11 +6120,11 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 			// BEFORE the swapchain copy, so both the screen and screenshots (which
 			// read ldrImage) show it. Runs on every view; the last (2D HUD) pass
 			// writes ldrImage last, so the overlay survives. (r_ddgiDebug)
-			if( r_ddgiDebug.GetInteger() > 0 && ddgiPass && ddgiPass->GetIrradianceAtlas() )
+			if( r_ddgiDebug.GetInteger() > 0 && ddgiPass && ddgiPass->GetIrradianceImage() )
 			{
 				const float dw = Min( ( float )renderSystem->GetNativeWidth(), 768.0f );
 				BlitParameters dbgParms;
-				dbgParms.sourceTexture = ddgiPass->GetIrradianceAtlas();
+				dbgParms.sourceTexture = ddgiPass->GetIrradianceImage()->GetTextureHandle();
 				dbgParms.targetFramebuffer = globalFramebuffers.ldrFBO->GetApiObject();
 				dbgParms.targetViewport = nvrhi::Viewport( 0.0f, dw, 0.0f, dw * 0.25f, 0.0f, 1.0f );
 				commonPasses.BlitTexture( commandList, dbgParms, &bindingCache );

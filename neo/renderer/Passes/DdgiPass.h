@@ -46,6 +46,7 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 class idRenderBackend;
+class idImage;
 struct viewDef_t;
 
 class DdgiPass
@@ -98,16 +99,33 @@ private:
 	nvrhi::SamplerHandle			m_LinearSampler;
 
 public:
-	// Debug: the octahedral irradiance atlas, for r_ddgiDebug on-screen overlay.
-	nvrhi::ITexture*	GetIrradianceAtlas() const
+	// The octahedral irradiance atlas as an idImage, so the ambient pass can Bind()
+	// it in place of the baked light grid and the debug overlay can blit it.
+	idImage*		GetIrradianceImage() const
 	{
-		return m_IrradianceAtlas;
+		return m_IrradianceImage;
+	}
+
+	// Camera-anchored probe volume for this frame, so the ambient pass can sample
+	// the DDGI atlas in place of the baked light grid (M4 stage 4).
+	const idVec3&	GetVolumeOrigin() const
+	{
+		return m_VolumeOrigin;
+	}
+	float			GetVolumeSpacing() const
+	{
+		return m_VolumeSpacing;
+	}
+	int				GetProbeCount( int axis ) const
+	{
+		return m_ProbeCounts[axis];
 	}
 
 private:
-	// probe integrate pass (M3): octahedral atlases the trace radiance folds into
-	nvrhi::TextureHandle			m_IrradianceAtlas;		// rgb irradiance per probe texel
-	nvrhi::TextureHandle			m_DistanceAtlas;		// mean, mean^2 distance
+	// probe integrate pass (M3): octahedral atlases the trace radiance folds into.
+	// idImages so the ambient pass can sample them through the normal bind path.
+	idImage*						m_IrradianceImage;		// rgb irradiance per probe texel
+	idImage*						m_DistanceImage;		// mean, mean^2 distance
 	nvrhi::ShaderHandle				m_IntegrateShader;
 	nvrhi::BindingLayoutHandle		m_IntegrateBindingLayout;
 	nvrhi::BindingSetHandle			m_IntegrateBindingSet;
@@ -120,6 +138,8 @@ private:
 	nvrhi::ComputePipelineHandle	m_BorderPipeline;
 
 	int						m_ProbeCounts[3];
+	idVec3					m_VolumeOrigin;		// snapped camera-anchored origin this frame
+	float					m_VolumeSpacing;	// world units between probes
 	int						m_FrameIndex;
 
 	bool					rayTracingSupported;

@@ -144,9 +144,16 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 		irradiance += rr.rgb * cosw;
 		sumWeight += cosw;
 
+		// Clamp the stored distance so mean^2 stays within fp16 range (RG16F max
+		// ~65504); miss rays return TMax (~10000) whose square would overflow to
+		// Inf and poison the Chebyshev test with NaN. Distances beyond a couple of
+		// probe cells do not affect visibility weighting anyway.
+		const float maxDist = 2.0f * max( g_Ddgi.probeGridSpacing.x, max( g_Ddgi.probeGridSpacing.y, g_Ddgi.probeGridSpacing.z ) );
+		const float clampedDist = min( rr.a, maxDist );
+
 		const float dw = pow( cosw, DDGI_DEPTH_SHARPNESS );
-		distMean += rr.a * dw;
-		distMean2 += rr.a * rr.a * dw;
+		distMean += clampedDist * dw;
+		distMean2 += clampedDist * clampedDist * dw;
 		distWeight += dw;
 	}
 
