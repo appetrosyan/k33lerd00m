@@ -89,6 +89,10 @@ private:
 	nvrhi::rt::IAccelStruct*		m_TraceBoundTlas;		// TLAS the binding set was built against
 	nvrhi::IBuffer*					m_TraceBoundInstanceData;	// instance-data buffer the set was built against
 
+	// per-frame projected-light buffer (M4 stage 2), bound as a StructuredBuffer SRV
+	nvrhi::BufferHandle				m_LightBuffer;
+	int								m_LightCapacity;
+
 public:
 	// Debug: the octahedral irradiance atlas, for r_ddgiDebug on-screen overlay.
 	nvrhi::ITexture*	GetIrradianceAtlas() const

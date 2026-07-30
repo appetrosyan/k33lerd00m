@@ -45,9 +45,21 @@ struct DdgiConstants
 	float4	rayRotation;			// quaternion
 
 	int		frameIndex;
-	int		pad0;
+	int		numLights;				// active projected lights in t_Lights
 	int		pad1;
 	int		pad2;
+};
+
+// Per-light shading data. Layout must match DdgiLight in DdgiPass.cpp. The four
+// planes are Doom's classic light-projection texgen planes.
+struct DdgiLight
+{
+	float4	projectS;
+	float4	projectT;
+	float4	projectQ;		// projection divide
+	float4	projectFalloff;	// distance falloff coord (0..1)
+	float4	color;			// rgb (+ pad)
+	float4	origin;			// world origin xyz (+ pad)
 };
 
 // Per-TLAS-instance shading data. Layout must match DdgiInstanceData in
@@ -66,6 +78,7 @@ RaytracingAccelerationStructure		t_TLAS			: register(t0);
 StructuredBuffer<DdgiInstanceData>	t_InstanceData	: register(t1);
 ByteAddressBuffer					t_Vertex		: register(t2);	// static idDrawVert cache
 ByteAddressBuffer					t_Index			: register(t3);	// static R16 index cache
+StructuredBuffer<DdgiLight>			t_Lights		: register(t4);	// projected lights
 RWStructuredBuffer<float4>			u_RayRadiance	: register(u0);
 
 cbuffer c_Ddgi : register(b1)
@@ -101,6 +114,72 @@ float3 SphericalFibonacci( float i, float n )
 float3 QuatRotate( float4 q, float3 v )
 {
 	return v + 2.0f * cross( q.xyz, cross( q.xyz, v ) + q.w * v );
+}
+
+// Evaluate all projected lights at a world-space hit point, with a shadow ray
+// per light against the world TLAS. Faithful to Doom's light shapes via the
+// texgen planes; the projection cookie texture is deferred (analytic edge fade).
+float3 DdgiShadeHit( float3 P, float3 N )
+{
+	float3 lit = float3( 0.0f, 0.0f, 0.0f );
+	const float4 P4 = float4( P, 1.0f );
+
+	for( int i = 0; i < g_Ddgi.numLights; i++ )
+	{
+		DdgiLight L = t_Lights[i];
+
+		// project the hit point into the light's volume (classic texgen)
+		float q = dot( L.projectQ, P4 );
+		if( q <= 0.0f )
+		{
+			continue;
+		}
+		float s = dot( L.projectS, P4 ) / q;
+		float t = dot( L.projectT, P4 ) / q;
+		float fall = dot( L.projectFalloff, P4 );
+		if( s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f || fall < 0.0f || fall > 1.0f )
+		{
+			continue;	// outside the light's projected volume
+		}
+
+		float3 toLight = L.origin.xyz - P;
+		float dist = length( toLight );
+		if( dist <= 0.0001f )
+		{
+			continue;
+		}
+		float3 Ldir = toLight / dist;
+		float ndl = saturate( dot( N, Ldir ) );
+		if( ndl <= 0.0f )
+		{
+			continue;
+		}
+
+		// shadow ray: any opaque hit before the light occludes this sample
+		RayDesc sray;
+		sray.Origin = P + N * g_Ddgi.normalBias;
+		sray.Direction = Ldir;
+		sray.TMin = 0.0f;
+		sray.TMax = max( 0.0f, dist - g_Ddgi.normalBias );
+
+		RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+		sq.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray );
+		sq.Proceed();
+		if( sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT )
+		{
+			continue;	// shadowed
+		}
+
+		// analytic falloff (cookie deferred): fade toward the volume edges and
+		// with the distance falloff coordinate.
+		float fadeS = smoothstep( 0.0f, 0.1f, s ) * ( 1.0f - smoothstep( 0.9f, 1.0f, s ) );
+		float fadeT = smoothstep( 0.0f, 0.1f, t ) * ( 1.0f - smoothstep( 0.9f, 1.0f, t ) );
+		float atten = ndl * ( 1.0f - fall ) * fadeS * fadeT;
+
+		lit += L.color.rgb * atten;
+	}
+
+	return lit;
 }
 
 [numthreads( 32, 1, 1 )]
@@ -165,11 +244,9 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 			N = -N;
 		}
 
-		// STAGE 1: temporary shade proving hit geometry + normal reconstruction.
-		// albedo lit by a fixed overhead term (Doom up axis is +Z); a non-black
-		// atlas confirms the pipeline. Real light evaluation is Stage 2.
-		const float ndl = saturate( dot( N, float3( 0.0f, 0.0f, 1.0f ) ) );
-		radiance = inst.albedo.rgb * ( 0.2f + 0.8f * ndl );
+		// STAGE 2: shade the hit with the real projected lights (shadowed).
+		const float3 hitPos = ray.Origin + dir * hitDistance;
+		radiance = inst.albedo.rgb * DdgiShadeHit( hitPos, N );
 	}
 	else
 	{

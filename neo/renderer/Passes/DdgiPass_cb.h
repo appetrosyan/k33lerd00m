@@ -51,7 +51,7 @@ struct DdgiConstants
 	idVec4		rayRotation;
 
 	int			frameIndex;
-	int			pad0;
+	int			numLights;				// active projected lights in the light buffer
 	int			pad1;
 	int			pad2;
 };

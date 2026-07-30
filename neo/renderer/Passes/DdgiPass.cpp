@@ -32,9 +32,26 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 
 // Main toggle lives with the other GI cvars in RenderSystem_init.cpp.
 extern idCVar r_useDDGI;
+extern idCVar r_lightScale;
 
 // Fixed probe volume for M2 (camera-centred). Made map-aware / cascaded later.
 static const int DDGI_MAX_RAYS = 256;
+
+// Upper bound on projected lights fed to the probe trace each frame (M4 stage 2).
+static const int DDGI_MAX_LIGHTS = 64;
+
+// Per-light shading data for the probe trace. Layout must match DdgiLight in
+// probe_trace.cs.hlsl. The four planes are Doom's classic light-projection
+// texgen planes (S, T, Q-divide, falloff); dot(plane, float4(worldPos,1)).
+struct DdgiLight
+{
+	float	projectS[4];
+	float	projectT[4];
+	float	projectQ[4];
+	float	projectFalloff[4];
+	float	color[4];		// rgb (+ pad)
+	float	origin[4];		// world origin xyz (+ pad)
+};
 
 // Pass-local tuning cvars (mirrors the SsaoPass convention of file-scope statics).
 idCVar r_ddgiProbeSpacing( "r_ddgiProbeSpacing", "64", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "DDGI probe spacing in world units" );
@@ -121,6 +138,7 @@ void DdgiPass::CreateTracePass()
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 1 ),	// t1 : per-instance data
 		nvrhi::BindingLayoutItem::RawBuffer_SRV( 2 ),			// t2 : static vertex cache
 		nvrhi::BindingLayoutItem::RawBuffer_SRV( 3 ),			// t3 : static index cache
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 4 ),	// t4 : projected lights
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : DdgiConstants
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : per-ray radiance
 	};
@@ -144,6 +162,16 @@ void DdgiPass::CreateTracePass()
 	bufferDesc.keepInitialState = true;
 	bufferDesc.debugName = "DDGI/RayRadiance";
 	m_RayRadianceBuffer = m_Device->createBuffer( bufferDesc );
+
+	// per-frame projected-light buffer (filled in DispatchProbeTrace)
+	nvrhi::BufferDesc lightDesc;
+	lightDesc.byteSize = ( uint64_t )DDGI_MAX_LIGHTS * sizeof( DdgiLight );
+	lightDesc.structStride = sizeof( DdgiLight );
+	lightDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+	lightDesc.keepInitialState = true;
+	lightDesc.debugName = "DDGI/Lights";
+	m_LightBuffer = m_Device->createBuffer( lightDesc );
+	m_LightCapacity = DDGI_MAX_LIGHTS;
 }
 
 /*
@@ -260,7 +288,68 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 	constants.rayRotation = idVec4( 0.0f, 0.0f, 0.0f, 1.0f );	// identity for M2; jittered later
 	constants.frameIndex = m_FrameIndex++;
 
+	// Gather visible projected lights for hit shading (M4 stage 2). Mirrors the
+	// interaction pass: colour = sum over light-shader stages of lightScale *
+	// shaderRegisters; the four texgen planes (S, T, Q-divide, falloff) drive the
+	// projected light shape so DDGI bounce matches Doom's lights.
+	const float lightScale = r_lightScale.GetFloat();
+	DdgiLight lights[DDGI_MAX_LIGHTS];
+	int numLights = 0;
+	for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL && numLights < DDGI_MAX_LIGHTS; vLight = vLight->next )
+	{
+		const idMaterial* lightShader = vLight->lightShader;
+		if( lightShader == NULL || vLight->shaderRegisters == NULL )
+		{
+			continue;
+		}
+		// only real illuminating lights bounce - skip fog and blend lights
+		if( lightShader->IsFogLight() || lightShader->IsBlendLight() )
+		{
+			continue;
+		}
+
+		const float* lightRegs = vLight->shaderRegisters;
+		idVec3 color( 0.0f, 0.0f, 0.0f );
+		for( int s = 0; s < lightShader->GetNumStages(); s++ )
+		{
+			const shaderStage_t* stage = lightShader->GetStage( s );
+			if( !lightRegs[ stage->conditionRegister ] )
+			{
+				continue;
+			}
+			color.x += lightScale * lightRegs[ stage->color.registers[0] ];
+			color.y += lightScale * lightRegs[ stage->color.registers[1] ];
+			color.z += lightScale * lightRegs[ stage->color.registers[2] ];
+		}
+		if( color.LengthSqr() <= 0.0f )
+		{
+			continue;
+		}
+
+		DdgiLight& L = lights[numLights++];
+		for( int p = 0; p < 4; p++ )
+		{
+			L.projectS[p]       = vLight->lightProject[0][p];
+			L.projectT[p]       = vLight->lightProject[1][p];
+			L.projectQ[p]       = vLight->lightProject[2][p];
+			L.projectFalloff[p] = vLight->lightProject[3][p];
+		}
+		L.color[0] = color.x;
+		L.color[1] = color.y;
+		L.color[2] = color.z;
+		L.color[3] = 0.0f;
+		L.origin[0] = vLight->globalLightOrigin.x;
+		L.origin[1] = vLight->globalLightOrigin.y;
+		L.origin[2] = vLight->globalLightOrigin.z;
+		L.origin[3] = 0.0f;
+	}
+	constants.numLights = numLights;
+
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
+	if( numLights > 0 )
+	{
+		commandList->writeBuffer( m_LightBuffer, lights, ( size_t )numLights * sizeof( DdgiLight ) );
+	}
 
 	// the TLAS handle changes when it is recreated to grow; rebuild the binding
 	// set to point at the current one.
@@ -275,6 +364,7 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 			nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, instanceData ),
 			nvrhi::BindingSetItem::RawBuffer_SRV( 2, m_AccelStructs.GetStaticVertexBuffer() ),
 			nvrhi::BindingSetItem::RawBuffer_SRV( 3, m_AccelStructs.GetStaticIndexBuffer() ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 4, m_LightBuffer ),
 			nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_RayRadianceBuffer ),
 		};
