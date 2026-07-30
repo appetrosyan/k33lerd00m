@@ -45,6 +45,7 @@ struct ReflectionConstants
 	float4	eyePos;
 
 	float4	params0;		// x = maxRayDist, y = normalBias, z = intensity, w = disoccEps
+	float4	params1;		// x = gateLo, y = gateHi, z = envMipScale, w unused
 	int2	screenSize;
 	int2	debugFlags;		// x = debug mode
 };
@@ -53,7 +54,8 @@ struct ReflectionConstants
 RaytracingAccelerationStructure	t_TLAS			: register(t0);
 Texture2D<float4>				t_SceneColor	: register(t1);	// resolved lit scene (HDR)
 Texture2D<float4>				t_Depth			: register(t2);	// hardware depth (.r)
-Texture2D<float4>				t_GBufferNormal	: register(t3);	// world normal in .rgb (*2-1)
+Texture2D<float4>				t_GBufferNormal	: register(t3);	// world normal .rgb (*2-1), roughness .a
+Texture2D<float4>				t_EnvRadiance	: register(t4);	// octahedral env radiance (off-screen fallback)
 RWTexture2D<float4>				u_Reflection	: register(u0);	// composited output
 SamplerState					s_LinearClamp	: register(s0);
 
@@ -62,6 +64,32 @@ cbuffer c_Refl : register(b1)
 	ReflectionConstants g_Refl;
 };
 // *INDENT-ON*
+
+// Octahedral encode matching the engine's octEncode (global_inc.hlsl) so the
+// baked radiance probes are addressed with the same convention they were packed.
+float2 SignNotZero( float2 v )
+{
+	return float2( ( v.x >= 0.0f ) ? 1.0f : -1.0f, ( v.y >= 0.0f ) ? 1.0f : -1.0f );
+}
+
+float2 OctEncode( float3 v )
+{
+	float l1 = abs( v.x ) + abs( v.y ) + abs( v.z );
+	float2 oct = v.xy * ( 1.0f / max( l1, 1e-6f ) );
+	if( v.z < 0.0f )
+	{
+		oct = ( 1.0f - abs( oct.yx ) ) * SignNotZero( oct.xy );
+	}
+	return oct;
+}
+
+// Sample the environment radiance probe along a world direction, roughness -> mip.
+float3 SampleEnv( float3 dir, float roughness )
+{
+	const float2 octUV = OctEncode( dir ) * 0.5f + 0.5f;
+	const float mip = roughness * g_Refl.params1.z;
+	return t_EnvRadiance.SampleLevel( s_LinearClamp, octUV, mip ).rgb;
+}
 
 // clip4 = float4( ndc, 1 ); world = (rows . clip4).xyz / w. The overall clip-space
 // scale cancels in the perspective divide, so we can feed w = 1 directly.
@@ -104,6 +132,17 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	}
 	const float3 N = normalize( nEnc );
 
+	// roughness gate: only smooth surfaces get a mirror reflection. Rough surfaces
+	// keep their existing (env-probe) shading untouched. Kept alive in debug so the
+	// trace visualisation still covers the whole frame.
+	const float roughness = t_GBufferNormal[pixel].a;
+	const float gate = 1.0f - smoothstep( g_Refl.params1.x, g_Refl.params1.y, roughness );
+	if( gate <= 0.0f && g_Refl.debugFlags.x == 0 )
+	{
+		u_Reflection[pixel] = float4( base, 1.0f );
+		return;
+	}
+
 	const float2 uv = ( float2( pixel ) + 0.5f ) / float2( g_Refl.screenSize );
 	const float3 worldP = ReconstructWorld( uv, depth );
 
@@ -122,7 +161,6 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	q.Proceed();
 
 	float3 reflColor = base;
-	float  weight = 0.0f;
 	bool   didHit = false;		// ray hit any geometry
 	bool   validSample = false;	// hit reprojected to an on-screen, non-occluded pixel
 
@@ -157,31 +195,41 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 				{
 					validSample = true;
 					reflColor = t_SceneColor.SampleLevel( s_LinearClamp, huv, 0 ).rgb;
-
-					// Fresnel-Schlick (dielectric) so reflections strengthen at grazing
-					const float NdotV = saturate( dot( N, -V ) );
-					const float fres = 0.04f + 0.96f * pow( 1.0f - NdotV, 5.0f );
-					weight = saturate( fres * g_Refl.params0.z );
 				}
 			}
 		}
 	}
 
+	// off-screen / occluded hit, or a miss into open space: fall back to the
+	// environment radiance probe along the reflection direction (this is what lets
+	// geometry the camera cannot see still appear in the reflection).
+	if( !validSample )
+	{
+		reflColor = SampleEnv( R, roughness );
+	}
+
 	// debug mode 2: visualise the trace pipeline (brightness-independent proof).
-	// red   = the reflection ray hit geometry but did not resolve to screen colour
-	// green = the hit reprojected to a valid on-screen, non-occluded pixel
+	// green = hit reprojected to a valid on-screen pixel (screen-colour reflection)
+	// red   = hit geometry but off-screen / occluded (env fallback)
+	// blue  = ray missed into open space (env fallback)
 	if( g_Refl.debugFlags.x == 2 )
 	{
 		const float3 dbg = validSample ? float3( 0.0f, 1.0f, 0.0f )
-					  : ( didHit ? float3( 1.0f, 0.0f, 0.0f ) : float3( 0.0f, 0.0f, 0.0f ) );
+					  : ( didHit ? float3( 1.0f, 0.0f, 0.0f ) : float3( 0.0f, 0.0f, 1.0f ) );
 		u_Reflection[pixel] = float4( dbg, 1.0f );
 		return;
 	}
 
-	// debug mode 1: show the reflection at full strength wherever it is valid
-	if( g_Refl.debugFlags.x == 1 && weight > 0.0f )
+	// Fresnel-Schlick (dielectric) so reflections strengthen at grazing angles,
+	// scaled by the roughness gate so only smooth surfaces mirror.
+	const float NdotV = saturate( dot( N, -V ) );
+	const float fres = 0.04f + 0.96f * pow( 1.0f - NdotV, 5.0f );
+	float weight = saturate( fres * g_Refl.params0.z ) * gate;
+
+	// debug mode 1: show the reflection at full strength on every gated surface
+	if( g_Refl.debugFlags.x == 1 )
 	{
-		weight = 1.0f;
+		weight = ( gate > 0.0f ) ? 1.0f : 0.0f;
 	}
 
 	u_Reflection[pixel] = float4( lerp( base, reflColor, weight ), 1.0f );

@@ -29,10 +29,12 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "global_inc.hlsl"
 #include "renderParmSet3.inc.hlsl"
+#include "BRDF.inc.hlsl"
 
 
 // *INDENT-OFF*
 Texture2D	 t_NormalMap	: register( t0 VK_DESCRIPTOR_SET( 1 ) );
+Texture2D	 t_SpecularMap	: register( t1 VK_DESCRIPTOR_SET( 1 ) );	// bound at INTERACTION_TEXUNIT_SPECULARMIX
 SamplerState s_Sampler		: register( s0 VK_DESCRIPTOR_SET( 2 ) );
 
 struct PS_IN
@@ -66,7 +68,12 @@ void main( PS_IN fragment, out PS_OUT result )
 
 	float4 bump = t_NormalMap.Sample( s_Sampler, bumpUV ) * 2.0f - 1.0f;
 
-	// TODO sample roughness and put it into the alpha channel
+	// sample the per-surface specular/gloss map and store roughness in the alpha
+	// channel so screen-space consumers (RT reflections) can gate on it. Legacy
+	// gloss estimate - matches the interaction / ambient IBL shaders. PBR RMAO maps
+	// pack roughness in .r; the legacy estimate is a coarse but adequate gate.
+	float4 specMap = t_SpecularMap.Sample( s_Sampler, specUV );
+	float roughness = EstimateLegacyRoughness( specMap.rgb );
 
 	float3 localNormal;
 	localNormal = float3( bump.wy, 0.0f );
@@ -81,5 +88,5 @@ void main( PS_IN fragment, out PS_OUT result )
 
 	// RB: rpColor is white and only used to generate the _fa_ uniform array
 	result.color.rgb = ( globalNormal.xyz * 0.5 + 0.5 ) * fragment.color.rgb;// * pc.rpColor;
-	result.color.a = 1.0;
+	result.color.a = roughness;
 }

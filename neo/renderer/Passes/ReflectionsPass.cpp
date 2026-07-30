@@ -38,6 +38,8 @@ idCVar r_rtReflectionMaxDist( "r_rtReflectionMaxDist", "4000", CVAR_RENDERER | C
 idCVar r_rtReflectionBias( "r_rtReflectionBias", "2.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: ray origin bias along the normal (self-intersection)" );
 idCVar r_rtReflectionIntensity( "r_rtReflectionIntensity", "1.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: reflection blend intensity", 0.0f, 1.0f );
 idCVar r_rtReflectionDisoccEps( "r_rtReflectionDisoccEps", "8.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: disocclusion tolerance in world units when sampling the reprojected hit" );
+idCVar r_rtReflectionGateLo( "r_rtReflectionGateLo", "0.1", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: roughness at/below which a surface fully mirrors", 0.0f, 1.0f );
+idCVar r_rtReflectionGateHi( "r_rtReflectionGateHi", "0.45", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: roughness at/above which a surface does not reflect", 0.0f, 1.0f );
 idCVar r_rtReflectionDebug( "r_rtReflectionDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT reflections: 1 = show reflections at full strength, 2 = visualise trace (red=hit, green=valid on-screen sample)", 0, 2 );
 
 ReflectionsPass::ReflectionsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
@@ -107,7 +109,8 @@ void ReflectionsPass::CreateTracePass()
 		nvrhi::BindingLayoutItem::RayTracingAccelStruct( 0 ),	// t0 : world TLAS
 		nvrhi::BindingLayoutItem::Texture_SRV( 1 ),			// t1 : resolved lit scene colour
 		nvrhi::BindingLayoutItem::Texture_SRV( 2 ),			// t2 : hardware depth
-		nvrhi::BindingLayoutItem::Texture_SRV( 3 ),			// t3 : gbuffer world normals
+		nvrhi::BindingLayoutItem::Texture_SRV( 3 ),			// t3 : gbuffer world normals + roughness
+		nvrhi::BindingLayoutItem::Texture_SRV( 4 ),			// t4 : env radiance (off-screen fallback)
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : ReflectionConstants
 		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : composited output
 		nvrhi::BindingLayoutItem::Sampler( 0 ),				// s0 : linear-clamp sampler
@@ -208,6 +211,10 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 								r_rtReflectionBias.GetFloat(),
 								r_rtReflectionIntensity.GetFloat(),
 								r_rtReflectionDisoccEps.GetFloat() );
+	// env-fallback mip scale: roughness -> mip over the radiance probe's LOD range
+	constants.params1 = idVec4( r_rtReflectionGateLo.GetFloat(),
+								r_rtReflectionGateHi.GetFloat(),
+								6.0f, 0.0f );
 	constants.screenSize = idVec2i( width, height );
 	constants.debugFlags = idVec2i( r_rtReflectionDebug.GetInteger(), 0 );
 
@@ -225,6 +232,7 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 			nvrhi::BindingSetItem::Texture_SRV( 1, globalImages->currentRenderImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::Texture_SRV( 2, globalImages->currentDepthImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::Texture_SRV( 3, globalImages->gbufferNormalsRoughnessImage->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_SRV( 4, globalImages->defaultUACRadianceCube->GetTextureHandle() ),
 			nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 			nvrhi::BindingSetItem::Texture_UAV( 0, m_ReflectionImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::Sampler( 0, m_LinearSampler ),

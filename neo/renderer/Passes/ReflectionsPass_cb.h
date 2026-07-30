@@ -50,6 +50,10 @@ struct ReflectionConstants
 
 	idVec4		params0;		// x = max ray distance, y = normal bias,
 	//							// z = reflection intensity, w = disocclusion eps
+	idVec4		params1;		// x = roughness gate low (full reflect <=),
+	//							// y = roughness gate high (no reflect >=),
+	//							// z = env-fallback mip scale, w unused
 	idVec2i		screenSize;		// x = width, y = height (pixels)
-	idVec2i		debugFlags;		// x = debug mode (0 normal, 1 show reflection), y unused
+	idVec2i		debugFlags;		// x = debug mode (0 normal, 1 show reflection,
+	//							// 2 visualise trace), y unused
 };
