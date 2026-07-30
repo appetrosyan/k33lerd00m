@@ -54,12 +54,21 @@ Average diffuse colour used for coloured probe bounce. Diffuse GI is
 low-frequency, so one representative colour per material is enough (design
 decision: per-surface average, no bindless / UVs).
 
-STAGE 1: returns flat grey so hit geometry + normals can be verified first.
-Real per-material average diffuse extraction is a Stage 1 refinement.
+Uses the material's fast-path diffuse image average colour (decoded from its 1x1
+mip at load time), falling back to mid-grey when there is no diffuse image.
 ========================
 */
 static idVec3 DDGI_MaterialAverageAlbedo( const idMaterial* material )
 {
+	if( material != NULL )
+	{
+		idImage* diffuse = material->GetFastPathDiffuseImage();
+		if( diffuse != NULL )
+		{
+			const idVec4& c = diffuse->GetAverageColor();
+			return idVec3( c.x, c.y, c.z );
+		}
+	}
 	return idVec3( 0.5f, 0.5f, 0.5f );
 }
 

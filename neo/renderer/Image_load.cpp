@@ -538,6 +538,58 @@ void idImage::GetGeneratedName( idStr& _name, const textureUsage_t& _usage, cons
 
 /*
 ===============
+R_DecodeAverageColor
+
+Approximate average diffuse colour from an image's smallest (1x1) mip, used by
+DDGI for coloured probe bounce. For the block-compressed formats the two RGB565
+endpoints of the single block are averaged; uncompressed formats read directly.
+Unknown formats fall back to mid-grey.
+===============
+*/
+static void R_Decode565( uint16 v, float& r, float& g, float& b )
+{
+	r = ( ( v >> 11 ) & 0x1F ) * ( 1.0f / 31.0f );
+	g = ( ( v >> 5 ) & 0x3F ) * ( 1.0f / 63.0f );
+	b = ( v & 0x1F ) * ( 1.0f / 31.0f );
+}
+
+static idVec4 R_DecodeAverageColor( textureFormat_t format, const byte* data )
+{
+	if( data == NULL )
+	{
+		return idVec4( 0.5f, 0.5f, 0.5f, 1.0f );
+	}
+
+	if( format == FMT_RGBA8 )
+	{
+		return idVec4( data[0] * ( 1.0f / 255.0f ), data[1] * ( 1.0f / 255.0f ), data[2] * ( 1.0f / 255.0f ), 1.0f );
+	}
+	if( format == FMT_RGB565 )
+	{
+		float r, g, b;
+		R_Decode565( ( uint16 )( data[0] | ( data[1] << 8 ) ), r, g, b );
+		return idVec4( r, g, b, 1.0f );
+	}
+	if( format == FMT_LUM8 )
+	{
+		const float l = data[0] * ( 1.0f / 255.0f );
+		return idVec4( l, l, l, 1.0f );
+	}
+	if( format == FMT_DXT1 || format == FMT_DXT5 )
+	{
+		// DXT5 stores 8 bytes of alpha before the BC1 colour block; DXT1 has none.
+		const byte* c = ( format == FMT_DXT5 ) ? ( data + 8 ) : data;
+		float r0, g0, b0, r1, g1, b1;
+		R_Decode565( ( uint16 )( c[0] | ( c[1] << 8 ) ), r0, g0, b0 );
+		R_Decode565( ( uint16 )( c[2] | ( c[3] << 8 ) ), r1, g1, b1 );
+		return idVec4( ( r0 + r1 ) * 0.5f, ( g0 + g1 ) * 0.5f, ( b0 + b1 ) * 0.5f, 1.0f );
+	}
+
+	return idVec4( 0.5f, 0.5f, 0.5f, 1.0f );	// BC6H/BC7/depth/etc.: grey
+}
+
+/*
+===============
 ActuallyLoadImage
 
 Absolutely every image goes through this path
@@ -889,6 +941,12 @@ void idImage::ActuallyLoadImage( bool fromBackEnd, nvrhi::ICommandList* commandL
 	}
 	commandList->setPermanentTextureState( texture, nvrhi::ResourceStates::ShaderResource );
 	commandList->commitBarriers();
+
+	// DDGI: cache the average diffuse colour from the smallest mip for probe bounce.
+	if( opts.textureType == DTT_2D && im.NumImages() > 0 )
+	{
+		averageColor = R_DecodeAverageColor( opts.format, im.GetImageData( im.NumImages() - 1 ) );
+	}
 #else
 	/*
 	for( int i = 0; i < im.NumImages(); i++ )

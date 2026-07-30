@@ -437,6 +437,13 @@ public:
 		return ( void* )texture.Get();
 	}
 
+	// Average diffuse colour of this image (from its 1x1 mip at load), used by DDGI
+	// for coloured probe bounce. Defaults to mid-grey until a real value is decoded.
+	const idVec4& GetAverageColor() const
+	{
+		return averageColor;
+	}
+
 	void* GetSampler( SamplerCache& samplerCache );
 
 	void* GetSampler( nvrhi::IDevice* device )
@@ -492,6 +499,8 @@ private:
 	nvrhi::TextureHandle	texture;
 	nvrhi::SamplerHandle	sampler;
 	nvrhi::SamplerDesc		samplerDesc;
+
+	idVec4					averageColor = idVec4( 0.5f, 0.5f, 0.5f, 1.0f );	// DDGI albedo (1x1 mip)
 
 #if defined( USE_AMD_ALLOCATOR )
 	VkImage					image;
