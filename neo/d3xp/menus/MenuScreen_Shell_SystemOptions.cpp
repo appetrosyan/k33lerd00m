@@ -40,6 +40,16 @@ extern idCVar s_volume_dB;
 extern idCVar r_exposure; // RB: use this to control HDR exposure or brightness in LDR mode
 extern idCVar r_lightScale;
 extern idCVar r_useSSR;
+// HDR output + ray-traced reflections (RenderSystem_init.cpp / ReflectionsPass.cpp / TonemapPass)
+extern idCVar r_hdrOutput;
+extern idCVar r_hdrPaperWhiteNits;
+extern idCVar r_hdrMaxNits;
+extern idCVar r_hdrToneMapOperator;
+extern idCVar r_hdrToneMapStrength;
+extern idCVar r_hdrGuiPaperWhiteNits;
+extern idCVar r_useRTReflections;
+extern idCVar r_rtReflectionIntensity;
+extern idCVar r_rtReflectionGateHi;
 
 /*
 ========================
@@ -175,6 +185,89 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_CRT_POSTFX );
 	options->AddChild( control );
 	// RB end
+
+	// HDR display output ------------------------------------------------------
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "HDR Output" );
+	control->SetDescription( "Present to an HDR display (scRGB). Requires an HDR monitor; restart to apply." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_OUTPUT );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_OUTPUT );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_BAR );
+	control->SetLabel( "HDR Paper White" );
+	control->SetDescription( "Luminance of SDR white on the HDR display (nits)." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_PAPERWHITE );
+	control->SetupEvents( 2, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_PAPERWHITE );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_BAR );
+	control->SetLabel( "HDR Peak Brightness" );
+	control->SetDescription( "Display peak luminance highlights roll off toward (nits)." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_MAXNITS );
+	control->SetupEvents( 2, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_MAXNITS );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "HDR Tone Curve" );
+	control->SetDescription( "HDR display tone curve." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_TONEMAP );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_TONEMAP );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_BAR );
+	control->SetLabel( "HDR Tone Curve Strength" );
+	control->SetDescription( "Blend the tone curve toward linear (0 = linear, 100 = full curve)." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_TONEMAP_STRENGTH );
+	control->SetupEvents( 2, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_TONEMAP_STRENGTH );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_BAR );
+	control->SetLabel( "HDR UI Brightness" );
+	control->SetDescription( "Luminance of the HUD / menus on the HDR display (nits)." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_GUI_BRIGHTNESS );
+	control->SetupEvents( 2, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_GUI_BRIGHTNESS );
+	options->AddChild( control );
+
+	// Ray-traced reflections --------------------------------------------------
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "Ray Traced Reflections" );
+	control->SetDescription( "Mirror reflections traced against scene geometry. Restart to apply." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_REFLECTIONS );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_REFLECTIONS );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_BAR );
+	control->SetLabel( "Reflection Strength" );
+	control->SetDescription( "How strongly ray-traced reflections show on smooth surfaces." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_INTENSITY );
+	control->SetupEvents( 2, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_INTENSITY );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_BAR );
+	control->SetLabel( "Reflection Roughness Cutoff" );
+	control->SetDescription( "Highest surface roughness that still reflects (higher = more surfaces reflect)." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_ROUGHNESS );
+	control->SetupEvents( 2, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_ROUGHNESS );
+	options->AddChild( control );
 
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
 	control->SetOptionType( OPTION_SLIDER_BAR );
@@ -450,6 +543,15 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData
 	originalPostProcessing = r_useFilmicPostFX.GetInteger();
 	originalCRTPostFX = r_useCRTPostFX.GetInteger();
 	// RB end
+	originalHdrOutput = r_hdrOutput.GetInteger();
+	originalHdrPaperWhite = r_hdrPaperWhiteNits.GetFloat();
+	originalHdrMaxNits = r_hdrMaxNits.GetFloat();
+	originalHdrToneMap = r_hdrToneMapOperator.GetInteger();
+	originalHdrToneMapStrength = r_hdrToneMapStrength.GetFloat();
+	originalHdrGuiBrightness = r_hdrGuiPaperWhiteNits.GetFloat();
+	originalRTReflections = r_useRTReflections.GetInteger();
+	originalRTIntensity = r_rtReflectionIntensity.GetFloat();
+	originalRTRoughness = r_rtReflectionGateHi.GetFloat();
 
 	const int fullscreen = r_fullscreen.GetInteger();
 	if( fullscreen > 0 )
@@ -482,6 +584,18 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsRestar
 	}
 
 	if( originalFramerate != com_engineHz.GetInteger() )
+	{
+		return true;
+	}
+
+	// HDR output (swapchain) and RT reflections (RT extensions + buffer flags) both
+	// only take effect on a restart.
+	if( originalHdrOutput != r_hdrOutput.GetInteger() )
+	{
+		return true;
+	}
+
+	if( originalRTReflections != r_useRTReflections.GetInteger() )
 	{
 		return true;
 	}
@@ -688,6 +802,69 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			s_volume_dB.SetFloat( DB_SILENCE - ( idMath::Sqrt( clamped / 100.0f ) * DB_SILENCE ) );
 			break;
 		}
+		case SYSTEM_FIELD_HDR_OUTPUT:
+		{
+			static const int numValues = 2;
+			static const int values[numValues] = { 0, 1 };
+			r_hdrOutput.SetInteger( AdjustOption( r_hdrOutput.GetInteger(), values, numValues, adjustAmount ) );
+			break;
+		}
+		case SYSTEM_FIELD_HDR_PAPERWHITE:
+		{
+			const float percent = LinearAdjust( r_hdrPaperWhiteNits.GetFloat(), 80.0f, 1000.0f, 0.0f, 100.0f );
+			const float clamped = idMath::ClampFloat( 0.0f, 100.0f, percent + ( float )adjustAmount );
+			r_hdrPaperWhiteNits.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 80.0f, 1000.0f ) );
+			break;
+		}
+		case SYSTEM_FIELD_HDR_MAXNITS:
+		{
+			const float percent = LinearAdjust( r_hdrMaxNits.GetFloat(), 200.0f, 2000.0f, 0.0f, 100.0f );
+			const float clamped = idMath::ClampFloat( 0.0f, 100.0f, percent + ( float )adjustAmount );
+			r_hdrMaxNits.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 200.0f, 2000.0f ) );
+			break;
+		}
+		case SYSTEM_FIELD_HDR_TONEMAP:
+		{
+			static const int numValues = 4;
+			static const int values[numValues] = { 0, 1, 2, 3 };
+			r_hdrToneMapOperator.SetInteger( AdjustOption( r_hdrToneMapOperator.GetInteger(), values, numValues, adjustAmount ) );
+			break;
+		}
+		case SYSTEM_FIELD_HDR_TONEMAP_STRENGTH:
+		{
+			const float percent = LinearAdjust( r_hdrToneMapStrength.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
+			const float clamped = idMath::ClampFloat( 0.0f, 100.0f, percent + ( float )adjustAmount );
+			r_hdrToneMapStrength.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 0.0f, 1.0f ) );
+			break;
+		}
+		case SYSTEM_FIELD_HDR_GUI_BRIGHTNESS:
+		{
+			const float percent = LinearAdjust( r_hdrGuiPaperWhiteNits.GetFloat(), 40.0f, 400.0f, 0.0f, 100.0f );
+			const float clamped = idMath::ClampFloat( 0.0f, 100.0f, percent + ( float )adjustAmount );
+			r_hdrGuiPaperWhiteNits.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 40.0f, 400.0f ) );
+			break;
+		}
+		case SYSTEM_FIELD_RT_REFLECTIONS:
+		{
+			static const int numValues = 2;
+			static const int values[numValues] = { 0, 1 };
+			r_useRTReflections.SetInteger( AdjustOption( r_useRTReflections.GetInteger(), values, numValues, adjustAmount ) );
+			break;
+		}
+		case SYSTEM_FIELD_RT_INTENSITY:
+		{
+			const float percent = LinearAdjust( r_rtReflectionIntensity.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
+			const float clamped = idMath::ClampFloat( 0.0f, 100.0f, percent + ( float )adjustAmount );
+			r_rtReflectionIntensity.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 0.0f, 1.0f ) );
+			break;
+		}
+		case SYSTEM_FIELD_RT_ROUGHNESS:
+		{
+			const float percent = LinearAdjust( r_rtReflectionGateHi.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
+			const float clamped = idMath::ClampFloat( 0.0f, 100.0f, percent + ( float )adjustAmount );
+			r_rtReflectionGateHi.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 0.0f, 1.0f ) );
+			break;
+		}
 	}
 	cvarSystem->ClearModifiedFlags( CVAR_ARCHIVE );
 }
@@ -875,6 +1052,43 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 		{
 			return 100.0f * Square( 1.0f - ( s_volume_dB.GetFloat() / DB_SILENCE ) );
 		}
+
+		case SYSTEM_FIELD_HDR_OUTPUT:
+			return r_hdrOutput.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
+
+		case SYSTEM_FIELD_HDR_PAPERWHITE:
+			return LinearAdjust( r_hdrPaperWhiteNits.GetFloat(), 80.0f, 1000.0f, 0.0f, 100.0f );
+
+		case SYSTEM_FIELD_HDR_MAXNITS:
+			return LinearAdjust( r_hdrMaxNits.GetFloat(), 200.0f, 2000.0f, 0.0f, 100.0f );
+
+		case SYSTEM_FIELD_HDR_TONEMAP:
+		{
+			static const int numValues = 4;
+			static const char* values[numValues] =
+			{
+				"Linear",
+				"Reinhard",
+				"ACES",
+				"Uncharted 2",
+			};
+			return values[ idMath::ClampInt( 0, numValues - 1, r_hdrToneMapOperator.GetInteger() ) ];
+		}
+
+		case SYSTEM_FIELD_HDR_TONEMAP_STRENGTH:
+			return LinearAdjust( r_hdrToneMapStrength.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
+
+		case SYSTEM_FIELD_HDR_GUI_BRIGHTNESS:
+			return LinearAdjust( r_hdrGuiPaperWhiteNits.GetFloat(), 40.0f, 400.0f, 0.0f, 100.0f );
+
+		case SYSTEM_FIELD_RT_REFLECTIONS:
+			return r_useRTReflections.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
+
+		case SYSTEM_FIELD_RT_INTENSITY:
+			return LinearAdjust( r_rtReflectionIntensity.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
+
+		case SYSTEM_FIELD_RT_ROUGHNESS:
+			return LinearAdjust( r_rtReflectionGateHi.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
 	}
 	return false;
 }
@@ -942,6 +1156,19 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsDataCh
 	}
 
 	if( originalVolume != s_volume_dB.GetFloat() )
+	{
+		return true;
+	}
+
+	if( originalHdrOutput != r_hdrOutput.GetInteger() ||
+			originalHdrPaperWhite != r_hdrPaperWhiteNits.GetFloat() ||
+			originalHdrMaxNits != r_hdrMaxNits.GetFloat() ||
+			originalHdrToneMap != r_hdrToneMapOperator.GetInteger() ||
+			originalHdrToneMapStrength != r_hdrToneMapStrength.GetFloat() ||
+			originalHdrGuiBrightness != r_hdrGuiPaperWhiteNits.GetFloat() ||
+			originalRTReflections != r_useRTReflections.GetInteger() ||
+			originalRTIntensity != r_rtReflectionIntensity.GetFloat() ||
+			originalRTRoughness != r_rtReflectionGateHi.GetFloat() )
 	{
 		return true;
 	}

@@ -1377,6 +1377,16 @@ public:
 			SYSTEM_FIELD_FILMIC_POSTFX,
 			SYSTEM_FIELD_CRT_POSTFX,
 			// RB end
+			// HDR output + ray-traced reflections
+			SYSTEM_FIELD_HDR_OUTPUT,
+			SYSTEM_FIELD_HDR_PAPERWHITE,
+			SYSTEM_FIELD_HDR_MAXNITS,
+			SYSTEM_FIELD_HDR_TONEMAP,
+			SYSTEM_FIELD_HDR_TONEMAP_STRENGTH,
+			SYSTEM_FIELD_HDR_GUI_BRIGHTNESS,
+			SYSTEM_FIELD_RT_REFLECTIONS,
+			SYSTEM_FIELD_RT_INTENSITY,
+			SYSTEM_FIELD_RT_ROUGHNESS,
 			SYSTEM_FIELD_BRIGHTNESS,
 			SYSTEM_FIELD_VOLUME,
 			MAX_SYSTEM_FIELDS
@@ -1417,6 +1427,16 @@ public:
 		int originalPostProcessing;
 		int originalCRTPostFX;
 		// RB end
+		// HDR output + RT reflections snapshots (for change tracking / restart prompt)
+		int originalHdrOutput;
+		float originalHdrPaperWhite;
+		float originalHdrMaxNits;
+		int originalHdrToneMap;
+		float originalHdrToneMapStrength;
+		float originalHdrGuiBrightness;
+		int originalRTReflections;
+		float originalRTIntensity;
+		float originalRTRoughness;
 
 		idList<vidMode_t>			modeList;
 	};
