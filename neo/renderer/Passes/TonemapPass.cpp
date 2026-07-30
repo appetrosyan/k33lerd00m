@@ -320,12 +320,16 @@ void TonemapPass::Render(
 		extern idCVar r_hdrOutput;
 		extern idCVar r_hdrPaperWhiteNits;
 		extern idCVar r_hdrMaxNits;
+		extern idCVar r_hdrToneMapOperator;
+		extern idCVar r_hdrToneMapStrength;
 		if( r_hdrOutput.GetBool() )
 		{
 			const float paperWhite = r_hdrPaperWhiteNits.GetFloat();
 			toneMappingConstants.hdrEnabled = 1.0f;
 			toneMappingConstants.hdrPaperScale = paperWhite / 80.0f;
 			toneMappingConstants.hdrPeak = Max( 1.0f, r_hdrMaxNits.GetFloat() / paperWhite );
+			toneMappingConstants.hdrOperator = ( float )r_hdrToneMapOperator.GetInteger();
+			toneMappingConstants.hdrStrength = r_hdrToneMapStrength.GetFloat();
 		}
 
 		if( !pcEnabledTonemap )

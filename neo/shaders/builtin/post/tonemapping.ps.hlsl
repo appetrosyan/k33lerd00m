@@ -61,6 +61,38 @@ float Luminance( float3 color )
 	return 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
 }
 
+// Hable/Uncharted2 filmic curve (scalar).
+float HableCurve( float x )
+{
+	const float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
+	return ( ( x * ( A * x + C * B ) + D * E ) / ( x * ( A * x + B ) + D * F ) ) - E / F;
+}
+
+// Map exposed luminance L (1.0 = SDR white) to display luminance Ld (1.0 = paper
+// white), highlights rolling toward `peak` (= maxNits/paperWhite). Runtime-selectable
+// so the accurate curve for a given panel can be dialled in (r_hdrToneMapOperator).
+float DisplayCurve( float L, float peak, int op )
+{
+	if( op == 1 )
+	{
+		// Reinhard: smooth, bounded to peak, near-linear in the SDR range
+		return L / ( 1.0 + L / peak );
+	}
+	if( op == 2 )
+	{
+		// ACES contrast on the SDR range + linear highlight extension to peak
+		return min( ACESFilm( float3( min( L, 1.0 ), 0, 0 ) ).x + max( L - 1.0, 0.0 ), peak );
+	}
+	if( op == 3 )
+	{
+		// Hable/Uncharted2 contrast on the SDR range + highlight extension to peak
+		float sdr = HableCurve( min( L, 1.0 ) ) / HableCurve( 1.0 );
+		return min( sdr + max( L - 1.0, 0.0 ), peak );
+	}
+	// op 0: linear midtones (accurate), soft shoulder only above SDR white
+	return ( L <= 1.0 ) ? L : ( 1.0 + ( peak - 1.0 ) * ( 1.0 - exp( -( L - 1.0 ) / max( peak - 1.0, 1e-3 ) ) ) );
+}
+
 float3 ConvertToLDR( float3 color )
 {
 	float srcLuminance = Luminance( color );
@@ -134,8 +166,11 @@ void main(
 		// Only luminance above SDR white gets a soft shoulder rolling off to the peak.
 		float peak = max( g_ToneMapping.hdrPeak, 1.0 );
 		float L = max( Luminance( exposed ), 1e-6 );
-		float Ld = ( L <= 1.0 ) ? L
-				   : ( 1.0 + ( peak - 1.0 ) * ( 1.0 - exp( -( L - 1.0 ) / max( peak - 1.0, 1e-3 ) ) ) );
+		// blend the chosen operator toward the linear curve (op 0) to lift the filmic
+		// toe back toward visibility without losing the operator's highlight shape
+		float Ld = lerp( DisplayCurve( L, peak, 0 ),
+						 DisplayCurve( L, peak, int( g_ToneMapping.hdrOperator ) ),
+						 saturate( g_ToneMapping.hdrStrength ) );
 		float3 disp = exposed * ( Ld / L );					// preserve chromaticity
 
 		o_rgba.rgb = disp * g_ToneMapping.hdrPaperScale;	// -> scRGB (1.0 = 80 nits)

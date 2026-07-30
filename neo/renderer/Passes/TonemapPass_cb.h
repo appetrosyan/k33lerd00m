@@ -49,5 +49,10 @@ struct ToneMappingConstants
 	float hdrEnabled;		// 0 = SDR, 1 = HDR
 	float hdrPaperScale;	// paperWhiteNits / 80
 	float hdrPeak;			// maxNits / paperWhiteNits
-	float hdrPad;
+	float hdrOperator;		// runtime tone curve: 0 linear, 1 Reinhard, 2 ACES, 3 Hable
+
+	float hdrStrength;		// blend operator toward linear (0..1)
+	float hdrPad0;
+	float hdrPad1;
+	float hdrPad2;
 };
