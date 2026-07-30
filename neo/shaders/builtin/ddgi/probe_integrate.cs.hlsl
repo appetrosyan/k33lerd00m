@@ -42,9 +42,16 @@ struct DdgiConstants
 	float4	rayRotation;			// quaternion
 
 	int		frameIndex;
-	int		pad0;
-	int		pad1;
-	int		pad2;
+	int		numLights;
+	float	bounceGain;
+	int		updateScope;			// 0 = visible only, 1 = + neighbours, 2 = full
+
+	float4	worldToClip0;
+	float4	worldToClip1;
+	float4	worldToClip2;
+	float4	worldToClip3;
+
+	float4	volumeCenter;			// xyz = volume centre; w = neighbour radius
 };
 
 // *INDENT-OFF*
@@ -74,6 +81,39 @@ float3 SphericalFibonacci( float i, float n )
 float3 QuatRotate( float4 q, float3 v )
 {
 	return v + 2.0f * cross( q.xyz, cross( q.xyz, v ) + q.w * v );
+}
+
+// Matches probe_trace: out-of-scope probes are not integrated, so they keep their
+// history rather than folding in this frame's (stale) ray-radiance buffer.
+bool DdgiProbeInScope( float3 probePos )
+{
+	if( g_Ddgi.updateScope >= 2 )
+	{
+		return true;
+	}
+
+	const float4 P4 = float4( probePos, 1.0f );
+	const float4 clip = float4(
+			dot( g_Ddgi.worldToClip0, P4 ),
+			dot( g_Ddgi.worldToClip1, P4 ),
+			dot( g_Ddgi.worldToClip2, P4 ),
+			dot( g_Ddgi.worldToClip3, P4 ) );
+
+	const float w = clip.w;
+	const bool inFrustum = ( w > 0.0f ) &&
+			( abs( clip.x ) <= w ) && ( abs( clip.y ) <= w ) &&
+			( clip.z >= 0.0f ) && ( clip.z <= w );
+	if( inFrustum )
+	{
+		return true;
+	}
+
+	if( g_Ddgi.updateScope >= 1 )
+	{
+		return distance( probePos, g_Ddgi.volumeCenter.xyz ) <= g_Ddgi.volumeCenter.w;
+	}
+
+	return false;
 }
 
 // Octahedral decode: [-1,1]^2 -> unit direction.
@@ -123,6 +163,13 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const int px = probeIndex % cx;
 	const int py = ( probeIndex / cx ) % cy;
 	const int pz = probeIndex / ( cx * cy );
+
+	// update-scope cull: leave out-of-scope probes' atlas texels untouched (history)
+	const float3 probePos = g_Ddgi.probeGridOrigin.xyz + float3( px, py, pz ) * g_Ddgi.probeGridSpacing.xyz;
+	if( !DdgiProbeInScope( probePos ) )
+	{
+		return;
+	}
 
 	const int raysPerProbe = g_Ddgi.raysPerProbe;
 	const int rayBase = probeIndex * raysPerProbe;

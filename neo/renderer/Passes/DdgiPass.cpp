@@ -60,6 +60,7 @@ idCVar r_ddgiHysteresis( "r_ddgiHysteresis", "0.97", CVAR_RENDERER | CVAR_FLOAT 
 idCVar r_ddgiNormalBias( "r_ddgiNormalBias", "0.25", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "probe sampling normal bias in world units" );
 idCVar r_ddgiDebug( "r_ddgiDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "overlay DDGI probe atlas: 1 = irradiance atlas", 0, 1 );
 idCVar r_ddgiBounceGain( "r_ddgiBounceGain", "0.95", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "DDGI multi-bounce feedback gain (0 = single bounce)", 0.0f, 2.0f );
+idCVar r_ddgiUpdateScope( "r_ddgiUpdateScope", "1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "which probes trace each frame: 0 = visible only, 1 = visible + neighbours, 2 = full", 0, 2 );
 
 DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
@@ -75,9 +76,9 @@ DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	// Camera-anchored volume. X*Z folds into the atlas width (countX*countZ*SIZE),
 	// which is texture-dimension limited (~16384) - not memory - so keep X*Z within
 	// ~1024. countY is cheap. r_ddgiUpdateScope culls which probes trace per frame.
-	m_ProbeCounts[0] = 16;
-	m_ProbeCounts[1] = 8;
-	m_ProbeCounts[2] = 16;
+	m_ProbeCounts[0] = 24;
+	m_ProbeCounts[1] = 16;
+	m_ProbeCounts[2] = 24;
 	m_VolumeSpacing = 64.0f;
 
 	m_AccelStructs.Init( device );
@@ -337,6 +338,17 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 	constants.rayRotation = idVec4( 0.0f, 0.0f, 0.0f, 1.0f );	// identity for M2; jittered later
 	constants.frameIndex = m_FrameIndex++;
 	constants.bounceGain = r_ddgiBounceGain.GetFloat();
+
+	// update scope: cull which probes trace this frame (the rest keep history).
+	// world->clip for the frustum test, plus the volume centre + neighbour radius.
+	constants.updateScope = r_ddgiUpdateScope.GetInteger();
+	const idRenderMatrix& worldToClip = viewDef->worldSpace.mvp;
+	constants.worldToClip0 = idVec4( worldToClip[0][0], worldToClip[0][1], worldToClip[0][2], worldToClip[0][3] );
+	constants.worldToClip1 = idVec4( worldToClip[1][0], worldToClip[1][1], worldToClip[1][2], worldToClip[1][3] );
+	constants.worldToClip2 = idVec4( worldToClip[2][0], worldToClip[2][1], worldToClip[2][2], worldToClip[2][3] );
+	constants.worldToClip3 = idVec4( worldToClip[3][0], worldToClip[3][1], worldToClip[3][2], worldToClip[3][3] );
+	const idVec3 center = origin + idVec3( m_ProbeCounts[0], m_ProbeCounts[1], m_ProbeCounts[2] ) * ( spacing * 0.5f );
+	constants.volumeCenter = idVec4( center.x, center.y, center.z, 4.0f * spacing );
 
 	// Gather visible projected lights for hit shading (M4 stage 2). Mirrors the
 	// interaction pass: colour = sum over light-shader stages of lightScale *

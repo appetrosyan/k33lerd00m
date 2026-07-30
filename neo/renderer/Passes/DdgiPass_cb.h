@@ -53,5 +53,13 @@ struct DdgiConstants
 	int			frameIndex;
 	int			numLights;				// active projected lights in the light buffer
 	float		bounceGain;				// multi-bounce feedback gain (r_ddgiBounceGain)
-	int			pad2;
+	int			updateScope;			// 0 = visible only, 1 = + neighbours, 2 = full
+
+	// world -> clip rows for frustum-culling which probes update this frame
+	idVec4		worldToClip0;
+	idVec4		worldToClip1;
+	idVec4		worldToClip2;
+	idVec4		worldToClip3;
+
+	idVec4		volumeCenter;			// xyz = camera-anchored volume centre; w = neighbour radius
 };

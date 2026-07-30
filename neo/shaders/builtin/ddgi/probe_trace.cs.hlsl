@@ -47,7 +47,14 @@ struct DdgiConstants
 	int		frameIndex;
 	int		numLights;				// active projected lights in t_Lights
 	float	bounceGain;				// multi-bounce feedback gain
-	int		pad2;
+	int		updateScope;			// 0 = visible only, 1 = + neighbours, 2 = full
+
+	float4	worldToClip0;
+	float4	worldToClip1;
+	float4	worldToClip2;
+	float4	worldToClip3;
+
+	float4	volumeCenter;			// xyz = volume centre; w = neighbour radius
 };
 
 // Per-light shading data. Layout must match DdgiLight in DdgiPass.cpp. The four
@@ -117,6 +124,41 @@ float3 SphericalFibonacci( float i, float n )
 float3 QuatRotate( float4 q, float3 v )
 {
 	return v + 2.0f * cross( q.xyz, cross( q.xyz, v ) + q.w * v );
+}
+
+// True if this probe should trace this frame given the update scope. Out-of-scope
+// probes keep their history (the trace and integrate both skip them).
+bool DdgiProbeInScope( float3 probePos )
+{
+	if( g_Ddgi.updateScope >= 2 )
+	{
+		return true;	// full
+	}
+
+	const float4 P4 = float4( probePos, 1.0f );
+	const float4 clip = float4(
+			dot( g_Ddgi.worldToClip0, P4 ),
+			dot( g_Ddgi.worldToClip1, P4 ),
+			dot( g_Ddgi.worldToClip2, P4 ),
+			dot( g_Ddgi.worldToClip3, P4 ) );
+
+	const float w = clip.w;
+	const bool inFrustum = ( w > 0.0f ) &&
+			( abs( clip.x ) <= w ) && ( abs( clip.y ) <= w ) &&
+			( clip.z >= 0.0f ) && ( clip.z <= w );
+	if( inFrustum )
+	{
+		return true;
+	}
+
+	// medium: also update probes near the camera-anchored volume centre so turning
+	// around does not reveal cold probes
+	if( g_Ddgi.updateScope >= 1 )
+	{
+		return distance( probePos, g_Ddgi.volumeCenter.xyz ) <= g_Ddgi.volumeCenter.w;
+	}
+
+	return false;	// low: visible only
 }
 
 // Evaluate all projected lights at a world-space hit point, with a shadow ray
@@ -301,6 +343,12 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const int pz = probeIndex / ( cx * cy );
 
 	const float3 probePos = g_Ddgi.probeGridOrigin.xyz + float3( px, py, pz ) * g_Ddgi.probeGridSpacing.xyz;
+
+	// update-scope cull: out-of-scope probes keep their history (skip the trace)
+	if( !DdgiProbeInScope( probePos ) )
+	{
+		return;
+	}
 
 	float3 dir = SphericalFibonacci( float( rayIndex ), float( g_Ddgi.raysPerProbe ) );
 	dir = normalize( QuatRotate( g_Ddgi.rayRotation, dir ) );
