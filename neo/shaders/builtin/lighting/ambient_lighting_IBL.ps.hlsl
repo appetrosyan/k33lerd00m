@@ -127,6 +127,13 @@ void main( PS_IN fragment, out PS_OUT result )
 	globalNormal.z = dot3( localNormal, fragment.texcoord6 );
 	globalNormal = normalize( globalNormal );
 
+	// Geometric specular AA for the env reflection: sub-pixel normal variance ->
+	// extra roughness, so the reflection mip widens where detail would otherwise
+	// alias into sparkling point noise (matches interaction.ps.hlsl, no temporal).
+	float3 dNdx = ddx( globalNormal );
+	float3 dNdy = ddy( globalNormal );
+	float specAAkernelRoughness2 = min( 2.0 * 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) ), 0.18 );
+
 	float3 globalPosition = fragment.texcoord7.xyz;
 
 	float3 globalView = normalize( pc.rpGlobalEyePos.xyz - globalPosition );
@@ -241,7 +248,9 @@ void main( PS_IN fragment, out PS_OUT result )
 	// however we can't use the last 3 mips with octahedrons because the quality suffers too much
 	// so it is 7 - 1
 	const float MAX_REFLECTION_LOD = 6.0;
-	float mip = clamp( ( roughness * MAX_REFLECTION_LOD ), 0.0, MAX_REFLECTION_LOD );
+	// widen roughness by the specular-AA kernel before picking the reflection mip
+	float specAAroughness = sqrt( saturate( roughness * roughness + specAAkernelRoughness2 ) );
+	float mip = clamp( ( specAAroughness * MAX_REFLECTION_LOD ), 0.0, MAX_REFLECTION_LOD );
 	//float mip = 0.0;
 
 	normalizedOctCoordZeroOne = OctTexCoord( reflectionVector );
