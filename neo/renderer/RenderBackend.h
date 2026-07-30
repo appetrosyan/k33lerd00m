@@ -39,6 +39,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Passes/SsaoPass.h"
 #include "Passes/DdgiPass.h"
 #include "Passes/ReflectionsPass.h"
+#include "Passes/HdrGuiCompositePass.h"
 #include "Passes/TonemapPass.h"
 #include "Passes/TemporalAntiAliasingPass.h"
 
@@ -385,6 +386,7 @@ private:
 	SsaoPass*						ssaoPass;
 	DdgiPass*						ddgiPass;
 	ReflectionsPass*				reflectionsPass;
+	HdrGuiCompositePass*			hdrGuiCompositePass;
 	MipMapGenPass*					hiZGenPass;
 	TonemapPass*					toneMapPass;
 	TemporalAntiAliasingPass*		taaPass;

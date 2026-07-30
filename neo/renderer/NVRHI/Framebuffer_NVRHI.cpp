@@ -147,6 +147,13 @@ void Framebuffer::ResizeFramebuffers( bool reloadImages )
 			.addColorAttachment( globalImages->currentRenderHDRImage->texture )
 			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
 
+	// HDR output: isolated 2D UI layer (shares the depth/stencil with ldrFBO so GUI
+	// masking still works), composited into ldrImage in linear light before present.
+	globalFramebuffers.guiFBO = new Framebuffer( "_guiComposite",
+			nvrhi::FramebufferDesc()
+			.addColorAttachment( globalImages->guiCompositeImage->texture )
+			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
+
 	globalFramebuffers.postProcFBO = new Framebuffer( "_postProc",
 			nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->currentRenderImage->texture ) );
@@ -221,6 +228,7 @@ void Framebuffer::ReloadImages()
 {
 	backEnd.commandList->open();
 	globalImages->ldrImage->Reload( false, backEnd.commandList );
+	globalImages->guiCompositeImage->Reload( false, backEnd.commandList );
 	globalImages->currentRenderImage->Reload( false, backEnd.commandList );
 	globalImages->currentDepthImage->Reload( false, backEnd.commandList );
 	globalImages->currentRenderHDRImage->Reload( false, backEnd.commandList );

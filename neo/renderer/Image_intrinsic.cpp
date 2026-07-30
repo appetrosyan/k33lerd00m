@@ -258,10 +258,21 @@ static void R_RGBA8LinearImage( idImage* image, nvrhi::ICommandList* commandList
 static void R_LdrNativeImage( idImage* image, nvrhi::ICommandList* commandList )
 {
 	// HDR output needs the final composite buffer to hold linear extended-range
-	// values (scRGB), so use FP16 instead of 8-bit when r_hdrOutput is set.
+	// values (scRGB), so use FP16 instead of 8-bit when r_hdrOutput is set. It also
+	// needs to be a UAV so the 2D UI composite (HdrGuiCompositePass) can blend the
+	// isolated GUI layer into it in place.
 	extern idCVar r_hdrOutput;
-	const textureUsage_t usage = r_hdrOutput.GetBool() ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, false, 1 );
+	const bool hdr = r_hdrOutput.GetBool();
+	const textureUsage_t usage = hdr ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
+	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, hdr, 1 );
+}
+
+static void R_GuiCompositeImage( idImage* image, nvrhi::ICommandList* commandList )
+{
+	// HDR output: the 2D UI is rendered in sRGB space into this isolated FP16 buffer
+	// and then composited into ldrImage in linear light. Only used when r_hdrOutput
+	// is set, but always allocated so a vid_restart toggle has it ready.
+	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true, false, 1 );
 }
 
 static void R_DepthImage( idImage* image, nvrhi::ICommandList* commandList )
@@ -1087,6 +1098,7 @@ void idImageManager::CreateIntrinsicImages()
 
 	currentRenderHDRImage = globalImages->ImageFromFunction( "_currentRenderHDR", R_HDR_RGBA16FImage_ResNative_MSAAOpt );
 	ldrImage = globalImages->ImageFromFunction( "_currentRenderLDR", R_LdrNativeImage );
+	guiCompositeImage = globalImages->ImageFromFunction( "_guiComposite", R_GuiCompositeImage );
 
 	taaMotionVectorsImage = ImageFromFunction( "_taaMotionVectors", R_HDR_RG16FImage_ResNative ); // RB: could be shared with _currentNormals.zw
 	taaResolvedImage = ImageFromFunction( "_taaResolved", R_HDR_RGBA16FImage_ResNative_UAV );

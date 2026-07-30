@@ -58,6 +58,7 @@ extern idCVar stereoRender_swapEyes;
 extern idCVar r_ddgiDebug;			// DDGI probe atlas overlay (Passes/DdgiPass.cpp)
 extern idCVar r_useDDGI;			// runtime DDGI toggle (RenderSystem_init.cpp)
 extern idCVar r_useRTReflections;	// runtime RT reflections toggle (RenderSystem_init.cpp)
+extern idCVar r_hdrOutput;			// HDR display output toggle (RenderSystem_init.cpp)
 
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
 bool drawView3D;
@@ -5700,6 +5701,14 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	{
 		viewDef->targetRender->Bind();
 	}
+	else if( r_hdrOutput.GetBool() && hdrGuiCompositePass && globalFramebuffers.guiFBO )
+	{
+		// HDR output: render the 2D UI into an isolated buffer (cleared to transparent)
+		// so it can be linearised + scaled to paper-white when composited over the
+		// linear scRGB scene, instead of writing gamma-space values straight into it.
+		globalFramebuffers.guiFBO->Bind();
+		clearColor = true;
+	}
 	else
 	{
 		globalFramebuffers.ldrFBO->Bind();
@@ -6149,6 +6158,14 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 				dbgParms.targetFramebuffer = globalFramebuffers.ldrFBO->GetApiObject();
 				dbgParms.targetViewport = nvrhi::Viewport( 0.0f, dw, 0.0f, dw * 0.25f, 0.0f, 1.0f );
 				commonPasses.BlitTexture( commandList, dbgParms, &bindingCache );
+			}
+
+			// HDR output: composite the isolated 2D UI layer into the linear scRGB
+			// scene (sRGB->linear + paper-white scale) in place, before presenting.
+			// Only for 2D views; the 3D view leaves the GUI layer empty.
+			if( r_hdrOutput.GetBool() && !is3D && hdrGuiCompositePass )
+			{
+				hdrGuiCompositePass->Render( commandList );
 			}
 
 			BlitParameters blitParms;

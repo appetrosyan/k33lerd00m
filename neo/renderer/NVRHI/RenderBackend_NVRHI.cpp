@@ -202,6 +202,7 @@ void idRenderBackend::Init()
 	ssaoPass = nullptr;
 	ddgiPass = nullptr;
 	reflectionsPass = nullptr;
+	hdrGuiCompositePass = nullptr;
 
 	// Maximum resolution of one tile within tiled shadow map. Resolution must be power of two and
 	// square, since quad-tree for managing tiles will not work correctly otherwise. Furthermore
@@ -2031,6 +2032,11 @@ void idRenderBackend::GL_StartFrame()
 		reflectionsPass = new ReflectionsPass( deviceManager->GetDevice(), &commonPasses );
 	}
 
+	if( !hdrGuiCompositePass )
+	{
+		hdrGuiCompositePass = new HdrGuiCompositePass( deviceManager->GetDevice() );
+	}
+
 	if( ( globalImages->hierarchicalZbufferImage->GetTextureID() != textureId || !hiZGenPass ) && R_UseHiZ() )
 	{
 		if( hiZGenPass )
@@ -2380,6 +2386,12 @@ void idRenderBackend::ClearCaches()
 		reflectionsPass = nullptr;
 	}
 
+	if( hdrGuiCompositePass )
+	{
+		delete hdrGuiCompositePass;
+		hdrGuiCompositePass = nullptr;
+	}
+
 	if( toneMapPass )
 	{
 		delete toneMapPass;
@@ -2500,6 +2512,7 @@ idRenderBackend::idRenderBackend()
 	ssaoPass = nullptr;
 	ddgiPass = nullptr;
 	reflectionsPass = nullptr;
+	hdrGuiCompositePass = nullptr;
 
 	memset( &glConfig, 0, sizeof( glConfig ) );
 

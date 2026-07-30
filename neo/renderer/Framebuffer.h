@@ -144,6 +144,7 @@ struct globalFramebuffers_t
 	Framebuffer*				shadowFBO[MAX_SHADOWMAP_RESOLUTIONS][6];
 	Framebuffer*				hdrFBO;
 	Framebuffer*				ldrFBO;
+	Framebuffer*				guiFBO;			// HDR output: isolated 2D UI layer
 	Framebuffer*				postProcFBO; // HDR16 used by 3D effects like heatHaze
 	Framebuffer*				taaMotionVectorsFBO;
 	Framebuffer*				taaResolvedFBO;
