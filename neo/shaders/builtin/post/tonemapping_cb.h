@@ -45,6 +45,14 @@ struct ToneMappingConstants
 
 	float2 colorLUTTextureSize;
 	float2 colorLUTTextureSizeInv;
+
+	// HDR display output (scRGB). hdrEnabled != 0 switches to the HDR path:
+	// exposed-linear -> highlight roll-off to hdrPeak -> scaled by hdrPaperScale,
+	// no ACES clamp and no gamma encode (scRGB is linear).
+	float hdrEnabled;		// 0 = SDR, 1 = HDR
+	float hdrPaperScale;	// paperWhiteNits / 80 (scRGB: 1.0 = 80 nits)
+	float hdrPeak;			// maxNits / paperWhiteNits (highlight white point)
+	float hdrPad;
 };
 
 #endif // DEPTH_CB_H

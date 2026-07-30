@@ -44,4 +44,10 @@ struct ToneMappingConstants
 
 	idVec2 colorLUTTextureSize;
 	idVec2 colorLUTTextureSizeInv;
+
+	// HDR display output (scRGB) - keep in sync with shaders/builtin/post/tonemapping_cb.h
+	float hdrEnabled;		// 0 = SDR, 1 = HDR
+	float hdrPaperScale;	// paperWhiteNits / 80
+	float hdrPeak;			// maxNits / paperWhiteNits
+	float hdrPad;
 };

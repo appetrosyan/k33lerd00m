@@ -257,7 +257,11 @@ static void R_RGBA8LinearImage( idImage* image, nvrhi::ICommandList* commandList
 
 static void R_LdrNativeImage( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true, false, 1 );
+	// HDR output needs the final composite buffer to hold linear extended-range
+	// values (scRGB), so use FP16 instead of 8-bit when r_hdrOutput is set.
+	extern idCVar r_hdrOutput;
+	const textureUsage_t usage = r_hdrOutput.GetBool() ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
+	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, false, 1 );
 }
 
 static void R_DepthImage( idImage* image, nvrhi::ICommandList* commandList )

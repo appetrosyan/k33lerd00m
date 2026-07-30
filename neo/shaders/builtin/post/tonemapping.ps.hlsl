@@ -113,6 +113,36 @@ void main(
 #else
 	float4 HdrColor = t_Source[pos.xy];
 #endif
+
+	// HDR display output: keep the scene linear and extended-range instead of
+	// clamping to SDR. Apply the same auto-exposure, roll highlights off toward the
+	// display peak, and scale to scRGB (1.0 = 80 nits) at paper-white. No ACES clamp,
+	// no gamma encode - the scRGB swapchain is linear.
+	if( g_ToneMapping.hdrEnabled > 0.0 )
+	{
+		float adaptedLuminance = asfloat( t_Exposure[0] );
+		if( adaptedLuminance <= 0 )
+		{
+			adaptedLuminance = g_ToneMapping.minAdaptedLuminance;
+		}
+
+		float3 exposed = HdrColor.rgb * ( g_ToneMapping.exposureScale / max( adaptedLuminance, 1e-6 ) );
+
+		// Map LUMINANCE and rescale colour by the ratio (preserves hue/saturation).
+		// The SDR range is kept LINEAR so midtones and colour stay accurate - no ACES
+		// S-curve, which crushes both shadows and highlights when there's HDR headroom.
+		// Only luminance above SDR white gets a soft shoulder rolling off to the peak.
+		float peak = max( g_ToneMapping.hdrPeak, 1.0 );
+		float L = max( Luminance( exposed ), 1e-6 );
+		float Ld = ( L <= 1.0 ) ? L
+				   : ( 1.0 + ( peak - 1.0 ) * ( 1.0 - exp( -( L - 1.0 ) / max( peak - 1.0, 1e-3 ) ) ) );
+		float3 disp = exposed * ( Ld / L );					// preserve chromaticity
+
+		o_rgba.rgb = disp * g_ToneMapping.hdrPaperScale;	// -> scRGB (1.0 = 80 nits)
+		o_rgba.a = HdrColor.a;
+		return;
+	}
+
 	o_rgba.rgb = ConvertToLDR( HdrColor.rgb );
 	o_rgba.a = HdrColor.a;
 

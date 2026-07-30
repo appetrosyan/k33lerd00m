@@ -315,6 +315,19 @@ void TonemapPass::Render(
 		toneMappingConstants.colorLUTTextureSize = enableColorLUT ? idVec2( colorLutSize * colorLutSize, colorLutSize ) : idVec2( 0.f, 0.f );
 		toneMappingConstants.colorLUTTextureSizeInv = enableColorLUT ? 1.f / toneMappingConstants.colorLUTTextureSize : idVec2( 0.f, 0.f );
 
+		// HDR display output: switch the shader to the linear scRGB path scaled to
+		// paper-white with highlight roll-off toward the display peak.
+		extern idCVar r_hdrOutput;
+		extern idCVar r_hdrPaperWhiteNits;
+		extern idCVar r_hdrMaxNits;
+		if( r_hdrOutput.GetBool() )
+		{
+			const float paperWhite = r_hdrPaperWhiteNits.GetFloat();
+			toneMappingConstants.hdrEnabled = 1.0f;
+			toneMappingConstants.hdrPaperScale = paperWhite / 80.0f;
+			toneMappingConstants.hdrPeak = Max( 1.0f, r_hdrMaxNits.GetFloat() / paperWhite );
+		}
+
 		if( !pcEnabledTonemap )
 		{
 			commandList->writeBuffer( toneMappingCb, &toneMappingConstants, sizeof( toneMappingConstants ) );
