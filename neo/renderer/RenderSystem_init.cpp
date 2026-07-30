@@ -294,6 +294,12 @@ idCVar r_useDDGI( "r_useDDGI", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "ray-t
 
 idCVar r_exposure( "r_exposure", "0.5", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "HDR exposure or LDR brightness [-4.0 .. 4.0]", -4.0f, 4.0f );
 
+// HDR display output (scRGB / extended-sRGB-linear FP16 swapchain). r_hdrOutput is
+// read when the swapchain is created, so it needs a vid_restart to take effect.
+idCVar r_hdrOutput( "r_hdrOutput", "0", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "present to an HDR display via an scRGB FP16 swapchain (needs an HDR monitor + compositor; vid_restart to apply)" );
+idCVar r_hdrPaperWhiteNits( "r_hdrPaperWhiteNits", "200", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "HDR paper-white luminance in nits (SDR-white maps here)", 80.0f, 1000.0f );
+idCVar r_hdrMaxNits( "r_hdrMaxNits", "1000", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "HDR display peak luminance in nits (highlights roll off toward this)", 200.0f, 10000.0f );
+
 idCVar r_useSSR( "r_useSSR", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "" );
 idCVar r_ssrJitter( "r_ssrJitter", "0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "" );
 idCVar r_ssrMaxDistance( "r_ssrMaxDistance", "100", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "In meters" );

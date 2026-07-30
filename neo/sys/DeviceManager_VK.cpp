@@ -248,7 +248,10 @@ private:
 			VK_EXT_LAYER_SETTINGS_EXTENSION_NAME,
 #endif
 			VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME,
-			VK_EXT_DEBUG_REPORT_EXTENSION_NAME
+			VK_EXT_DEBUG_REPORT_EXTENSION_NAME,
+			// exposes HDR surface colorspaces (HDR10 PQ / scRGB) so getSurfaceFormatsKHR
+			// can report them for HDR output
+			VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME
 		},
 		// layers
 		{ },
@@ -702,6 +705,19 @@ bool DeviceManager_VK::pickPhysicalDevice()
 		auto surfaceCaps = dev.getSurfaceCapabilitiesKHR( m_WindowSurface );
 		auto surfaceFmts = dev.getSurfaceFormatsKHR( m_WindowSurface );
 		auto surfacePModes = dev.getSurfacePresentModesKHR( m_WindowSurface );
+
+		// HDR diagnostic (only when HDR output is requested): dump the surface
+		// formats/colorspaces this device+compositor advertises. Colorspaces of
+		// interest: eExtendedSrgbLinearExt = 1000104002 (scRGB), eHdr10St2084Ext = 1000104008.
+		extern idCVar r_hdrOutput;
+		if( r_hdrOutput.GetBool() )
+		{
+			idLib::Printf( "Vulkan surface formats for '%s' (%zu):\n", prop.deviceName.data(), surfaceFmts.size() );
+			for( const vk::SurfaceFormatKHR& sf : surfaceFmts )
+			{
+				idLib::Printf( "  format=%i colorSpace=%i\n", ( int )sf.format, ( int )sf.colorSpace );
+			}
+		}
 
 		// SRS/Ricardo Garcia rg3 - clamp swapChainBufferCount to the min/max capabilities of the surface
 		m_DeviceParams.swapChainBufferCount = Max( surfaceCaps.minImageCount, m_DeviceParams.swapChainBufferCount );
@@ -1223,10 +1239,13 @@ void DeviceManager_VK::destroySwapChain()
 
 bool DeviceManager_VK::createSwapChain()
 {
+	// HDR output presents linear FP16 in the extended-sRGB (scRGB) colorspace; SDR
+	// uses the usual sRGB-nonlinear space.
+	extern idCVar r_hdrOutput;
 	m_SwapChainFormat =
 	{
 		vk::Format( nvrhi::vulkan::convertFormat( m_DeviceParams.swapChainFormat ) ),
-		vk::ColorSpaceKHR::eSrgbNonlinear
+		r_hdrOutput.GetBool() ? vk::ColorSpaceKHR::eExtendedSrgbLinearEXT : vk::ColorSpaceKHR::eSrgbNonlinear
 	};
 
 	// SRS - Clamp swap chain extent within the range supported by the device / window surface
@@ -1368,7 +1387,14 @@ bool DeviceManager_VK::CreateDeviceAndSwapChain()
 		installDebugCallback();
 	}
 
-	if( m_DeviceParams.swapChainFormat == nvrhi::Format::SRGBA8_UNORM )
+	// HDR output requests an FP16 scRGB (extended-sRGB-linear) swapchain; otherwise
+	// use the 8-bit SDR format (swapped to BGRA which is what the surface prefers).
+	extern idCVar r_hdrOutput;
+	if( r_hdrOutput.GetBool() )
+	{
+		m_DeviceParams.swapChainFormat = nvrhi::Format::RGBA16_FLOAT;
+	}
+	else if( m_DeviceParams.swapChainFormat == nvrhi::Format::SRGBA8_UNORM )
 	{
 		m_DeviceParams.swapChainFormat = nvrhi::Format::SBGRA8_UNORM;
 	}
