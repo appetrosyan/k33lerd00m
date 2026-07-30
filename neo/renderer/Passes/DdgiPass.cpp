@@ -41,11 +41,13 @@ idCVar r_ddgiProbeSpacing( "r_ddgiProbeSpacing", "64", CVAR_RENDERER | CVAR_FLOA
 idCVar r_ddgiRaysPerProbe( "r_ddgiRaysPerProbe", "128", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "rays traced per probe per frame", 32, 256 );
 idCVar r_ddgiHysteresis( "r_ddgiHysteresis", "0.97", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "temporal blend weight for probe history [0..1]", 0.0f, 1.0f );
 idCVar r_ddgiNormalBias( "r_ddgiNormalBias", "0.25", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "probe sampling normal bias in world units" );
+idCVar r_ddgiDebug( "r_ddgiDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "overlay DDGI probe atlas: 1 = irradiance atlas", 0, 1 );
 
 DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
 	, m_CommonPasses( commonPasses )
 	, m_TraceBoundTlas( nullptr )
+	, m_TraceBoundInstanceData( nullptr )
 	, m_FrameIndex( 0 )
 	, rayTracingSupported( false )
 	, loggedFirstBuild( false )
@@ -116,6 +118,9 @@ void DdgiPass::CreateTracePass()
 	layoutDesc.bindings =
 	{
 		nvrhi::BindingLayoutItem::RayTracingAccelStruct( 0 ),	// t0 : world TLAS
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 1 ),	// t1 : per-instance data
+		nvrhi::BindingLayoutItem::RawBuffer_SRV( 2 ),			// t2 : static vertex cache
+		nvrhi::BindingLayoutItem::RawBuffer_SRV( 3 ),			// t3 : static index cache
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : DdgiConstants
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : per-ray radiance
 	};
@@ -132,9 +137,11 @@ void DdgiPass::CreateTracePass()
 	bufferDesc.byteSize = ( uint64_t )maxProbes * DDGI_MAX_RAYS * sizeof( float ) * 4;
 	bufferDesc.structStride = sizeof( float ) * 4;			// float4 per (probe, ray)
 	bufferDesc.canHaveUAVs = true;
-	// state-tracked (not keepInitialState) so nvrhi auto-inserts the UAV->SRV
-	// barrier between the trace (writes it) and the integrate pass (reads it).
+	// keepInitialState seeds the state tracker (else first use = "Unknown prior
+	// state" fatal); nvrhi still auto-inserts the UAV->SRV barrier between the
+	// trace (writes it) and the integrate pass (reads it) during the list.
 	bufferDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
+	bufferDesc.keepInitialState = true;
 	bufferDesc.debugName = "DDGI/RayRadiance";
 	m_RayRadianceBuffer = m_Device->createBuffer( bufferDesc );
 }
@@ -258,17 +265,22 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 	// the TLAS handle changes when it is recreated to grow; rebuild the binding
 	// set to point at the current one.
 	nvrhi::rt::IAccelStruct* tlas = m_AccelStructs.GetTLAS();
-	if( m_TraceBindingSet == nullptr || m_TraceBoundTlas != tlas )
+	nvrhi::IBuffer* instanceData = m_AccelStructs.GetInstanceDataBuffer();
+	if( m_TraceBindingSet == nullptr || m_TraceBoundTlas != tlas || m_TraceBoundInstanceData != instanceData )
 	{
 		nvrhi::BindingSetDesc setDesc;
 		setDesc.bindings =
 		{
 			nvrhi::BindingSetItem::RayTracingAccelStruct( 0, tlas ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, instanceData ),
+			nvrhi::BindingSetItem::RawBuffer_SRV( 2, m_AccelStructs.GetStaticVertexBuffer() ),
+			nvrhi::BindingSetItem::RawBuffer_SRV( 3, m_AccelStructs.GetStaticIndexBuffer() ),
 			nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_RayRadianceBuffer ),
 		};
 		m_TraceBindingSet = m_Device->createBindingSet( setDesc, m_TraceBindingLayout );
 		m_TraceBoundTlas = tlas;
+		m_TraceBoundInstanceData = instanceData;
 	}
 
 	nvrhi::ComputeState state;

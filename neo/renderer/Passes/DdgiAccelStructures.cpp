@@ -32,7 +32,35 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 DdgiAccelStructures::DdgiAccelStructures()
 	: m_TlasCapacity( 0 )
 	, m_NumInstances( 0 )
+	, m_InstanceDataCapacity( 0 )
 {
+}
+
+nvrhi::IBuffer* DdgiAccelStructures::GetStaticVertexBuffer() const
+{
+	return vertexCache.staticData.vertexBuffer.GetAPIObject();
+}
+
+nvrhi::IBuffer* DdgiAccelStructures::GetStaticIndexBuffer() const
+{
+	return vertexCache.staticData.indexBuffer.GetAPIObject();
+}
+
+/*
+========================
+DDGI_MaterialAverageAlbedo
+
+Average diffuse colour used for coloured probe bounce. Diffuse GI is
+low-frequency, so one representative colour per material is enough (design
+decision: per-surface average, no bindless / UVs).
+
+STAGE 1: returns flat grey so hit geometry + normals can be verified first.
+Real per-material average diffuse extraction is a Stage 1 refinement.
+========================
+*/
+static idVec3 DDGI_MaterialAverageAlbedo( const idMaterial* material )
+{
+	return idVec3( 0.5f, 0.5f, 0.5f );
 }
 
 void DdgiAccelStructures::Init( nvrhi::IDevice* device )
@@ -46,6 +74,8 @@ void DdgiAccelStructures::Shutdown()
 	m_Tlas = nullptr;
 	m_TlasCapacity = 0;
 	m_NumInstances = 0;
+	m_InstanceDataBuffer = nullptr;
+	m_InstanceDataCapacity = 0;
 }
 
 /*
@@ -131,7 +161,9 @@ DdgiAccelStructures::RebuildFromView
 bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef )
 {
 	std::vector<nvrhi::rt::InstanceDesc> instances;
+	std::vector<DdgiInstanceData> instanceData;
 	instances.reserve( viewDef->numDrawSurfs );
+	instanceData.reserve( viewDef->numDrawSurfs );
 
 	for( int i = 0; i < viewDef->numDrawSurfs; i++ )
 	{
@@ -164,6 +196,20 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 		instance.setTransform( xform );
 
 		instances.push_back( instance );
+
+		// Parallel per-instance shading data (InstanceID == index). Offsets are
+		// byte offsets into the shared static cache, matching GetOrBuildBottomLevel.
+		DdgiInstanceData data;
+		data.vertexByteOffset = static_cast<uint32_t>( surf->ambientCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
+		data.indexByteOffset = static_cast<uint32_t>( surf->indexCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
+		data.pad0 = 0;
+		data.pad1 = 0;
+		const idVec3 albedo = DDGI_MaterialAverageAlbedo( surf->material );
+		data.albedo[0] = albedo.x;
+		data.albedo[1] = albedo.y;
+		data.albedo[2] = albedo.z;
+		data.albedo[3] = 0.0f;
+		instanceData.push_back( data );
 	}
 
 	m_NumInstances = static_cast<int>( instances.size() );
@@ -171,6 +217,22 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 	{
 		return false;
 	}
+
+	// (Re)create the per-instance data buffer when it needs to grow, then upload
+	// this frame's records. Bound as a StructuredBuffer SRV to the trace shader.
+	if( !m_InstanceDataBuffer || instanceData.size() > m_InstanceDataCapacity )
+	{
+		m_InstanceDataCapacity = instanceData.size();
+
+		nvrhi::BufferDesc dataDesc;
+		dataDesc.byteSize = m_InstanceDataCapacity * sizeof( DdgiInstanceData );
+		dataDesc.structStride = sizeof( DdgiInstanceData );
+		dataDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+		dataDesc.keepInitialState = true;	// seed state tracking; writeBuffer transitions to CopyDest and back
+		dataDesc.debugName = "DDGI/InstanceData";
+		m_InstanceDataBuffer = m_Device->createBuffer( dataDesc );
+	}
+	commandList->writeBuffer( m_InstanceDataBuffer, instanceData.data(), instanceData.size() * sizeof( DdgiInstanceData ) );
 
 	// (Re)create the TLAS only when it needs to grow to fit the instance count.
 	if( !m_Tlas || instances.size() > m_TlasCapacity )

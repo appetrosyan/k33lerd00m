@@ -217,6 +217,9 @@ bool idVertexBuffer::AllocBufferObject( const void* data, int allocSize, bufferU
 	if( usage == BU_STATIC && r_useDDGI.GetBool() )
 	{
 		vertexBufferDesc.isAccelStructBuildInput = true;
+		// The DDGI trace shader also reads hit-triangle positions from this
+		// buffer as a raw ByteAddressBuffer.
+		vertexBufferDesc.canHaveRawViews = true;
 	}
 
 #if defined( USE_AMD_ALLOCATOR )

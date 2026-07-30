@@ -53,6 +53,18 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 struct viewDef_t;
 struct drawSurf_t;
 
+// Per-TLAS-instance shading data, indexed by the ray hit's InstanceID in the
+// trace shader. Layout must match DdgiInstanceData in probe_trace.cs.hlsl.
+// Offsets are byte offsets into the shared static vertex/index cache buffers.
+struct DdgiInstanceData
+{
+	uint32_t	vertexByteOffset;	// start of this surface's idDrawVert run
+	uint32_t	indexByteOffset;	// start of this surface's index run (R16)
+	uint32_t	pad0;
+	uint32_t	pad1;
+	float		albedo[4];			// average diffuse rgb (+ pad)
+};
+
 class DdgiAccelStructures
 {
 public:
@@ -74,6 +86,17 @@ public:
 		return m_NumInstances;
 	}
 
+	// Parallel to the TLAS instances (indexed by InstanceID): per-hit geometry
+	// offsets + average albedo. Bound as a StructuredBuffer SRV to the trace shader.
+	nvrhi::IBuffer*	GetInstanceDataBuffer() const
+	{
+		return m_InstanceDataBuffer;
+	}
+	// The shared static vertex/index cache buffers the BLAS reference, bound raw
+	// (ByteAddressBuffer) so the trace shader can fetch hit-triangle positions.
+	nvrhi::IBuffer*	GetStaticVertexBuffer() const;
+	nvrhi::IBuffer*	GetStaticIndexBuffer() const;
+
 private:
 	nvrhi::rt::IAccelStruct*	GetOrBuildBottomLevel( nvrhi::ICommandList* commandList, const drawSurf_t* surf );
 
@@ -81,6 +104,9 @@ private:
 	nvrhi::rt::AccelStructHandle	m_Tlas;
 	size_t							m_TlasCapacity;
 	int								m_NumInstances;
+
+	nvrhi::BufferHandle				m_InstanceDataBuffer;
+	size_t							m_InstanceDataCapacity;	// in instances
 
 	// BLAS cache keyed by the static ambientCache handle (unique per surface).
 	std::unordered_map<vertCacheHandle_t, nvrhi::rt::AccelStructHandle> m_BlasCache;

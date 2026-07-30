@@ -55,6 +55,7 @@ idCVar r_skipInteractionFastPath( "r_skipInteractionFastPath", "1", CVAR_RENDERE
 idCVar r_useLightStencilSelect( "r_useLightStencilSelect", "0", CVAR_RENDERER | CVAR_BOOL, "use stencil select pass" );
 
 extern idCVar stereoRender_swapEyes;
+extern idCVar r_ddgiDebug;			// DDGI probe atlas overlay (Passes/DdgiPass.cpp)
 
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
 bool drawView3D;
@@ -6084,6 +6085,20 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 #endif
 			//if( stereoEye == 1 || stereoEye == 0 )
 		{
+			// DDGI debug: overlay the octahedral irradiance atlas into ldrImage
+			// BEFORE the swapchain copy, so both the screen and screenshots (which
+			// read ldrImage) show it. Runs on every view; the last (2D HUD) pass
+			// writes ldrImage last, so the overlay survives. (r_ddgiDebug)
+			if( r_ddgiDebug.GetInteger() > 0 && ddgiPass && ddgiPass->GetIrradianceAtlas() )
+			{
+				const float dw = Min( ( float )renderSystem->GetNativeWidth(), 768.0f );
+				BlitParameters dbgParms;
+				dbgParms.sourceTexture = ddgiPass->GetIrradianceAtlas();
+				dbgParms.targetFramebuffer = globalFramebuffers.ldrFBO->GetApiObject();
+				dbgParms.targetViewport = nvrhi::Viewport( 0.0f, dw, 0.0f, dw * 0.25f, 0.0f, 1.0f );
+				commonPasses.BlitTexture( commandList, dbgParms, &bindingCache );
+			}
+
 			BlitParameters blitParms;
 			blitParms.sourceTexture = ( nvrhi::ITexture* )globalImages->ldrImage->GetTextureID();
 			blitParms.targetFramebuffer = deviceManager->GetCurrentFramebuffer();

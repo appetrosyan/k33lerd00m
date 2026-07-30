@@ -50,8 +50,22 @@ struct DdgiConstants
 	int		pad2;
 };
 
+// Per-TLAS-instance shading data. Layout must match DdgiInstanceData in
+// DdgiAccelStructures.h. Offsets are byte offsets into the shared static cache.
+struct DdgiInstanceData
+{
+	uint	vertexByteOffset;
+	uint	indexByteOffset;
+	uint	pad0;
+	uint	pad1;
+	float4	albedo;			// average diffuse rgb (+ pad)
+};
+
 // *INDENT-OFF*
 RaytracingAccelerationStructure		t_TLAS			: register(t0);
+StructuredBuffer<DdgiInstanceData>	t_InstanceData	: register(t1);
+ByteAddressBuffer					t_Vertex		: register(t2);	// static idDrawVert cache
+ByteAddressBuffer					t_Index			: register(t3);	// static R16 index cache
 RWStructuredBuffer<float4>			u_RayRadiance	: register(u0);
 
 cbuffer c_Ddgi : register(b1)
@@ -59,6 +73,17 @@ cbuffer c_Ddgi : register(b1)
 	DdgiConstants g_Ddgi;
 };
 // *INDENT-ON*
+
+// idDrawVert is a 32-byte vertex with the float3 position at offset 0.
+static const uint DDGI_DRAWVERT_STRIDE = 32;
+
+// Fetch one 16-bit index from the raw index buffer (4-byte aligned loads).
+uint DdgiLoadIndex16( uint byteAddr )
+{
+	uint word = t_Index.Load( byteAddr & ~3u );
+	uint shift = ( byteAddr & 2u ) * 8u;
+	return ( word >> shift ) & 0xFFFFu;
+}
 
 static const float DDGI_PI = 3.14159265358979f;
 
@@ -117,13 +142,39 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	if( q.CommittedStatus() == COMMITTED_TRIANGLE_HIT )
 	{
 		hitDistance = q.CommittedRayT();
-		// M2: no surface bounce yet - treat hits as occluded.
-		radiance = float3( 0.0f, 0.0f, 0.0f );
+
+		// reconstruct the hit triangle from the shared static cache
+		DdgiInstanceData inst = t_InstanceData[q.CommittedInstanceID()];
+		const uint triBase = inst.indexByteOffset + q.CommittedPrimitiveIndex() * 6u;	// 3 * R16
+		const uint i0 = DdgiLoadIndex16( triBase + 0u );
+		const uint i1 = DdgiLoadIndex16( triBase + 2u );
+		const uint i2 = DdgiLoadIndex16( triBase + 4u );
+
+		const float3 p0 = asfloat( t_Vertex.Load3( inst.vertexByteOffset + i0 * DDGI_DRAWVERT_STRIDE ) );
+		const float3 p1 = asfloat( t_Vertex.Load3( inst.vertexByteOffset + i1 * DDGI_DRAWVERT_STRIDE ) );
+		const float3 p2 = asfloat( t_Vertex.Load3( inst.vertexByteOffset + i2 * DDGI_DRAWVERT_STRIDE ) );
+
+		// object -> world, then geometric normal faced toward the ray origin
+		const float3x4 o2w = q.CommittedObjectToWorld3x4();
+		const float3 w0 = mul( o2w, float4( p0, 1.0f ) );
+		const float3 w1 = mul( o2w, float4( p1, 1.0f ) );
+		const float3 w2 = mul( o2w, float4( p2, 1.0f ) );
+		float3 N = normalize( cross( w1 - w0, w2 - w0 ) );
+		if( dot( N, dir ) > 0.0f )
+		{
+			N = -N;
+		}
+
+		// STAGE 1: temporary shade proving hit geometry + normal reconstruction.
+		// albedo lit by a fixed overhead term (Doom up axis is +Z); a non-black
+		// atlas confirms the pipeline. Real light evaluation is Stage 2.
+		const float ndl = saturate( dot( N, float3( 0.0f, 0.0f, 1.0f ) ) );
+		radiance = inst.albedo.rgb * ( 0.2f + 0.8f * ndl );
 	}
 	else
 	{
 		hitDistance = ray.TMax;
-		// placeholder sky / ambient radiance
+		// placeholder sky / ambient radiance for rays that escape the geometry
 		radiance = float3( 0.30f, 0.45f, 0.60f );
 	}
 

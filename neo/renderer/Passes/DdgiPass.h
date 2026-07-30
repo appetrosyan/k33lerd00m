@@ -87,7 +87,16 @@ private:
 	nvrhi::BindingSetHandle			m_TraceBindingSet;
 	nvrhi::ComputePipelineHandle	m_TracePipeline;
 	nvrhi::rt::IAccelStruct*		m_TraceBoundTlas;		// TLAS the binding set was built against
+	nvrhi::IBuffer*					m_TraceBoundInstanceData;	// instance-data buffer the set was built against
 
+public:
+	// Debug: the octahedral irradiance atlas, for r_ddgiDebug on-screen overlay.
+	nvrhi::ITexture*	GetIrradianceAtlas() const
+	{
+		return m_IrradianceAtlas;
+	}
+
+private:
 	// probe integrate pass (M3): octahedral atlases the trace radiance folds into
 	nvrhi::TextureHandle			m_IrradianceAtlas;		// rgb irradiance per probe texel
 	nvrhi::TextureHandle			m_DistanceAtlas;		// mean, mean^2 distance
