@@ -98,6 +98,16 @@ void main( PS_IN fragment, out PS_OUT result )
 	localNormal.z = sqrt( abs( dot( localNormal.xy, localNormal.xy ) - 0.25 ) );
 	localNormal = normalize( localNormal );
 
+	// Geometric specular antialiasing (Kaplanyan/Tokuyoshi): estimate the sub-pixel
+	// variance of the shading normal from its screen-space derivatives and turn it
+	// into extra GGX roughness. This stops shiny, detailed surfaces - wet blood
+	// especially - from aliasing into sparkling specular point noise, at the source,
+	// without any temporal accumulation.
+	float3 dNdx = ddx( localNormal );
+	float3 dNdy = ddy( localNormal );
+	float specAAvariance = 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) );
+	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.18 );
+
 	// traditional very dark Lambert light model used in Doom 3
 	float ldotN = saturate( dot3( localNormal, lightVector ) );
 
@@ -167,7 +177,9 @@ void main( PS_IN fragment, out PS_OUT result )
 	// page 26
 
 	float rr = roughness * roughness;
-	float rrrr = rr * rr;
+	// widen GGX alpha^2 by the specular-AA kernel so sub-pixel normal detail can't
+	// alias into firefly highlights
+	float rrrr = saturate( rr * rr + specAAkernelRoughness2 );
 
 	// disney GGX
 	float D = ( hdotN * hdotN ) * ( rrrr - 1.0 ) + 1.0;

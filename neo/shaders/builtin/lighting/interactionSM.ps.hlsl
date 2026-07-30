@@ -137,6 +137,14 @@ void main( PS_IN fragment, out PS_OUT result )
 	localNormal.z = sqrt( abs( dot( localNormal.xy, localNormal.xy ) - 0.25 ) );
 	localNormal = normalize( localNormal );
 
+	// Geometric specular antialiasing: sub-pixel normal variance -> extra GGX
+	// roughness, so shiny detailed surfaces (wet blood) don't alias into specular
+	// point noise. Source-level fix, no temporal accumulation. See interaction.ps.hlsl.
+	float3 dNdx = ddx( localNormal );
+	float3 dNdy = ddy( localNormal );
+	float specAAvariance = 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) );
+	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.18 );
+
 	// traditional very dark Lambert light model used in Doom 3
 	float ldotN = saturate( dot3( localNormal, lightVector ) );
 
