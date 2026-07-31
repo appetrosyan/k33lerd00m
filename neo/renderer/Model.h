@@ -60,7 +60,17 @@ const int SHADOW_CAP_INFINITE	= 64;
 
 class idRenderModelStatic;
 class idImportOptions;
+class idShadowVert;			// defined in idlib/geometry/DrawVert.h (used only by pointer here)
 struct viewDef_t;
+
+// Stencil shadow volumes: a silhouette edge is shared by two triangles ("planes")
+// and defined by two verts; it becomes a shadow-volume quad when exactly one of the
+// two triangles faces the light. Restored from DOOM-3-BFG (jobs/dynamicshadowvolume).
+struct silEdge_t
+{
+	triIndex_t					p1, p2;					// planes (triangles) defining the edge
+	triIndex_t					v1, v2;					// verts defining the edge
+};
 
 // our only drawing geometry type
 struct srfTriangles_t
@@ -83,6 +93,17 @@ struct srfTriangles_t
 	triIndex_t* 				indexes;				// indexes, allocated with special allocator
 
 	triIndex_t* 				silIndexes;				// indexes changed to be the first vertex with same XYZ, ignoring normal and texcoords
+
+	// stencil shadow volumes (restored from DOOM-3-BFG)
+	int							numSilEdges;			// number of silhouette edges
+	silEdge_t*					silEdges;				// silhouette edges
+
+	int							numShadowIndexesNoFrontCaps;	// shadow volume indexes with the front caps omitted
+	int							numShadowIndexesNoCaps;			// shadow volume indexes with front and rear caps omitted
+	int							shadowCapPlaneBits;				// which of the light frustum planes the volume projects onto
+	//													// (SHADOW_CAP_INFINITE for dynamic shadow volumes)
+	idShadowVert*				preLightShadowVertexes;			// CPU shadow verts for dmap-precomputed prelight shadow volumes
+	idShadowVert*				staticShadowVertexes;			// CPU shadow verts for static shadow volumes
 
 	// RB begin
 	idVec4*						mocVerts;				// idDrawVert has no w position
@@ -110,6 +131,7 @@ struct srfTriangles_t
 	// data in vertex object space, not directly readable by the CPU
 	vertCacheHandle_t			indexCache;				// GL_INDEX_TYPE
 	vertCacheHandle_t			ambientCache;			// idDrawVert
+	vertCacheHandle_t			shadowCache;			// idShadowVert / idShadowVertSkinned (doubled w=1/w=0 verts)
 
 	DISALLOW_COPY_AND_ASSIGN( srfTriangles_t );
 };

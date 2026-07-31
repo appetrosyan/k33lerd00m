@@ -29,7 +29,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "precompiled.h"
 #pragma hdrstop
 
-#if 0
+// Stencil shadow volumes: re-enabled (was #if 0'd out in the shadow-map-only build).
 /*
 ============
 idShadowVert::CreateShadowCache
@@ -79,4 +79,3 @@ int idShadowVertSkinned::CreateShadowCache( idShadowVertSkinned* vertexCache, co
 	}
 	return numVerts * 2;
 }
-#endif

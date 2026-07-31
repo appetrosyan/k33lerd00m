@@ -1641,6 +1641,8 @@ srfTriangles_t* 	R_AllocStaticTriSurf();
 void				R_AllocStaticTriSurfVerts( srfTriangles_t* tri, int numVerts );
 void				R_AllocStaticTriSurfIndexes( srfTriangles_t* tri, int numIndexes );
 void				R_AllocStaticTriSurfSilIndexes( srfTriangles_t* tri, int numIndexes );
+void				R_AllocStaticTriSurfSilEdges( srfTriangles_t* tri, int numSilEdges );
+void				R_AllocStaticTriSurfPreLightShadowVerts( srfTriangles_t* tri, int numVerts );
 void				R_AllocStaticTriSurfDominantTris( srfTriangles_t* tri, int numVerts );
 void				R_AllocStaticTriSurfMirroredVerts( srfTriangles_t* tri, int numMirroredVerts );
 void				R_AllocStaticTriSurfDupVerts( srfTriangles_t* tri, int numDupVerts );
@@ -1666,6 +1668,7 @@ int					R_TriSurfMemory( const srfTriangles_t* tri );
 void				R_BoundTriSurf( srfTriangles_t* tri );
 void				R_RemoveDuplicatedTriangles( srfTriangles_t* tri );
 void				R_CreateSilIndexes( srfTriangles_t* tri );
+void				R_IdentifySilEdges( srfTriangles_t* tri, bool omitCoplanarEdges );
 void				R_CreateMaskedOcclusionCullingTris( srfTriangles_t* tri ); // RB
 void				R_RemoveDegenerateTriangles( srfTriangles_t* tri );
 void				R_RemoveUnusedVerts( srfTriangles_t* tri );

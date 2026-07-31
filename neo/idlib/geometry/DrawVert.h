@@ -793,7 +793,7 @@ ID_INLINE idVec3 idDrawVert::GetSkinnedDrawVertPosition( const idDrawVert& vert,
 	return accum * idVec4( vert.xyz.x, vert.xyz.y, vert.xyz.z, 1.0f );
 }
 
-#if 0
+// Stencil shadow volumes: re-enabled (was #if 0'd out in the shadow-map-only build).
 /*
 ===============================================================================
 Shadow Vertex
@@ -846,6 +846,5 @@ ID_INLINE void idShadowVertSkinned::Clear()
 {
 	xyzw.Zero();
 }
-#endif
 
 #endif /* !__DRAWVERT_H__ */
