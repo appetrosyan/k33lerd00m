@@ -51,6 +51,7 @@ extern idCVar r_useRTReflections;
 extern idCVar r_rtReflectionIntensity;
 extern idCVar r_rtReflectionGateHi;
 extern idCVar r_emberDissolve;
+extern idCVar r_useBloom;
 
 /*
 ========================
@@ -564,6 +565,7 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData
 	originalRTIntensity = r_rtReflectionIntensity.GetFloat();
 	originalRTRoughness = r_rtReflectionGateHi.GetFloat();
 	originalEmberDissolve = r_emberDissolve.GetInteger();
+	originalBloom = r_useBloom.GetInteger();
 
 	const int fullscreen = r_fullscreen.GetInteger();
 	if( fullscreen > 0 )
@@ -884,6 +886,13 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			r_emberDissolve.SetInteger( AdjustOption( r_emberDissolve.GetInteger(), values, numValues, adjustAmount ) );
 			break;
 		}
+		case SYSTEM_FIELD_BLOOM:
+		{
+			static const int numValues = 2;
+			static const int values[numValues] = { 0, 1 };
+			r_useBloom.SetInteger( AdjustOption( r_useBloom.GetInteger(), values, numValues, adjustAmount ) );
+			break;
+		}
 	}
 	cvarSystem->ClearModifiedFlags( CVAR_ARCHIVE );
 }
@@ -1111,6 +1120,9 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 
 		case SYSTEM_FIELD_EMBER_DISSOLVE:
 			return r_emberDissolve.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
+
+		case SYSTEM_FIELD_BLOOM:
+			return r_useBloom.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
 	}
 	return false;
 }
@@ -1190,7 +1202,8 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsDataCh
 			originalHdrGuiBrightness != r_hdrGuiPaperWhiteNits.GetFloat() ||
 			originalRTReflections != r_useRTReflections.GetInteger() ||
 			originalRTIntensity != r_rtReflectionIntensity.GetFloat() ||
-			originalRTRoughness != r_rtReflectionGateHi.GetFloat() )
+			originalRTRoughness != r_rtReflectionGateHi.GetFloat() ||
+			originalBloom != r_useBloom.GetInteger() )
 	{
 		return true;
 	}
