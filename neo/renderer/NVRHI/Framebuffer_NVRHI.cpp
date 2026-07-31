@@ -142,6 +142,13 @@ void Framebuffer::ResizeFramebuffers( bool reloadImages )
 			.addColorAttachment( globalImages->ldrImage->texture )
 			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
 
+	// SSAA: native-resolution resolve target; also the surface the 2D UI composites onto.
+	// Native depth/stencil (currentDepthImage is supersampled under SSAA).
+	globalFramebuffers.ldrResolvedFBO = new Framebuffer( "_ldrResolved",
+			nvrhi::FramebufferDesc()
+			.addColorAttachment( globalImages->ldrResolvedImage->texture )
+			.setDepthAttachment( globalImages->ldrResolvedDepthImage->texture ) );
+
 	globalFramebuffers.hdrFBO = new Framebuffer( "_hdr",
 			nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->currentRenderHDRImage->texture )
