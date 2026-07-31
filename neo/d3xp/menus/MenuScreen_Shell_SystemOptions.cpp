@@ -53,6 +53,7 @@ extern idCVar r_rtReflectionGateHi;
 extern idCVar r_emberDissolve;
 extern idCVar r_useBloom;
 extern idCVar r_ssaaScale;
+extern idCVar r_useDDGI;
 float R_SSAAScale();
 
 /*
@@ -159,7 +160,17 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
 	control->SetOptionType( OPTION_SLIDER_TEXT );
-	control->SetLabel( "Blood Reflections" );
+	control->SetLabel( "Global Illumination" );
+	control->SetDescription( "Indirect diffuse light. Baked = static light grid. Dynamic (DDGI) = ray-traced bounce that updates with the lights - most obvious in enclosed, dimly-lit rooms with coloured bounce or moving/toggled lights; it is auto-skipped where it would only cost frame rate. Requires ray query support; restart to apply." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_GI );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_GI );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "Reflections" );
+	control->SetDescription( "Static env probe, Dynamic screen-space (SSR), or Hybrid (SSR colour with ray-traced hit-finding). Switching to or from Hybrid needs a restart." );
 	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOD_REFLECTIONS );
 	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOD_REFLECTIONS );
@@ -245,16 +256,7 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_HDR_GUI_BRIGHTNESS );
 	options->AddChild( control );
 
-	// Ray-traced reflections --------------------------------------------------
-	control = new( TAG_SWF ) idMenuWidget_ControlButton();
-	control->SetOptionType( OPTION_SLIDER_TEXT );
-	control->SetLabel( "Ray Traced Reflections" );
-	control->SetDescription( "Mirror reflections traced against scene geometry. Restart to apply." );
-	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_REFLECTIONS );
-	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
-	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_REFLECTIONS );
-	options->AddChild( control );
-
+	// Ray-traced reflection tuning (applies when Reflections = Ray Traced) --------
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
 	control->SetOptionType( OPTION_SLIDER_BAR );
 	control->SetLabel( "Reflection Strength" );
@@ -572,6 +574,7 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData
 	originalRenderMode = r_renderMode.GetInteger();
 	originalAmbientBrightness = r_forceAmbient.GetFloat();
 	originalSSAO = r_useSSAO.GetInteger();
+	originalGI = r_useDDGI.GetInteger();
 	originalBloodReflections = r_useSSR.GetInteger();
 	originalPostProcessing = r_useFilmicPostFX.GetInteger();
 	originalCRTPostFX = r_useCRTPostFX.GetInteger();
@@ -638,6 +641,12 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsRestar
 
 	// SSAA changes the size of the scene render targets, which are allocated at startup.
 	if( originalSSAA != R_SSAAScale() )
+	{
+		return true;
+	}
+
+	// DDGI vs baked light grid is chosen at startup (probe volume + ray-query setup).
+	if( originalGI != r_useDDGI.GetInteger() )
 	{
 		return true;
 	}
@@ -802,6 +811,14 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			r_lodBias.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, -1.0f, 1.0f ) );
 			break;
 		}*/
+		case SYSTEM_FIELD_GI:
+		{
+			// indirect diffuse source: 0 = baked light grid, 1 = dynamic DDGI
+			static const int numValues = 2;
+			static const int values[numValues] = { 0, 1 };
+			r_useDDGI.SetInteger( AdjustOption( r_useDDGI.GetInteger(), values, numValues, adjustAmount ) );
+			break;
+		}
 		case SYSTEM_FIELD_SSAO:
 		{
 			static const int numValues = 2;
@@ -811,9 +828,14 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 		}
 		case SYSTEM_FIELD_BLOOD_REFLECTIONS:
 		{
-			static const int numValues = 2;
-			static const int values[numValues] = { 0, 1 };
-			r_useSSR.SetInteger( AdjustOption( r_useSSR.GetInteger(), values, numValues, adjustAmount ) );
+			// single reflection-technique selector: 0 = Static (env probe),
+			// 1 = Dynamic screen-space (SSR), 2 = Hybrid (SSR colour + ray-traced hit-finding)
+			static const int numValues = 3;
+			static const int values[numValues] = { 0, 1, 2 };
+			int mode = r_useRTReflections.GetBool() ? 2 : ( r_useSSR.GetBool() ? 1 : 0 );
+			mode = AdjustOption( mode, values, numValues, adjustAmount );
+			r_useSSR.SetInteger( mode == 1 ? 1 : 0 );
+			r_useRTReflections.SetInteger( mode == 2 ? 1 : 0 );
 			break;
 		}
 		case SYSTEM_FIELD_AMBIENT_BRIGHTNESS:
@@ -884,13 +906,6 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			const float percent = LinearAdjust( r_hdrGuiPaperWhiteNits.GetFloat(), 40.0f, 400.0f, 0.0f, 100.0f );
 			const float clamped = idMath::ClampFloat( 0.0f, 100.0f, percent + ( float )adjustAmount );
 			r_hdrGuiPaperWhiteNits.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 40.0f, 400.0f ) );
-			break;
-		}
-		case SYSTEM_FIELD_RT_REFLECTIONS:
-		{
-			static const int numValues = 2;
-			static const int values[numValues] = { 0, 1 };
-			r_useRTReflections.SetInteger( AdjustOption( r_useRTReflections.GetInteger(), values, numValues, adjustAmount ) );
 			break;
 		}
 		case SYSTEM_FIELD_RT_INTENSITY:
@@ -1097,15 +1112,19 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 				return "#str_swf_disabled";
 			}
 
+		case SYSTEM_FIELD_GI:
+			return r_useDDGI.GetBool() ? "Dynamic (DDGI)" : "Baked";
+
 		case SYSTEM_FIELD_BLOOD_REFLECTIONS:
+			if( r_useRTReflections.GetBool() )
+			{
+				return "Hybrid (SSR+RT)";
+			}
 			if( r_useSSR.GetInteger() == 1 )
 			{
 				return "Dynamic (SSR)";
 			}
-			else
-			{
-				return "Static";
-			}
+			return "Static";
 
 		case SYSTEM_FIELD_AMBIENT_BRIGHTNESS:
 			return LinearAdjust( r_forceAmbient.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
@@ -1146,8 +1165,6 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 		case SYSTEM_FIELD_HDR_GUI_BRIGHTNESS:
 			return LinearAdjust( r_hdrGuiPaperWhiteNits.GetFloat(), 40.0f, 400.0f, 0.0f, 100.0f );
 
-		case SYSTEM_FIELD_RT_REFLECTIONS:
-			return r_useRTReflections.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
 
 		case SYSTEM_FIELD_RT_INTENSITY:
 			return LinearAdjust( r_rtReflectionIntensity.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
@@ -1211,6 +1228,11 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsDataCh
 	}
 
 	if( originalAmbientBrightness != r_forceAmbient.GetFloat() )
+	{
+		return true;
+	}
+
+	if( originalGI != r_useDDGI.GetInteger() )
 	{
 		return true;
 	}

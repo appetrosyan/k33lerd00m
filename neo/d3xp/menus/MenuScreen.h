@@ -1373,6 +1373,7 @@ public:
 			SYSTEM_FIELD_RENDERMODE,
 			SYSTEM_FIELD_AMBIENT_BRIGHTNESS,
 			SYSTEM_FIELD_SSAO,
+			SYSTEM_FIELD_GI,
 			SYSTEM_FIELD_BLOOD_REFLECTIONS,
 			SYSTEM_FIELD_FILMIC_POSTFX,
 			SYSTEM_FIELD_CRT_POSTFX,
@@ -1426,6 +1427,7 @@ public:
 		int originalRenderMode;
 		float originalAmbientBrightness;
 		int originalSSAO;
+		int originalGI;
 		int originalBloodReflections;
 		int originalPostProcessing;
 		int originalCRTPostFX;
