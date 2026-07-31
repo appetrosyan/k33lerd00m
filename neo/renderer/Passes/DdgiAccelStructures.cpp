@@ -26,8 +26,15 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 #pragma hdrstop
 
 #include "renderer/RenderCommon.h"
+#include "renderer/RenderWorld_local.h"
 
 #include "DdgiAccelStructures.h"
+
+// Widen the RT occluder set beyond the view frustum so shadows / reflections stop
+// popping as portal-area visibility flips. Shared by every RT pass (DDGI, reflections,
+// shadows) since they all build through RebuildFromView.
+idCVar r_rtWorldOccluders( "r_rtWorldOccluders", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: also gather static world geometry from the camera's BSP area + portal-connected neighbours, not just the visible frustum (fixes shadow/reflection area pop)" );
+idCVar r_rtOccluderAreaHops( "r_rtOccluderAreaHops", "8", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT accel struct: how many portal hops out from the camera area to gather static occluders (r_rtWorldOccluders)", 0, 64 );
 
 DdgiAccelStructures::DdgiAccelStructures()
 	: m_TlasCapacity( 0 )
@@ -183,11 +190,9 @@ the shared static vertex/index cache. Only the position channel of idDrawVert
 is used for ray tracing.
 ========================
 */
-nvrhi::rt::IAccelStruct* DdgiAccelStructures::GetOrBuildBottomLevel( nvrhi::ICommandList* commandList, const drawSurf_t* surf )
+nvrhi::rt::IAccelStruct* DdgiAccelStructures::GetOrBuildBottomLevel( nvrhi::ICommandList* commandList,
+		vertCacheHandle_t vbHandle, vertCacheHandle_t ibHandle, int numVerts, int numIndexes )
 {
-	const vertCacheHandle_t vbHandle = surf->ambientCache;
-	const vertCacheHandle_t ibHandle = surf->indexCache;
-
 	std::unordered_map<vertCacheHandle_t, nvrhi::rt::AccelStructHandle>::iterator it = m_BlasCache.find( vbHandle );
 	if( it != m_BlasCache.end() )
 	{
@@ -211,11 +216,11 @@ nvrhi::rt::IAccelStruct* DdgiAccelStructures::GetOrBuildBottomLevel( nvrhi::ICom
 	.setVertexFormat( nvrhi::Format::RGB32_FLOAT )
 	.setVertexOffset( vertOffset + DRAWVERT_XYZ_OFFSET )
 	.setVertexStride( sizeof( idDrawVert ) )
-	.setVertexCount( surf->frontEndGeo->numVerts )
+	.setVertexCount( numVerts )
 	.setIndexBuffer( indexBuffer->GetAPIObject() )
 	.setIndexFormat( nvrhi::Format::R16_UINT )
 	.setIndexOffset( indexOffset )
-	.setIndexCount( surf->numIndexes );
+	.setIndexCount( numIndexes );
 
 	nvrhi::rt::GeometryDesc geom;
 	geom.setTriangles( tris ).setFlags( nvrhi::rt::GeometryFlags::Opaque );
@@ -443,12 +448,183 @@ void DdgiAccelStructures::BuildSkinnedInstances( nvrhi::ICommandList* commandLis
 DdgiAccelStructures::RebuildFromView
 ========================
 */
+/*
+========================
+DdgiAccelStructures::AppendInstance
+
+Push one TLAS instance + its parallel shading record for a static surface.
+========================
+*/
+void DdgiAccelStructures::AppendInstance( std::vector<nvrhi::rt::InstanceDesc>& instances,
+		std::vector<DdgiInstanceData>& instanceData, nvrhi::rt::IAccelStruct* blas,
+		const float* modelMatrix, vertCacheHandle_t ambientCache, vertCacheHandle_t indexCache,
+		const idMaterial* material )
+{
+	nvrhi::rt::InstanceDesc instance;
+	instance.setBLAS( blas );
+	instance.setInstanceMask( 0xFF );
+	instance.setInstanceID( static_cast<uint32_t>( instances.size() ) );
+
+	nvrhi::rt::AffineTransform xform;
+	R_ModelMatrixToAffine( modelMatrix, xform );
+	instance.setTransform( xform );
+
+	instances.push_back( instance );
+
+	// Parallel per-instance shading data (InstanceID == index). Offsets are byte
+	// offsets into the shared static cache, matching GetOrBuildBottomLevel.
+	DdgiInstanceData data;
+	data.vertexByteOffset = static_cast<uint32_t>( ambientCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
+	data.indexByteOffset = static_cast<uint32_t>( indexCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
+	data.pad0 = 0;
+	data.pad1 = 0;
+	const idVec3 albedo = DDGI_MaterialAverageAlbedo( material );
+	data.albedo[0] = albedo.x;
+	data.albedo[1] = albedo.y;
+	data.albedo[2] = albedo.z;
+	data.albedo[3] = 0.0f;
+	instanceData.push_back( data );
+}
+
+/*
+========================
+DdgiAccelStructures::AppendStaticAreaOccluders
+
+Gather static world geometry from the camera's BSP area plus its portal-connected
+neighbours (hop-capped), independent of the view frustum, so occluders the camera
+cannot currently see still cast shadows / appear in reflections instead of popping
+as portal-area visibility flips. Deduped against surfaces already added from the view.
+
+Each portal area owns a static "_area%i" world model at entityDefs[i] (i <
+numPortalAreas) with an identity transform; we walk those models' surfaces directly.
+Surfaces whose static cache is not yet resident (area never rendered) are skipped -
+they get picked up the first frame the area is actually drawn, which is exactly when
+the pop would otherwise start.
+========================
+*/
+void DdgiAccelStructures::AppendStaticAreaOccluders( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
+		std::vector<nvrhi::rt::InstanceDesc>& instances, std::vector<DdgiInstanceData>& instanceData,
+		std::unordered_set<vertCacheHandle_t>& seen )
+{
+	if( !r_rtWorldOccluders.GetBool() )
+	{
+		return;
+	}
+
+	idRenderWorldLocal* world = viewDef->renderWorld;
+	if( world == NULL || world->numPortalAreas <= 0 )
+	{
+		return;
+	}
+
+	// target areas: camera area + portal-connected neighbours up to N hops. Outside the
+	// world (areaNum < 0) -> gather everything, mirroring the portal-disabled view path.
+	idList<int> areas;
+	const int camArea = world->PointInArea( viewDef->renderView.vieworg );
+	if( camArea < 0 )
+	{
+		for( int i = 0; i < world->numPortalAreas; i++ )
+		{
+			areas.Append( i );
+		}
+	}
+	else
+	{
+		const int maxHops = r_rtOccluderAreaHops.GetInteger();
+		idList<bool> visited;
+		visited.AssureSize( world->numPortalAreas, false );
+		idList<int> frontier;
+		visited[camArea] = true;
+		areas.Append( camArea );
+		frontier.Append( camArea );
+
+		for( int hop = 0; hop < maxHops && frontier.Num() > 0; hop++ )
+		{
+			idList<int> next;
+			for( int f = 0; f < frontier.Num(); f++ )
+			{
+				const portalArea_t& pa = world->portalAreas[frontier[f]];
+				for( portal_t* p = pa.portals; p != NULL; p = p->next )
+				{
+					if( ( p->doublePortal->blockingBits & PS_BLOCK_VIEW ) != 0 )
+					{
+						continue;	// sealed by a closed door - do not gather behind it
+					}
+					const int na = p->intoArea;
+					if( na >= 0 && na < world->numPortalAreas && !visited[na] )
+					{
+						visited[na] = true;
+						areas.Append( na );
+						next.Append( na );
+					}
+				}
+			}
+			frontier = next;
+		}
+	}
+
+	for( int a = 0; a < areas.Num(); a++ )
+	{
+		const portalArea_t& pa = world->portalAreas[areas[a]];
+		for( areaReference_t* ref = pa.entityRefs.areaNext; ref != &pa.entityRefs; ref = ref->areaNext )
+		{
+			idRenderEntityLocal* ent = ref->entity;
+			// only the static per-area world models (entityDefs[0 .. numPortalAreas));
+			// movable entities are dynamic and handled by the view / skinned paths.
+			if( ent == NULL || ent->index >= world->numPortalAreas )
+			{
+				continue;
+			}
+			const idRenderModel* model = ent->parms.hModel;
+			if( model == NULL )
+			{
+				continue;
+			}
+
+			const int numSurfaces = model->NumSurfaces();
+			for( int s = 0; s < numSurfaces; s++ )
+			{
+				const modelSurface_t* msurf = model->Surface( s );
+				if( msurf == NULL || msurf->geometry == NULL )
+				{
+					continue;
+				}
+				const srfTriangles_t* tri = msurf->geometry;
+				if( tri->numIndexes <= 0 )
+				{
+					continue;
+				}
+				if( !vertexCache.CacheIsStatic( tri->ambientCache ) || !vertexCache.CacheIsStatic( tri->indexCache ) )
+				{
+					continue;
+				}
+				if( seen.find( tri->ambientCache ) != seen.end() )
+				{
+					continue;
+				}
+				seen.insert( tri->ambientCache );
+
+				nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, tri->ambientCache, tri->indexCache, tri->numVerts, tri->numIndexes );
+				if( blas == NULL )
+				{
+					continue;
+				}
+				AppendInstance( instances, instanceData, blas, ent->modelMatrix, tri->ambientCache, tri->indexCache, msurf->shader );
+			}
+		}
+	}
+}
+
 bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef )
 {
 	std::vector<nvrhi::rt::InstanceDesc> instances;
 	std::vector<DdgiInstanceData> instanceData;
 	instances.reserve( viewDef->numDrawSurfs );
 	instanceData.reserve( viewDef->numDrawSurfs );
+
+	// static surfaces already added (keyed by ambientCache) so the wider area gather
+	// below does not double-add the geometry the view already contributed.
+	std::unordered_set<vertCacheHandle_t> seen;
 
 	for( int i = 0; i < viewDef->numDrawSurfs; i++ )
 	{
@@ -473,37 +649,20 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 			continue;
 		}
 
-		nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, surf );
+		nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, surf->ambientCache, surf->indexCache, surf->frontEndGeo->numVerts, surf->numIndexes );
 		if( blas == NULL )
 		{
 			continue;
 		}
 
-		nvrhi::rt::InstanceDesc instance;
-		instance.setBLAS( blas );
-		instance.setInstanceMask( 0xFF );
-		instance.setInstanceID( static_cast<uint32_t>( instances.size() ) );
-
-		nvrhi::rt::AffineTransform xform;
-		R_ModelMatrixToAffine( surf->space->modelMatrix, xform );
-		instance.setTransform( xform );
-
-		instances.push_back( instance );
-
-		// Parallel per-instance shading data (InstanceID == index). Offsets are
-		// byte offsets into the shared static cache, matching GetOrBuildBottomLevel.
-		DdgiInstanceData data;
-		data.vertexByteOffset = static_cast<uint32_t>( surf->ambientCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
-		data.indexByteOffset = static_cast<uint32_t>( surf->indexCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
-		data.pad0 = 0;
-		data.pad1 = 0;
-		const idVec3 albedo = DDGI_MaterialAverageAlbedo( surf->material );
-		data.albedo[0] = albedo.x;
-		data.albedo[1] = albedo.y;
-		data.albedo[2] = albedo.z;
-		data.albedo[3] = 0.0f;
-		instanceData.push_back( data );
+		AppendInstance( instances, instanceData, blas, surf->space->modelMatrix, surf->ambientCache, surf->indexCache, surf->material );
+		seen.insert( surf->ambientCache );
 	}
+
+	// Widen beyond the frustum: gather static world occluders from the camera area +
+	// portal-connected neighbours so off-screen geometry stops popping in shadows /
+	// reflections. Deduped against the view surfaces above.
+	AppendStaticAreaOccluders( commandList, viewDef, instances, instanceData, seen );
 
 	// animated actors: skin + build BLAS per skinned surface and append instances
 	BuildSkinnedInstances( commandList, viewDef, instances, instanceData );

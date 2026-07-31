@@ -26,6 +26,7 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 #define RENDERER_PASSES_DDGIACCELSTRUCTURES_H_
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /*
@@ -52,6 +53,7 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 
 struct viewDef_t;
 struct drawSurf_t;
+class idMaterial;
 
 // Per-TLAS-instance shading data, indexed by the ray hit's InstanceID in the
 // trace shader. Layout must match DdgiInstanceData in probe_trace.cs.hlsl.
@@ -117,7 +119,26 @@ public:
 	}
 
 private:
-	nvrhi::rt::IAccelStruct*	GetOrBuildBottomLevel( nvrhi::ICommandList* commandList, const drawSurf_t* surf );
+	// Build (or fetch cached) a BLAS for a static surface from its vertex/index cache
+	// handles. Keyed by ambientCache so each unique surface is built once.
+	nvrhi::rt::IAccelStruct*	GetOrBuildBottomLevel( nvrhi::ICommandList* commandList,
+			vertCacheHandle_t vbHandle, vertCacheHandle_t ibHandle, int numVerts, int numIndexes );
+
+	// Push one TLAS instance + its parallel shading record for a static surface.
+	void			AppendInstance( std::vector<nvrhi::rt::InstanceDesc>& instances,
+									std::vector<DdgiInstanceData>& instanceData,
+									nvrhi::rt::IAccelStruct* blas, const float* modelMatrix,
+									vertCacheHandle_t ambientCache, vertCacheHandle_t indexCache,
+									const idMaterial* material );
+
+	// Widen the occluder set beyond the view frustum: gather the static world geometry
+	// of the camera's BSP area plus its portal-connected neighbours (hop-capped), so
+	// shadows / reflections of geometry the camera cannot currently see stop popping as
+	// portal-area visibility flips. Deduped against surfaces already added from the view.
+	void			AppendStaticAreaOccluders( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
+			std::vector<nvrhi::rt::InstanceDesc>& instances,
+			std::vector<DdgiInstanceData>& instanceData,
+			std::unordered_set<vertCacheHandle_t>& seen );
 
 	// Skinned/animated actors: GPU-skin the posed positions into a pooled buffer and
 	// build a per-surface BLAS from them each frame, so animated actors reflect in
