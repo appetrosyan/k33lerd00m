@@ -5921,6 +5921,29 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	}
 
 	//-------------------------------------------------
+	// GPU mesh-seeded ember death dissolve: seed particles from the dying entity's
+	// posed mesh vertices, integrate on the GPU, and draw additive emissive embers
+	// into the HDR scene target
+	//-------------------------------------------------
+	if( is3D && emberPass )
+	{
+		OPTICK_GPU_EVENT( "Render_Embers" );
+
+		// seed from whichever RT pass produced a posed-vertex pool this frame
+		DdgiAccelStructures* accel = NULL;
+		if( reflectionsPass && r_useRTReflections.GetBool() )
+		{
+			accel = &reflectionsPass->GetAccelStructures();
+		}
+		else if( ddgiPass && r_useDDGI.GetBool() )
+		{
+			accel = &ddgiPass->GetAccelStructures();
+		}
+
+		emberPass->Render( commandList, _viewDef, accel, globalFramebuffers.hdrFBO->GetApiObject() );
+	}
+
+	//-------------------------------------------------
 	// now draw any non-light dependent shading passes
 	//-------------------------------------------------
 

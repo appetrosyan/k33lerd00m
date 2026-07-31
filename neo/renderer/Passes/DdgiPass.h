@@ -66,6 +66,12 @@ public:
 	// is available, traces the probe rays. Later: integrate + blend atlases.
 	void			Render( nvrhi::ICommandList* commandList, const viewDef_t* viewDef );
 
+	// Ember dissolve seeds from the posed-vertex pool this pass builds.
+	DdgiAccelStructures&	GetAccelStructures()
+	{
+		return m_AccelStructs;
+	}
+
 private:
 	// Build the probe trace compute pipeline + ray-radiance buffer (M2).
 	void			CreateTracePass();

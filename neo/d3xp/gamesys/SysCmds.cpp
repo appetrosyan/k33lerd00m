@@ -288,6 +288,48 @@ void Cmd_KillMonsters_f( const idCmdArgs& args )
 
 /*
 ==================
+Cmd_EmberKill_f
+
+Kills every monster through the real damage/Killed path (not EV_Remove), so the
+GPU ember death dissolve is triggered. Direction is the player's view forward, so
+the enemies come apart away from the camera. Dev/verification aid.
+==================
+*/
+void Cmd_EmberKill_f( const idCmdArgs& args )
+{
+	idPlayer* player = gameLocal.GetLocalPlayer();
+	if( player == NULL || !gameLocal.CheatsOk( false ) )
+	{
+		return;
+	}
+
+	idVec3 dir = player->viewAngles.ToForward();
+	dir.z += 0.2f;
+	dir.Normalize();
+
+	const idVec3 playerOrg = player->GetPhysics()->GetOrigin();
+
+	int killed = 0;
+	idEntity* next = NULL;
+	for( idEntity* ent = gameLocal.spawnedEntities.Next(); ent != NULL; ent = next )
+	{
+		next = ent->spawnNode.Next();
+		// only nearby monsters, so mass map-wide deaths don't trip scripted sequences
+		if( ent->IsType( idAI::Type ) && ent->health > 0 &&
+				( ent->GetPhysics()->GetOrigin() - playerOrg ).LengthSqr() < ( 512.0f * 512.0f ) )
+		{
+			// low health + a light hit kills without gibbing, so the posed mesh
+			// survives the frame the ember pass needs to seed from it
+			ent->health = 5;
+			ent->Damage( player, player, dir, "damage_pistol", 1.0f, INVALID_JOINT );
+			killed++;
+		}
+	}
+	gameLocal.Printf( "emberKill: killed %i monster(s)\n", killed );
+}
+
+/*
+==================
 Cmd_KillMovables_f
 
 Kills all the moveables in a level.
@@ -2808,6 +2850,7 @@ void idGameLocal::InitConsoleCommands()
 	cmdSystem->AddCommand( "damage",				Cmd_Damage_f,				CMD_FL_GAME | CMD_FL_CHEAT,	"apply damage to an entity", idGameLocal::ArgCompletion_EntityName );
 	cmdSystem->AddCommand( "remove",				Cmd_Remove_f,				CMD_FL_GAME | CMD_FL_CHEAT,	"removes an entity", idGameLocal::ArgCompletion_EntityName );
 	cmdSystem->AddCommand( "killMonsters",			Cmd_KillMonsters_f,			CMD_FL_GAME | CMD_FL_CHEAT,	"removes all monsters" );
+	cmdSystem->AddCommand( "emberKill",				Cmd_EmberKill_f,			CMD_FL_GAME | CMD_FL_CHEAT,	"kills all monsters via the death path (ember dissolve test)" );
 	cmdSystem->AddCommand( "killMoveables",			Cmd_KillMovables_f,			CMD_FL_GAME | CMD_FL_CHEAT,	"removes all moveables" );
 	cmdSystem->AddCommand( "killRagdolls",			Cmd_KillRagdolls_f,			CMD_FL_GAME | CMD_FL_CHEAT,	"removes all ragdolls" );
 	cmdSystem->AddCommand( "addline",				Cmd_AddDebugLine_f,			CMD_FL_GAME | CMD_FL_CHEAT,	"adds a debug line" );

@@ -97,6 +97,25 @@ public:
 	nvrhi::IBuffer*	GetStaticVertexBuffer() const;
 	nvrhi::IBuffer*	GetStaticIndexBuffer() const;
 
+	// Ember dissolve: expose the posed-position pool + the per-surface ranges skinned
+	// this frame, so the ember pass can seed particles from the posed mesh vertices.
+	// Valid for the current frame only (rebuilt every RebuildFromView).
+	struct PosedRange
+	{
+		int			entityIndex;	// idRenderEntityLocal::index (== entity handle)
+		uint32_t	outVertBase;	// first posed vertex in the pool (float3 units)
+		uint32_t	numVerts;
+		float		modelMatrix[16];	// model->world (id column-major)
+	};
+	nvrhi::IBuffer*	GetPosedBuffer() const
+	{
+		return m_PosedBuffer;
+	}
+	const std::vector<PosedRange>& GetPosedRanges() const
+	{
+		return m_PosedRanges;
+	}
+
 private:
 	nvrhi::rt::IAccelStruct*	GetOrBuildBottomLevel( nvrhi::ICommandList* commandList, const drawSurf_t* surf );
 
@@ -134,6 +153,9 @@ private:
 	nvrhi::BufferHandle				m_PosedBuffer;
 	size_t							m_PosedCapacityVerts;
 	std::vector<nvrhi::rt::AccelStructHandle> m_SkinnedBlas;
+
+	// per-surface posed ranges skinned this frame (for ember seeding)
+	std::vector<PosedRange>			m_PosedRanges;
 };
 
 #endif

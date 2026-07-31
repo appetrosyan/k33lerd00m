@@ -70,6 +70,9 @@ const int SHADERPARM_PARTICLE_STOPTIME = 8;	// don't spawn any more particles af
 // guis
 const int MAX_RENDERENTITY_GUI		= 3;
 
+// max recorded impact points that seed the ember death dissolve
+const int MAX_ENTITY_EMBER_IMPACTS	= 8;
+
 // the renderEntity_s::joints array needs to point at enough memory to store the number of joints rounded up to two for SIMD
 ID_INLINE int SIMD_ROUND_JOINTS( int numJoints )
 {
@@ -163,7 +166,21 @@ typedef struct renderEntity_s
 	int						forceUpdate;			// force an update (NOTE: not a bool to keep this struct a multiple of 4 bytes)
 	int						timeGroup;
 	int						xrayIndex;
+
+	// GPU mesh-seeded ember death dissolve (set by idAI::Killed). emberStartTime is
+	// the kill time in ms (0 = none); emberDir is the killing-blow direction. The
+	// per-hit impact points are delivered separately via R_RegisterEmberImpacts() to
+	// keep this widely-copied struct's size a multiple of 16 (a SIMD copy relies on
+	// it). Read while the corpse is still presented; the pass then owns the sim.
+	int						emberStartTime;
+	idVec3					emberDir;
 } renderEntity_t;
+
+// Ember death dissolve: hand the renderer the MODEL-space impact points (shotgun
+// pellets etc.) for a dying entity. The ember pass seeds embers only from mesh
+// vertices near these, so just the wounded area comes apart while the body burns.
+// Kept out of renderEntity_t so that struct stays 16-byte sized.
+void R_RegisterEmberImpacts( int renderEntityHandle, const idVec3* impacts, int numImpacts );
 
 
 typedef struct renderLight_s

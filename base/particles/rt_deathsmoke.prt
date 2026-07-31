@@ -1,0 +1,50 @@
+/*
+	Impactful monster death - emissive embers + rising smoke.
+	Author: Aleksandr Petrosyan
+	The .fx orients this system along the killing-blow direction, so the cone
+	emission sprays with the shot; negative gravity floats the residue upward.
+*/
+particle rt_deathsmoke
+{
+	depthHack 8
+
+	// emissive embers - additive, warm, blasted along the hit direction then rising
+	{
+		count			70
+		material		textures/particles/rt_ember
+		time			1.600
+		cycles			1.000
+		bunching		0.200
+		distribution	rect 10 10 10
+		direction		cone 40
+		orientation		view
+		speed			"160" to "20"
+		size			"5" to "16"
+		aspect			"1"
+		fadeIn			0.030
+		fadeOut			0.700
+		color			3 1.6 0.5 1
+		fadeColor		0 0 0 0
+		gravity			-45.000
+	}
+
+	// dense smoke - translucent, sprayed then billowing upward
+	{
+		count			26
+		material		textures/particles/rt_smoke
+		time			2.800
+		cycles			1.000
+		bunching		0.150
+		distribution	rect 16 16 16
+		direction		cone 60
+		orientation		view
+		speed			"55" to "6"
+		size			"32" to "110"
+		aspect			"1"
+		fadeIn			0.080
+		fadeOut			0.500
+		color			0.14 0.14 0.14 1
+		fadeColor		0.05 0.05 0.05 0
+		gravity			-16.000
+	}
+}

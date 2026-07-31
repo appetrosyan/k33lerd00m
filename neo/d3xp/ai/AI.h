@@ -402,6 +402,7 @@ protected:
 
 	// special fx
 	bool					restartParticles;			// should smoke emissions restart
+	int						deathFXTime;				// gameLocal.time the death dissolve started (0 = none)
 	bool					useBoneAxis;				// use the bone vs the model axis
 	idList<particleEmitter_t, TAG_AI> particles;				// particle data
 

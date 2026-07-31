@@ -202,6 +202,7 @@ void idRenderBackend::Init()
 	ssaoPass = nullptr;
 	ddgiPass = nullptr;
 	reflectionsPass = nullptr;
+	emberPass = nullptr;
 	hdrGuiCompositePass = nullptr;
 
 	// Maximum resolution of one tile within tiled shadow map. Resolution must be power of two and
@@ -2032,6 +2033,11 @@ void idRenderBackend::GL_StartFrame()
 		reflectionsPass = new ReflectionsPass( deviceManager->GetDevice(), &commonPasses );
 	}
 
+	if( !emberPass )
+	{
+		emberPass = new EmberPass( deviceManager->GetDevice() );
+	}
+
 	if( !hdrGuiCompositePass )
 	{
 		hdrGuiCompositePass = new HdrGuiCompositePass( deviceManager->GetDevice() );
@@ -2386,6 +2392,12 @@ void idRenderBackend::ClearCaches()
 		reflectionsPass = nullptr;
 	}
 
+	if( emberPass )
+	{
+		delete emberPass;
+		emberPass = nullptr;
+	}
+
 	if( hdrGuiCompositePass )
 	{
 		delete hdrGuiCompositePass;
@@ -2512,6 +2524,7 @@ idRenderBackend::idRenderBackend()
 	ssaoPass = nullptr;
 	ddgiPass = nullptr;
 	reflectionsPass = nullptr;
+	emberPass = nullptr;
 	hdrGuiCompositePass = nullptr;
 
 	memset( &glConfig, 0, sizeof( glConfig ) );

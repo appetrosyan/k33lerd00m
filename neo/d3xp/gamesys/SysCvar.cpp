@@ -81,6 +81,9 @@ idCVar g_roeNightmare(				"g_roeNightmare",			"0",			CVAR_GAME | CVAR_ARCHIVE | 
 idCVar g_leNightmare(				"g_leNightmare",			"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "if nightmare mode is allowed for le" );
 idCVar g_gravity(					"g_gravity",		DEFAULT_GRAVITY_STRING, CVAR_GAME | CVAR_FLOAT, "" );
 idCVar g_skipFX(					"g_skipFX",					"0",			CVAR_GAME | CVAR_BOOL, "" );
+idCVar g_deathFX(					"g_deathFX",				"1",			CVAR_GAME | CVAR_BOOL, "impactful monster deaths: directional smoke/ember burst + immediate dissolve carrying the killing blow" );
+idCVar g_deathFXMomentum(			"g_deathFXMomentum",		"1.0",			CVAR_GAME | CVAR_FLOAT, "death FX: scale of the killing-blow momentum imparted to the smoke" );
+idCVar g_deathFXDissolveScale(		"g_deathFXDissolveScale",	"0.5",			CVAR_GAME | CVAR_FLOAT, "death FX: model dissolve speed multiplier (1 = engine default, 0.5 = half speed / twice as slow)" );
 
 idCVar g_disasm(					"g_disasm",					"0",			CVAR_GAME | CVAR_BOOL, "disassemble script into base/script/disasm.txt on the local drive when script is compiled" );
 idCVar g_debugBounds(				"g_debugBounds",			"0",			CVAR_GAME | CVAR_BOOL, "checks for models with bounds > 2048" );

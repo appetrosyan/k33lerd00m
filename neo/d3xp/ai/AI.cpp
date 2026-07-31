@@ -348,6 +348,7 @@ idAI::idAI()
 
 	particles.Clear();
 	restartParticles	= true;
+	deathFXTime			= 0;
 	useBoneAxis			= false;
 
 	wakeOnFlashlight	= false;
@@ -1212,6 +1213,18 @@ void idAI::Think()
 	if( !ai_think.GetBool() )
 	{
 		return;
+	}
+
+	// Impactful death: drive the model dissolve at a slowed, tunable rate. The burn
+	// material erodes on ( time - SHADERPARM_TIME_OF_DEATH ) at a rate baked into the
+	// material, so to slow it we advance that parm at a fraction of real time (scale
+	// < 1 => the burn clock runs slower => the body dissolves more gradually).
+	if( deathFXTime > 0 && g_deathFX.GetBool() )
+	{
+		const float scale = idMath::ClampFloat( 0.05f, 1.0f, g_deathFXDissolveScale.GetFloat() );
+		const float elapsed = MS2SEC( gameLocal.time - deathFXTime );
+		renderEntity.shaderParms[ SHADERPARM_TIME_OF_DEATH ] = MS2SEC( gameLocal.time ) - scale * elapsed;
+		UpdateVisuals();
 	}
 
 	if( thinkFlags & TH_THINK )
@@ -4010,6 +4023,90 @@ void idAI::Killed( idEntity* inflictor, idEntity* attacker, int damage, const id
 			harvestEnt.GetEntity()->Init( this );
 			harvestEnt.GetEntity()->BecomeActive( TH_THINK );
 		}
+	}
+
+	// Impactful death: the enemy comes apart the moment it dies - the model
+	// dissolves immediately (instead of the slow scripted burn-away) while a
+	// smoke + emissive ember burst erupts along the killing-blow direction.
+	if( g_deathFX.GetBool() )
+	{
+		idVec3 fxOrigin = physicsObj.GetOrigin();
+		const jointHandle_t chestJoint = animator.GetJointHandle( "chest" );
+		if( chestJoint != INVALID_JOINT )
+		{
+			idVec3 jointOrigin;
+			idMat3 jointAxis;
+			animator.GetJointTransform( chestJoint, gameLocal.time, jointOrigin, jointAxis );
+			fxOrigin = renderEntity.origin + jointOrigin * renderEntity.axis;
+		}
+
+		// orient the burst along the killing blow so the smoke sprays with the shot
+		idMat3 fxAxis = mat3_identity;
+		if( dir.LengthSqr() > VECTOR_EPSILON )
+		{
+			idVec3 fwd = dir;
+			fwd.Normalize();
+			fxAxis = fwd.ToMat3();
+		}
+
+		idEntityFx::StartFx( "fx/rt_deathburst", &fxOrigin, &fxAxis, this, false );
+
+		// dissolve the model right now: apply the burn skin (if any) and start the
+		// SHADERPARM_TIME_OF_DEATH clock so the body disintegrates from this instant,
+		// rather than waiting on the per-monster "burnaway" script delay.
+		const char* burnSkin = spawnArgs.GetString( "skin_burn" );
+		if( burnSkin != NULL && *burnSkin )
+		{
+			SetSkin( declManager->FindSkin( burnSkin ) );
+		}
+		deathFXTime = gameLocal.time;
+		renderEntity.shaderParms[ SHADERPARM_TIME_OF_DEATH ] = MS2SEC( gameLocal.time );
+
+		// GPU mesh-seeded ember dissolve: hand the renderer the kill time, blow
+		// direction, and the recent impact points (model space). The ember pass seeds
+		// embers only from mesh vertices near those impacts - so the wounded area comes
+		// apart into burning chunks while the rest of the body just burns.
+		renderEntity.emberStartTime = gameLocal.time;
+		if( dir.LengthSqr() > VECTOR_EPSILON )
+		{
+			renderEntity.emberDir = dir;
+			renderEntity.emberDir.Normalize();
+		}
+		else
+		{
+			renderEntity.emberDir.Set( 0.0f, 0.0f, 1.0f );
+		}
+
+		idVec3 emberImpacts[ MAX_ENTITY_EMBER_IMPACTS ];
+		int nImpacts = 0;
+		for( const damageEffect_t* de = this->damageEffects;
+				de != NULL && nImpacts < MAX_ENTITY_EMBER_IMPACTS; de = de->next )
+		{
+			if( de->jointNum < 0 || de->jointNum >= renderEntity.numJoints )
+			{
+				continue;
+			}
+			// joint-space wound origin -> model space (matches AddLocalDamageEffect)
+			const idMat3 jm = renderEntity.joints[ de->jointNum ].ToMat3();
+			const idVec3 jo = renderEntity.joints[ de->jointNum ].ToVec3();
+			emberImpacts[ nImpacts++ ] = jo + de->localOrigin * jm;
+		}
+		if( nImpacts == 0 )
+		{
+			// no recorded wounds (e.g. console kill): fall back to the torso
+			jointHandle_t j = animator.GetJointHandle( "chest" );
+			if( j == INVALID_JOINT )
+			{
+				j = animator.GetJointHandle( "head" );
+			}
+			if( j != INVALID_JOINT && ( int )j < renderEntity.numJoints )
+			{
+				emberImpacts[ nImpacts++ ] = renderEntity.joints[ j ].ToVec3();
+			}
+		}
+		R_RegisterEmberImpacts( GetModelDefHandle(), emberImpacts, nImpacts );
+
+		UpdateVisuals();
 	}
 }
 

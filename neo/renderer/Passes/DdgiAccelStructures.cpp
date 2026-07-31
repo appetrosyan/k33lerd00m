@@ -248,6 +248,8 @@ void DdgiAccelStructures::BuildSkinnedInstances( nvrhi::ICommandList* commandLis
 		std::vector<nvrhi::rt::InstanceDesc>& instances,
 		std::vector<DdgiInstanceData>& instanceData )
 {
+	m_PosedRanges.clear();
+
 	EnsureSkinPipeline();
 	if( m_SkinPipeline == nullptr )
 	{
@@ -296,6 +298,14 @@ void DdgiAccelStructures::BuildSkinnedInstances( nvrhi::ICommandList* commandLis
 		s.outVertBase = totalVerts;
 		totalVerts += s.numVerts;
 		skinned.push_back( s );
+
+		// record the posed range so the ember pass can seed from this surface
+		PosedRange pr;
+		pr.entityIndex = ( surf->space->entityDef != NULL ) ? surf->space->entityDef->index : -1;
+		pr.outVertBase = s.outVertBase;
+		pr.numVerts = s.numVerts;
+		memcpy( pr.modelMatrix, surf->space->modelMatrix, sizeof( pr.modelMatrix ) );
+		m_PosedRanges.push_back( pr );
 	}
 
 	if( skinned.empty() )

@@ -1,0 +1,29 @@
+// Death FX particle materials (impactful monster deaths).
+// Author: Aleksandr Petrosyan
+// Reuses existing base images so nothing is missing.
+
+textures/particles/rt_ember
+{
+	noshadows
+	nonsolid
+	noimpact
+	translucent
+	{
+		blend		add
+		map			textures/decals/ember1_dif.tga
+		vertexColor
+	}
+}
+
+textures/particles/rt_smoke
+{
+	noshadows
+	nonsolid
+	noimpact
+	translucent
+	{
+		blend		blend
+		map			textures/decals/smoke01.tga
+		vertexColor
+	}
+}

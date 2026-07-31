@@ -50,6 +50,7 @@ extern idCVar r_hdrGuiPaperWhiteNits;
 extern idCVar r_useRTReflections;
 extern idCVar r_rtReflectionIntensity;
 extern idCVar r_rtReflectionGateHi;
+extern idCVar r_emberDissolve;
 
 /*
 ========================
@@ -267,6 +268,16 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_ROUGHNESS );
 	control->SetupEvents( 2, options->GetChildren().Num() );
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_RT_ROUGHNESS );
+	options->AddChild( control );
+
+	// Ember death dissolve -----------------------------------------------------
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "Ember Death Dissolve" );
+	control->SetDescription( "Killed demons come apart into GPU embers seeded from their mesh." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_EMBER_DISSOLVE );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_EMBER_DISSOLVE );
 	options->AddChild( control );
 
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
@@ -552,6 +563,7 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData
 	originalRTReflections = r_useRTReflections.GetInteger();
 	originalRTIntensity = r_rtReflectionIntensity.GetFloat();
 	originalRTRoughness = r_rtReflectionGateHi.GetFloat();
+	originalEmberDissolve = r_emberDissolve.GetInteger();
 
 	const int fullscreen = r_fullscreen.GetInteger();
 	if( fullscreen > 0 )
@@ -865,6 +877,13 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			r_rtReflectionGateHi.SetFloat( LinearAdjust( clamped, 0.0f, 100.0f, 0.0f, 1.0f ) );
 			break;
 		}
+		case SYSTEM_FIELD_EMBER_DISSOLVE:
+		{
+			static const int numValues = 2;
+			static const int values[numValues] = { 0, 1 };
+			r_emberDissolve.SetInteger( AdjustOption( r_emberDissolve.GetInteger(), values, numValues, adjustAmount ) );
+			break;
+		}
 	}
 	cvarSystem->ClearModifiedFlags( CVAR_ARCHIVE );
 }
@@ -1089,6 +1108,9 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 
 		case SYSTEM_FIELD_RT_ROUGHNESS:
 			return LinearAdjust( r_rtReflectionGateHi.GetFloat(), 0.0f, 1.0f, 0.0f, 100.0f );
+
+		case SYSTEM_FIELD_EMBER_DISSOLVE:
+			return r_emberDissolve.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
 	}
 	return false;
 }

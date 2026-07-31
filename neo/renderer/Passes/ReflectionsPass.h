@@ -75,6 +75,12 @@ public:
 		return m_ReflectionImage;
 	}
 
+	// Ember dissolve seeds from the posed-vertex pool this pass just built.
+	DdgiAccelStructures&	GetAccelStructures()
+	{
+		return m_AccelStructs;
+	}
+
 private:
 	void			CreateTracePass();
 	// (Re)create the screen-sized output image when the render resolution changes.
