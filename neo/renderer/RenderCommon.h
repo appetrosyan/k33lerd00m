@@ -895,6 +895,8 @@ public:
 	virtual int				GetHeight() const;
 	virtual int				GetNativeWidth() const;
 	virtual int				GetNativeHeight() const;
+	virtual int				GetRenderWidth() const;
+	virtual int				GetRenderHeight() const;
 	virtual int				GetVirtualWidth() const;
 	virtual int				GetVirtualHeight() const;
 	virtual float			GetPixelAspect() const;
@@ -1330,6 +1332,10 @@ INITIALIZATION
 bool R_UsePixelatedLook();
 
 bool R_UseTemporalAA();
+
+extern idCVar r_ssaaScale;
+bool R_UseSSAA();
+float R_SSAAScale();
 
 bool R_UseHiZ();
 

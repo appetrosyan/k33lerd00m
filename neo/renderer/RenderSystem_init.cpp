@@ -85,6 +85,10 @@ idCVar r_useValidationLayers( "r_useValidationLayers", "1", CVAR_INTEGER | CVAR_
 	idCVar r_antiAliasing( "r_antiAliasing", "2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, " 0 = None\n 1 = SMAA 1x\n 2 = TAA", 0, ANTI_ALIASING_TAA );
 #endif
 // RB end
+
+// SSAA supersampling: render the 3D scene at nativeRes * scale and downsample. Snapped to
+// {1.0, 1.5, 2.0} by R_SSAAScale(). Changing it reallocates the scene render targets.
+idCVar r_ssaaScale( "r_ssaaScale", "1.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "supersample the 3D scene: 1 = off, 1.5, 2.0", 1.0f, 2.0f );
 idCVar r_vidMode( "r_vidMode", "0", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_INTEGER, "fullscreen video mode number" );
 idCVar r_displayRefresh( "r_displayRefresh", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NOCHEAT, "optional display refresh rate option for vid mode", 0.0f, 240.0f );
 // SRS - redefined mode -2 to be borderless fullscreen, implemented borderless modes -2 and -1 for Windows and linux/macOS (SDL)
@@ -344,6 +348,26 @@ DeviceManager* deviceManager = NULL;
 bool R_UsePixelatedLook()
 {
 	return ( r_renderMode.GetInteger() == RENDERMODE_PSX ) || image_pixelLook.GetBool();
+}
+
+float R_SSAAScale()
+{
+	// snap the archived float to the discrete set the menu exposes
+	const float s = r_ssaaScale.GetFloat();
+	if( s >= 2.0f )
+	{
+		return 2.0f;
+	}
+	if( s >= 1.5f )
+	{
+		return 1.5f;
+	}
+	return 1.0f;
+}
+
+bool R_UseSSAA()
+{
+	return R_SSAAScale() > 1.0f;
 }
 
 bool R_UseTemporalAA()
@@ -2622,6 +2646,19 @@ int idRenderSystemLocal::GetNativeHeight() const
 	return glConfig.nativeScreenHeight;
 }
 // RB end
+
+// SSAA: the 3D scene render resolution = window resolution * scale. Used only by the scene
+// render targets and the scene/post viewports; the UI, present and screenshot stay at
+// GetWidth()/GetNativeWidth() so menus, HUD and cursor mapping remain native.
+int idRenderSystemLocal::GetRenderWidth() const
+{
+	return idMath::Ftoi( GetWidth() * R_SSAAScale() );
+}
+
+int idRenderSystemLocal::GetRenderHeight() const
+{
+	return idMath::Ftoi( GetHeight() * R_SSAAScale() );
+}
 
 /*
 ========================

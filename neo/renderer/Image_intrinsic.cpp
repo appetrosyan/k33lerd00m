@@ -264,7 +264,7 @@ static void R_LdrNativeImage( idImage* image, nvrhi::ICommandList* commandList )
 	extern idCVar r_hdrOutput;
 	const bool hdr = r_hdrOutput.GetBool();
 	const textureUsage_t usage = hdr ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, hdr, 1 );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, hdr, 1 );
 }
 
 static void R_GuiCompositeImage( idImage* image, nvrhi::ICommandList* commandList )
@@ -279,7 +279,7 @@ static void R_DepthImage( idImage* image, nvrhi::ICommandList* commandList )
 {
 	uint sampleCount = R_GetMSAASamples();
 
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_DEPTH_STENCIL, nullptr, true, false, sampleCount );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_DEPTH_STENCIL, nullptr, true, false, sampleCount );
 }
 
 // RB begin
@@ -287,22 +287,22 @@ static void R_HDR_RGBA16FImage_ResNative_MSAAOpt( idImage* image, nvrhi::IComman
 {
 	uint sampleCount = R_GetMSAASamples();
 
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true, sampleCount == 1, sampleCount );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true, sampleCount == 1, sampleCount );
 }
 
 static void R_HDR_RG16FImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_RG16F, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_RG16F, nullptr, true );
 }
 
 static void R_HDR_RGBA16FImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true );
 }
 
 static void R_HDR_RGBA16FImage_ResNative_UAV( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true, true );
 }
 
 static void R_HDR_RGBA16FImage_ResGui( idImage* image, nvrhi::ICommandList* commandList )
@@ -342,7 +342,7 @@ static void R_HDR_RGBA16FImage_ResQuarter( idImage* image, nvrhi::ICommandList* 
 
 static void R_HDR_RGBA16FImage_ResQuarter_Linear( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth() / 4, renderSystem->GetHeight() / 4, TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth() / 4, renderSystem->GetRenderHeight() / 4, TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
 }
 
 static void R_HDR_RGBA16FImage_Res64( idImage* image, nvrhi::ICommandList* commandList )
@@ -351,29 +351,40 @@ static void R_HDR_RGBA16FImage_Res64( idImage* image, nvrhi::ICommandList* comma
 }
 static void R_SMAAImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
+}
+
+static void R_SMAAColorImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
+{
+	// The SMAA colour copy must match ldrImage's format. In HDR output mode ldrImage is
+	// FP16 scRGB-linear with paperwhite-scaled values above 1.0; an 8-bit buffer here would
+	// clamp that extended range on the input blit and dim the whole frame on the HDR display.
+	// The edge and blend-weight buffers stay 8-bit -- they only hold [0,1] data.
+	extern idCVar r_hdrOutput;
+	const textureUsage_t usage = r_hdrOutput.GetBool() ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_LINEAR, TR_CLAMP, usage, nullptr, true );
 }
 
 static void R_AmbientOcclusionImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_LINEAR, TR_CLAMP, TD_R8F, nullptr, true, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_LINEAR, TR_CLAMP, TD_R8F, nullptr, true, true );
 }
 
 static void R_GeometryBufferImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
 {
 	uint sampleCount = R_GetMSAASamples();
 
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_LINEAR, TR_CLAMP, TD_RGBA16F, nullptr, true, false, sampleCount );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_LINEAR, TR_CLAMP, TD_RGBA16F, nullptr, true, false, sampleCount );
 }
 
 static void R_SSAOImage_ResHalf( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth() / 2, renderSystem->GetHeight() / 2, TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth() / 2, renderSystem->GetRenderHeight() / 2, TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
 }
 
 static void R_HierarchicalZBufferImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST_MIPMAP, TR_CLAMP, TD_R32F, nullptr, true, true );
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST_MIPMAP, TR_CLAMP, TD_R32F, nullptr, true, true );
 }
 
 static void R_R8Image_ResNative_Linear( idImage* image, nvrhi::ICommandList* commandList )
@@ -1124,7 +1135,7 @@ void idImageManager::CreateIntrinsicImages()
 
 	grainImage1 = globalImages->ImageFromFunction( "_grain1", R_CreateGrainImage1 );
 
-	smaaInputImage = ImageFromFunction( "_smaaInput", R_SMAAImage_ResNative );
+	smaaInputImage = ImageFromFunction( "_smaaInput", R_SMAAColorImage_ResNative );
 	smaaAreaImage = globalImages->ImageFromFunction( "_smaaArea", R_CreateSMAAAreaImage );
 	smaaSearchImage = globalImages->ImageFromFunction( "_smaaSearch", R_CreateSMAASearchImage );
 

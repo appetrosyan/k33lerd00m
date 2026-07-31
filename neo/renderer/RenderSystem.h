@@ -261,6 +261,9 @@ public:
 	virtual int				GetHeight() const = 0;
 	virtual int				GetNativeWidth() const = 0;
 	virtual int				GetNativeHeight() const = 0;
+	// SSAA scene render resolution (window resolution * r_ssaaScale); native for scale 1.0
+	virtual int				GetRenderWidth() const = 0;
+	virtual int				GetRenderHeight() const = 0;
 	virtual int				GetVirtualWidth() const = 0;
 	virtual int				GetVirtualHeight() const = 0;
 

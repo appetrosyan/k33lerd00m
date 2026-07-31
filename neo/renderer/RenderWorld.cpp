@@ -1068,6 +1068,18 @@ void idRenderWorldLocal::RenderScene( const renderView_t* renderView )
 		}
 		tr.CropRenderSize( windowWidth, windowHeight );
 		tr.GetCroppedViewport( &parms->viewport );
+
+		// SSAA: render this 3D world view into the full supersampled scene target from the
+		// top-left. CropRenderSize keeps running on the native size for its side effects and
+		// crop state; only the final viewport is widened. The 2D GUI never comes through here
+		// (it is a separate is2Dgui view), so it stays native.
+		if( R_UseSSAA() )
+		{
+			parms->viewport.x1 = 0;
+			parms->viewport.y1 = 0;
+			parms->viewport.x2 = tr.GetRenderWidth() - 1;
+			parms->viewport.y2 = tr.GetRenderHeight() - 1;
+		}
 	}
 
 	// the scissor bounds may be shrunk in subviews even if

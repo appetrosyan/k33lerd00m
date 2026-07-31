@@ -454,8 +454,8 @@ void idRenderBackend::PrepareStageTexturing( const shaderStage_t* pStage,  const
 		);
 
 		// should this be the viewport width / height instead?
-		int w = renderSystem->GetWidth();
-		int h = renderSystem->GetHeight();
+		int w = renderSystem->GetRenderWidth();
+		int h = renderSystem->GetRenderHeight();
 
 		ALIGNTYPE16 const idRenderMatrix screenScale(
 			w,  0.0f, 0.0f, 0.0f,
@@ -5124,8 +5124,8 @@ void idRenderBackend::Bloom( const viewDef_t* _viewDef )
 
 	GL_State( /*GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO |*/ GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS | GLS_CULL_TWOSIDED );
 
-	int screenWidth = renderSystem->GetWidth();
-	int screenHeight = renderSystem->GetHeight();
+	int screenWidth = renderSystem->GetRenderWidth();
+	int screenHeight = renderSystem->GetRenderHeight();
 
 	// set the window clipping
 	GL_Viewport( 0, 0, screenWidth / 4, screenHeight / 4 );
@@ -5257,8 +5257,8 @@ void idRenderBackend::DrawScreenSpaceAmbientOcclusion( const viewDef_t* _viewDef
 
 	Framebuffer* previousFramebuffer = Framebuffer::GetActiveFramebuffer();
 
-	int screenWidth = renderSystem->GetWidth();
-	int screenHeight = renderSystem->GetHeight();
+	int screenWidth = renderSystem->GetRenderWidth();
+	int screenHeight = renderSystem->GetRenderHeight();
 
 	commandList->clearTextureFloat( globalImages->ambientOcclusionImage[0]->GetTextureHandle(), nvrhi::AllSubresources, nvrhi::Color( 1.0f ) );
 
@@ -5918,7 +5918,7 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 			nvrhi::IFramebuffer* currentFB = ( nvrhi::IFramebuffer* )currentFrameBuffer->GetApiObject();
 			blitParms.sourceTexture = currentFB->getDesc().colorAttachments[0].texture;
 			blitParms.targetFramebuffer = globalFramebuffers.postProcFBO->GetApiObject(); // _currentRender image
-			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth(), renderSystem->GetHeight() );
+			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight() );
 			commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
 		}
 
@@ -5938,7 +5938,7 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 			BlitParameters blitParms;
 			blitParms.sourceTexture = reflectionsPass->GetReflectionImage()->GetTextureHandle();
 			blitParms.targetFramebuffer = globalFramebuffers.hdrFBO->GetApiObject();
-			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth(), renderSystem->GetHeight() );
+			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight() );
 			commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
 		}
 	}
@@ -6031,7 +6031,7 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 			nvrhi::IFramebuffer* currentFB = ( nvrhi::IFramebuffer* )currentFrameBuffer->GetApiObject();
 			blitParms.sourceTexture = currentFB->getDesc().colorAttachments[0].texture;
 			blitParms.targetFramebuffer = globalFramebuffers.postProcFBO->GetApiObject(); // _currentRender image
-			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth(), renderSystem->GetHeight() );
+			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight() );
 			commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
 		}
 
@@ -6534,8 +6534,8 @@ void idRenderBackend::PostProcess( const void* data )
 
 	GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO | GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS |  GLS_CULL_TWOSIDED );
 
-	int screenWidth = renderSystem->GetWidth();
-	int screenHeight = renderSystem->GetHeight();
+	int screenWidth = renderSystem->GetRenderWidth();
+	int screenHeight = renderSystem->GetRenderHeight();
 
 	// set the window clipping
 	GL_Viewport( 0, 0, screenWidth, screenHeight );
@@ -6579,7 +6579,7 @@ void idRenderBackend::PostProcess( const void* data )
 		blitParms.sourceTexture = ( nvrhi::ITexture* )globalImages->ldrImage->GetTextureID();
 		blitParms.targetFramebuffer = globalFramebuffers.smaaInputFBO->GetApiObject();
 
-		blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth(), renderSystem->GetHeight() );
+		blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight() );
 		commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
 
 		{
@@ -6640,7 +6640,7 @@ void idRenderBackend::PostProcess( const void* data )
 		blitParms.sourceTexture = ( nvrhi::ITexture* )globalImages->ldrImage->GetTextureID();
 		blitParms.targetFramebuffer = globalFramebuffers.smaaBlendFBO->GetApiObject();
 
-		blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth(), renderSystem->GetHeight() );
+		blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight() );
 		commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
 
 		globalFramebuffers.smaaBlendFBO->Bind();
@@ -6840,8 +6840,8 @@ void idRenderBackend::CRTPostProcess()
 
 	GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO | GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS |  GLS_CULL_TWOSIDED );
 
-	int screenWidth = renderSystem->GetWidth();
-	int screenHeight = renderSystem->GetHeight();
+	int screenWidth = renderSystem->GetRenderWidth();
+	int screenHeight = renderSystem->GetRenderHeight();
 
 	// set the window clipping
 	GL_Viewport( 0, 0, screenWidth, screenHeight );
@@ -6870,7 +6870,7 @@ void idRenderBackend::CRTPostProcess()
 			blitParms.sourceTexture = ( nvrhi::ITexture* )globalImages->ldrImage->GetTextureID();
 			blitParms.targetFramebuffer = globalFramebuffers.bloomRenderFBO[0]->GetApiObject();
 
-			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth() / 4, renderSystem->GetHeight() / 4 );
+			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetRenderWidth() / 4, renderSystem->GetRenderHeight() / 4 );
 			commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
 
 			GL_SelectTexture( 0 );
@@ -6883,7 +6883,7 @@ void idRenderBackend::CRTPostProcess()
 			blitParms.sourceTexture = ( nvrhi::ITexture* )globalImages->ldrImage->GetTextureID();
 			blitParms.targetFramebuffer = globalFramebuffers.smaaBlendFBO->GetApiObject();
 
-			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetWidth(), renderSystem->GetHeight() );
+			blitParms.targetViewport = nvrhi::Viewport( renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight() );
 			commonPasses.BlitTexture( commandList, blitParms, &bindingCache );
 
 			GL_SelectTexture( 0 );
@@ -6912,8 +6912,8 @@ void idRenderBackend::CRTPostProcess()
 		idVec4 sourceSizeParam;
 		if( quarterRes )
 		{
-			sourceSizeParam.x = renderSystem->GetWidth() / 4;
-			sourceSizeParam.y = renderSystem->GetHeight() / 4;
+			sourceSizeParam.x = renderSystem->GetRenderWidth() / 4;
+			sourceSizeParam.y = renderSystem->GetRenderHeight() / 4;
 		}
 		else
 		{
