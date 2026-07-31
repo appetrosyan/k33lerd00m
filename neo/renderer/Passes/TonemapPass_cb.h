@@ -52,7 +52,7 @@ struct ToneMappingConstants
 	float hdrOperator;		// runtime tone curve: 0 linear, 1 Reinhard, 2 ACES, 3 Hable
 
 	float hdrStrength;		// blend operator toward linear (0..1)
-	float hdrPad0;
+	float ssaaScale;		// SSAA: supersample factor of the source vs native output (1 = off)
 	float hdrPad1;
 	float hdrPad2;
 };

@@ -302,6 +302,15 @@ void TonemapPass::Render(
 								  ( float )viewDef->viewport.y2 + 1,
 								  viewDef->viewport.zmin,
 								  viewDef->viewport.zmax };
+
+		// SSAA: the 3D view renders at the supersampled resolution, but the tonemap writes the
+		// native ldrImage. Cover the full native target here while the shader samples the scaled
+		// source at normalised UVs (linear sampler) -> the tonemap doubles as the downsample.
+		if( R_UseSSAA() )
+		{
+			const nvrhi::FramebufferInfoEx& fbInfo = _targetFb->getFramebufferInfo();
+			viewport = nvrhi::Viewport( 0.f, ( float )fbInfo.width, 0.f, ( float )fbInfo.height, 0.f, 1.f );
+		}
 		state.viewport.addViewportAndScissorRect( viewport );
 
 		bool enableColorLUT = params.enableColorLUT && colorLutSize > 0;
@@ -312,6 +321,10 @@ void TonemapPass::Render(
 		toneMappingConstants.minAdaptedLuminance = r_hdrMinLuminance.GetFloat();
 		toneMappingConstants.maxAdaptedLuminance = r_hdrMaxLuminance.GetFloat();
 		toneMappingConstants.sourceSlice = 0;
+		// SSAA: tell the shader how much bigger the source is than the native output so it can
+		// box-downsample. Only when the 3D scene is actually supersampled (viewDef->viewport
+		// is at render resolution and this pass writes the native ldrImage).
+		toneMappingConstants.ssaaScale = R_UseSSAA() ? R_SSAAScale() : 1.0f;
 		toneMappingConstants.colorLUTTextureSize = enableColorLUT ? idVec2( colorLutSize * colorLutSize, colorLutSize ) : idVec2( 0.f, 0.f );
 		toneMappingConstants.colorLUTTextureSizeInv = enableColorLUT ? 1.f / toneMappingConstants.colorLUTTextureSize : idVec2( 0.f, 0.f );
 
@@ -432,6 +445,10 @@ void TonemapPass::AddFrameToHistogram( nvrhi::ICommandList* commandList, const v
 		toneMappingConstants.viewOrigin = idVec2i( scissor.minX, scissor.minY );
 		toneMappingConstants.viewSize = idVec2i( scissor.maxX - scissor.minX, scissor.maxY - scissor.minY );
 		toneMappingConstants.sourceSlice = 0;
+		// SSAA: tell the shader how much bigger the source is than the native output so it can
+		// box-downsample. Only when the 3D scene is actually supersampled (viewDef->viewport
+		// is at render resolution and this pass writes the native ldrImage).
+		toneMappingConstants.ssaaScale = R_UseSSAA() ? R_SSAAScale() : 1.0f;
 
 		if( !pcEnabledHistogram )
 		{

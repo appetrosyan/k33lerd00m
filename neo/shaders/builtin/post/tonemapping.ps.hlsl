@@ -140,11 +140,44 @@ void main(
 	in float2 uv : UV,
 	out float4 o_rgba : SV_Target )
 {
+	// SSAA: the source may be supersampled (ssaaScale > 1) while this pass writes the native
+	// output. Box-downsample the ssaaScale x ssaaScale source block with a Karis 1/(1+luma)
+	// weight so a bright sub-pixel sample can't dominate an HDR edge. At scale 1 this is a
+	// single texel load, identical to the original 1:1 behaviour.
+	float4 HdrColor;
+	{
+		const float ssaa = g_ToneMapping.ssaaScale;
+		if( ssaa <= 1.001 )
+		{
 #if SOURCE_ARRAY
-	float4 HdrColor = t_Source[uint3( pos.xy, g_ToneMapping.sourceSlice )];
+			HdrColor = t_Source[uint3( pos.xy, g_ToneMapping.sourceSlice )];
 #else
-	float4 HdrColor = t_Source[pos.xy];
+			HdrColor = t_Source[pos.xy];
 #endif
+		}
+		else
+		{
+			const int n = int( ceil( ssaa ) );
+			const int2 base = int2( pos.xy * ssaa );
+			float4 acc = float4( 0.0, 0.0, 0.0, 0.0 );
+			float wsum = 0.0;
+			for( int y = 0; y < n; y++ )
+			{
+				for( int x = 0; x < n; x++ )
+				{
+#if SOURCE_ARRAY
+					float4 c = t_Source[uint3( base + int2( x, y ), g_ToneMapping.sourceSlice )];
+#else
+					float4 c = t_Source[uint2( base + int2( x, y ) )];
+#endif
+					float w = 1.0 / ( 1.0 + max( Luminance( c.rgb ), 0.0 ) );
+					acc += c * w;
+					wsum += w;
+				}
+			}
+			HdrColor = acc / max( wsum, 1e-5 );
+		}
+	}
 
 	// HDR display output: keep the scene linear and extended-range instead of
 	// clamping to SDR. Apply the same auto-exposure, roll highlights off toward the

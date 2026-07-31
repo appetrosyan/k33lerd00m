@@ -264,7 +264,7 @@ static void R_LdrNativeImage( idImage* image, nvrhi::ICommandList* commandList )
 	extern idCVar r_hdrOutput;
 	const bool hdr = r_hdrOutput.GetBool();
 	const textureUsage_t usage = hdr ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
-	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, hdr, 1 );
+	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, hdr, 1 );
 }
 
 static void R_GuiCompositeImage( idImage* image, nvrhi::ICommandList* commandList )
@@ -360,7 +360,7 @@ static void R_HDR_RGBA16FImage_ResQuarter( idImage* image, nvrhi::ICommandList* 
 
 static void R_HDR_RGBA16FImage_ResQuarter_Linear( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetRenderWidth() / 4, renderSystem->GetRenderHeight() / 4, TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetWidth() / 4, renderSystem->GetHeight() / 4, TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
 }
 
 static void R_HDR_RGBA16FImage_Res64( idImage* image, nvrhi::ICommandList* commandList )
@@ -369,7 +369,7 @@ static void R_HDR_RGBA16FImage_Res64( idImage* image, nvrhi::ICommandList* comma
 }
 static void R_SMAAImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
 {
-	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_LINEAR, TR_CLAMP, TD_LOOKUP_TABLE_RGBA, nullptr, true );
 }
 
 static void R_SMAAColorImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
@@ -380,7 +380,7 @@ static void R_SMAAColorImage_ResNative( idImage* image, nvrhi::ICommandList* com
 	// The edge and blend-weight buffers stay 8-bit -- they only hold [0,1] data.
 	extern idCVar r_hdrOutput;
 	const textureUsage_t usage = r_hdrOutput.GetBool() ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
-	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_LINEAR, TR_CLAMP, usage, nullptr, true );
+	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_LINEAR, TR_CLAMP, usage, nullptr, true );
 }
 
 static void R_AmbientOcclusionImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
