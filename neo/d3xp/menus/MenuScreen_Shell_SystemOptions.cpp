@@ -52,6 +52,8 @@ extern idCVar r_rtReflectionIntensity;
 extern idCVar r_rtReflectionGateHi;
 extern idCVar r_emberDissolve;
 extern idCVar r_useBloom;
+extern idCVar r_ssaaScale;
+float R_SSAAScale();
 
 /*
 ========================
@@ -279,6 +281,25 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_EMBER_DISSOLVE );
 	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_EMBER_DISSOLVE );
+	options->AddChild( control );
+
+	// Anti-aliasing quality -----------------------------------------------------
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "Bloom" );
+	control->SetDescription( "Glare halo around over-bright emissive surfaces (plasma, lights, muzzle flashes)." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOM );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOM );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "Supersampling (SSAA)" );
+	control->SetDescription( "Render the 3D scene at a higher resolution and downsample. Sharpest anti-aliasing; restart to apply." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_SSAA );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_SSAA );
 	options->AddChild( control );
 
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
@@ -566,6 +587,7 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData
 	originalRTRoughness = r_rtReflectionGateHi.GetFloat();
 	originalEmberDissolve = r_emberDissolve.GetInteger();
 	originalBloom = r_useBloom.GetInteger();
+	originalSSAA = R_SSAAScale();
 
 	const int fullscreen = r_fullscreen.GetInteger();
 	if( fullscreen > 0 )
@@ -610,6 +632,12 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsRestar
 	}
 
 	if( originalRTReflections != r_useRTReflections.GetInteger() )
+	{
+		return true;
+	}
+
+	// SSAA changes the size of the scene render targets, which are allocated at startup.
+	if( originalSSAA != R_SSAAScale() )
 	{
 		return true;
 	}
@@ -893,6 +921,15 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			r_useBloom.SetInteger( AdjustOption( r_useBloom.GetInteger(), values, numValues, adjustAmount ) );
 			break;
 		}
+		case SYSTEM_FIELD_SSAA:
+		{
+			// discrete supersample factors: off / 1.5x / 2x (stored as x100 for the int helper)
+			static const int numValues = 3;
+			static const int values[numValues] = { 100, 150, 200 };
+			const int cur = idMath::Ftoi( R_SSAAScale() * 100.0f );
+			r_ssaaScale.SetFloat( AdjustOption( cur, values, numValues, adjustAmount ) * 0.01f );
+			break;
+		}
 	}
 	cvarSystem->ClearModifiedFlags( CVAR_ARCHIVE );
 }
@@ -1123,6 +1160,20 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 
 		case SYSTEM_FIELD_BLOOM:
 			return r_useBloom.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
+
+		case SYSTEM_FIELD_SSAA:
+		{
+			const float s = R_SSAAScale();
+			if( s >= 2.0f )
+			{
+				return "2x";
+			}
+			if( s >= 1.5f )
+			{
+				return "1.5x";
+			}
+			return "#str_swf_disabled";
+		}
 	}
 	return false;
 }
@@ -1203,7 +1254,8 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsDataCh
 			originalRTReflections != r_useRTReflections.GetInteger() ||
 			originalRTIntensity != r_rtReflectionIntensity.GetFloat() ||
 			originalRTRoughness != r_rtReflectionGateHi.GetFloat() ||
-			originalBloom != r_useBloom.GetInteger() )
+			originalBloom != r_useBloom.GetInteger() ||
+			originalSSAA != R_SSAAScale() )
 	{
 		return true;
 	}

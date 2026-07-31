@@ -1389,6 +1389,7 @@ public:
 			SYSTEM_FIELD_RT_ROUGHNESS,
 			SYSTEM_FIELD_EMBER_DISSOLVE,
 			SYSTEM_FIELD_BLOOM,
+			SYSTEM_FIELD_SSAA,
 			SYSTEM_FIELD_BRIGHTNESS,
 			SYSTEM_FIELD_VOLUME,
 			MAX_SYSTEM_FIELDS
@@ -1441,6 +1442,7 @@ public:
 		float originalRTRoughness;
 		int originalEmberDissolve;
 		int originalBloom;
+		float originalSSAA;
 
 		idList<vidMode_t>			modeList;
 	};
