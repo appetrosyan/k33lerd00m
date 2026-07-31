@@ -52,7 +52,10 @@ struct PS_OUT
 };
 // *INDENT-ON*
 
-#define USE_CHROMATIC_ABERRATION			1
+// Chromatic aberration and dithering/grain are toggled at runtime, not compile time:
+// rpJitterTexScale.z = chromatic aberration on/off, rpJitterTexScale.w = grain on/off
+// (set by the filmic post pass in RenderBackend from r_filmicChromaticAberration /
+// r_filmicGrain). USE_* below only gates the compile-time-only extras.
 #define Chromatic_Amount					0.075
 
 #define USE_TECHNICOLOR						0		// [0 or 1]
@@ -484,9 +487,11 @@ void main( PS_IN fragment, out PS_OUT result )
 	ContrastAdaptiveSharpeningPass( color, fragment );
 #endif
 
-#if USE_CHROMATIC_ABERRATION
-	ChromaticAberrationPass( color, fragment );
-#endif
+	// r_filmicChromaticAberration
+	if( pc.rpJitterTexScale.z > 0.0 )
+	{
+		ChromaticAberrationPass( color, fragment );
+	}
 
 #if USE_TECHNICOLOR
 	TechnicolorPass( color );
@@ -496,9 +501,11 @@ void main( PS_IN fragment, out PS_OUT result )
 	VibrancePass( color );
 #endif
 
-#if USE_DITHERING
-	DitheringPass( color, fragment );
-#endif
+	// r_filmicGrain (blue-noise dithering / grain)
+	if( pc.rpJitterTexScale.w > 0.0 )
+	{
+		DitheringPass( color, fragment );
+	}
 
 	result.color = color;
 }

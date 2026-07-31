@@ -6729,7 +6729,7 @@ void idRenderBackend::PostProcess( const void* data )
 	}
 #endif
 
-	if( r_useFilmicPostFX.GetBool() || r_renderMode.GetInteger() > 0 )
+	if( r_filmicChromaticAberration.GetBool() || r_filmicGrain.GetBool() || r_renderMode.GetInteger() > 0 )
 	{
 		OPTICK_GPU_EVENT( "Render_FilmicPostFX" );
 
@@ -6867,6 +6867,9 @@ void idRenderBackend::PostProcess( const void* data )
 		}
 
 		jitterTexScale[1] = r_retroDitherScale.GetFloat();
+		// individual filmic effect toggles consumed by builtin/post/postprocess.ps.hlsl
+		jitterTexScale[2] = r_filmicChromaticAberration.GetBool() ? 1.0f : 0.0f;
+		jitterTexScale[3] = r_filmicGrain.GetBool() ? 1.0f : 0.0f;
 		SetFragmentParm( RENDERPARM_JITTERTEXSCALE, jitterTexScale ); // rpJitterTexScale
 
 		float jitterTexOffset[4];

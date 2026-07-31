@@ -1376,7 +1376,8 @@ public:
 			SYSTEM_FIELD_GI,
 			SYSTEM_FIELD_SHADOWS,
 			SYSTEM_FIELD_BLOOD_REFLECTIONS,
-			SYSTEM_FIELD_FILMIC_POSTFX,
+			SYSTEM_FIELD_FILMIC_CA,
+			SYSTEM_FIELD_FILMIC_GRAIN,
 			SYSTEM_FIELD_CRT_POSTFX,
 			// RB end
 			// HDR output + ray-traced reflections
@@ -1430,7 +1431,8 @@ public:
 		int originalSSAO;
 		int originalGI;
 		int originalBloodReflections;
-		int originalPostProcessing;
+		int originalChromaticAberration;
+		int originalFilmGrain;
 		int originalCRTPostFX;
 		// RB end
 		// HDR output + RT reflections snapshots (for change tracking / restart prompt)
