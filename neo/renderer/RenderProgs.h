@@ -485,7 +485,6 @@ enum
 	BUILTIN_CRT_NUPIXIE,
 	BUILTIN_CRT_EASYMODE,
 	BUILTIN_SCREEN,
-	BUILTIN_SSAA_RESOLVE,
 	BUILTIN_TONEMAP,
 	BUILTIN_BRIGHTPASS,
 	BUILTIN_HDR_GLARE_CHROMATIC,
@@ -1006,11 +1005,6 @@ public:
 	void	BindShader_Screen()
 	{
 		BindShader_Builtin( BUILTIN_SCREEN );
-	}
-
-	void	BindShader_SSAAResolve()
-	{
-		BindShader_Builtin( BUILTIN_SSAA_RESOLVE );
 	}
 
 	void	BindShader_Tonemap()

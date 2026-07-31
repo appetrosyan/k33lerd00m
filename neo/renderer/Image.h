@@ -612,8 +612,6 @@ public:
 	idImage*			blueNoiseImage256;
 	idImage*			currentRenderHDRImage;
 	idImage*			ldrImage;						// tonemapped result which can be used for further post processing
-	idImage*			ldrResolvedImage;				// SSAA: native-res downsample of ldrImage; the 2D UI composites onto this
-	idImage*			ldrResolvedDepthImage;			// SSAA: native depth/stencil for the resolved FBO (2D gui stencil masking)
 	idImage*			guiCompositeImage;				// HDR output: isolated 2D UI layer, composited into ldrImage in linear light
 	idImage*			taaMotionVectorsImage;			// motion vectors for TAA projection
 	idImage*			taaResolvedImage;

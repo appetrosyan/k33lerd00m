@@ -275,24 +275,6 @@ static void R_GuiCompositeImage( idImage* image, nvrhi::ICommandList* commandLis
 	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA16F, nullptr, true, false, 1 );
 }
 
-static void R_LdrResolvedImage( idImage* image, nvrhi::ICommandList* commandList )
-{
-	// SSAA: native-resolution downsample target for the supersampled ldrImage, and the
-	// surface the native 2D UI composites onto. Mirrors ldrImage's format (FP16 scRGB
-	// under HDR output, 8-bit otherwise) so the resolve and present are format-clean.
-	extern idCVar r_hdrOutput;
-	const bool hdr = r_hdrOutput.GetBool();
-	const textureUsage_t usage = hdr ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_LINEAR, TR_CLAMP, usage, nullptr, true, hdr, 1 );
-}
-
-static void R_ResolvedDepthImage( idImage* image, nvrhi::ICommandList* commandList )
-{
-	// SSAA: native depth/stencil for the resolved FBO. The 2D gui clears stencil to 128
-	// for masking and cannot reuse currentDepthImage, which is supersampled under SSAA.
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, TD_DEPTH_STENCIL, nullptr, true, false, 1 );
-}
-
 static void R_DepthImage( idImage* image, nvrhi::ICommandList* commandList )
 {
 	uint sampleCount = R_GetMSAASamples();
@@ -1127,8 +1109,6 @@ void idImageManager::CreateIntrinsicImages()
 
 	currentRenderHDRImage = globalImages->ImageFromFunction( "_currentRenderHDR", R_HDR_RGBA16FImage_ResNative_MSAAOpt );
 	ldrImage = globalImages->ImageFromFunction( "_currentRenderLDR", R_LdrNativeImage );
-	ldrResolvedImage = globalImages->ImageFromFunction( "_currentRenderLDRResolved", R_LdrResolvedImage );
-	ldrResolvedDepthImage = globalImages->ImageFromFunction( "_resolvedDepth", R_ResolvedDepthImage );
 	guiCompositeImage = globalImages->ImageFromFunction( "_guiComposite", R_GuiCompositeImage );
 
 	taaMotionVectorsImage = ImageFromFunction( "_taaMotionVectors", R_HDR_RG16FImage_ResNative ); // RB: could be shared with _currentNormals.zw
