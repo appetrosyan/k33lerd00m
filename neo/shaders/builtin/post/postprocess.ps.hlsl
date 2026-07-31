@@ -52,10 +52,9 @@ struct PS_OUT
 };
 // *INDENT-ON*
 
-// Chromatic aberration and dithering/grain are toggled at runtime, not compile time:
-// rpJitterTexScale.z = chromatic aberration on/off, rpJitterTexScale.w = grain on/off
-// (set by the filmic post pass in RenderBackend from r_filmicChromaticAberration /
-// r_filmicGrain). USE_* below only gates the compile-time-only extras.
+// Chromatic aberration is toggled at runtime via rpJitterTexScale.z (set by the
+// filmic post pass in RenderBackend from r_filmicChromaticAberration). USE_* below
+// only gates the compile-time-only extras.
 #define Chromatic_Amount					0.075
 
 #define USE_TECHNICOLOR						0		// [0 or 1]
@@ -71,11 +70,6 @@ struct PS_OUT
 #define	Vibrance_RGB_Balance				float3( 1.0, 1.0, 1.0 )
 
 #define USE_CAS                             0
-
-#define USE_DITHERING 						1
-#define Dithering_QuantizationSteps         16.0 // 8.0 = 2 ^ 3 quantization bits
-#define Dithering_NoiseBoost                1.0
-#define Dithering_Wide                      1.0
 
 float3 overlay( float3 a, float3 b )
 {
@@ -286,90 +280,6 @@ float3 BlueNoise3( float2 n, float x )
 }
 
 
-// Used for stills.
-float3 Step3( float2 uv )
-{
-	float3 noise = BlueNoise3( uv, 0.0 );
-
-#if 1
-	noise.x = RemapNoiseTriErp( noise.x );
-	noise.y = RemapNoiseTriErp( noise.y );
-	noise.z = RemapNoiseTriErp( noise.z );
-
-	noise = noise * 2.0 - 1.0;
-#endif
-
-	return noise;
-}
-
-// Used for temporal dither.
-float3 Step3T( float2 uv )
-{
-	float3 noise = BlueNoise3( uv, 1.0 );
-
-#if 1
-	noise.x = RemapNoiseTriErp( noise.x );
-	noise.y = RemapNoiseTriErp( noise.y );
-	noise.z = RemapNoiseTriErp( noise.z );
-
-	noise = noise * 2.0 - 1.0;
-#endif
-
-	return noise;
-}
-
-
-void DitheringPass( inout float4 fragColor, PS_IN fragment )
-{
-	float2 uv = fragment.position.xy * 1.0;
-	float2 uv2 = fragment.texcoord0;
-
-	float3 color = fragColor.rgb;
-
-#if 0
-	if( uv2.y >= 0.975 )
-	{
-		// BOTTOM: Show bands.
-		color = _float3( uv2.x );
-
-	}
-	else if( uv2.y >= 0.95 )
-	{
-		// quantized signal
-		color = _float3( uv2.x );
-		color = floor( color * Dithering_QuantizationSteps ) * ( 1.0 / ( Dithering_QuantizationSteps - 1.0 ) );
-	}
-	else if( uv2.y >= 0.925 )
-	{
-		// quantized signal dithered temporally
-		color = _float3( uv2.x );
-		color = floor( color * Dithering_QuantizationSteps + Step3( uv ) * Dithering_NoiseBoost ) * ( 1.0 / ( Dithering_QuantizationSteps - 1.0 ) );
-	}
-	else if( uv2.y >= 0.9 )
-	{
-		// TOP: Show dither texture.
-		color = Step3( uv ) * ( 0.25 * Dithering_NoiseBoost ) + 0.5;
-	}
-	else
-#endif
-	{
-#if 0
-		if( uv2.x <= 0.5 )
-		{
-			// quantized but not dithered
-			color = floor( 0.5 + color * ( Dithering_QuantizationSteps + Dithering_Wide - 1.0 ) + ( -Dithering_Wide * 0.5 ) ) * ( 1.0 / ( Dithering_QuantizationSteps - 1.0 ) );
-		}
-		else
-#endif
-		{
-			color = floor( 0.5 + color * ( Dithering_QuantizationSteps + Dithering_Wide - 1.0 ) + ( -Dithering_Wide * 0.5 ) + Step3T( uv ) * ( Dithering_Wide ) ) * ( 1.0 / ( Dithering_QuantizationSteps - 1.0 ) );
-		}
-	}
-
-	fragColor.rgb = color;
-}
-
-
 float Min3( float x, float y, float z )
 {
 	return min( x, min( y, z ) );
@@ -500,12 +410,6 @@ void main( PS_IN fragment, out PS_OUT result )
 #if USE_VIBRANCE
 	VibrancePass( color );
 #endif
-
-	// r_filmicGrain (blue-noise dithering / grain)
-	if( pc.rpJitterTexScale.w > 0.0 )
-	{
-		DitheringPass( color, fragment );
-	}
 
 	result.color = color;
 }

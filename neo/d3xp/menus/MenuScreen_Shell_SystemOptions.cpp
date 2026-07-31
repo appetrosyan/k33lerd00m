@@ -35,7 +35,6 @@ const static int NUM_SYSTEM_OPTIONS_OPTIONS = 8;
 extern idCVar r_graphicsAPI;
 extern idCVar r_antiAliasing;
 extern idCVar r_filmicChromaticAberration;
-extern idCVar r_filmicGrain;
 extern idCVar r_swapInterval;
 extern idCVar s_volume_dB;
 extern idCVar r_exposure; // RB: use this to control HDR exposure or brightness in LDR mode
@@ -203,15 +202,6 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FILMIC_CA );
 	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FILMIC_CA );
-	options->AddChild( control );
-
-	control = new( TAG_SWF ) idMenuWidget_ControlButton();
-	control->SetOptionType( OPTION_SLIDER_TEXT );
-	control->SetLabel( "Film Grain" );
-	control->SetDescription( "Blue-noise grain overlaid on the image; also dithers away colour banding in gradients." );
-	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FILMIC_GRAIN );
-	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
-	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_FILMIC_GRAIN );
 	options->AddChild( control );
 
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
@@ -590,7 +580,6 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::LoadData
 	originalGI = r_useDDGI.GetInteger();
 	originalBloodReflections = r_useSSR.GetInteger();
 	originalChromaticAberration = r_filmicChromaticAberration.GetInteger();
-	originalFilmGrain = r_filmicGrain.GetInteger();
 	originalCRTPostFX = r_useCRTPostFX.GetInteger();
 	// RB end
 	originalHdrOutput = r_hdrOutput.GetInteger();
@@ -829,13 +818,6 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			static const int numValues = 2;
 			static const int values[numValues] = { 0, 1 };
 			r_filmicChromaticAberration.SetInteger( AdjustOption( r_filmicChromaticAberration.GetInteger(), values, numValues, adjustAmount ) );
-			break;
-		}
-		case SYSTEM_FIELD_FILMIC_GRAIN:
-		{
-			static const int numValues = 2;
-			static const int values[numValues] = { 0, 1 };
-			r_filmicGrain.SetInteger( AdjustOption( r_filmicGrain.GetInteger(), values, numValues, adjustAmount ) );
 			break;
 		}
 		case SYSTEM_FIELD_CRT_POSTFX:
@@ -1116,8 +1098,6 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 		case SYSTEM_FIELD_FILMIC_CA:
 			return r_filmicChromaticAberration.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
 
-		case SYSTEM_FIELD_FILMIC_GRAIN:
-			return r_filmicGrain.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
 
 		case SYSTEM_FIELD_CRT_POSTFX:
 		{
@@ -1276,10 +1256,6 @@ bool idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::IsDataCh
 		return true;
 	}
 
-	if( originalFilmGrain != r_filmicGrain.GetInteger() )
-	{
-		return true;
-	}
 
 	if( originalCRTPostFX != r_useCRTPostFX.GetInteger() )
 	{

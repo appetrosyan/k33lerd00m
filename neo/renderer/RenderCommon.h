@@ -1292,7 +1292,6 @@ extern idCVar r_taaMaxRadiance;
 extern idCVar r_taaMotionVectors;
 
 extern idCVar r_filmicChromaticAberration;
-extern idCVar r_filmicGrain;
 extern idCVar r_useCRTPostFX;
 extern idCVar r_crtCurvature;
 extern idCVar r_crtVignette;
