@@ -294,6 +294,7 @@ idCVar r_useDDGI( "r_useDDGI", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "ray-t
 idCVar r_useRTReflections( "r_useRTReflections", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "ray-traced reflections for low-roughness surfaces (requires ray query support; set at startup)" );
 
 idCVar r_exposure( "r_exposure", "0.5", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "HDR exposure or LDR brightness [-4.0 .. 4.0]", -4.0f, 4.0f );
+idCVar r_emissiveScale( "r_emissiveScale", "2.5", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "brightness multiplier applied to additive (blend add) material stages so emissive FX exceed unit brightness for HDR glow/bloom; 1.0 = off", 1.0f, 16.0f );
 
 // HDR display output (scRGB / extended-sRGB-linear FP16 swapchain). r_hdrOutput is
 // read when the swapchain is created, so it needs a vid_restart to take effect.

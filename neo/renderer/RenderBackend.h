@@ -279,6 +279,14 @@ private:
 		GL_Color( color[0], color[1], color[2], color[3] );
 	}
 
+	// SRS - like GL_Color but leaves the RGB unclamped above 1.0 so additive/emissive
+	// stages can write over-bright values into the HDR scene buffer (alpha still [0,1])
+	void				GL_ColorRaw( float r, float g, float b, float a );
+	ID_INLINE void		GL_ColorRaw( const idVec4& color )
+	{
+		GL_ColorRaw( color[0], color[1], color[2], color[3] );
+	}
+
 //	void				GL_Color( float* color );
 
 	void				SetBuffer( const void* data );

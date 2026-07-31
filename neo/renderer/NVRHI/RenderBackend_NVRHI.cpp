@@ -2266,6 +2266,26 @@ void idRenderBackend::GL_Color( float r, float g, float b, float a )
 }
 
 /*
+====================
+idRenderBackend::GL_ColorRaw
+
+Like GL_Color, but the RGB channels are only clamped from below (>= 0), leaving
+over-bright values above 1.0 intact. Used by additive/emissive material stages so
+they can push HDR-bright colour into the scene buffer for glow and bloom. Alpha is
+still clamped to [0,1].
+====================
+*/
+void idRenderBackend::GL_ColorRaw( float r, float g, float b, float a )
+{
+	float parm[4];
+	parm[0] = Max( 0.0f, r );
+	parm[1] = Max( 0.0f, g );
+	parm[2] = Max( 0.0f, b );
+	parm[3] = idMath::ClampFloat( 0.0f, 1.0f, a );
+	renderProgManager.SetRenderParm( RENDERPARM_COLOR, parm );
+}
+
+/*
 ========================
 idRenderBackend::GL_Clear
 ========================

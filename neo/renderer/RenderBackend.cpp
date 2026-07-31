@@ -4365,9 +4365,12 @@ int idRenderBackend::DrawShaderPasses( const drawSurf_t* const* const drawSurfs,
 			color[2] = regs[ pStage->color.registers[2] ];
 			color[3] = regs[ pStage->color.registers[3] ];
 
+			// SRS - additive (blend add) stages are the emissive/glow path
+			const bool isAdditiveStage =
+				( stageGLState & ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS ) ) == ( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE );
+
 			// skip the entire stage if an add would be black
-			if( ( stageGLState & ( GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS ) ) == ( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE )
-					&& color[0] <= 0 && color[1] <= 0 && color[2] <= 0 )
+			if( isAdditiveStage && color[0] <= 0 && color[1] <= 0 && color[2] <= 0 )
 			{
 				continue;
 			}
@@ -4382,7 +4385,22 @@ int idRenderBackend::DrawShaderPasses( const drawSurf_t* const* const drawSurfs,
 			stageVertexColor_t svc = pStage->vertexColor;
 
 			renderLog.OpenBlock( "Standard Shader Stage", colorGreen );
-			GL_Color( color );
+
+			// SRS - push additive/emissive stages over unit brightness so they exploit HDR
+			// headroom and bloom; r_emissiveScale 1.0 keeps the original clamped behaviour.
+			// Scope this to 3D world surfaces only: GUI panels and the 2D HUD/menus draw
+			// through additive stages too, and must not be over-brightened or bloomed.
+			const float emissiveScale = r_emissiveScale.GetFloat();
+			const bool applyEmissive = isAdditiveStage && emissiveScale != 1.0f
+									   && !viewDef->is2Dgui && !surf->space->isGuiSurface;
+			if( applyEmissive )
+			{
+				GL_ColorRaw( color[0] * emissiveScale, color[1] * emissiveScale, color[2] * emissiveScale, color[3] );
+			}
+			else
+			{
+				GL_Color( color );
+			}
 
 			if( surf->space->isGuiSurface )
 			{

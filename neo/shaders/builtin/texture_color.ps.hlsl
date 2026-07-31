@@ -57,5 +57,10 @@ void main( in PS_IN fragment, out PS_OUT result )
 
 	float4 color = t_BaseColor.Sample( s_Sampler, uv ) * fragment.color;
 	clip( color.a - pc.rpAlphaTest.x );
-	result.color = sRGBAToLinearRGBA( color );
+
+	// SRS - sRGBAToLinearRGBA clamps to [0,1], which would flatten emissive/additive
+	// stages that intentionally exceed white (r_emissiveScale). Linearize the in-gamut
+	// part exactly as before and add any over-bright back as a linear tail, so the [0,1]
+	// range is bit-identical to the old path while HDR glow above white is preserved.
+	result.color = sRGBAToLinearRGBA( min( color, 1.0 ) ) + float4( max( color.rgb - 1.0, 0.0 ), 0.0 );
 }
