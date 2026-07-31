@@ -73,6 +73,13 @@ struct surfaceInteraction_t
 	// generated in static vertex memory.
 	int						numLightTrisIndexes;
 	vertCacheHandle_t		lightTrisIndexCache;
+
+	// so we can avoid rendering shadows if there are no lit tris (restored for
+	// stencil shadow volumes). The shadow volume indexes reference the doubled
+	// idShadowVert cache of the ambient surface.
+	int						numShadowIndexes;
+	int						numShadowIndexesNoCaps;		// shadow volume without caps (view outside the volume)
+	vertCacheHandle_t		shadowIndexCache;
 };
 
 

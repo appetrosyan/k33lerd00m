@@ -47,6 +47,10 @@ idCVar r_skipDynamicShadows( "r_skipDynamicShadows", "0", CVAR_RENDERER | CVAR_B
 idCVar r_useParallelAddModels( "r_useParallelAddModels", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "add all models in parallel with jobs" );
 idCVar r_useParallelAddShadows( "r_useParallelAddShadows", "1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NOCHEAT, "0 = off, 1 = threaded", 0, 1 );
 idCVar r_forceShadowCaps( "r_forceShadowCaps", "0", CVAR_RENDERER | CVAR_BOOL, "0 = skip rendering shadow caps if view is outside shadow volume, 1 = always render shadow caps" );
+// WIP: restore stencil shadow volumes. When on, static shadow-casting surfaces build a
+// stencil shadow-volume drawSurf (into vLight->globalShadows/localShadows) instead of a
+// shadow-map caster. M4 will fold this into an r_shadowMethod selector, default stencil.
+idCVar r_useStencilShadows( "r_useStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "use stencil shadow volumes instead of shadow maps (WIP)" );
 // RB begin
 idCVar r_forceShadowMapsOnAlphaTestedSurfaces( "r_forceShadowMapsOnAlphaTestedSurfaces", "1", CVAR_RENDERER | CVAR_BOOL, "0 = same shadowing as with stencil shadows, 1 = ignore noshadows for alpha tested materials" );
 // RB end
@@ -1078,6 +1082,39 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 			if( entityDef->parms.suppressShadowInLightID && entityDef->parms.suppressShadowInLightID == lightDef->parms.lightId )
 			{
 				continue;
+			}
+
+			// stencil shadow volumes: build a shadow-volume drawSurf from the precomputed static
+			// volume (its indexes reference the ambient surface's doubled shadowCache) and link it
+			// into the light's global/local shadow chain, then skip the shadow-map occluder path.
+			// M1: static surfaces only, always z-fail with caps (robust; z-pass + cap selection is
+			// a later optimisation). Dynamic / GPU-skinned casters still fall through for now.
+			if( r_useStencilShadows.GetBool() && tri->silEdges != NULL &&
+					surfInter != NULL && surfInter->numShadowIndexes > 0 &&
+					vertexCache.CacheIsCurrent( surfInter->shadowIndexCache ) &&
+					vertexCache.CacheIsCurrent( tri->shadowCache ) )
+			{
+				drawSurf_t* shadowDrawSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *shadowDrawSurf ), FRAME_ALLOC_DRAW_SURFACE );
+
+				shadowDrawSurf->numIndexes = surfInter->numShadowIndexes;	// with caps
+				shadowDrawSurf->indexCache = surfInter->shadowIndexCache;
+				shadowDrawSurf->shadowCache = tri->shadowCache;
+				shadowDrawSurf->ambientCache = 0;
+				shadowDrawSurf->jointCache = 0;
+				shadowDrawSurf->frontEndGeo = NULL;
+				shadowDrawSurf->space = vEntity;
+				shadowDrawSurf->material = NULL;
+				shadowDrawSurf->extraGLState = 0;
+				shadowDrawSurf->scissorRect = vLight->scissorRect;
+				shadowDrawSurf->sort = 0.0f;
+				shadowDrawSurf->renderZFail = 1;	// M1: always z-fail (correct when the view is inside the volume)
+				shadowDrawSurf->shaderRegisters = NULL;
+
+				shadowDrawSurf->linkChain = shader->TestMaterialFlag( MF_NOSELFSHADOW ) ? &vLight->localShadows : &vLight->globalShadows;
+				shadowDrawSurf->nextOnLight = vEntity->drawSurfs;
+				vEntity->drawSurfs = shadowDrawSurf;
+
+				continue;	// stencil volume built; skip the shadow-map occluder path for this surface
 			}
 
 

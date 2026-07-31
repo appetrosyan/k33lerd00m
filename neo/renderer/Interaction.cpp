@@ -164,6 +164,146 @@ void R_FreeInteractionCullInfo( srfCullInfo_t& cullInfo )
 }
 
 /*
+=====================
+R_CreateInteractionShadowVolume
+
+Creates a static shadow volume triangle surface (indexes into the doubled
+idShadowVert cache of the ambient surface). Restored verbatim from DOOM-3-BFG.
+=====================
+*/
+static srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent,
+		const srfTriangles_t* tri, const idRenderLightLocal* light )
+{
+	SCOPED_PROFILE_EVENT( "R_CreateInteractionShadowVolume" );
+
+	srfCullInfo_t cullInfo = {};
+
+	R_CalcInteractionFacing( ent, tri, light, cullInfo );
+	R_CalcInteractionCullBits( ent, tri, light, cullInfo );
+
+	int numFaces = tri->numIndexes / 3;
+	int	numShadowingFaces = 0;
+	const byte* facing = cullInfo.facing;
+
+	// if all the triangles are inside the light frustum
+	if( cullInfo.cullBits == LIGHT_CULL_ALL_FRONT )
+	{
+		// count the number of shadowing faces
+		for( int i = 0; i < numFaces; i++ )
+		{
+			numShadowingFaces += facing[i];
+		}
+		numShadowingFaces = numFaces - numShadowingFaces;
+	}
+	else
+	{
+		// make all triangles that are outside the light frustum "facing", so they won't cast shadows
+		const triIndex_t* indexes = tri->indexes;
+		byte* modifyFacing = cullInfo.facing;
+		const byte* cullBits = cullInfo.cullBits;
+		for( int i = 0, j = 0; i < tri->numIndexes; i += 3, j++ )
+		{
+			if( !modifyFacing[j] )
+			{
+				int	i1 = indexes[i + 0];
+				int	i2 = indexes[i + 1];
+				int	i3 = indexes[i + 2];
+				if( cullBits[i1] & cullBits[i2] & cullBits[i3] )
+				{
+					modifyFacing[j] = 1;
+				}
+				else
+				{
+					numShadowingFaces++;
+				}
+			}
+		}
+	}
+
+	if( !numShadowingFaces )
+	{
+		// no faces are inside the light frustum and still facing the right way
+		R_FreeInteractionCullInfo( cullInfo );
+		return NULL;
+	}
+
+	// shadowVerts will be NULL on these surfaces, so the shadowVerts will be taken from the ambient surface
+	srfTriangles_t* newTri = R_AllocStaticTriSurf();
+
+	newTri->numVerts = tri->numVerts * 2;
+
+	// alloc the max possible size
+	R_AllocStaticTriSurfIndexes( newTri, ( numShadowingFaces + tri->numSilEdges ) * 6 );
+	triIndex_t* tempIndexes = newTri->indexes;
+	triIndex_t* shadowIndexes = newTri->indexes;
+
+	// create new triangles along sil planes
+	const silEdge_t* sil = tri->silEdges;
+	for( int i = tri->numSilEdges; i > 0; i--, sil++ )
+	{
+		int f1 = facing[sil->p1];
+		int f2 = facing[sil->p2];
+
+		if( !( f1 ^ f2 ) )
+		{
+			continue;
+		}
+
+		int v1 = sil->v1 << 1;
+		int v2 = sil->v2 << 1;
+
+		// set the two triangle winding orders based on facing
+		// without using a poorly-predictable branch
+		shadowIndexes[0] = v1;
+		shadowIndexes[1] = v2 ^ f1;
+		shadowIndexes[2] = v2 ^ f2;
+		shadowIndexes[3] = v1 ^ f2;
+		shadowIndexes[4] = v1 ^ f1;
+		shadowIndexes[5] = v2 ^ 1;
+
+		shadowIndexes += 6;
+	}
+
+	int	numShadowIndexes = shadowIndexes - tempIndexes;
+
+	// we aren't bothering to separate front and back caps on these
+	newTri->numIndexes = newTri->numShadowIndexesNoFrontCaps = numShadowIndexes + numShadowingFaces * 6;
+	newTri->numShadowIndexesNoCaps = numShadowIndexes;
+	newTri->shadowCapPlaneBits = SHADOW_CAP_INFINITE;
+
+	// these have no effect, because they extend to infinity
+	newTri->bounds.Clear();
+
+	// put some faces on the model and some on the distant projection
+	const triIndex_t* indexes = tri->indexes;
+	shadowIndexes = newTri->indexes + numShadowIndexes;
+	for( int i = 0, j = 0; i < tri->numIndexes; i += 3, j++ )
+	{
+		if( facing[j] )
+		{
+			continue;
+		}
+
+		int i0 = indexes[i + 0] << 1;
+		int i1 = indexes[i + 1] << 1;
+		int i2 = indexes[i + 2] << 1;
+
+		shadowIndexes[0] = i2;
+		shadowIndexes[1] = i1;
+		shadowIndexes[2] = i0;
+		shadowIndexes[3] = i0 ^ 1;
+		shadowIndexes[4] = i1 ^ 1;
+		shadowIndexes[5] = i2 ^ 1;
+
+		shadowIndexes += 6;
+	}
+
+	R_FreeInteractionCullInfo( cullInfo );
+
+	return newTri;
+}
+
+/*
 ====================
 R_CreateInteractionLightTris
 
@@ -667,6 +807,30 @@ void idInteraction::CreateStaticInteraction( nvrhi::ICommandList* commandList )
 				interactionGenerated = true;
 				R_FreeStaticTriSurf( lightTris );
 			}
+		}
+
+		// stencil shadow volumes: build a static shadow volume for this surface and cache its
+		// indexes (they reference the ambient surface's doubled shadowCache). Restored from
+		// DOOM-3-BFG; the prelight-model optimisation is omitted for now (always build).
+		if( HasShadows() && shader->SurfaceCastsShadow() && tri->silEdges != NULL )
+		{
+			srfTriangles_t* shadowTris = R_CreateInteractionShadowVolume( entityDef, tri, lightDef );
+			if( shadowTris != NULL )
+			{
+				sint->shadowIndexCache = vertexCache.AllocStaticIndex( shadowTris->indexes, shadowTris->numIndexes * sizeof( shadowTris->indexes[0] ), commandList );
+				sint->numShadowIndexes = shadowTris->numIndexes;
+				if( shader->Coverage() != MC_OPAQUE )
+				{
+					// perforated / translucent casters can be seen through, so the caps are always needed
+					sint->numShadowIndexesNoCaps = shadowTris->numIndexes;
+				}
+				else
+				{
+					sint->numShadowIndexesNoCaps = shadowTris->numShadowIndexesNoCaps;
+				}
+				R_FreeStaticTriSurf( shadowTris );
+			}
+			interactionGenerated = true;
 		}
 	}
 

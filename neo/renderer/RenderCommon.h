@@ -92,6 +92,7 @@ struct drawSurf_t
 	int						numIndexes;
 	vertCacheHandle_t		indexCache;			// triIndex_t
 	vertCacheHandle_t		ambientCache;		// idDrawVert
+	vertCacheHandle_t		shadowCache;		// idShadowVert / idShadowVertSkinned (stencil shadow volumes)
 	vertCacheHandle_t		jointCache;			// idJointMat
 	const viewEntity_t* 	space;
 	const idMaterial* 		material;			// may be NULL for shadow volumes
@@ -101,6 +102,7 @@ struct drawSurf_t
 	drawSurf_t* 			nextOnLight;		// viewLight chains
 	drawSurf_t** 			linkChain;			// defer linking to lights to a serial section to avoid a mutex
 	idScreenRect			scissorRect;		// for scissor clipping, local inside renderView viewport
+	int						renderZFail;		// stencil shadow volumes: 1 = render with z-fail (view inside volume)
 	const struct portalArea_s*	area;			// RB: if != NULL then the area provides valid lightgrid
 };
 

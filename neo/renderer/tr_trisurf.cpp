@@ -2322,6 +2322,7 @@ void R_CreateStaticBuffersForTri( srfTriangles_t& tri, nvrhi::ICommandList* comm
 {
 	tri.indexCache = 0;
 	tri.ambientCache = 0;
+	tri.shadowCache = 0;
 
 	// index cache
 	if( tri.indexes != NULL )
@@ -2333,6 +2334,15 @@ void R_CreateStaticBuffersForTri( srfTriangles_t& tri, nvrhi::ICommandList* comm
 	if( tri.verts != NULL )
 	{
 		tri.ambientCache = vertexCache.AllocStaticVertex( tri.verts, tri.numVerts * sizeof( tri.verts[0] ), commandList );
+
+		// stencil shadow volumes: build the doubled shadow vertex cache (each xyz duplicated
+		// with w=1 for the near cap and w=0 for the projected-to-infinity end cap), so shadow
+		// volume drawSurfs can index into it. Restored from DOOM-3-BFG (idShadowVert::CreateShadowCache).
+		const int shadowSize = tri.numVerts * 2 * ( int )sizeof( idShadowVert );
+		idShadowVert* shadowVerts = ( idShadowVert* )Mem_Alloc16( shadowSize, TAG_TRI_SHADOW );
+		idShadowVert::CreateShadowCache( shadowVerts, tri.verts, tri.numVerts );
+		tri.shadowCache = vertexCache.AllocStaticVertex( shadowVerts, shadowSize, commandList );
+		Mem_Free16( shadowVerts );
 	}
 }
 
