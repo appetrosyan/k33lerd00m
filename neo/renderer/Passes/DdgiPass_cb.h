@@ -62,4 +62,7 @@ struct DdgiConstants
 	idVec4		worldToClip3;
 
 	idVec4		volumeCenter;			// xyz = camera-anchored volume centre; w = neighbour radius
+
+	// dynamic-light-aware auto-skip: static-only probes trace on a slow stagger
+	idVec4		ddgiSkipParams;			// x = autoSkip(0/1), y = staticPeriod, z = dynamicMargin (world units), w = pad
 };

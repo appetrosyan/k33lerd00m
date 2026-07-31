@@ -61,6 +61,10 @@ idCVar r_ddgiNormalBias( "r_ddgiNormalBias", "0.25", CVAR_RENDERER | CVAR_FLOAT 
 idCVar r_ddgiDebug( "r_ddgiDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "DDGI debug: 1 = overlay irradiance atlas, 2 = isolate ambient (direct light off) to see the DDGI term", 0, 2 );
 idCVar r_ddgiBounceGain( "r_ddgiBounceGain", "0.95", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "DDGI multi-bounce feedback gain (0 = single bounce)", 0.0f, 2.0f );
 idCVar r_ddgiUpdateScope( "r_ddgiUpdateScope", "1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "which probes trace each frame: 0 = visible only, 1 = visible + neighbours, 2 = full", 0, 2 );
+idCVar r_ddgiAutoSkip( "r_ddgiAutoSkip", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "auto-skip DDGI probes lit only by static/baked lighting (0 = every in-scope probe traces every frame)" );
+idCVar r_ddgiStaticPeriod( "r_ddgiStaticPeriod", "32", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "static-only DDGI probes re-trace every N frames (staggered)", 1, 256 );
+idCVar r_ddgiDynamicMargin( "r_ddgiDynamicMargin", "1.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "extra radius (in probe spacings) around a dynamic light within which probes trace at full rate", 0.0f, 8.0f );
+idCVar r_ddgiDynamicHoldFrames( "r_ddgiDynamicHoldFrames", "2", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "treat a light as dynamic for N frames after its last modification (catches flickering lights)", 0, 64 );
 
 DdgiPass::DdgiPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
@@ -232,6 +236,7 @@ void DdgiPass::CreateIntegratePass()
 	layoutDesc.bindings =
 	{
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 0 ),	// t0 : per-ray radiance
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 1 ),	// t1 : projected lights (auto-skip gate)
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : DdgiConstants
 		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : irradiance atlas
 		nvrhi::BindingLayoutItem::Texture_UAV( 1 ),			// u1 : distance atlas
@@ -247,6 +252,7 @@ void DdgiPass::CreateIntegratePass()
 	setDesc.bindings =
 	{
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_RayRadianceBuffer ),
+		nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, m_LightBuffer ),
 		nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 		nvrhi::BindingSetItem::Texture_UAV( 0, m_IrradianceImage->GetTextureHandle() ),
 		nvrhi::BindingSetItem::Texture_UAV( 1, m_DistanceImage->GetTextureHandle() ),
@@ -396,16 +402,53 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 			L.projectQ[p]       = vLight->lightProject[2][p];
 			L.projectFalloff[p] = vLight->lightProject[3][p];
 		}
+		// classify dynamic vs static/baked: a light the baked grid does not represent
+		// is one that moved or was re-submitted this frame (flashlight, muzzle flash,
+		// mover, flicker). Static map lights stay put -> lightHasMoved false, stale
+		// lastModifiedFrameNum. Only dynamic lights force full-rate probe re-tracing.
+		bool isDynamic = false;
+		float radius = 0.0f;
+		if( vLight->lightDef != NULL )
+		{
+			const idRenderLightLocal* lightDef = vLight->lightDef;
+			const int holdFrames = r_ddgiDynamicHoldFrames.GetInteger();
+			isDynamic = lightDef->lightHasMoved ||
+						( lightDef->lastModifiedFrameNum >= tr.frameCount - holdFrames );
+
+			// conservative spherical influence: farthest bounds corner from the origin
+			// (works for point and projected lights; parms.lightRadius is often 0 for
+			// projected lights such as the flashlight, so it is not used).
+			idVec3 corners[8];
+			lightDef->globalLightBounds.ToPoints( corners );
+			for( int c = 0; c < 8; c++ )
+			{
+				const float d = ( corners[c] - vLight->globalLightOrigin ).Length();
+				if( d > radius )
+				{
+					radius = d;
+				}
+			}
+			radius = idMath::ClampFloat( 0.0f, 100000.0f, radius );
+		}
+
 		L.color[0] = color.x;
 		L.color[1] = color.y;
 		L.color[2] = color.z;
-		L.color[3] = 0.0f;
+		L.color[3] = isDynamic ? 1.0f : 0.0f;			// dynamic flag for the auto-skip gate
 		L.origin[0] = vLight->globalLightOrigin.x;
 		L.origin[1] = vLight->globalLightOrigin.y;
 		L.origin[2] = vLight->globalLightOrigin.z;
-		L.origin[3] = 0.0f;
+		L.origin[3] = radius;							// world-space influence radius
 	}
 	constants.numLights = numLights;
+
+	// dynamic-light-aware auto-skip parameters (margin carried in world units;
+	// probe spacing is uniform across axes here)
+	constants.ddgiSkipParams = idVec4(
+			r_ddgiAutoSkip.GetBool() ? 1.0f : 0.0f,
+			( float )r_ddgiStaticPeriod.GetInteger(),
+			r_ddgiDynamicMargin.GetFloat() * spacing,
+			0.0f );
 
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 	if( numLights > 0 )

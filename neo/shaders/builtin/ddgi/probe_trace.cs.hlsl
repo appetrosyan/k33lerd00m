@@ -55,6 +55,7 @@ struct DdgiConstants
 	float4	worldToClip3;
 
 	float4	volumeCenter;			// xyz = volume centre; w = neighbour radius
+	float4	ddgiSkipParams;			// x = autoSkip(0/1), y = staticPeriod, z = dynamicMargin, w = pad
 };
 
 // Per-light shading data. Layout must match DdgiLight in DdgiPass.cpp. The four
@@ -159,6 +160,42 @@ bool DdgiProbeInScope( float3 probePos )
 	}
 
 	return false;	// low: visible only
+}
+
+// Dynamic-light-aware auto-skip. A probe traces at full rate only when a dynamic
+// light is within range; a probe lit only by static/baked lighting drops to a
+// staggered slow cadence and otherwise keeps its history. Stateless (no per-probe
+// persistence) so it survives the camera-anchored volume sliding each frame.
+// MUST stay byte-identical to the copy in probe_integrate.cs.hlsl.
+bool DdgiProbeShouldTrace( float3 probePos, int probeIndex )
+{
+	if( g_Ddgi.ddgiSkipParams.x < 0.5f )	// auto-skip off -> old behaviour
+	{
+		return true;
+	}
+	if( g_Ddgi.frameIndex == 0 )			// frame-0 baseline for every in-scope probe
+	{
+		return true;
+	}
+
+	// any DYNAMIC light within (influence radius + margin)?
+	const float margin = g_Ddgi.ddgiSkipParams.z;
+	for( int i = 0; i < g_Ddgi.numLights; i++ )
+	{
+		DdgiLight L = t_Lights[i];
+		if( L.color.w < 0.5f )				// static light - ignore
+		{
+			continue;
+		}
+		if( distance( probePos, L.origin.xyz ) <= L.origin.w + margin )
+		{
+			return true;
+		}
+	}
+
+	// static-only: staggered slow cadence (spreads the refresh cost across frames)
+	const int period = max( 1, int( g_Ddgi.ddgiSkipParams.y ) );
+	return ( ( probeIndex + g_Ddgi.frameIndex ) % period ) == 0;
 }
 
 // Evaluate all projected lights at a world-space hit point, with a shadow ray
@@ -346,6 +383,12 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 
 	// update-scope cull: out-of-scope probes keep their history (skip the trace)
 	if( !DdgiProbeInScope( probePos ) )
+	{
+		return;
+	}
+
+	// dynamic-light-aware auto-skip: static-only probes trace on a slow stagger
+	if( !DdgiProbeShouldTrace( probePos, probeIndex ) )
 	{
 		return;
 	}

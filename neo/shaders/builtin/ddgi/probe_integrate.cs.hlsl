@@ -52,10 +52,24 @@ struct DdgiConstants
 	float4	worldToClip3;
 
 	float4	volumeCenter;			// xyz = volume centre; w = neighbour radius
+	float4	ddgiSkipParams;			// x = autoSkip(0/1), y = staticPeriod, z = dynamicMargin, w = pad
+};
+
+// Per-light shading data. Layout must match DdgiLight in DdgiPass.cpp. Only the
+// origin/radius (origin.xyz/.w) and dynamic flag (color.w) are used by the gate.
+struct DdgiLight
+{
+	float4	projectS;
+	float4	projectT;
+	float4	projectQ;
+	float4	projectFalloff;
+	float4	color;			// rgb + dynamic flag in .w
+	float4	origin;			// world origin xyz + influence radius in .w
 };
 
 // *INDENT-OFF*
 StructuredBuffer<float4>	t_RayRadiance		: register(t0);
+StructuredBuffer<DdgiLight>	t_Lights			: register(t1);	// projected lights (dynamic-skip gate)
 RWTexture2D<float4>			u_IrradianceAtlas	: register(u0);	// rgb = irradiance
 RWTexture2D<float2>			u_DistanceAtlas		: register(u1);	// x = mean, y = mean^2
 
@@ -116,6 +130,40 @@ bool DdgiProbeInScope( float3 probePos )
 	return false;
 }
 
+// Dynamic-light-aware auto-skip. MUST stay byte-identical to the copy in
+// probe_trace.cs.hlsl so the trace and integrate passes agree on which probes
+// updated this frame (else integrate would re-fold stale ray radiance).
+bool DdgiProbeShouldTrace( float3 probePos, int probeIndex )
+{
+	if( g_Ddgi.ddgiSkipParams.x < 0.5f )	// auto-skip off -> old behaviour
+	{
+		return true;
+	}
+	if( g_Ddgi.frameIndex == 0 )			// frame-0 baseline for every in-scope probe
+	{
+		return true;
+	}
+
+	// any DYNAMIC light within (influence radius + margin)?
+	const float margin = g_Ddgi.ddgiSkipParams.z;
+	for( int i = 0; i < g_Ddgi.numLights; i++ )
+	{
+		DdgiLight L = t_Lights[i];
+		if( L.color.w < 0.5f )				// static light - ignore
+		{
+			continue;
+		}
+		if( distance( probePos, L.origin.xyz ) <= L.origin.w + margin )
+		{
+			return true;
+		}
+	}
+
+	// static-only: staggered slow cadence (spreads the refresh cost across frames)
+	const int period = max( 1, int( g_Ddgi.ddgiSkipParams.y ) );
+	return ( ( probeIndex + g_Ddgi.frameIndex ) % period ) == 0;
+}
+
 // Octahedral decode: [-1,1]^2 -> unit direction.
 float3 OctDecode( float2 f )
 {
@@ -167,6 +215,12 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	// update-scope cull: leave out-of-scope probes' atlas texels untouched (history)
 	const float3 probePos = g_Ddgi.probeGridOrigin.xyz + float3( px, py, pz ) * g_Ddgi.probeGridSpacing.xyz;
 	if( !DdgiProbeInScope( probePos ) )
+	{
+		return;
+	}
+
+	// dynamic-light-aware auto-skip: match probe_trace so skipped probes keep history
+	if( !DdgiProbeShouldTrace( probePos, probeIndex ) )
 	{
 		return;
 	}
