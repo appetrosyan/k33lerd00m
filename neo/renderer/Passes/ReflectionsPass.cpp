@@ -181,8 +181,14 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 		loggedFirstBuild = true;
 	}
 
-	const int width = renderSystem->GetWidth();
-	const int height = renderSystem->GetHeight();
+	// Run at the render (supersampled) resolution, NOT native: the pass samples the
+	// scene G-buffers and screen-colour copy (currentRenderImage / depth / normals),
+	// all sized GetRenderWidth, and composites into the supersampled scene. Using
+	// native GetWidth here made screenSize/dispatch/output native while the sampled
+	// images were 2x under SSAA, so reflections read the screen colour at half scale
+	// -> doubled/ghosted reflections on every reflective surface.
+	const int width = renderSystem->GetRenderWidth();
+	const int height = renderSystem->GetRenderHeight();
 	if( width <= 0 || height <= 0 )
 	{
 		return false;
