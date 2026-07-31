@@ -2544,6 +2544,8 @@ idRenderBackend::idRenderBackend()
 	ssaoPass = nullptr;
 	ddgiPass = nullptr;
 	reflectionsPass = nullptr;
+	lastRenderWidth = 0;
+	lastRenderHeight = 0;
 	emberPass = nullptr;
 	hdrGuiCompositePass = nullptr;
 

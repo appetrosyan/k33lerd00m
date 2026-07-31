@@ -395,6 +395,8 @@ private:
 	SsaoPass*						ssaoPass;
 	DdgiPass*						ddgiPass;
 	ReflectionsPass*				reflectionsPass;
+	int								lastRenderWidth;			// scene render resolution the targets were last (re)allocated at; a change (e.g. live SSAA toggle) forces a realloc
+	int								lastRenderHeight;
 	EmberPass*						emberPass;
 	HdrGuiCompositePass*			hdrGuiCompositePass;
 	MipMapGenPass*					hiZGenPass;

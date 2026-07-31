@@ -5522,6 +5522,23 @@ void idRenderBackend::ExecuteBackEndCommands( const emptyCommand_t* cmds )
 	// by the window system
 	ResizeImages();
 
+	// The window-size path above only reacts to the native backbuffer size, but the
+	// 3D scene render targets are sized GetRenderWidth() = GetWidth() * SSAA scale. A
+	// live SSAA toggle changes that render resolution WITHOUT a window resize, so the
+	// scene targets would keep their old size and composite as a mis-scaled sub-frame.
+	// GetWidth()/GetHeight() are the (stable) native dims here, so this fires only on a
+	// real window resize or an SSAA-scale change - never per-frame from dynamic scaling.
+	{
+		const int renderWidth = renderSystem->GetRenderWidth();
+		const int renderHeight = renderSystem->GetRenderHeight();
+		if( renderWidth != lastRenderWidth || renderHeight != lastRenderHeight )
+		{
+			Framebuffer::ResizeFramebuffers( true );
+			lastRenderWidth = renderWidth;
+			lastRenderHeight = renderHeight;
+		}
+	}
+
 	if( cmds->commandId == RC_NOP && !cmds->next )
 	{
 		return;
