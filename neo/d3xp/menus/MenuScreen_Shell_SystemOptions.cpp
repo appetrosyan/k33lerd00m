@@ -127,6 +127,7 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
 	control->SetOptionType( OPTION_SLIDER_TEXT );
 	control->SetLabel( "#str_04128" );
+	control->SetDescription( "Per-frame AA (SMAA/TAA) or Supersampling (SSAA), which renders the 3D scene at a higher resolution and downsamples for the sharpest edges. Switching to or from an SSAA factor needs a restart." );
 	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_ANTIALIASING );
 	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_ANTIALIASING );
@@ -293,15 +294,6 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOM );
 	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOM );
-	options->AddChild( control );
-
-	control = new( TAG_SWF ) idMenuWidget_ControlButton();
-	control->SetOptionType( OPTION_SLIDER_TEXT );
-	control->SetLabel( "Supersampling (SSAA)" );
-	control->SetDescription( "Render the 3D scene at a higher resolution and downsample. Sharpest anti-aliasing; restart to apply." );
-	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_SSAA );
-	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
-	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_SSAA );
 	options->AddChild( control );
 
 	control = new( TAG_SWF ) idMenuWidget_ControlButton();
@@ -756,27 +748,50 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 		}
 		case SYSTEM_FIELD_ANTIALIASING:
 		{
+			// Combined AA selector: the per-frame r_antiAliasing modes followed by the
+			// SSAA supersampling factors, exposed as one mutually exclusive list.
+			// Selecting a supersampling factor forces per-frame AA off; selecting an AA
+			// mode drops supersampling back to 1x.
 #if ID_MSAA
-			static const int numValues = 5;
-			static const int values[numValues] =
-			{
-				ANTI_ALIASING_NONE,
-				ANTI_ALIASING_TAA,
-				ANTI_ALIASING_TAA_SMAA_1X,
-				ANTI_ALIASING_MSAA_2X,
-				ANTI_ALIASING_MSAA_4X,
-			};
+			static const int aaValues[] = { ANTI_ALIASING_NONE, ANTI_ALIASING_TAA, ANTI_ALIASING_TAA_SMAA_1X, ANTI_ALIASING_MSAA_2X, ANTI_ALIASING_MSAA_4X };
 #else
-			static const int numValues = 3;
-			static const int values[numValues] =
-			{
-				ANTI_ALIASING_NONE,
-				ANTI_ALIASING_SMAA_1X,
-				ANTI_ALIASING_TAA,
-			};
+			static const int aaValues[] = { ANTI_ALIASING_NONE, ANTI_ALIASING_SMAA_1X, ANTI_ALIASING_TAA };
 #endif
+			const int numAA = sizeof( aaValues ) / sizeof( aaValues[0] );
+			static const float ssaaValues[] = { 1.5f, 2.0f };
+			const int numSSAA = sizeof( ssaaValues ) / sizeof( ssaaValues[0] );
 
-			r_antiAliasing.SetInteger( AdjustOption( r_antiAliasing.GetInteger(), values, numValues, adjustAmount ) );
+			// current combined index: the SSAA factors sit after the AA modes
+			int cur = 0;
+			if( R_SSAAScale() > 1.001f )
+			{
+				cur = numAA + ( ( R_SSAAScale() >= 2.0f ) ? 1 : 0 );
+			}
+			else
+			{
+				for( int i = 0; i < numAA; i++ )
+				{
+					if( aaValues[i] == r_antiAliasing.GetInteger() )
+					{
+						cur = i;
+						break;
+					}
+				}
+			}
+
+			static const int modeIdx[] = { 0, 1, 2, 3, 4, 5, 6 };
+			cur = AdjustOption( cur, modeIdx, numAA + numSSAA, adjustAmount );
+
+			if( cur < numAA )
+			{
+				r_antiAliasing.SetInteger( aaValues[cur] );
+				r_ssaaScale.SetFloat( 1.0f );
+			}
+			else
+			{
+				r_antiAliasing.SetInteger( ANTI_ALIASING_NONE );
+				r_ssaaScale.SetFloat( ssaaValues[cur - numAA] );
+			}
 			break;
 		}
 		// RB begin
@@ -936,15 +951,6 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			r_useBloom.SetInteger( AdjustOption( r_useBloom.GetInteger(), values, numValues, adjustAmount ) );
 			break;
 		}
-		case SYSTEM_FIELD_SSAA:
-		{
-			// discrete supersample factors: off / 1.5x / 2x (stored as x100 for the int helper)
-			static const int numValues = 3;
-			static const int values[numValues] = { 100, 150, 200 };
-			const int cur = idMath::Ftoi( R_SSAAScale() * 100.0f );
-			r_ssaaScale.SetFloat( AdjustOption( cur, values, numValues, adjustAmount ) * 0.01f );
-			break;
-		}
 	}
 	cvarSystem->ClearModifiedFlags( CVAR_ARCHIVE );
 }
@@ -1023,36 +1029,31 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 
 		case SYSTEM_FIELD_ANTIALIASING:
 		{
-			if( r_antiAliasing.GetInteger() == 0 )
+			// Combined AA + SSAA label (mirrors the AdjustField list above).
+			if( R_SSAAScale() >= 2.0f )
 			{
-				return "#str_swf_disabled";
+				return "SSAA 2X";
 			}
-
+			if( R_SSAAScale() >= 1.5f )
+			{
+				return "SSAA 1.5X";
+			}
 #if ID_MSAA
-			static const int numValues = 5;
-			static const char* values[numValues] =
-			{
-				"None",
-				"TAA",
-				"TAA + SMAA 1X",
-				"MSAA 2X",
-				"MSAA 4X",
-			};
-
-			compile_time_assert( numValues == ( ANTI_ALIASING_MSAA_4X + 1 ) );
+			static const int aaValues[] = { ANTI_ALIASING_NONE, ANTI_ALIASING_TAA, ANTI_ALIASING_TAA_SMAA_1X, ANTI_ALIASING_MSAA_2X, ANTI_ALIASING_MSAA_4X };
+			static const char* aaLabels[] = { "None", "TAA", "TAA + SMAA 1X", "MSAA 2X", "MSAA 4X" };
 #else
-			static const int numValues = 3;
-			static const char* values[numValues] =
-			{
-				"None",
-				"SMAA",
-				"TAA"
-			};
-
-			compile_time_assert( numValues == ( ANTI_ALIASING_TAA + 1 ) );
+			static const int aaValues[] = { ANTI_ALIASING_NONE, ANTI_ALIASING_SMAA_1X, ANTI_ALIASING_TAA };
+			static const char* aaLabels[] = { "None", "SMAA", "TAA" };
 #endif
-
-			return values[ r_antiAliasing.GetInteger() ];
+			const int numAA = sizeof( aaValues ) / sizeof( aaValues[0] );
+			for( int i = 0; i < numAA; i++ )
+			{
+				if( aaValues[i] == r_antiAliasing.GetInteger() )
+				{
+					return aaLabels[i];
+				}
+			}
+			return "None";
 		}
 		case SYSTEM_FIELD_RENDERMODE:
 		{
@@ -1178,19 +1179,6 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 		case SYSTEM_FIELD_BLOOM:
 			return r_useBloom.GetBool() ? "#str_swf_enabled" : "#str_swf_disabled";
 
-		case SYSTEM_FIELD_SSAA:
-		{
-			const float s = R_SSAAScale();
-			if( s >= 2.0f )
-			{
-				return "2x";
-			}
-			if( s >= 1.5f )
-			{
-				return "1.5x";
-			}
-			return "#str_swf_disabled";
-		}
 	}
 	return false;
 }
