@@ -1670,7 +1670,27 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		const bool pbr = ( specUsage == TD_SPECULAR_PBR_RMAO || specUsage == TD_SPECULAR_PBR_RMAOD );
 		const bool skinned = ( din->surf->jointCache != 0 );
 
-		if( din->vLight->pointLight )
+		// Depth-hacked surfaces (the view weapon, some particle models) write a squashed,
+		// non-physical depth so they never clip into walls - so world-position reconstruction
+		// from that depth is garbage, and the RT mask value at their screen pixels is wrong
+		// (this is the "disembodied hands"). SSAO/SSR skip these surfaces for the same reason.
+		// The RT light has already bound its mask over texunit 5, so a shadow-map variant would
+		// sample the mask as if it were a depth atlas; draw them with the plain unshadowed
+		// interaction variant instead (which ignores texunit 5 entirely).
+		if( din->surf->space->weaponDepthHack || din->surf->space->modelDepthHack != 0.0f )
+		{
+			if( pbr )
+			{
+				skinned ? renderProgManager.BindShader_PBR_InteractionSkinned()
+				: renderProgManager.BindShader_PBR_Interaction();
+			}
+			else
+			{
+				skinned ? renderProgManager.BindShader_InteractionSkinned()
+				: renderProgManager.BindShader_Interaction();
+			}
+		}
+		else if( din->vLight->pointLight )
 		{
 			if( pbr )
 			{
