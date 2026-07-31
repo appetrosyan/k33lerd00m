@@ -3499,16 +3499,16 @@ models/weapons/plasmagun/plasmabolt
 		
 
 	}
-   	//{
-   // 		 Blend add
-	//	Map   models/weapons/plasmagun/plasmabolt2.tga
-	//	zeroclamp
-	//	rotate	time * -0.6
-	//	//centerscale   mgscaleTable[time* .9], mgscaleTable[time* .9] 
-	//	rgb		fireballtable[ time * 1 ]
-	//	
+   	{
+    		 Blend add
+		Map   models/weapons/plasmagun/plasmabolt2.tga
+		zeroclamp
+		rotate	time * -0.6
+		//centerscale   mgscaleTable[time* .9], mgscaleTable[time* .9] 
+		rgb		fireballtable[ time * 1 ]
+		
 
-	//}
+	}
 }
 
 models/monsters/sentry/plasmatracer
@@ -3529,16 +3529,16 @@ models/monsters/sentry/plasmatracer
 		
 
 	}
-   	//{
-   // 		 Blend add
-	//	Map   models/weapons/plasmagun/plasmabolt2.tga
-	//	zeroclamp
-	//	rotate	time * -0.6
-	//	//centerscale   mgscaleTable[time* .9], mgscaleTable[time* .9] 
-	//	rgb		fireballtable[ time * 1 ]
-	//	
+   	{
+    		 Blend add
+		Map   models/weapons/plasmagun/plasmabolt2.tga
+		zeroclamp
+		rotate	time * -0.6
+		//centerscale   mgscaleTable[time* .9], mgscaleTable[time* .9] 
+		rgb		fireballtable[ time * 1 ]
+		
 
-	//}
+	}
 }
 
 models/weapons/impfireball/impfireball
