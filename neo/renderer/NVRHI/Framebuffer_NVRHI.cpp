@@ -238,6 +238,7 @@ void Framebuffer::ReloadImages()
 	}
 	globalImages->hierarchicalZbufferImage->Reload( false, backEnd.commandList );
 	globalImages->gbufferNormalsRoughnessImage->Reload( false, backEnd.commandList );
+	globalImages->rtShadowMaskImage->Reload( false, backEnd.commandList );
 	globalImages->taaMotionVectorsImage->Reload( false, backEnd.commandList );
 	globalImages->taaFeedback1Image->Reload( false, backEnd.commandList );
 	globalImages->taaFeedback2Image->Reload( false, backEnd.commandList );

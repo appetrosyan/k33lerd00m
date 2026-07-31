@@ -54,6 +54,7 @@ extern idCVar r_emberDissolve;
 extern idCVar r_useBloom;
 extern idCVar r_ssaaScale;
 extern idCVar r_useDDGI;
+extern idCVar r_useRTShadows;
 float R_SSAAScale();
 
 /*
@@ -175,6 +176,15 @@ void idMenuScreen_Shell_SystemOptions::Initialize( idMenuHandler* data )
 	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOD_REFLECTIONS );
 	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
 	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_BLOOD_REFLECTIONS );
+	options->AddChild( control );
+
+	control = new( TAG_SWF ) idMenuWidget_ControlButton();
+	control->SetOptionType( OPTION_SLIDER_TEXT );
+	control->SetLabel( "Shadows" );
+	control->SetDescription( "Shadow Maps = the standard projected depth maps (soft, slightly unstable edges). Ray Traced = pixel-exact hard shadows traced against the scene, no shadow-map shimmer, for point and spot lights (sun stays mapped). Requires ray query support; toggles live." );
+	control->SetDataSource( &systemData, idMenuDataSource_SystemSettings::SYSTEM_FIELD_SHADOWS );
+	control->SetupEvents( DEFAULT_REPEAT_TIME, options->GetChildren().Num() );
+	control->AddEventAction( WIDGET_EVENT_PRESS ).Set( WIDGET_ACTION_COMMAND, idMenuDataSource_SystemSettings::SYSTEM_FIELD_SHADOWS );
 	options->AddChild( control );
 
 	/*control = new( TAG_SWF ) idMenuWidget_ControlButton();
@@ -834,6 +844,14 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 			r_useDDGI.SetInteger( AdjustOption( r_useDDGI.GetInteger(), values, numValues, adjustAmount ) );
 			break;
 		}
+		case SYSTEM_FIELD_SHADOWS:
+		{
+			// shadow technique: 0 = shadow maps, 1 = ray traced (point + spot)
+			static const int numValues = 2;
+			static const int values[numValues] = { 0, 1 };
+			r_useRTShadows.SetInteger( AdjustOption( r_useRTShadows.GetInteger(), values, numValues, adjustAmount ) );
+			break;
+		}
 		case SYSTEM_FIELD_SSAO:
 		{
 			static const int numValues = 2;
@@ -1115,6 +1133,9 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 
 		case SYSTEM_FIELD_GI:
 			return r_useDDGI.GetBool() ? "Dynamic (DDGI)" : "Baked";
+
+		case SYSTEM_FIELD_SHADOWS:
+			return r_useRTShadows.GetBool() ? "Ray Traced" : "Shadow Maps";
 
 		case SYSTEM_FIELD_BLOOD_REFLECTIONS:
 			if( r_useRTReflections.GetBool() )

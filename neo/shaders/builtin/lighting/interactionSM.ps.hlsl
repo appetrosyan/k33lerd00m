@@ -163,6 +163,14 @@ void main( PS_IN fragment, out PS_OUT result )
 	//
 	// shadow mapping
 	//
+#if USE_RT_SHADOW
+	// Ray-traced visibility: RtShadowsPass wrote a screen-space mask for this light.
+	// SV_Position matches the mask 1:1 (both at render resolution), so a direct Load
+	// replaces the entire light-space projection + PCF path below. t_ShadowAtlas is
+	// the mask texture (bound at the shadow-map texunit; RT variants compile with
+	// USE_SHADOW_ATLAS so the Texture2D binding exists).
+	float shadow = t_ShadowAtlas.Load( int3( int2( fragment.position.xy ), 0 ) ).r;
+#else
 	int shadowIndex = 0;
 
 #if LIGHT_POINT
@@ -475,6 +483,8 @@ void main( PS_IN fragment, out PS_OUT result )
 #endif
 
 #endif
+
+#endif // USE_RT_SHADOW
 
 	// allow shadows to fade out
 	shadow = saturate( max( shadow, pc.rpJitterTexScale.z ) );

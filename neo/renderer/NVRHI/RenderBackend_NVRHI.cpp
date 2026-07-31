@@ -202,6 +202,7 @@ void idRenderBackend::Init()
 	ssaoPass = nullptr;
 	ddgiPass = nullptr;
 	reflectionsPass = nullptr;
+	rtShadowsPass = nullptr;
 	emberPass = nullptr;
 	hdrGuiCompositePass = nullptr;
 
@@ -2033,6 +2034,13 @@ void idRenderBackend::GL_StartFrame()
 		reflectionsPass = new ReflectionsPass( deviceManager->GetDevice(), &commonPasses );
 	}
 
+	// RT shadows is a live toggle, so the pass is always constructed (it does no work
+	// until r_useRTShadows drives BeginView). Cheap when idle: just a TLAS builder + pipeline.
+	if( !rtShadowsPass )
+	{
+		rtShadowsPass = new RtShadowsPass( deviceManager->GetDevice(), &commonPasses );
+	}
+
 	if( !emberPass )
 	{
 		emberPass = new EmberPass( deviceManager->GetDevice() );
@@ -2412,6 +2420,12 @@ void idRenderBackend::ClearCaches()
 		reflectionsPass = nullptr;
 	}
 
+	if( rtShadowsPass )
+	{
+		delete rtShadowsPass;
+		rtShadowsPass = nullptr;
+	}
+
 	if( emberPass )
 	{
 		delete emberPass;
@@ -2544,6 +2558,8 @@ idRenderBackend::idRenderBackend()
 	ssaoPass = nullptr;
 	ddgiPass = nullptr;
 	reflectionsPass = nullptr;
+	rtShadowsPass = nullptr;
+	rtShadowsActiveThisView = false;
 	lastRenderWidth = 0;
 	lastRenderHeight = 0;
 	emberPass = nullptr;

@@ -39,6 +39,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Passes/SsaoPass.h"
 #include "Passes/DdgiPass.h"
 #include "Passes/ReflectionsPass.h"
+#include "Passes/RtShadowsPass.h"
 #include "Passes/EmberPass.h"
 #include "Passes/HdrGuiCompositePass.h"
 #include "Passes/TonemapPass.h"
@@ -395,6 +396,8 @@ private:
 	SsaoPass*						ssaoPass;
 	DdgiPass*						ddgiPass;
 	ReflectionsPass*				reflectionsPass;
+	RtShadowsPass*					rtShadowsPass;
+	bool							rtShadowsActiveThisView;	// RT shadow TLAS built this view; interaction pass binds the mask + RT variant
 	int								lastRenderWidth;			// scene render resolution the targets were last (re)allocated at; a change (e.g. live SSAA toggle) forces a realloc
 	int								lastRenderHeight;
 	EmberPass*						emberPass;

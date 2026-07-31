@@ -449,6 +449,18 @@ enum
 	BUILTIN_PBR_INTERACTION_SHADOW_ATLAS_PARALLEL,
 	BUILTIN_PBR_INTERACTION_SHADOW_ATLAS_PARALLEL_SKINNED,
 
+	// ray-traced shadows: screen-space visibility mask instead of shadow-map PCF
+	// (point + spot only; parallel/sun stays on the shadow-map path)
+	BUILTIN_INTERACTION_RTSHADOW_SPOT,
+	BUILTIN_INTERACTION_RTSHADOW_SPOT_SKINNED,
+	BUILTIN_INTERACTION_RTSHADOW_POINT,
+	BUILTIN_INTERACTION_RTSHADOW_POINT_SKINNED,
+
+	BUILTIN_PBR_INTERACTION_RTSHADOW_SPOT,
+	BUILTIN_PBR_INTERACTION_RTSHADOW_SPOT_SKINNED,
+	BUILTIN_PBR_INTERACTION_RTSHADOW_POINT,
+	BUILTIN_PBR_INTERACTION_RTSHADOW_POINT_SKINNED,
+
 	BUILTIN_DEBUG_LIGHTGRID,
 	BUILTIN_DEBUG_LIGHTGRID_SKINNED,
 
@@ -835,6 +847,50 @@ public:
 	void	BindShader_PBR_Interaction_ShadowAtlas_Parallel_Skinned()
 	{
 		BindShader_Builtin( BUILTIN_PBR_INTERACTION_SHADOW_ATLAS_PARALLEL_SKINNED );
+	}
+
+	//
+	// ray-traced shadows
+	//
+
+	void	BindShader_Interaction_RTShadow_Spot()
+	{
+		BindShader_Builtin( BUILTIN_INTERACTION_RTSHADOW_SPOT );
+	}
+
+	void	BindShader_Interaction_RTShadow_Spot_Skinned()
+	{
+		BindShader_Builtin( BUILTIN_INTERACTION_RTSHADOW_SPOT_SKINNED );
+	}
+
+	void	BindShader_Interaction_RTShadow_Point()
+	{
+		BindShader_Builtin( BUILTIN_INTERACTION_RTSHADOW_POINT );
+	}
+
+	void	BindShader_Interaction_RTShadow_Point_Skinned()
+	{
+		BindShader_Builtin( BUILTIN_INTERACTION_RTSHADOW_POINT_SKINNED );
+	}
+
+	void	BindShader_PBR_Interaction_RTShadow_Spot()
+	{
+		BindShader_Builtin( BUILTIN_PBR_INTERACTION_RTSHADOW_SPOT );
+	}
+
+	void	BindShader_PBR_Interaction_RTShadow_Spot_Skinned()
+	{
+		BindShader_Builtin( BUILTIN_PBR_INTERACTION_RTSHADOW_SPOT_SKINNED );
+	}
+
+	void	BindShader_PBR_Interaction_RTShadow_Point()
+	{
+		BindShader_Builtin( BUILTIN_PBR_INTERACTION_RTSHADOW_POINT );
+	}
+
+	void	BindShader_PBR_Interaction_RTShadow_Point_Skinned()
+	{
+		BindShader_Builtin( BUILTIN_PBR_INTERACTION_RTSHADOW_POINT_SKINNED );
 	}
 
 	//

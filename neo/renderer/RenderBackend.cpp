@@ -58,10 +58,24 @@ extern idCVar stereoRender_swapEyes;
 extern idCVar r_ddgiDebug;			// DDGI probe atlas overlay (Passes/DdgiPass.cpp)
 extern idCVar r_useDDGI;			// runtime DDGI toggle (RenderSystem_init.cpp)
 extern idCVar r_useRTReflections;	// runtime RT reflections toggle (RenderSystem_init.cpp)
+extern idCVar r_useRTShadows;		// runtime RT shadows toggle (RenderSystem_init.cpp)
 extern idCVar r_hdrOutput;			// HDR display output toggle (RenderSystem_init.cpp)
 
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
 bool drawView3D;
+
+// Ray-traced shadows: a light uses the RT visibility mask (instead of the shadow map)
+// when RT shadows built a TLAS this view AND the light is a shadow-casting point/spot
+// (parallel/sun stay mapped; ambient lights are unshadowed). The dispatch, the mask
+// bind at texunit 5, and the interaction shader-variant choice must all agree on this.
+static ID_INLINE bool R_LightUsesRTShadows( bool rtShadowsActiveThisView, const viewLight_t* vLight )
+{
+	// vLight is NULL for the ambient/G-buffer pass (AmbientPass -> DrawSingleInteraction),
+	// which is unshadowed - guard before dereferencing.
+	return rtShadowsActiveThisView && vLight != NULL && vLight->globalShadows != NULL
+		   && vLight->shadowLOD > -1 && !vLight->parallel
+		   && !vLight->lightShader->IsAmbientLight();
+}
 
 /*
 ================
@@ -1647,6 +1661,43 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 	}
 	// RB end
 
+	// Ray-traced shadows override: replace the shadow-map interaction variant chosen
+	// above with the RT-visibility variant, which Loads the screen-space mask bound at
+	// texunit 5 instead of projecting into a shadow map. Point + spot only; the predicate
+	// matches R_LightUsesRTShadows so the mask bind and the shader agree.
+	if( R_LightUsesRTShadows( rtShadowsActiveThisView, din->vLight ) )
+	{
+		const bool pbr = ( specUsage == TD_SPECULAR_PBR_RMAO || specUsage == TD_SPECULAR_PBR_RMAOD );
+		const bool skinned = ( din->surf->jointCache != 0 );
+
+		if( din->vLight->pointLight )
+		{
+			if( pbr )
+			{
+				skinned ? renderProgManager.BindShader_PBR_Interaction_RTShadow_Point_Skinned()
+				: renderProgManager.BindShader_PBR_Interaction_RTShadow_Point();
+			}
+			else
+			{
+				skinned ? renderProgManager.BindShader_Interaction_RTShadow_Point_Skinned()
+				: renderProgManager.BindShader_Interaction_RTShadow_Point();
+			}
+		}
+		else
+		{
+			if( pbr )
+			{
+				skinned ? renderProgManager.BindShader_PBR_Interaction_RTShadow_Spot_Skinned()
+				: renderProgManager.BindShader_PBR_Interaction_RTShadow_Spot();
+			}
+			else
+			{
+				skinned ? renderProgManager.BindShader_Interaction_RTShadow_Spot_Skinned()
+				: renderProgManager.BindShader_Interaction_RTShadow_Spot();
+			}
+		}
+	}
+
 	// texture 0 will be the per-surface bump map
 	GL_SelectTexture( INTERACTION_TEXUNIT_BUMP );
 	din->bumpImage->Bind();
@@ -1910,9 +1961,14 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 		GL_SelectTexture( INTERACTION_TEXUNIT_PROJECTION );
 		lightStage->texture.image->Bind();
 
-		// texture 5 will be the shadow maps array
+		// texture 5 will be the shadow maps array (or the RT visibility mask, which the
+		// RT interaction variant Loads in screen space instead of projecting)
 		GL_SelectTexture( INTERACTION_TEXUNIT_SHADOWMAPS );
-		if( r_useShadowAtlas.GetBool() )
+		if( R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
+		{
+			globalImages->rtShadowMaskImage->Bind();
+		}
+		else if( r_useShadowAtlas.GetBool() )
 		{
 			globalImages->shadowAtlasImage->Bind();
 		}
@@ -3889,6 +3945,15 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 
 	Framebuffer* previousFramebuffer = Framebuffer::GetActiveFramebuffer();
 
+	// Ray-traced shadows: build the world TLAS once for the whole light loop. Each
+	// shadow-casting point/spot light then traces its own screen-space visibility mask
+	// just before its interactions are drawn (below); the interaction shader Loads that
+	// mask instead of sampling the shadow map. Sun/parallel lights stay shadow-mapped.
+	// Live toggle (r_useRTShadows); rtShadowsActive is false unless the TLAS built.
+	rtShadowsActiveThisView = rtShadowsPass && rtShadowsPass->IsSupported()
+							  && r_useRTShadows.GetBool() && !r_skipShadows.GetBool()
+							  && rtShadowsPass->BeginView( commandList, _viewDef );
+
 	//
 	// for each light, perform shadowing and adding
 	//
@@ -3916,6 +3981,13 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 		if( useLightDepthBounds )
 		{
 			GL_DepthBoundsTest( vLight->scissorRect.zmin, vLight->scissorRect.zmax );
+		}
+
+		// ray-traced shadows: trace this light's visibility into the shadow mask before
+		// its interactions draw. DrawSingleInteraction then binds the RT variant + mask.
+		if( R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
+		{
+			rtShadowsPass->RenderLight( commandList, _viewDef, vLight );
 		}
 
 		// RB: render interactions with shadow mapping
