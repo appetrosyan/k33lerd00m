@@ -33,7 +33,12 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 // Widen the RT occluder set beyond the view frustum so shadows / reflections stop
 // popping as portal-area visibility flips. Shared by every RT pass (DDGI, reflections,
 // shadows) since they all build through RebuildFromView.
-idCVar r_rtWorldOccluders( "r_rtWorldOccluders", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: also gather static world geometry from the camera's BSP area + portal-connected neighbours, not just the visible frustum (fixes shadow/reflection area pop)" );
+// DEFAULT OFF: the gather walks the LIVE render world (portalAreas / entityRefs /
+// entity models) from the backend RebuildFromView, which races the frontend and
+// segfaults sporadically (crash was in AppendStaticAreaOccluders). Every other RT
+// pass reads only the frozen viewDef snapshot for this reason. Re-enable once the
+// gather is moved into the frontend (safe world access) - see rt-shadows notes.
+idCVar r_rtWorldOccluders( "r_rtWorldOccluders", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: also gather static world geometry from the camera's BSP area + portal-connected neighbours, not just the visible frustum (fixes shadow/reflection area pop). UNSTABLE: backend walks the live world - crashes; needs a frontend redesign" );
 idCVar r_rtOccluderAreaHops( "r_rtOccluderAreaHops", "8", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT accel struct: how many portal hops out from the camera area to gather static occluders (r_rtWorldOccluders)", 0, 64 );
 
 DdgiAccelStructures::DdgiAccelStructures()
