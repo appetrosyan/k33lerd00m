@@ -1272,6 +1272,8 @@ extern idCVar r_exposure;
 
 extern idCVar r_emissiveScale;
 
+extern idCVar r_useBloom;
+
 extern idCVar r_useSSR;
 extern idCVar r_ssrJitter;
 extern idCVar r_ssrMaxDistance;

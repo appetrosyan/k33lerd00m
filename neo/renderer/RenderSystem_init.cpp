@@ -266,9 +266,10 @@ idCVar r_hdrAdaptionRate( "r_hdrAdaptionRate", "1", CVAR_RENDERER | CVAR_FLOAT |
 idCVar r_hdrMinLuminance( "r_hdrMinLuminance", "0.02", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "" );
 idCVar r_hdrMaxLuminance( "r_hdrMaxLuminance", "0.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "" );
 idCVar r_hdrKey( "r_hdrKey", "0.015", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "magic exposure key that works well with Doom 3 maps" );
-idCVar r_hdrContrastDynamicThreshold( "r_hdrContrastDynamicThreshold", "2", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "if auto exposure is on, all pixels brighter than this cause HDR bloom glares" );
-idCVar r_hdrContrastStaticThreshold( "r_hdrContrastStaticThreshold", "3", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "if auto exposure is off, all pixels brighter than this cause HDR bloom glares" );
-idCVar r_hdrContrastOffset( "r_hdrContrastOffset", "100", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "" );
+idCVar r_useBloom( "r_useBloom", "1", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "add a glare/bloom halo around over-bright (emissive) surfaces" );
+idCVar r_hdrContrastDynamicThreshold( "r_hdrContrastDynamicThreshold", "1.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "if auto exposure is on, absolute scene luminance above this blooms (1.0 = brighter than SDR white)" );
+idCVar r_hdrContrastStaticThreshold( "r_hdrContrastStaticThreshold", "1.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "if auto exposure is off, absolute scene luminance above this blooms (1.0 = brighter than SDR white)" );
+idCVar r_hdrContrastOffset( "r_hdrContrastOffset", "1.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "soft-knee rolloff width for the bloom brightpass; smaller = sharper glare onset" );
 idCVar r_hdrGlarePasses( "r_hdrGlarePasses", "8", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "how many times the bloom blur is rendered offscreen. number should be even" );
 idCVar r_hdrDebug( "r_hdrDebug", "0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "show scene luminance as heat map" );
 

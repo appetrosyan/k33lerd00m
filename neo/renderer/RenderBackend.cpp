@@ -5139,10 +5139,15 @@ void idRenderBackend::Bloom( const viewDef_t* _viewDef )
 
 	renderProgManager.BindShader_Brightpass();
 
+	// SRS - hdrKey/hdrAverageLuminance/hdrMaxLuminance are unmaintained on the NVRHI branch
+	// (never assigned), so feed neutral constants: key == avgLuminance makes the brightpass
+	// exposure a no-op and its relative luminance Yr collapse to the absolute scene luminance
+	// Y. The ACES operator in the brightpass then keeps the extracted glare in [0,1] so it
+	// composites cleanly onto the tonemapped ldrFBO. Thresholding is driven by rpOverbright.
 	float screenCorrectionParm[4];
-	screenCorrectionParm[0] = hdrKey;
-	screenCorrectionParm[1] = hdrAverageLuminance;
-	screenCorrectionParm[2] = hdrMaxLuminance;
+	screenCorrectionParm[0] = 1.0f;
+	screenCorrectionParm[1] = 1.0f;
+	screenCorrectionParm[2] = 1.0f;
 	screenCorrectionParm[3] = 1.0f;
 	SetFragmentParm( RENDERPARM_SCREENCORRECTIONFACTOR, screenCorrectionParm ); // rpScreenCorrectionFactor
 
@@ -6114,8 +6119,10 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	// bloom post processing
 	//-------------------------------------------------
 
-	// TODO implement bloom
-	//Bloom( _viewDef );
+	if( r_useBloom.GetBool() && is3D && !( _viewDef->renderView.rdflags & RDF_IRRADIANCE ) && !_viewDef->targetRender )
+	{
+		Bloom( _viewDef );
+	}
 
 	if( _viewDef->renderView.rdflags & RDF_IRRADIANCE )
 	{
