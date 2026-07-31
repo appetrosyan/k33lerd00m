@@ -143,7 +143,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	float3 dNdx = ddx( localNormal );
 	float3 dNdy = ddy( localNormal );
 	float specAAvariance = 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) );
-	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.18 );
+	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.25 );
 
 	// traditional very dark Lambert light model used in Doom 3
 	float ldotN = saturate( dot3( localNormal, lightVector ) );
@@ -512,14 +512,12 @@ void main( PS_IN fragment, out PS_OUT result )
 	float3 specularColor = specMapSRGB.rgb; // RB: should be linear but it looks too flat
 #endif
 
-#if 0
-	// specular AA - https://yusuketokuyoshi.com/papers/2021/Tokuyoshi2021SAA.pdf
-
-	//roughness = IsotropicNDFFiltering( localNormal, roughness * roughness );
-
-	float r2 = roughness * roughness;
-	roughness = AxisAlignedNDFFiltering( halfAngleVector, float2( r2, r2 ) ).x;
-#endif
+	// Geometric specular AA: widen roughness by the sub-pixel normal-variance kernel
+	// computed near the top of the shader. This shadow-mapped interaction is the path
+	// most in-game lights take, and it previously computed the kernel but never applied
+	// it, so bright specular detail (wet blood, metal trim) crawled on this path. Applied
+	// as the isotropic variance form to match interaction.ps.hlsl; no temporal component.
+	roughness = sqrt( saturate( roughness * roughness + specAAkernelRoughness2 ) );
 
 
 	// RB FIXME or not: compensate r_lightScale 3 and the division of Pi

@@ -132,7 +132,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	// alias into sparkling point noise (matches interaction.ps.hlsl, no temporal).
 	float3 dNdx = ddx( globalNormal );
 	float3 dNdy = ddy( globalNormal );
-	float specAAkernelRoughness2 = min( 2.0 * 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) ), 0.18 );
+	float specAAkernelRoughness2 = min( 2.0 * 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) ), 0.25 );
 
 	float3 globalPosition = fragment.texcoord7.xyz;
 
@@ -173,7 +173,7 @@ void main( PS_IN fragment, out PS_OUT result )
 
 #if USE_PBR
 	const float metallic = specMapSRGB.g;
-	const float roughness = specMapSRGB.r;
+	const float roughness = max( 0.045, specMapSRGB.r );
 	const float glossiness = 1.0 - roughness;
 	float ao = specMapSRGB.b;
 

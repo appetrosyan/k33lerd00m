@@ -106,7 +106,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	float3 dNdx = ddx( localNormal );
 	float3 dNdy = ddy( localNormal );
 	float specAAvariance = 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) );
-	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.18 );
+	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.25 );
 
 	// traditional very dark Lambert light model used in Doom 3
 	float ldotN = saturate( dot3( localNormal, lightVector ) );
