@@ -45,8 +45,10 @@ struct RtShadowConstants
 	idVec4		unprojToWorld3;
 
 	idVec4		lightOrigin;	// xyz = world-space light origin, w = light radius (soft shadows)
-	idVec4		params;			// x = normal bias, y = max ray distance (0 = to light),
+	idVec4		params;			// x = normal bias, y = umbra floor (min shadow term),
 	//							// z = ray count, w = frame index (soft-shadow jitter)
 	idVec2i		screenSize;		// x = width, y = height (pixels, render resolution)
-	idVec2i		pad;
+	idVec2i		pad;			// x = backface cull, y = debug force/hit-dist mode
+	idVec2i		scissorMin;		// top-left pixel of this light's dispatch rect (screen space)
+	idVec2i		pad2;
 };

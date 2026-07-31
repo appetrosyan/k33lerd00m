@@ -37,7 +37,24 @@ extern idCVar r_useRTShadows;
 idCVar r_rtShadowBias( "r_rtShadowBias", "1.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: ray origin bias along the surface normal (self-intersection)" );
 idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: visibility rays per pixel (1 = hard shadow; >1 = brute-force soft, no denoiser)", 1, 16 );
 idCVar r_rtShadowSoftRadius( "r_rtShadowSoftRadius", "12.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: light radius in world units used for soft penumbra when r_rtShadowRays > 1" );
-idCVar r_rtShadowBackfaceCull( "r_rtShadowBackfaceCull", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: cull back-facing triangles as occluders so coplanar/thin back-side surfaces don't wrongly shadow (fixes flashlight-cone z-fighting); 0 if it light-leaks on one-sided geometry" );
+idCVar r_rtShadowBackfaceCull( "r_rtShadowBackfaceCull", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: cull back-facing triangles as occluders. 0 = one-sided world walls occlude correctly (default); 1 = drop coplanar/thin back faces (helps the flashlight cone but light-leaks through one-sided geometry)" );
+// Keep lights that portal-culling would drop (a light reachable only through a hidden
+// window). Default OFF: it also pulls in lights that then over-illuminate rooms they
+// should not reach, which read as "bright where it should be dark". Gate for tr_frontend.
+idCVar r_rtShadowExtraLights( "r_rtShadowExtraLights", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows: keep shadow-casting lights in view even when their frustum misses the visible portal chain. 0 = original light culling (no phantom illumination); 1 = keep them (fixes shadows from lights only reachable through a window, but can over-light)" );
+idCVar r_rtShadowUmbra( "r_rtShadowUmbra", "0.15", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT shadows: minimum shadow term (umbra light floor). RT visibility is binary and pitch-black; a small floor gives back the shipped stencil shadows' gentler darkening without softening the edge. 0 = hard black umbra", 0.0f, 1.0f );
+idCVar r_rtShadowForce( "r_rtShadowForce", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT shadows debug: 0 = normal, 1 = force the whole mask fully shadowed (black), 2 = force fully lit (white). If forcing 1 does NOT darken an area, that area is not lit by an RT-shadowed light - its brightness comes from ambient / DDGI / a non-RT light.", 0, 2 );
+idCVar r_rtShadowShowMask( "r_rtShadowShowMask", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows debug: blit the last light's visibility mask over the scene (red = lit, dark = shadowed) to check its spatial registration against the lit geometry" );
+// Build the shadow TLAS from real shadow casters only (honour noShadows, drop translucent
+// glass). Default ON so RT shadows match the stencil caster set. Toggle OFF to confirm the
+// mechanism: the stipple / spurious shadows from grates, railings, decals and window glass
+// come back, because those surfaces then re-enter the shadow acceleration structure.
+idCVar r_rtShadowCasterFilter( "r_rtShadowCasterFilter", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows: restrict the shadow TLAS to real casters (skip noShadows + translucent surfaces). 0 = add all static geometry (spurious detail shadows / glass blocks light)" );
+// Perf: dispatch the visibility trace over only the light's screen-space scissor rect
+// instead of the whole framebuffer. A light that touches a small screen region then traces
+// rays for just those pixels (its interactions are scissored to the same rect anyway).
+idCVar r_rtShadowScissor( "r_rtShadowScissor", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows: trace only each light's screen scissor rect (perf). 0 = full-screen dispatch per light" );
+extern idCVar r_useScissor;
 
 RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
@@ -136,6 +153,7 @@ bool RtShadowsPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t
 		return false;
 	}
 
+	m_AccelStructs.SetShadowCastersOnly( r_rtShadowCasterFilter.GetBool() );
 	m_ViewReady = m_AccelStructs.RebuildFromView( commandList, viewDef );
 
 	if( m_ViewReady && !loggedFirstBuild )
@@ -186,17 +204,50 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	const idVec3 lightOrigin = vLight->globalLightOrigin;
 	constants.lightOrigin = idVec4( lightOrigin.x, lightOrigin.y, lightOrigin.z, r_rtShadowSoftRadius.GetFloat() );
 	constants.params = idVec4( r_rtShadowBias.GetFloat(),
-							   0.0f,
+							   r_rtShadowUmbra.GetFloat(),
 							   ( float )r_rtShadowRays.GetInteger(),
 							   ( float )( tr.frameCount & 1023 ) );
 	constants.screenSize = idVec2i( width, height );
-	constants.pad = idVec2i( r_rtShadowBackfaceCull.GetBool() ? 1 : 0, 0 );
+	constants.pad = idVec2i( r_rtShadowBackfaceCull.GetBool() ? 1 : 0, r_rtShadowForce.GetInteger() );
+
+	// Dispatch only over the light's screen scissor rect. The mask / gbuffer are top-left
+	// origin (SV_Position), while vLight->scissorRect is Doom's bottom-left screen space
+	// (y increasing upward, y2 = top edge) - so the rect's top row in mask space is
+	// height-1-y2. Fall back to full-screen if scissor is disabled or empty.
+	int dispX = 0, dispY = 0, dispW = width, dispH = height;
+	if( r_rtShadowScissor.GetBool() && r_useScissor.GetBool() )
+	{
+		const idScreenRect& sc = vLight->scissorRect;
+		const int sw = sc.x2 - sc.x1 + 1;
+		const int sh = sc.y2 - sc.y1 + 1;
+		if( sw > 0 && sh > 0 )
+		{
+			dispX = idMath::ClampInt( 0, width - 1, ( int )sc.x1 );
+			dispY = idMath::ClampInt( 0, height - 1, height - 1 - ( int )sc.y2 );
+			dispW = Min( sw, width - dispX );
+			dispH = Min( sh, height - dispY );
+		}
+	}
+	constants.scissorMin = idVec2i( dispX, dispY );
 
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 
 	// the TLAS handle changes when it is recreated to grow; rebuild the binding set
 	// (also invalidated when the mask image handle changes) to track current resources.
 	nvrhi::rt::IAccelStruct* tlas = m_AccelStructs.GetTLAS();
+	if( tlas == nullptr )
+	{
+		// An empty TLAS (no instances built this view) leaves a null accel structure;
+		// creating a binding set with it fatals ("binding set slot 0 does not match the
+		// layout"). Skip the dispatch instead of crashing, and say so once.
+		static bool warned = false;
+		if( !warned )
+		{
+			common->Warning( "RtShadowsPass: TLAS is empty (no shadow-caster instances) - skipping RT shadow dispatch. Check r_rtAccelDebug / r_rtShadowCasterFilter." );
+			warned = true;
+		}
+		return false;
+	}
 	if( m_TraceBindingSet == nullptr || m_BoundTlas != tlas || m_BoundMask != mask )
 	{
 		nvrhi::BindingSetDesc setDesc;
@@ -218,7 +269,7 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	state.bindings = { m_TraceBindingSet };
 	commandList->setComputeState( state );
 
-	commandList->dispatch( ( width + 7 ) / 8, ( height + 7 ) / 8, 1 );
+	commandList->dispatch( ( dispW + 7 ) / 8, ( dispH + 7 ) / 8, 1 );
 
 	return true;
 }

@@ -39,9 +39,11 @@ struct RtShadowConstants
 	float4	unprojToWorld3;
 
 	float4	lightOrigin;	// xyz = world light origin, w = light radius (soft)
-	float4	params;			// x = normalBias, y = maxDist (0 = to light), z = rayCount, w = frameIndex
+	float4	params;			// x = normalBias, y = umbra floor (min shadow term), z = rayCount, w = frameIndex
 	int2	screenSize;
 	int2	pad;
+	int2	scissorMin;		// top-left pixel of this light's dispatch rect
+	int2	pad2;
 };
 
 // *INDENT-OFF*
@@ -92,25 +94,34 @@ void OrthoBasis( float3 n, out float3 t, out float3 b )
 }
 
 // Trace one occlusion ray. Returns 1 when the light is visible, 0 when occluded.
-float TraceVisibility( float3 origin, float3 dir, float tmax )
+float TraceVisibility( float3 origin, float3 dir, float tmin, float tmax )
 {
 	RayDesc ray;
 	ray.Origin = origin;
 	ray.Direction = dir;
-	// Skip the first `bias` world units along the ray so a receiver-coplanar surface
+	// Skip the first `tmin` world units along the ray so a receiver-coplanar surface
 	// (Doom stacks decals / light panels z-fighting on walls) does not self-occlude the
-	// flashlight cone. Combined with the N*bias origin offset in main().
-	ray.TMin = g_Sh.params.x;
+	// flashlight cone. tmin is the slope-scaled bias from main() (larger at grazing
+	// angles), matching the N*tmin origin offset there.
+	ray.TMin = tmin;
 	ray.TMax = tmax;
 
-	// Backface culling (g_Sh.pad.x) removes back-facing triangles as occluders - the
-	// back side of a thin or coplanar surface is not between the receiver and the light,
-	// so counting it produces the wrong shadow (the flashlight-cone artifact). Toggled by
-	// r_rtShadowBackfaceCull in case any one-sided world geometry light-leaks with it on.
+	// Self-intersection avoidance by FRONT-FACE CULLING (the established fix for a shadow
+	// ray traced from a depth-reconstructed gbuffer position - see Wicked Engine
+	// screenspaceshadowCS, which reconstructs P from depth exactly as we do). The shaded
+	// receiver presents a front face to the light-ward ray, so culling front-facing
+	// triangles makes the receiver's own surface an invalid occluder -> self-shadow acne
+	// is structurally impossible at ANY distance, with no bias to tune. A real occluder is
+	// still caught on its far (back) face. pad.x flips to back-face culling to debug any
+	// one-sided world geometry that light-leaks with front culling.
 	uint rayFlags = RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
 	if( g_Sh.pad.x != 0 )
 	{
 		rayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+	}
+	else
+	{
+		rayFlags |= RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
 	}
 
 	RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
@@ -123,9 +134,26 @@ float TraceVisibility( float3 origin, float3 dir, float tmax )
 [numthreads( 8, 8, 1 )]
 void main( uint3 dispatchID : SV_DispatchThreadID )
 {
-	const int2 pixel = int2( dispatchID.xy );
+	// The dispatch covers only this light's screen-space scissor rect, not the whole
+	// screen - scissorMin is its top-left pixel. Pixels outside the rect are never lit by
+	// this light (its interactions are scissored to the same rect), so we skip the rays.
+	const int2 pixel = int2( dispatchID.xy ) + g_Sh.scissorMin;
 	if( pixel.x >= g_Sh.screenSize.x || pixel.y >= g_Sh.screenSize.y )
 	{
+		return;
+	}
+
+	// debug force (g_Sh.pad.y): 1 = fully shadowed, 2 = fully lit. Lets us test whether a
+	// wrongly-bright area is even lit by an RT-shadowed light (if forcing black does not
+	// darken it, the light is elsewhere - ambient / DDGI / non-RT).
+	if( g_Sh.pad.y == 1 )
+	{
+		u_ShadowMask[pixel] = 0.0f;
+		return;
+	}
+	if( g_Sh.pad.y == 2 )
+	{
+		u_ShadowMask[pixel] = 1.0f;
 		return;
 	}
 
@@ -137,20 +165,28 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 		return;
 	}
 
-	// world normal from the gbuffer; degenerate (unwritten) normals -> treat as lit
+	// gbuffer normal only used to detect degenerate (unwritten) texels -> treat as lit.
+	// Front-face culling handles self-occlusion, so the normal is no longer needed to
+	// offset the ray origin.
 	const float3 nEnc = t_GBufferNormal[pixel].xyz * 2.0f - 1.0f;
 	if( dot( nEnc, nEnc ) < 1e-4f )
 	{
 		u_ShadowMask[pixel] = 1.0f;
 		return;
 	}
-	const float3 N = normalize( nEnc );
 
 	const float2 uv = ( float2( pixel ) + 0.5f ) / float2( g_Sh.screenSize );
 	const float3 worldP = ReconstructWorld( uv, depth );
 
-	const float bias = g_Sh.params.x;
-	const float3 origin = worldP + N * bias;
+	// Distant / degenerate reconstruction: at the far plane w.w -> 0, so worldP blows up to
+	// huge or NaN values and the shadow ray becomes garbage (the thrashing outdoor mask with
+	// a hard seam at the window's near/far depth cliff). Skip such pixels - very distant
+	// geometry - rather than trace nonsense. Same failure hits ReconstructWorld in reflections.
+	if( !all( isfinite( worldP ) ) || dot( worldP, worldP ) > 1.0e14f )
+	{
+		u_ShadowMask[pixel] = 1.0f;
+		return;
+	}
 
 	const float3 toLight = g_Sh.lightOrigin.xyz - worldP;
 	const float lightDist = length( toLight );
@@ -161,13 +197,50 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	}
 	const float3 L = toLight / lightDist;
 
+	// Trace from the reconstructed world position UNoffset - front-face culling (in
+	// TraceVisibility) is what prevents self-occlusion, not an origin push. The earlier
+	// N*bias offset was the wrong tool: it leaked over thin walls and could never cover
+	// the depth-reconstruction error that grows with view distance (the outdoor stipple).
+	// TMin still skips the first `bias` units so coincident decals / light panels
+	// z-fighting on a wall do not register as occluders.
+	const float bias = g_Sh.params.x;
+	const float3 origin = worldP;
+
 	const int rays = max( 1, int( g_Sh.params.z ) );
+
+	// Umbra floor (g_Sh.params.y): the minimum shadow term, so full shadow is not pitch
+	// black. RT visibility is binary (0/1); the shipped stencil shadows never fully
+	// darkened, so a small floor gives back that gentler "less pronounced" umbra without
+	// touching the edge. 0 = hard black umbra.
+	const float umbraFloor = g_Sh.params.y;
+
+	// Hit-distance debug (g_Sh.pad.y == 3): instead of 0/1 occlusion, write the shadow
+	// ray's hit distance normalised to 64 world units. Purpose: diagnose the stipple.
+	//   - DARK (T near 0)  -> the occluder is right on the receiver = self-intersection /
+	//     reconstruction landing inside the surface / coincident geometry. Fix = bias.
+	//   - BRIGHT (T large) -> a genuinely distant occluder = a real geometry / wrong-ray
+	//     problem, not bias. WHITE = ray reached the light unobstructed (correctly lit).
+	if( g_Sh.pad.y == 3 )
+	{
+		RayDesc dray;
+		dray.Origin = origin;
+		dray.Direction = L;
+		dray.TMin = bias;
+		dray.TMax = max( 0.0f, lightDist - bias );
+		RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> dq;
+		dq.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, dray );
+		dq.Proceed();
+		u_ShadowMask[pixel] = ( dq.CommittedStatus() == COMMITTED_TRIANGLE_HIT )
+							  ? saturate( dq.CommittedRayT() / 64.0f )
+							  : 1.0f;
+		return;
+	}
 
 	if( rays <= 1 )
 	{
 		// hard shadow: single ray straight at the light
 		const float tmax = max( 0.0f, lightDist - bias );
-		u_ShadowMask[pixel] = TraceVisibility( origin, L, tmax );
+		u_ShadowMask[pixel] = max( TraceVisibility( origin, L, bias, tmax ), umbraFloor );
 		return;
 	}
 
@@ -189,8 +262,8 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 
 		const float3 d = target - worldP;
 		const float dist = length( d );
-		vis += TraceVisibility( origin, d / max( dist, 1e-4f ), max( 0.0f, dist - bias ) );
+		vis += TraceVisibility( origin, d / max( dist, 1e-4f ), bias, max( 0.0f, dist - bias ) );
 	}
 
-	u_ShadowMask[pixel] = vis / float( rays );
+	u_ShadowMask[pixel] = max( vis / float( rays ), umbraFloor );
 }

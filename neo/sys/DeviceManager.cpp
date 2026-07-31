@@ -131,9 +131,13 @@ void DefaultMessageCallback::message( nvrhi::MessageSeverity severity, const cha
 			common->Warning( messageText );
 			break;
 		case nvrhi::MessageSeverity::Error:
-			common->FatalError( "%s", messageText );
-			break;
 		case nvrhi::MessageSeverity::Fatal:
+			// Print + flush the raw message to stderr BEFORE FatalError: FatalError tears
+			// the process down (and can cascade into a second fatal during vid_restart)
+			// before its own console output is flushed, so the actual nvrhi validation
+			// complaint was being lost. This guarantees it reaches a 2>&1 capture.
+			fprintf( stderr, "\n[nvrhi %s] %s\n", severity == nvrhi::MessageSeverity::Fatal ? "FATAL" : "ERROR", messageText );
+			fflush( stderr );
 			common->FatalError( "%s", messageText );
 			break;
 	}

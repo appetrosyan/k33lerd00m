@@ -3970,8 +3970,15 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 	// just before its interactions are drawn (below); the interaction shader Loads that
 	// mask instead of sampling the shadow map. Sun/parallel lights stay shadow-mapped.
 	// Live toggle (r_useRTShadows); rtShadowsActive is false unless the TLAS built.
+	//
+	// Skip subviews (mirrors, remote cameras, window portals): a mirror subview renders
+	// reflected geometry with a mirrored projection, so world-position reconstruction from
+	// its depth lands in mirrored space while the TLAS is real space - the shadow rays are
+	// garbage and the mask flips/thrashes. Subviews fall back to shadow maps, which are
+	// correct there.
 	rtShadowsActiveThisView = rtShadowsPass && rtShadowsPass->IsSupported()
 							  && r_useRTShadows.GetBool() && !r_skipShadows.GetBool()
+							  && !_viewDef->isSubview
 							  && rtShadowsPass->BeginView( commandList, _viewDef );
 
 	//
@@ -6013,6 +6020,20 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	// main light renderer
 	//-------------------------------------------------
 	DrawInteractions( _viewDef );
+
+	// debug: blit the RT shadow mask (last light) over the scene so its spatial
+	// registration against the lit geometry is visible (red = lit, dark = shadowed).
+	{
+		extern idCVar r_rtShadowShowMask;
+		if( is3D && r_rtShadowShowMask.GetBool() && rtShadowsActiveThisView )
+		{
+			commonPasses.BlitTexture(
+				commandList,
+				globalFramebuffers.hdrFBO->GetApiObject(),
+				globalImages->rtShadowMaskImage->GetTextureHandle(),
+				&bindingCache );
+		}
+	}
 
 	//-------------------------------------------------
 	// resolve the screen for SSR / RT reflections (both sample the lit scene colour)
