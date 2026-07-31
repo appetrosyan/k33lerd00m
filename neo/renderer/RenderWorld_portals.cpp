@@ -32,6 +32,8 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "RenderCommon.h"
 
+extern idCVar r_rtShadowExtraLights;	// keep shadow-casting lights in the view even if their frustum misses the visible portal chain (RtShadowsPass.cpp)
+
 // if we hit this many planes, we will just stop cropping the
 // view down, which is still correct, just conservative
 const int MAX_PORTAL_PLANES	= 20;
@@ -387,7 +389,11 @@ void idRenderWorldLocal::AddAreaViewLights( int areaNum, const portalStack_t* ps
 		}
 
 		// cull frustum
-		if( CullLightByPortals( light, ps ) )
+		// RT shadows: a light touching this (visible) area can cast shadows into it from
+		// occluders even when the light's own frustum does not fit this portal sub-chain,
+		// so keep it in the view - otherwise a light reachable only through a now-hidden
+		// window drops out entirely and its whole lit volume goes unshadowed.
+		if( !r_rtShadowExtraLights.GetBool() && CullLightByPortals( light, ps ) )
 		{
 			// we are culled out through this portal chain, but it might
 			// still be visible through others

@@ -168,6 +168,15 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 		return false;
 	}
 
+	// Skip subviews (mirrors / remote cameras / window portals): world-position
+	// reconstruction + reprojection go through the subview's mirrored projection while the
+	// TLAS and scene-colour are real-space, so the result thrashes. Same reason RT shadows
+	// skip subviews (RenderBackend.cpp). The subview keeps its non-RT (SSR / env) path.
+	if( viewDef->isSubview )
+	{
+		return false;
+	}
+
 	// (Re)build the TLAS from the visible static world geometry.
 	const bool tlasReady = m_AccelStructs.RebuildFromView( commandList, viewDef );
 	if( !tlasReady )

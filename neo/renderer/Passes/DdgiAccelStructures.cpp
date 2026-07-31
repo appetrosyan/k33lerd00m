@@ -26,23 +26,21 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 #pragma hdrstop
 
 #include "renderer/RenderCommon.h"
-#include "renderer/RenderWorld_local.h"
 
 #include "DdgiAccelStructures.h"
 
-// Widen the RT occluder set beyond the view frustum so shadows / reflections stop
-// popping as portal-area visibility flips. Shared by every RT pass (DDGI, reflections,
-// shadows) since they all build through RebuildFromView.
-// DEFAULT OFF: the gather walks the LIVE render world (portalAreas / entityRefs /
-// entity models) from the backend RebuildFromView, which races the frontend and
-// segfaults sporadically (crash was in AppendStaticAreaOccluders). Every other RT
-// pass reads only the frozen viewDef snapshot for this reason. Re-enable once the
-// gather is moved into the frontend (safe world access) - see rt-shadows notes.
-idCVar r_rtWorldOccluders( "r_rtWorldOccluders", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: also gather static world geometry from the camera's BSP area + portal-connected neighbours, not just the visible frustum (fixes shadow/reflection area pop). UNSTABLE: backend walks the live world - crashes; needs a frontend redesign" );
-idCVar r_rtOccluderAreaHops( "r_rtOccluderAreaHops", "8", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT accel struct: how many portal hops out from the camera area to gather static occluders (r_rtWorldOccluders)", 0, 64 );
+// Widen the RT occluder set beyond the view frustum so shadows stop going bright when
+// a caster rotates out of view. Sources the extra occluders from each visible light's
+// shadow-caster list (vLight->globalShadows/localShadows) - a frozen viewDef snapshot
+// the frontend already builds (force-resident, per-light so it survives rotation), so
+// there is no live-world access from the backend. Shared by every RT pass (DDGI,
+// reflections, shadows) since they all build through RebuildFromView.
+idCVar r_rtWorldOccluders( "r_rtWorldOccluders", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: also add each visible light's shadow casters (incl. off-frustum) to the TLAS, not just the frustum-visible surfaces - fixes shadows going bright when a caster rotates out of view" );
+idCVar r_rtAccelDebug( "r_rtAccelDebug", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: print TLAS composition (view / light-caster / occluder / skinned instance counts, surfaces dropped by the shadow caster filter, empty-TLAS warnings) whenever it changes" );
 
 DdgiAccelStructures::DdgiAccelStructures()
-	: m_TlasCapacity( 0 )
+	: m_ShadowCastersOnly( false )
+	, m_TlasCapacity( 0 )
 	, m_NumInstances( 0 )
 	, m_InstanceDataCapacity( 0 )
 	, m_SkinBoundJoints( nullptr )
@@ -86,6 +84,35 @@ static idVec3 DDGI_MaterialAverageAlbedo( const idMaterial* material )
 		}
 	}
 	return idVec3( 0.5f, 0.5f, 0.5f );
+}
+
+/*
+========================
+DDGI_MaterialCastsRTShadow
+
+Whether a surface belongs in the RT SHADOW acceleration structure. Mirrors the
+criterion the stencil path uses for shadow casters: honour the noShadows /
+forceShadows material flags, and never treat translucent geometry (glass, blended
+window panes) as a solid occluder. Perforated (alpha-tested) surfaces are kept -
+the stencil path also shadows them by silhouette. Applied only when the owning
+pass set SetShadowCastersOnly(); DDGI / reflections keep the full geometry set.
+========================
+*/
+static bool DDGI_MaterialCastsRTShadow( const idMaterial* material )
+{
+	if( material == NULL )
+	{
+		return false;
+	}
+	if( !material->SurfaceCastsShadow() )
+	{
+		return false;
+	}
+	if( material->Coverage() == MC_TRANSLUCENT )
+	{
+		return false;
+	}
+	return true;
 }
 
 void DdgiAccelStructures::Init( nvrhi::IDevice* device )
@@ -493,21 +520,20 @@ void DdgiAccelStructures::AppendInstance( std::vector<nvrhi::rt::InstanceDesc>& 
 
 /*
 ========================
-DdgiAccelStructures::AppendStaticAreaOccluders
+DdgiAccelStructures::AppendLightShadowCasters
 
-Gather static world geometry from the camera's BSP area plus its portal-connected
-neighbours (hop-capped), independent of the view frustum, so occluders the camera
-cannot currently see still cast shadows / appear in reflections instead of popping
-as portal-area visibility flips. Deduped against surfaces already added from the view.
-
-Each portal area owns a static "_area%i" world model at entityDefs[i] (i <
-numPortalAreas) with an identity transform; we walk those models' surfaces directly.
-Surfaces whose static cache is not yet resident (area never rendered) are skipped -
-they get picked up the first frame the area is actually drawn, which is exactly when
-the pop would otherwise start.
+Widen the occluder set beyond the view frustum WITHOUT touching the live world. Every
+visible light already carries its shadow-caster surfaces (vLight->globalShadows /
+localShadows), gathered per-LIGHT by the frontend: they include casters outside the
+camera frustum (shadow maps need them), the frontend force-allocates their vertex cache
+so they are always resident, and they live in the frozen viewDef - safe to read from the
+backend, unlike the render world. Because they are keyed to the light and not the camera,
+they do NOT drop out of the TLAS when the view rotates, which is what made whole lit
+volumes go unshadowed (a caster rotating out of the frustum left the shadow ray hitting
+nothing). Deduped against the surfaces the view already contributed.
 ========================
 */
-void DdgiAccelStructures::AppendStaticAreaOccluders( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
+void DdgiAccelStructures::AppendLightShadowCasters( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
 		std::vector<nvrhi::rt::InstanceDesc>& instances, std::vector<DdgiInstanceData>& instanceData,
 		std::unordered_set<vertCacheHandle_t>& seen )
 {
@@ -516,107 +542,85 @@ void DdgiAccelStructures::AppendStaticAreaOccluders( nvrhi::ICommandList* comman
 		return;
 	}
 
-	idRenderWorldLocal* world = viewDef->renderWorld;
-	if( world == NULL || world->numPortalAreas <= 0 )
+	for( viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
 	{
-		return;
-	}
-
-	// target areas: camera area + portal-connected neighbours up to N hops. Outside the
-	// world (areaNum < 0) -> gather everything, mirroring the portal-disabled view path.
-	idList<int> areas;
-	const int camArea = world->PointInArea( viewDef->renderView.vieworg );
-	if( camArea < 0 )
-	{
-		for( int i = 0; i < world->numPortalAreas; i++ )
+		const drawSurf_t* chains[2] = { vLight->globalShadows, vLight->localShadows };
+		for( int c = 0; c < 2; c++ )
 		{
-			areas.Append( i );
-		}
-	}
-	else
-	{
-		const int maxHops = r_rtOccluderAreaHops.GetInteger();
-		idList<bool> visited;
-		visited.AssureSize( world->numPortalAreas, false );
-		idList<int> frontier;
-		visited[camArea] = true;
-		areas.Append( camArea );
-		frontier.Append( camArea );
-
-		for( int hop = 0; hop < maxHops && frontier.Num() > 0; hop++ )
-		{
-			idList<int> next;
-			for( int f = 0; f < frontier.Num(); f++ )
+			for( const drawSurf_t* surf = chains[c]; surf != NULL; surf = surf->nextOnLight )
 			{
-				const portalArea_t& pa = world->portalAreas[frontier[f]];
-				for( portal_t* p = pa.portals; p != NULL; p = p->next )
-				{
-					if( ( p->doublePortal->blockingBits & PS_BLOCK_VIEW ) != 0 )
-					{
-						continue;	// sealed by a closed door - do not gather behind it
-					}
-					const int na = p->intoArea;
-					if( na >= 0 && na < world->numPortalAreas && !visited[na] )
-					{
-						visited[na] = true;
-						areas.Append( na );
-						next.Append( na );
-					}
-				}
-			}
-			frontier = next;
-		}
-	}
-
-	for( int a = 0; a < areas.Num(); a++ )
-	{
-		const portalArea_t& pa = world->portalAreas[areas[a]];
-		for( areaReference_t* ref = pa.entityRefs.areaNext; ref != &pa.entityRefs; ref = ref->areaNext )
-		{
-			idRenderEntityLocal* ent = ref->entity;
-			// only the static per-area world models (entityDefs[0 .. numPortalAreas));
-			// movable entities are dynamic and handled by the view / skinned paths.
-			if( ent == NULL || ent->index >= world->numPortalAreas )
-			{
-				continue;
-			}
-			const idRenderModel* model = ent->parms.hModel;
-			if( model == NULL )
-			{
-				continue;
-			}
-
-			const int numSurfaces = model->NumSurfaces();
-			for( int s = 0; s < numSurfaces; s++ )
-			{
-				const modelSurface_t* msurf = model->Surface( s );
-				if( msurf == NULL || msurf->geometry == NULL )
+				if( surf->numIndexes <= 0 || surf->frontEndGeo == NULL || surf->space == NULL )
 				{
 					continue;
 				}
-				const srfTriangles_t* tri = msurf->geometry;
-				if( tri->numIndexes <= 0 )
+				// skinned/dynamic casters live in the per-frame cache; skinned actors are
+				// handled by BuildSkinnedInstances, so only static-cache geometry here.
+				if( surf->jointCache != 0 )
 				{
 					continue;
 				}
-				if( !vertexCache.CacheIsStatic( tri->ambientCache ) || !vertexCache.CacheIsStatic( tri->indexCache ) )
+				if( !vertexCache.CacheIsStatic( surf->ambientCache ) || !vertexCache.CacheIsStatic( surf->indexCache ) )
 				{
 					continue;
 				}
-				if( seen.find( tri->ambientCache ) != seen.end() )
+				if( seen.find( surf->ambientCache ) != seen.end() )
 				{
 					continue;
 				}
-				seen.insert( tri->ambientCache );
+				seen.insert( surf->ambientCache );
 
-				nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, tri->ambientCache, tri->indexCache, tri->numVerts, tri->numIndexes );
+				nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, surf->ambientCache, surf->indexCache, surf->frontEndGeo->numVerts, surf->numIndexes );
 				if( blas == NULL )
 				{
 					continue;
 				}
-				AppendInstance( instances, instanceData, blas, ent->modelMatrix, tri->ambientCache, tri->indexCache, msurf->shader );
+				AppendInstance( instances, instanceData, blas, surf->space->modelMatrix, surf->ambientCache, surf->indexCache, surf->material );
 			}
 		}
+	}
+}
+
+/*
+========================
+DdgiAccelStructures::AppendFrontendOccluders
+
+Add the static world occluders the frontend snapshotted into viewDef->rtOccluders -
+the camera's connected-area geometry, independent of the view frustum. This is the
+source that keeps shadows AND reflections of off-view geometry alive when the camera
+rotates in place. Deduped against the view + light-caster surfaces already added.
+========================
+*/
+void DdgiAccelStructures::AppendFrontendOccluders( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
+		std::vector<nvrhi::rt::InstanceDesc>& instances, std::vector<DdgiInstanceData>& instanceData,
+		std::unordered_set<vertCacheHandle_t>& seen )
+{
+	for( int i = 0; i < viewDef->numRtOccluders; i++ )
+	{
+		const rtOccluderSurf_t& o = viewDef->rtOccluders[i];
+		if( o.numIndexes <= 0 )
+		{
+			continue;
+		}
+		if( m_ShadowCastersOnly && !DDGI_MaterialCastsRTShadow( o.material ) )
+		{
+			continue;
+		}
+		if( !vertexCache.CacheIsStatic( o.ambientCache ) || !vertexCache.CacheIsStatic( o.indexCache ) )
+		{
+			continue;
+		}
+		if( seen.find( o.ambientCache ) != seen.end() )
+		{
+			continue;
+		}
+		seen.insert( o.ambientCache );
+
+		nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, o.ambientCache, o.indexCache, o.numVerts, o.numIndexes );
+		if( blas == NULL )
+		{
+			continue;
+		}
+		AppendInstance( instances, instanceData, blas, o.modelMatrix, o.ambientCache, o.indexCache, o.material );
 	}
 }
 
@@ -630,6 +634,9 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 	// static surfaces already added (keyed by ambientCache) so the wider area gather
 	// below does not double-add the geometry the view already contributed.
 	std::unordered_set<vertCacheHandle_t> seen;
+
+	// diagnostics: how the TLAS is composed this build (see r_rtAccelDebug).
+	int numViewFiltered = 0;
 
 	for( int i = 0; i < viewDef->numDrawSurfs; i++ )
 	{
@@ -654,6 +661,15 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 			continue;
 		}
 
+		// RT shadows: exclude non-casters (noShadows detail, glass/translucent) so the
+		// shadow TLAS matches the stencil caster set instead of shadowing every railing,
+		// grate and window pane in view.
+		if( m_ShadowCastersOnly && !DDGI_MaterialCastsRTShadow( surf->material ) )
+		{
+			numViewFiltered++;
+			continue;
+		}
+
 		nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, surf->ambientCache, surf->indexCache, surf->frontEndGeo->numVerts, surf->numIndexes );
 		if( blas == NULL )
 		{
@@ -664,15 +680,47 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 		seen.insert( surf->ambientCache );
 	}
 
-	// Widen beyond the frustum: gather static world occluders from the camera area +
-	// portal-connected neighbours so off-screen geometry stops popping in shadows /
-	// reflections. Deduped against the view surfaces above.
-	AppendStaticAreaOccluders( commandList, viewDef, instances, instanceData, seen );
+	const int numViewInstances = static_cast<int>( instances.size() );
+
+	// Widen beyond the frustum: add each visible light's shadow casters (entity props etc.)
+	// plus the frontend-gathered static world geometry of the camera's connected areas, so
+	// shadows AND reflections of off-view geometry survive camera rotation. Both deduped
+	// against the view surfaces above (and each other) via the shared seen set.
+	AppendLightShadowCasters( commandList, viewDef, instances, instanceData, seen );
+	const int numLightCasters = static_cast<int>( instances.size() ) - numViewInstances;
+	AppendFrontendOccluders( commandList, viewDef, instances, instanceData, seen );
+	const int numOccluders = static_cast<int>( instances.size() ) - numViewInstances - numLightCasters;
 
 	// animated actors: skin + build BLAS per skinned surface and append instances
 	BuildSkinnedInstances( commandList, viewDef, instances, instanceData );
+	const int numSkinned = static_cast<int>( instances.size() ) - numViewInstances - numLightCasters - numOccluders;
 
 	m_NumInstances = static_cast<int>( instances.size() );
+
+	// Diagnostics: report TLAS composition when it changes. Without this the pass is a
+	// black box - an empty TLAS (e.g. an over-aggressive caster filter dropping every
+	// surface) silently yields a null accel structure and a downstream binding crash,
+	// with no hint why. Print only on change to avoid per-frame spam.
+	if( r_rtAccelDebug.GetBool() )
+	{
+		static int lastTotal = -1, lastView = -1, lastLight = -1, lastOcc = -1, lastSkin = -1, lastFiltered = -1;
+		const int total = m_NumInstances;
+		if( total != lastTotal || numViewInstances != lastView || numLightCasters != lastLight ||
+				numOccluders != lastOcc || numSkinned != lastSkin || numViewFiltered != lastFiltered )
+		{
+			common->Printf( "RT accel: %i instances (view %i, lightCasters %i, occluders %i, skinned %i)%s; caster-filter dropped %i view surfaces%s\n",
+							total, numViewInstances, numLightCasters, numOccluders, numSkinned,
+							m_ShadowCastersOnly ? " [shadow]" : "",
+							numViewFiltered, ( total == 0 ) ? " -- EMPTY TLAS (nothing to trace)" : "" );
+			lastTotal = total;
+			lastView = numViewInstances;
+			lastLight = numLightCasters;
+			lastOcc = numOccluders;
+			lastSkin = numSkinned;
+			lastFiltered = numViewFiltered;
+		}
+	}
+
 	if( instances.empty() )
 	{
 		return false;

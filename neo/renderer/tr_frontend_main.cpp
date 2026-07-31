@@ -791,6 +791,210 @@ static void R_FindClosestEnvironmentProbes2()
 }
 // RB end
 
+// RT occluder gather (feeds the ray-tracing TLAS for shadows + reflections). Master
+// switch lives with the accel-struct code; radius bounds the gather to nearby areas.
+extern idCVar r_rtWorldOccluders;
+idCVar r_rtOccluderAreaHops( "r_rtOccluderAreaHops", "6", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT occluders: portal hops out from the camera area to gather static world geometry (0 = camera area only). Larger = fewer off-view shadow/reflection dropouts, more TLAS cost", 0, 64 );
+idCVar r_rtOccluderDebug( "r_rtOccluderDebug", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "print R_GatherRTOccluders stats (flooded areas / gathered surfaces) on each camera-area change" );
+
+/*
+================
+R_GatherRTOccluders
+
+Snapshot the static world geometry of the camera's portal-connected areas (frustum-
+independent) into viewDef->rtOccluders, for the ray-tracing TLAS. Runs in the single-
+threaded frontend after FindViewLightsAndEntities (so connectedAreas is known and the
+render world is safe to read), producing a frozen frame-allocated array the backend can
+consume without touching the live world. This is the occluder source that keeps shadows
+and reflections of off-view geometry alive when the camera rotates in place.
+
+Each portal area's static "_area%i" world model is entityDefs[area]; its surface caches
+are made static-resident at load, so we just read the handles (no allocation).
+================
+*/
+static void R_GatherRTOccluders( viewDef_t* viewDef )
+{
+	viewDef->rtOccluders = NULL;
+	viewDef->numRtOccluders = 0;
+
+	if( !r_rtWorldOccluders.GetBool() )
+	{
+		return;
+	}
+
+	idRenderWorldLocal* world = static_cast<idRenderWorldLocal*>( viewDef->renderWorld );
+	if( world == NULL || world->numPortalAreas <= 0 )
+	{
+		return;
+	}
+
+	// Collect nearby areas by flooding portals out from the camera area (hop-capped),
+	// through any portal not sealed by a closed door (PS_BLOCK_VIEW). This is the set of
+	// areas the camera could see into by moving/rotating. viewDef->connectedAreas is NOT
+	// this set - it collapses to just the camera area in an enclosed room (measured 1/94
+	// at the delta1 spawn), which starved the gather. Outside the world (areaNum < 0)
+	// gather every area.
+	bool* areaVisited = ( bool* )R_ClearedFrameAlloc( world->numPortalAreas * sizeof( bool ) );
+	const int camArea = viewDef->areaNum;
+	if( camArea < 0 || camArea >= world->numPortalAreas )
+	{
+		for( int a = 0; a < world->numPortalAreas; a++ )
+		{
+			areaVisited[a] = true;
+		}
+	}
+	else
+	{
+		const int maxHops = r_rtOccluderAreaHops.GetInteger();
+		int* frontier = ( int* )R_FrameAlloc( world->numPortalAreas * sizeof( int ) );
+		int* nextFrontier = ( int* )R_FrameAlloc( world->numPortalAreas * sizeof( int ) );
+		int frontierNum = 0;
+		areaVisited[camArea] = true;
+		frontier[frontierNum++] = camArea;
+		for( int hop = 0; hop < maxHops && frontierNum > 0; hop++ )
+		{
+			int nextNum = 0;
+			for( int f = 0; f < frontierNum; f++ )
+			{
+				for( portal_t* p = world->portalAreas[frontier[f]].portals; p != NULL; p = p->next )
+				{
+					if( ( p->doublePortal->blockingBits & PS_BLOCK_VIEW ) != 0 )
+					{
+						continue;	// sealed by a closed door
+					}
+					const int na = p->intoArea;
+					if( na >= 0 && na < world->numPortalAreas && !areaVisited[na] )
+					{
+						areaVisited[na] = true;
+						nextFrontier[nextNum++] = na;
+					}
+				}
+			}
+			int* tmp = frontier;
+			frontier = nextFrontier;
+			nextFrontier = tmp;
+			frontierNum = nextNum;
+		}
+	}
+
+	// Collect the unique static-model entities in the flooded areas: the per-area world
+	// model AND static props (func_static etc.), deduped by entity index. This is what
+	// the earlier area-model-only gather missed - an off-view shadow/reflection occluder
+	// is often a prop, not BSP world geometry.
+	const int numEntityDefs = world->entityDefs.Num();
+	bool* entVisited = ( bool* )R_ClearedFrameAlloc( ( numEntityDefs > 0 ? numEntityDefs : 1 ) * sizeof( bool ) );
+	idRenderEntityLocal** ents = ( idRenderEntityLocal** )R_FrameAlloc( ( numEntityDefs > 0 ? numEntityDefs : 1 ) * sizeof( idRenderEntityLocal* ) );
+	int numEnts = 0;
+	for( int a = 0; a < world->numPortalAreas; a++ )
+	{
+		if( !areaVisited[a] )
+		{
+			continue;
+		}
+		const portalArea_t& pa = world->portalAreas[a];
+		for( areaReference_t* ref = pa.entityRefs.areaNext; ref != &pa.entityRefs; ref = ref->areaNext )
+		{
+			idRenderEntityLocal* ent = ref->entity;
+			if( ent == NULL || ent->index < 0 || ent->index >= numEntityDefs || entVisited[ent->index] )
+			{
+				continue;
+			}
+			entVisited[ent->index] = true;
+			if( ent->parms.hModel == NULL )
+			{
+				continue;
+			}
+			// static geometry only: skip dynamic / procedural / skinned models - calling
+			// Surface() on those is unsafe, and they are not static occluders.
+			if( ent->parms.hModel->IsDynamicModel() != DM_STATIC )
+			{
+				continue;
+			}
+			ents[numEnts++] = ent;
+		}
+	}
+
+	// Two passes over the collected entities' surfaces: count, allocate, fill.
+	int count = 0;
+	for( int pass = 0; pass < 2; pass++ )
+	{
+		rtOccluderSurf_t* list = NULL;
+		int n = 0;
+		if( pass == 1 )
+		{
+			if( count == 0 )
+			{
+				return;
+			}
+			list = ( rtOccluderSurf_t* )R_FrameAlloc( count * sizeof( rtOccluderSurf_t ), FRAME_ALLOC_UNKNOWN );
+		}
+
+		for( int e = 0; e < numEnts; e++ )
+		{
+			idRenderEntityLocal* ent = ents[e];
+			const idRenderModel* model = ent->parms.hModel;
+			const int numSurfaces = model->NumSurfaces();
+			for( int s = 0; s < numSurfaces; s++ )
+			{
+				const modelSurface_t* msurf = model->Surface( s );
+				if( msurf == NULL || msurf->geometry == NULL )
+				{
+					continue;
+				}
+				const srfTriangles_t* tri = msurf->geometry;
+				if( tri->numIndexes <= 0 )
+				{
+					continue;
+				}
+				if( !vertexCache.CacheIsStatic( tri->ambientCache ) || !vertexCache.CacheIsStatic( tri->indexCache ) )
+				{
+					continue;
+				}
+
+				if( pass == 0 )
+				{
+					count++;
+				}
+				else
+				{
+					rtOccluderSurf_t& o = list[n++];
+					o.ambientCache = tri->ambientCache;
+					o.indexCache = tri->indexCache;
+					o.numVerts = tri->numVerts;
+					o.numIndexes = tri->numIndexes;
+					o.material = msurf->shader;
+					memcpy( o.modelMatrix, ent->modelMatrix, sizeof( o.modelMatrix ) );
+				}
+			}
+		}
+
+		if( pass == 1 )
+		{
+			viewDef->rtOccluders = list;
+			viewDef->numRtOccluders = n;
+		}
+	}
+
+	// diagnostic: print on camera-area change so we can read the numbers wherever the
+	// dropout is seen, not just at spawn. r_rtOccluderDebug 0 silences it.
+	extern idCVar r_rtOccluderDebug;
+	static int s_rtLastLoggedArea = -2;
+	if( r_rtOccluderDebug.GetBool() && camArea != s_rtLastLoggedArea )
+	{
+		s_rtLastLoggedArea = camArea;
+		int flooded = 0;
+		for( int a = 0; a < world->numPortalAreas; a++ )
+		{
+			if( areaVisited[a] )
+			{
+				flooded++;
+			}
+		}
+		common->Printf( "R_GatherRTOccluders: camArea %i, %i/%i flooded areas (%i hops), %i static ents, gathered %i occluder surfaces\n",
+						camArea, flooded, world->numPortalAreas, r_rtOccluderAreaHops.GetInteger(), numEnts, viewDef->numRtOccluders );
+	}
+}
+
 /*
 ================
 R_RenderView
@@ -849,6 +1053,10 @@ void R_RenderView( viewDef_t* parms )
 	// identify all the visible portal areas, and create view lights and view entities
 	// for all the the entityDefs and lightDefs that are in the visible portal areas
 	static_cast<idRenderWorldLocal*>( parms->renderWorld )->FindViewLightsAndEntities();
+
+	// snapshot static world occluders from the camera's connected areas for the RT TLAS
+	// (frustum-independent, so shadows / reflections of off-view geometry don't drop out)
+	R_GatherRTOccluders( tr.viewDef );
 
 	// wait for any shadow volume jobs from the previous frame to finish
 	tr.frontEndJobList->Wait();

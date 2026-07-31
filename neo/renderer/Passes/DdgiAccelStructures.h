@@ -75,6 +75,16 @@ public:
 	void			Init( nvrhi::IDevice* device );
 	void			Shutdown();
 
+	// RT shadows only: restrict the TLAS to real shadow casters - drop noShadows-flagged
+	// surfaces and translucent geometry (glass, blended). Without this the shadow TLAS
+	// includes the same detail the stencil path excludes (grates, railings, decals, window
+	// glass), which casts spurious aliased shadows and turns lit areas dark. DDGI and
+	// reflections leave this off so their rays still see that geometry.
+	void			SetShadowCastersOnly( bool b )
+	{
+		m_ShadowCastersOnly = b;
+	}
+
 	// (Re)build the TLAS for this view, building any missing static BLAS as a
 	// side effect. Returns true when a non-empty TLAS is ready to trace against.
 	bool			RebuildFromView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef );
@@ -131,11 +141,19 @@ private:
 									vertCacheHandle_t ambientCache, vertCacheHandle_t indexCache,
 									const idMaterial* material );
 
-	// Widen the occluder set beyond the view frustum: gather the static world geometry
-	// of the camera's BSP area plus its portal-connected neighbours (hop-capped), so
-	// shadows / reflections of geometry the camera cannot currently see stop popping as
-	// portal-area visibility flips. Deduped against surfaces already added from the view.
-	void			AppendStaticAreaOccluders( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
+	// Widen the occluder set beyond the view frustum by adding each visible light's
+	// shadow-caster surfaces (vLight->globalShadows/localShadows) - a frozen viewDef
+	// snapshot the frontend already builds, force-resident and per-light, so off-view
+	// casters stay in the TLAS under camera rotation. Deduped against the view surfaces.
+	void			AppendLightShadowCasters( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
+			std::vector<nvrhi::rt::InstanceDesc>& instances,
+			std::vector<DdgiInstanceData>& instanceData,
+			std::unordered_set<vertCacheHandle_t>& seen );
+
+	// Add the frontend-gathered static world occluders (viewDef->rtOccluders): the
+	// camera's connected-area geometry, frustum-independent, for shadows AND reflections.
+	// A frozen frame-allocated snapshot (see R_GatherRTOccluders), safe to read here.
+	void			AppendFrontendOccluders( nvrhi::ICommandList* commandList, const viewDef_t* viewDef,
 			std::vector<nvrhi::rt::InstanceDesc>& instances,
 			std::vector<DdgiInstanceData>& instanceData,
 			std::unordered_set<vertCacheHandle_t>& seen );
@@ -148,6 +166,9 @@ private:
 										   std::vector<nvrhi::rt::InstanceDesc>& instances,
 										   std::vector<DdgiInstanceData>& instanceData );
 	void			EnsureSkinPipeline();
+
+	// RT shadows only: build the TLAS from real shadow casters (see SetShadowCastersOnly).
+	bool							m_ShadowCastersOnly;
 
 	nvrhi::DeviceHandle				m_Device;
 	nvrhi::rt::AccelStructHandle	m_Tlas;

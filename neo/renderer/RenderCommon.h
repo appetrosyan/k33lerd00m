@@ -528,6 +528,18 @@ enum
 typedef idPlane frustum_t[FRUSTUM_PLANES];
 // RB end
 
+// One static world occluder surface gathered for the ray-tracing TLAS. Carries just
+// what the BLAS/instance build needs, read from the load-resident static vertex cache.
+struct rtOccluderSurf_t
+{
+	vertCacheHandle_t	ambientCache;
+	vertCacheHandle_t	indexCache;
+	int					numVerts;
+	int					numIndexes;
+	const idMaterial*	material;
+	float				modelMatrix[16];
+};
+
 // viewDefs are allocated on the frame temporary stack memory
 struct viewDef_t
 {
@@ -608,6 +620,13 @@ struct viewDef_t
 	// crossing a closed door.  This is used to avoid drawing interactions
 	// when the light is behind a closed door.
 	bool* 				connectedAreas;
+
+	// Static world occluder surfaces gathered per-frame from the camera's connected
+	// areas (frustum-independent), for the ray-tracing TLAS. Frame-allocated snapshot so
+	// the backend can read it safely; feeds RT shadows AND reflections so off-view
+	// geometry does not drop out when the camera rotates. See R_GatherRTOccluders.
+	rtOccluderSurf_t*	rtOccluders;
+	int					numRtOccluders;
 
 	// RB: collect environment probes like lights
 	viewEnvprobe_t*		viewEnvprobes;

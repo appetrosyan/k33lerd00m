@@ -42,6 +42,7 @@ If you have questions concerning this license or the applicable additional terms
 
 extern idCVar r_useAreasConnectedForShadowCulling;
 extern idCVar r_useParallelAddShadows;
+extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
 extern idCVar r_forceShadowCaps;
 extern idCVar r_useShadowPreciseInsideTest;
 
@@ -600,8 +601,12 @@ static void R_AddSingleLight( viewLight_t* vLight )
 			// of those cases.
 
 			// this doesn't say that the shadow can't effect anything, only that it can't
-			// effect anything in the view, so we shouldn't set up a view entity
-			if( idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
+			// effect anything in the view, so we shouldn't set up a view entity.
+			// RT shadows trace the actual scene: an occluder whose shadow does not land
+			// in the current frame can still be hit by a shadow ray once the camera turns,
+			// so keep it in the caster set (this is what stops lit volumes going bright
+			// when a window / portal to the occluder rotates out of view).
+			if( !r_useRTShadows.GetBool() && idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
 			{
 				continue;
 			}
