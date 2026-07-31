@@ -97,11 +97,24 @@ float TraceVisibility( float3 origin, float3 dir, float tmax )
 	RayDesc ray;
 	ray.Origin = origin;
 	ray.Direction = dir;
-	ray.TMin = 0.0f;
+	// Skip the first `bias` world units along the ray so a receiver-coplanar surface
+	// (Doom stacks decals / light panels z-fighting on walls) does not self-occlude the
+	// flashlight cone. Combined with the N*bias origin offset in main().
+	ray.TMin = g_Sh.params.x;
 	ray.TMax = tmax;
 
+	// Backface culling (g_Sh.pad.x) removes back-facing triangles as occluders - the
+	// back side of a thin or coplanar surface is not between the receiver and the light,
+	// so counting it produces the wrong shadow (the flashlight-cone artifact). Toggled by
+	// r_rtShadowBackfaceCull in case any one-sided world geometry light-leaks with it on.
+	uint rayFlags = RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+	if( g_Sh.pad.x != 0 )
+	{
+		rayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+	}
+
 	RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-	q.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray );
+	q.TraceRayInline( t_TLAS, rayFlags, 0xFF, ray );
 	q.Proceed();
 
 	return ( q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ) ? 0.0f : 1.0f;

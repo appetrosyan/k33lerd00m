@@ -37,6 +37,7 @@ extern idCVar r_useRTShadows;
 idCVar r_rtShadowBias( "r_rtShadowBias", "1.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: ray origin bias along the surface normal (self-intersection)" );
 idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: visibility rays per pixel (1 = hard shadow; >1 = brute-force soft, no denoiser)", 1, 16 );
 idCVar r_rtShadowSoftRadius( "r_rtShadowSoftRadius", "12.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: light radius in world units used for soft penumbra when r_rtShadowRays > 1" );
+idCVar r_rtShadowBackfaceCull( "r_rtShadowBackfaceCull", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: cull back-facing triangles as occluders so coplanar/thin back-side surfaces don't wrongly shadow (fixes flashlight-cone z-fighting); 0 if it light-leaks on one-sided geometry" );
 
 RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
@@ -189,6 +190,7 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 							   ( float )r_rtShadowRays.GetInteger(),
 							   ( float )( tr.frameCount & 1023 ) );
 	constants.screenSize = idVec2i( width, height );
+	constants.pad = idVec2i( r_rtShadowBackfaceCull.GetBool() ? 1 : 0, 0 );
 
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 
