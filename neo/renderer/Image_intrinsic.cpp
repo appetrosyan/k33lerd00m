@@ -258,13 +258,19 @@ static void R_RGBA8LinearImage( idImage* image, nvrhi::ICommandList* commandList
 static void R_LdrNativeImage( idImage* image, nvrhi::ICommandList* commandList )
 {
 	// HDR output needs the final composite buffer to hold linear extended-range
-	// values (scRGB), so use FP16 instead of 8-bit when r_hdrOutput is set. It also
-	// needs to be a UAV so the 2D UI composite (HdrGuiCompositePass) can blend the
-	// isolated GUI layer into it in place.
+	// values (scRGB), so use FP16 instead of 8-bit when r_hdrOutput is set.
+	//
+	// The UAV flag must be UNCONDITIONAL, not gated on r_hdrOutput here: the 2D UI
+	// composite (HdrGuiCompositePass) binds this image as a UAV whenever HDR output
+	// is on, but this generator can run while HDR is off (e.g. before the archived
+	// r_hdrOutput is applied at startup, or after an off->on toggle regenerates other
+	// state first). Generating without isUAV then binding it as a UAV made the nvrhi
+	// validation layer FatalError ("_currentRenderLDR ... does not have the isUAV
+	// flag set"). The flag is harmless on the 8-bit SDR image, so always request it.
 	extern idCVar r_hdrOutput;
 	const bool hdr = r_hdrOutput.GetBool();
 	const textureUsage_t usage = hdr ? TD_RGBA16F : TD_LOOKUP_TABLE_RGBA;
-	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, hdr, 1 );
+	image->GenerateImage( NULL, renderSystem->GetWidth(), renderSystem->GetHeight(), TF_NEAREST, TR_CLAMP, usage, nullptr, true, true, 1 );
 }
 
 static void R_GuiCompositeImage( idImage* image, nvrhi::ICommandList* commandList )

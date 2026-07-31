@@ -46,8 +46,8 @@ struct HdrGuiConstants
 
 HdrGuiCompositePass::HdrGuiCompositePass( nvrhi::IDevice* device )
 	: m_Device( device )
-	, m_BoundGui( nullptr )
-	, m_BoundLdr( nullptr )
+	, m_BoundGuiTex( nullptr )
+	, m_BoundLdrTex( nullptr )
 	, m_Valid( false )
 {
 	idList<shaderMacro_t> macros;
@@ -110,6 +110,17 @@ void HdrGuiCompositePass::Render( nvrhi::ICommandList* commandList )
 		return;
 	}
 
+	// The idImage may exist while its GPU texture is not (re)allocated yet - e.g. the
+	// frame right after a vid_restart / ReloadImages, exactly what toggling r_hdrOutput
+	// triggers. Binding a null texture makes the nvrhi validation layer FatalError, so
+	// skip this frame until both textures are live.
+	nvrhi::ITexture* guiTex = gui->GetTextureHandle();
+	nvrhi::ITexture* ldrTex = ldr->GetTextureHandle();
+	if( guiTex == NULL || ldrTex == NULL )
+	{
+		return;
+	}
+
 	HdrGuiConstants constants;
 	constants.paperScale = Max( 1.0f, r_hdrGuiPaperWhiteNits.GetFloat() ) / 80.0f;
 	constants.width = width;
@@ -117,19 +128,22 @@ void HdrGuiCompositePass::Render( nvrhi::ICommandList* commandList )
 	constants.pad = 0;
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 
-	// (re)build the binding set when the backing images change (resize / reload)
-	if( m_BindingSet == nullptr || m_BoundGui != gui || m_BoundLdr != ldr )
+	// (re)build the binding set when the backing GPU textures change. Compare texture
+	// handles, not idImage pointers: a resize/reload/vid_restart reallocates the
+	// texture under the same idImage, and a stale cached handle here is a use-after-
+	// free that the validation layer turns into a FatalError.
+	if( m_BindingSet == nullptr || m_BoundGuiTex != guiTex || m_BoundLdrTex != ldrTex )
 	{
 		nvrhi::BindingSetDesc setDesc;
 		setDesc.bindings =
 		{
-			nvrhi::BindingSetItem::Texture_SRV( 0, gui->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_SRV( 0, guiTex ),
 			nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
-			nvrhi::BindingSetItem::Texture_UAV( 0, ldr->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_UAV( 0, ldrTex ),
 		};
 		m_BindingSet = m_Device->createBindingSet( setDesc, m_BindingLayout );
-		m_BoundGui = gui;
-		m_BoundLdr = ldr;
+		m_BoundGuiTex = guiTex;
+		m_BoundLdrTex = ldrTex;
 	}
 
 	nvrhi::ComputeState state;

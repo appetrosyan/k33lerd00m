@@ -60,9 +60,13 @@ private:
 	nvrhi::BindingSetHandle			m_BindingSet;
 	nvrhi::ComputePipelineHandle	m_Pipeline;
 
-	// rebuild the binding set when the backing images are (re)created on resize
-	idImage*						m_BoundGui;
-	idImage*						m_BoundLdr;
+	// rebuild the binding set when the backing GPU textures are (re)created on a
+	// resize / reload / vid_restart. Tracked by texture handle, NOT idImage pointer:
+	// ReloadImages/ResizeFramebuffers reallocate the texture while keeping the same
+	// idImage object, so a pointer check would keep a stale (freed) handle bound.
+	// Non-owning raw pointers, for identity comparison only.
+	nvrhi::ITexture*				m_BoundGuiTex;
+	nvrhi::ITexture*				m_BoundLdrTex;
 
 	bool							m_Valid;
 };
