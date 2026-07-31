@@ -158,7 +158,11 @@ void main(
 		else
 		{
 			const int n = int( ceil( ssaa ) );
-			const int2 base = int2( pos.xy * ssaa );
+			// key the source block off the integer native pixel index, not the pixel
+			// centre: pos.xy is (index + 0.5), so pos.xy*ssaa shifts every block by
+			// 0.5*ssaa source texels (half-pixel ghosting at 2x, overlapping/skipping
+			// blocks at 1.5x). floor(pos.xy)*ssaa gives the exact non-overlapping block.
+			const int2 base = int2( floor( pos.xy ) * ssaa );
 			float4 acc = float4( 0.0, 0.0, 0.0, 0.0 );
 			float wsum = 0.0;
 			for( int y = 0; y < n; y++ )
