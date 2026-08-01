@@ -85,6 +85,17 @@ public:
 		m_ShadowCastersOnly = b;
 	}
 
+	// RT shadows only: skip the 94-area frontend flood-occluder gather (AppendFrontendOccluders,
+	// the bulk of the TLAS - thousands of instances every frame). The per-light shadow-caster
+	// chains (AppendLightShadowCasters, vLight->globalShadows/localShadows) already carry every
+	// occluder that shadows a visible light, including off-frustum ones, so for SHADOWS the flood
+	// gather is redundant; dropping it shrinks the shadow TLAS from thousands to hundreds (faster
+	// build AND faster rays). Reflections/DDGI leave this off - they genuinely need the wide world.
+	void			SetSkipFrontendOccluders( bool b )
+	{
+		m_SkipFrontendOccluders = b;
+	}
+
 	// (Re)build the TLAS for this view, building any missing static BLAS as a
 	// side effect. Returns true when a non-empty TLAS is ready to trace against.
 	bool			RebuildFromView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef );
@@ -170,10 +181,15 @@ private:
 	// RT shadows only: build the TLAS from real shadow casters (see SetShadowCastersOnly).
 	bool							m_ShadowCastersOnly;
 
+	// RT shadows only: skip the wide 94-area flood gather (see SetSkipFrontendOccluders).
+	bool							m_SkipFrontendOccluders;
+
 	nvrhi::DeviceHandle				m_Device;
 	nvrhi::rt::AccelStructHandle	m_Tlas;
 	size_t							m_TlasCapacity;
 	int								m_NumInstances;
+	int								m_NumShadowBrushInstances = 0;	// diagnostics: textures/common/shadow casters in the TLAS
+	int								m_LastShadowBrushInstances = -1;
 
 	nvrhi::BufferHandle				m_InstanceDataBuffer;
 	size_t							m_InstanceDataCapacity;	// in instances

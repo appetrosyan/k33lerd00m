@@ -37,19 +37,25 @@ extern idCVar r_useRTShadows;
 idCVar r_rtShadowBias( "r_rtShadowBias", "1.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: ray origin bias along the surface normal (self-intersection)" );
 idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: visibility rays per pixel (1 = hard shadow; >1 = brute-force soft, no denoiser)", 1, 16 );
 idCVar r_rtShadowSoftRadius( "r_rtShadowSoftRadius", "12.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: light radius in world units used for soft penumbra when r_rtShadowRays > 1" );
-idCVar r_rtShadowBackfaceCull( "r_rtShadowBackfaceCull", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: cull back-facing triangles as occluders. 0 = one-sided world walls occlude correctly (default); 1 = drop coplanar/thin back faces (helps the flashlight cone but light-leaks through one-sided geometry)" );
+idCVar r_rtShadowBackfaceCull( "r_rtShadowBackfaceCull", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT shadows ray face culling (debug). 0 = two-sided, occlude regardless of facing (default; matches stencil, no facing seam on single-sided world geometry); 1 = cull back faces; 2 = cull front faces. NOT archived - two-sided is the correct default.", 0, 2 );
 // Keep lights that portal-culling would drop (a light reachable only through a hidden
 // window). Default OFF: it also pulls in lights that then over-illuminate rooms they
 // should not reach, which read as "bright where it should be dark". Gate for tr_frontend.
 idCVar r_rtShadowExtraLights( "r_rtShadowExtraLights", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows: keep shadow-casting lights in view even when their frustum misses the visible portal chain. 0 = original light culling (no phantom illumination); 1 = keep them (fixes shadows from lights only reachable through a window, but can over-light)" );
 idCVar r_rtShadowUmbra( "r_rtShadowUmbra", "0.15", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT shadows: minimum shadow term (umbra light floor). RT visibility is binary and pitch-black; a small floor gives back the shipped stencil shadows' gentler darkening without softening the edge. 0 = hard black umbra", 0.0f, 1.0f );
-idCVar r_rtShadowForce( "r_rtShadowForce", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT shadows debug: 0 = normal, 1 = force the whole mask fully shadowed (black), 2 = force fully lit (white). If forcing 1 does NOT darken an area, that area is not lit by an RT-shadowed light - its brightness comes from ambient / DDGI / a non-RT light.", 0, 2 );
+idCVar r_rtShadowForce( "r_rtShadowForce", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT shadows debug: 0 = normal, 1 = force the whole mask fully shadowed (black), 2 = force fully lit, 3 = hit distance, 4 = primary-ray TLAS coverage probe (green=surface in TLAS, blue=occluded, red=MISSING). If forcing 1 does NOT darken an area, that area is not lit by an RT-shadowed light - its brightness comes from ambient / DDGI / a non-RT light. 5/6 = bisection: plain binary occlusion, generous t-range, 5 toward light / 6 straight up.", 0, 6 );
 idCVar r_rtShadowShowMask( "r_rtShadowShowMask", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows debug: blit the last light's visibility mask over the scene (red = lit, dark = shadowed) to check its spatial registration against the lit geometry" );
 // Build the shadow TLAS from real shadow casters only (honour noShadows, drop translucent
 // glass). Default ON so RT shadows match the stencil caster set. Toggle OFF to confirm the
 // mechanism: the stipple / spurious shadows from grates, railings, decals and window glass
 // come back, because those surfaces then re-enter the shadow acceleration structure.
 idCVar r_rtShadowCasterFilter( "r_rtShadowCasterFilter", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows: restrict the shadow TLAS to real casters (skip noShadows + translucent surfaces). 0 = add all static geometry (spurious detail shadows / glass blocks light)" );
+// Perf: the shadow TLAS omits the wide 94-area frontend flood-occluder gather (thousands of
+// instances/frame). The per-light shadow-caster chains (vLight->globalShadows/localShadows)
+// already carry every occluder that shadows a visible light, incl. off-frustum ones, so for
+// shadows the flood is redundant - dropping it shrinks the TLAS from thousands to hundreds
+// (faster build AND faster rays). 0 restores the flood if a missing off-view shadow appears.
+idCVar r_rtShadowSkipWorldFlood( "r_rtShadowSkipWorldFlood", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows: skip the wide 94-area flood-occluder gather in the shadow TLAS (per-light casters cover shadows). 0 = keep the flood (slower; only needed if an off-view shadow is missing)" );
 // Perf: dispatch the visibility trace over only the light's screen-space scissor rect
 // instead of the whole framebuffer. A light that touches a small screen region then traces
 // rays for just those pixels (its interactions are scissored to the same rect anyway).
@@ -154,6 +160,7 @@ bool RtShadowsPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t
 	}
 
 	m_AccelStructs.SetShadowCastersOnly( r_rtShadowCasterFilter.GetBool() );
+	m_AccelStructs.SetSkipFrontendOccluders( r_rtShadowSkipWorldFlood.GetBool() );
 	m_ViewReady = m_AccelStructs.RebuildFromView( commandList, viewDef );
 
 	if( m_ViewReady && !loggedFirstBuild )
@@ -208,27 +215,21 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 							   ( float )r_rtShadowRays.GetInteger(),
 							   ( float )( tr.frameCount & 1023 ) );
 	constants.screenSize = idVec2i( width, height );
-	constants.pad = idVec2i( r_rtShadowBackfaceCull.GetBool() ? 1 : 0, r_rtShadowForce.GetInteger() );
+	constants.pad = idVec2i( r_rtShadowBackfaceCull.GetInteger(), r_rtShadowForce.GetInteger() );
 
-	// Dispatch only over the light's screen scissor rect. The mask / gbuffer are top-left
-	// origin (SV_Position), while vLight->scissorRect is Doom's bottom-left screen space
-	// (y increasing upward, y2 = top edge) - so the rect's top row in mask space is
-	// height-1-y2. Fall back to full-screen if scissor is disabled or empty.
+	// Dispatch the mask over the FULL screen. The scissor-rect optimisation limited the mask to
+	// the light's screen rect, but its top-left conversion (height-1-y2) assumes a full-height
+	// viewport, while RenderInteractions reads the mask at (viewport.y2 - y2). When the viewport
+	// is not full-height those disagree, so the mask is written in one band and sampled in
+	// another - the shadow ends at a hard straight rectangle edge with lit floor right past it.
+	// Computing the whole mask makes the read alignment irrelevant (each light overwrites the
+	// shared mask and its scissored interactions sample only their own region). A correctly
+	// aligned scissor dispatch can be restored later as a perf optimisation. r_rtShadowScissor
+	// is retained for A/B testing but no longer gates the dispatch.
 	int dispX = 0, dispY = 0, dispW = width, dispH = height;
-	if( r_rtShadowScissor.GetBool() && r_useScissor.GetBool() )
-	{
-		const idScreenRect& sc = vLight->scissorRect;
-		const int sw = sc.x2 - sc.x1 + 1;
-		const int sh = sc.y2 - sc.y1 + 1;
-		if( sw > 0 && sh > 0 )
-		{
-			dispX = idMath::ClampInt( 0, width - 1, ( int )sc.x1 );
-			dispY = idMath::ClampInt( 0, height - 1, height - 1 - ( int )sc.y2 );
-			dispW = Min( sw, width - dispX );
-			dispH = Min( sh, height - dispY );
-		}
-	}
 	constants.scissorMin = idVec2i( dispX, dispY );
+	const idVec3& eye = viewDef->renderView.vieworg;
+	constants.cameraOrigin = idVec4( eye.x, eye.y, eye.z, 0.0f );
 
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 

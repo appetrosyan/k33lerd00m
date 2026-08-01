@@ -50,7 +50,16 @@ idCVar r_forceShadowCaps( "r_forceShadowCaps", "0", CVAR_RENDERER | CVAR_BOOL, "
 // WIP: restore stencil shadow volumes. When on, static shadow-casting surfaces build a
 // stencil shadow-volume drawSurf (into vLight->globalShadows/localShadows) instead of a
 // shadow-map caster. M4 will fold this into an r_shadowMethod selector, default stencil.
-idCVar r_useStencilShadows( "r_useStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "use stencil shadow volumes instead of shadow maps (WIP)" );
+idCVar r_useStencilShadows( "r_useStencilShadows", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "use stencil shadow volumes instead of shadow maps (WIP)" );
+
+// M2 diagnostics: cumulative tallies of stencil-volume caster gate outcomes (see R_AddSingleModel).
+// Printed by DrawInteractions when r_showShadows is set; names the missing prerequisite when 0 volumes build.
+int fe_stencilBuilt = 0;
+int fe_rejSilEdges = 0;
+int fe_rejSurfInter = 0;
+int fe_rejNumIdx = 0;
+int fe_rejIdxStale = 0;
+int fe_rejShadowCache = 0;
 // RB begin
 idCVar r_forceShadowMapsOnAlphaTestedSurfaces( "r_forceShadowMapsOnAlphaTestedSurfaces", "1", CVAR_RENDERER | CVAR_BOOL, "0 = same shadowing as with stencil shadows, 1 = ignore noshadows for alpha tested materials" );
 // RB end
@@ -58,6 +67,53 @@ idCVar r_forceShadowMapsOnAlphaTestedSurfaces( "r_forceShadowMapsOnAlphaTestedSu
 idCVar r_lodMaterialDistance( "r_lodMaterialDistance", "500", CVAR_RENDERER | CVAR_FLOAT, "surfaces further than this distance will use lower quality versions (if their material uses the lod1-4 keywords, persistentLOD disables the max distance checks)" );
 
 static const float CHECK_BOUNDS_EPSILON = 1.0f;
+
+// Stencil shadow volumes: how far to stretch the near-clip expansion of the inside test.
+// (In theory should vary with FOV.) Restored from DOOM-3-BFG jobs/ShadowShared.
+static const float INSIDE_SHADOW_VOLUME_EXTRA_STRETCH = 4.0f;
+
+/*
+======================
+R_ViewPotentiallyInsideInfiniteShadowVolume
+
+If we know that we are "off to the side" of an infinite shadow volume, we can draw it without
+caps in Z-pass mode - which avoids the projected-to-infinity far cap entirely. Only when the
+view might be inside the volume do we need Z-fail with caps. Restored verbatim from the deleted
+DOOM-3-BFG jobs/ShadowShared.cpp so the stencil pass can choose Z-pass at a distance (the common
+case) instead of forcing Z-fail everywhere - forcing Z-fail draws the far cap for every caster,
+and against distant scene depth that cap paints phantom shadows down long corridors.
+======================
+*/
+static bool R_ViewPotentiallyInsideInfiniteShadowVolume( const idBounds& occluderBounds, const idVec3& localLight, const idVec3& localView, const float zNear )
+{
+	// Expand the bounds to account for the near clip plane, because the view could be
+	// mathematically outside, but if the near clip plane chops a volume edge then the
+	// Z-pass rendering would fail.
+	const idBounds expandedBounds = occluderBounds.Expand( zNear );
+
+	// If the view is inside the geometry bounding box then the view is also inside the shadow projection.
+	if( expandedBounds.ContainsPoint( localView ) )
+	{
+		return true;
+	}
+
+	// If the light is inside the geometry bounding box then the shadow is projected in all
+	// directions and any view position is inside the infinite shadow projection.
+	if( expandedBounds.ContainsPoint( localLight ) )
+	{
+		return true;
+	}
+
+	// If the line from localLight to localView intersects the geometry bounding box then the
+	// view is inside the infinite shadow projection.
+	if( expandedBounds.LineIntersection( localLight, localView ) )
+	{
+		return true;
+	}
+
+	// The view is definitely not inside the projected shadow.
+	return false;
+}
 
 
 
@@ -425,9 +481,18 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				R_ShadowBounds( entityDef->globalReferenceBounds, lightDef->globalLightBounds, lightDef->globalLightOrigin, shadowBounds );
 
 				// this doesn't say that the shadow can't effect anything, only that it can't
-				// effect anything in the view. RT shadows keep off-view casters (see the
-				// matching gate in tr_frontend_addlights.cpp).
-				if( !r_useRTShadows.GetBool() && idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
+				// effect anything in the view. Only ray-traced shadows need off-view casters
+				// (their TLAS gathers occluders behind the view); stencil shadow volumes render
+				// into the view, so a caster whose shadow bounds miss the frustum can't affect it
+				// and MUST be culled - otherwise its volume's far cap paints phantom shadows on
+				// distant surfaces that vanish as the caster comes into view. So keep off-view
+				// casters only when RT shadows are the active method, not merely when the archived
+				// r_useRTShadows cvar lingers on alongside stencil.
+				// Shadow-method precedence: RT wins when on, else stencil, else shadow maps. RT is the
+				// only method that needs off-view casters (its TLAS traces them), so keep them exactly
+				// when RT is the active method - stencil renders volumes into the view and must cull.
+				const bool keepOffViewCasters = r_useRTShadows.GetBool();
+				if( !keepOffViewCasters && idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
 				{
 					continue;
 				}
@@ -1084,37 +1149,127 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				continue;
 			}
 
-			// stencil shadow volumes: build a shadow-volume drawSurf from the precomputed static
-			// volume (its indexes reference the ambient surface's doubled shadowCache) and link it
-			// into the light's global/local shadow chain, then skip the shadow-map occluder path.
-			// M1: static surfaces only, always z-fail with caps (robust; z-pass + cap selection is
-			// a later optimisation). Dynamic / GPU-skinned casters still fall through for now.
-			if( r_useStencilShadows.GetBool() && tri->silEdges != NULL &&
-					surfInter != NULL && surfInter->numShadowIndexes > 0 &&
-					vertexCache.CacheIsCurrent( surfInter->shadowIndexCache ) &&
-					vertexCache.CacheIsCurrent( tri->shadowCache ) )
+			// stencil shadow volumes: build a shadow-volume drawSurf from the surface's static
+			// shadow volume (indexes in surfInter->shadowIndexCache reference the surface's doubled
+			// static shadowCache, both built at load) and link it into the light's global/local
+			// shadow chain, then skip the shadow-map occluder path. M2: static casters only (their
+			// shadowCache is a static buffer); always z-fail with caps (z-pass + cap selection is a
+			// later optimisation). Dynamic / GPU-skinned casters fall through to shadow maps for now.
+			if( r_useStencilShadows.GetBool() && !r_useRTShadows.GetBool() )	// RT takes precedence when both are on
 			{
-				drawSurf_t* shadowDrawSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *shadowDrawSurf ), FRAME_ALLOC_DRAW_SURFACE );
+				// stencil mode: build a shadow-VOLUME drawSurf if this static caster has one. Crucially
+				// we NEVER build a shadow-MAP occluder in this mode - those carry ambientCache, not
+				// shadowCache, and the stencil pass (which walks vLight->globalShadows/localShadows)
+				// would try to draw them as volumes and fail. So continue regardless. M2: static
+				// casters only; always z-fail with caps (z-pass + cap selection is a later opt).
+				// M2 diagnostics: tally why casters are accepted/rejected for a stencil volume.
+				extern int fe_stencilBuilt, fe_rejSilEdges, fe_rejSurfInter, fe_rejNumIdx, fe_rejIdxStale, fe_rejShadowCache;
+				if( tri->silEdges == NULL )			fe_rejSilEdges++;
+				else if( surfInter == NULL )			fe_rejSurfInter++;
+				else if( surfInter->numShadowIndexes <= 0 )	fe_rejNumIdx++;
+				else if( !vertexCache.CacheIsCurrent( surfInter->shadowIndexCache ) )	fe_rejIdxStale++;
+				else if( !vertexCache.CacheIsStatic( tri->shadowCache ) )	fe_rejShadowCache++;
+				else						fe_stencilBuilt++;
 
-				shadowDrawSurf->numIndexes = surfInter->numShadowIndexes;	// with caps
-				shadowDrawSurf->indexCache = surfInter->shadowIndexCache;
-				shadowDrawSurf->shadowCache = tri->shadowCache;
-				shadowDrawSurf->ambientCache = 0;
-				shadowDrawSurf->jointCache = 0;
-				shadowDrawSurf->frontEndGeo = NULL;
-				shadowDrawSurf->space = vEntity;
-				shadowDrawSurf->material = NULL;
-				shadowDrawSurf->extraGLState = 0;
-				shadowDrawSurf->scissorRect = vLight->scissorRect;
-				shadowDrawSurf->sort = 0.0f;
-				shadowDrawSurf->renderZFail = 1;	// M1: always z-fail (correct when the view is inside the volume)
-				shadowDrawSurf->shaderRegisters = NULL;
+				// diagnostics: with r_singleLight + r_listViewLights, name every accepted stencil
+				// caster so an enveloping/broken volume can be traced to its source surface.
+				extern idCVar r_listViewLights;
+				if( r_listViewLights.GetBool() && r_singleLight.GetInteger() == vLight->lightDef->index &&
+						tri->silEdges != NULL && surfInter != NULL && surfInter->numShadowIndexes > 0 )
+				{
+					common->Printf( "stencilCaster light %i: ent %i model '%s' shader '%s' tris %i shadowIdx %i bounds (%.0f %.0f %.0f)-(%.0f %.0f %.0f)\n",
+									vLight->lightDef->index, entityDef->index,
+									entityDef->parms.hModel ? entityDef->parms.hModel->Name() : "?",
+									shader->GetName(), tri->numIndexes / 3, surfInter->numShadowIndexes,
+									tri->bounds[0].x, tri->bounds[0].y, tri->bounds[0].z,
+									tri->bounds[1].x, tri->bounds[1].y, tri->bounds[1].z );
+				}
 
-				shadowDrawSurf->linkChain = shader->TestMaterialFlag( MF_NOSELFSHADOW ) ? &vLight->localShadows : &vLight->globalShadows;
-				shadowDrawSurf->nextOnLight = vEntity->drawSurfs;
-				vEntity->drawSurfs = shadowDrawSurf;
+				if( tri->silEdges != NULL && surfInter != NULL && surfInter->numShadowIndexes > 0 &&
+						vertexCache.CacheIsCurrent( surfInter->shadowIndexCache ) &&
+						vertexCache.CacheIsStatic( tri->shadowCache ) )
+				{
+					drawSurf_t* shadowDrawSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *shadowDrawSurf ), FRAME_ALLOC_DRAW_SURFACE );
 
-				continue;	// stencil volume built; skip the shadow-map occluder path for this surface
+					// Z-pass vs Z-fail: force Z-fail (full front+rear caps) only when the view might be
+						// inside this caster's infinite shadow volume; otherwise Z-pass with NO caps. Z-pass
+						// omits the projected-to-infinity far cap - forcing that cap for every caster is what
+						// paints phantom shadows on distant geometry down long corridors (dark at range, lit
+						// up close). localView/localLightOrigin are in this entity's model space.
+						const bool viewMaybeInside = R_ViewPotentiallyInsideInfiniteShadowVolume(
+								tri->bounds, localLightOrigin, localViewOrigin,
+								r_znear.GetFloat() * INSIDE_SHADOW_VOLUME_EXTRA_STRETCH );
+						shadowDrawSurf->numIndexes = viewMaybeInside ? surfInter->numShadowIndexes : surfInter->numShadowIndexesNoCaps;
+					shadowDrawSurf->indexCache = surfInter->shadowIndexCache;
+					shadowDrawSurf->shadowCache = tri->shadowCache;
+					shadowDrawSurf->ambientCache = 0;
+					shadowDrawSurf->jointCache = 0;
+					shadowDrawSurf->frontEndGeo = NULL;
+					shadowDrawSurf->space = vEntity;
+					shadowDrawSurf->material = NULL;
+					shadowDrawSurf->extraGLState = 0;
+					shadowDrawSurf->scissorRect = vLight->scissorRect;
+					shadowDrawSurf->sort = 0.0f;
+					shadowDrawSurf->renderZFail = viewMaybeInside ? 1 : 0;	// Z-fail (with caps) only when possibly inside
+					shadowDrawSurf->shaderRegisters = NULL;
+
+					shadowDrawSurf->linkChain = shader->TestMaterialFlag( MF_NOSELFSHADOW ) ? &vLight->localShadows : &vLight->globalShadows;
+					shadowDrawSurf->nextOnLight = vEntity->drawSurfs;
+					vEntity->drawSurfs = shadowDrawSurf;
+				}
+
+				continue;	// stencil mode never uses the shadow-map occluder path
+			}
+
+			// RT shadows: put into the world TLAS EXACTLY the casters stencil shadows this light
+			// from - gated on surfInter->numShadowIndexes > 0 (a precomputed shadow interaction
+			// exists for THIS surface+light pair), the same criterion the stencil branch above uses.
+			// This is the unification: same occluder set, so RT and stencil agree. Do NOT add every
+			// shadow-casting surface unconditionally - that throws the whole level at each light
+			// (surfaces it neither lights nor casts for become false occluders), which drowned the
+			// flashlight in spurious shadow. Use the caster's FULL static geometry (frontEndGeo +
+			// full ambient/index cache, NOT the light-frustum-culled lightTrisIndexCache subset,
+			// whose missing triangles let shadow rays through -> cut-off shadows). AppendLightShadow-
+			// Casters builds one BLAS per unique ambientCache and dedupes against the flood gather.
+			// Static caches only: skinned/dynamic casters are handled by BuildSkinnedInstances /
+			// out of M-scope (matches stencil, which also needs surfInter != NULL). Then skip the
+			// shadow-map occluder path (RT visibility masks replace it).
+			if( r_useRTShadows.GetBool() )
+			{
+				if( surfInter != NULL && surfInter->numShadowIndexes > 0 && tri->numIndexes > 0 &&
+						vertexCache.CacheIsStatic( tri->ambientCache ) && vertexCache.CacheIsStatic( tri->indexCache ) )
+				{
+					drawSurf_t* shadowDrawSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *shadowDrawSurf ), FRAME_ALLOC_DRAW_SURFACE );
+					shadowDrawSurf->numIndexes = tri->numIndexes;
+					shadowDrawSurf->indexCache = tri->indexCache;
+					shadowDrawSurf->ambientCache = tri->ambientCache;
+					shadowDrawSurf->shadowCache = 0;
+					shadowDrawSurf->jointCache = 0;
+					shadowDrawSurf->frontEndGeo = tri;
+					shadowDrawSurf->space = vEntity;
+					shadowDrawSurf->material = shader;
+					shadowDrawSurf->extraGLState = 0;
+					shadowDrawSurf->scissorRect = vLight->scissorRect;
+					shadowDrawSurf->sort = 0.0f;
+					shadowDrawSurf->renderZFail = 0;
+					shadowDrawSurf->shaderRegisters = NULL;
+
+					// The shadow-MAP atlas pass still runs for these lights (RT does not yet
+					// suppress it) and walks globalShadows: an alpha-tested caster reaches
+					// ShadowMapPassPerforated, which dereferences shaderRegisters. Set the shader
+					// (perforated) and joints exactly as the shadow-map occluder path below does,
+					// or that pass segfaults on our bespoke drawSurf.
+					if( shader->Coverage() == MC_PERFORATED )
+					{
+						R_SetupDrawSurfShader( shadowDrawSurf, shader, renderEntity );
+					}
+					R_SetupDrawSurfJoints( shadowDrawSurf, tri, shader );
+
+					shadowDrawSurf->linkChain = &vLight->globalShadows;
+					shadowDrawSurf->nextOnLight = vEntity->drawSurfs;
+					vEntity->drawSurfs = shadowDrawSurf;
+				}
+				continue;
 			}
 
 

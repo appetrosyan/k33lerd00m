@@ -36,10 +36,11 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 // there is no live-world access from the backend. Shared by every RT pass (DDGI,
 // reflections, shadows) since they all build through RebuildFromView.
 idCVar r_rtWorldOccluders( "r_rtWorldOccluders", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: also add each visible light's shadow casters (incl. off-frustum) to the TLAS, not just the frustum-visible surfaces - fixes shadows going bright when a caster rotates out of view" );
-idCVar r_rtAccelDebug( "r_rtAccelDebug", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT accel struct: print TLAS composition (view / light-caster / occluder / skinned instance counts, surfaces dropped by the shadow caster filter, empty-TLAS warnings) whenever it changes" );
+idCVar r_rtAccelDebug( "r_rtAccelDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT accel struct: 1 = print TLAS composition (view / light-caster / occluder / skinned instance counts, filter drops, empty-TLAS warnings) whenever it changes; 2 = flood-only TLAS; 3 = append a phantom kiosk instance 300u up (instance-path probe)", 0, 3 );
 
 DdgiAccelStructures::DdgiAccelStructures()
 	: m_ShadowCastersOnly( false )
+	, m_SkipFrontendOccluders( false )
 	, m_TlasCapacity( 0 )
 	, m_NumInstances( 0 )
 	, m_InstanceDataCapacity( 0 )
@@ -107,6 +108,15 @@ static bool DDGI_MaterialCastsRTShadow( const idMaterial* material )
 	if( !material->SurfaceCastsShadow() )
 	{
 		return false;
+	}
+	// Mapper-placed invisible shadow casters (textures/common/shadow) have no drawn stages, so
+	// their coverage reads MC_TRANSLUCENT - but they are forceShadows materials whose entire
+	// purpose is occlusion (containing fake-sun lights whose projection origin sits outside the
+	// room). Stencil and shadow maps both honor them; rays must too, or those lights spill
+	// straight-edged bright bands across geometry the mapper deliberately shadowed.
+	if( material->TestMaterialFlag( MF_FORCESHADOWS ) )
+	{
+		return true;
 	}
 	if( material->Coverage() == MC_TRANSLUCENT )
 	{
@@ -492,6 +502,12 @@ void DdgiAccelStructures::AppendInstance( std::vector<nvrhi::rt::InstanceDesc>& 
 		const float* modelMatrix, vertCacheHandle_t ambientCache, vertCacheHandle_t indexCache,
 		const idMaterial* material )
 {
+	// diagnostics: count mapper-placed invisible shadow-caster brushes reaching the TLAS
+	if( material != NULL && idStr::Icmp( material->GetName(), "textures/common/shadow" ) == 0 )
+	{
+		m_NumShadowBrushInstances++;
+	}
+
 	nvrhi::rt::InstanceDesc instance;
 	instance.setBLAS( blas );
 	instance.setInstanceMask( 0xFF );
@@ -559,7 +575,14 @@ void DdgiAccelStructures::AppendLightShadowCasters( nvrhi::ICommandList* command
 				{
 					continue;
 				}
-				if( !vertexCache.CacheIsStatic( surf->ambientCache ) || !vertexCache.CacheIsStatic( surf->indexCache ) )
+				// Build the shadow BLAS from the caster's FULL surface geometry (frontEndGeo), NOT
+				// surf->indexCache: for static world casters that handle is lightTrisIndexCache, the
+				// light-frustum-culled subset. An off-view caster is added here first and marked seen,
+				// so the flood's full-geometry copy is then deduped away - leaving a partial occluder
+				// whose missing triangles let shadow rays pass through (RT under-shadows vs stencil,
+				// which occludes with the full silhouette). Use the full index cache to match.
+				const srfTriangles_t* geo = surf->frontEndGeo;
+				if( !vertexCache.CacheIsStatic( surf->ambientCache ) || !vertexCache.CacheIsStatic( geo->indexCache ) )
 				{
 					continue;
 				}
@@ -569,12 +592,12 @@ void DdgiAccelStructures::AppendLightShadowCasters( nvrhi::ICommandList* command
 				}
 				seen.insert( surf->ambientCache );
 
-				nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, surf->ambientCache, surf->indexCache, surf->frontEndGeo->numVerts, surf->numIndexes );
+				nvrhi::rt::IAccelStruct* blas = GetOrBuildBottomLevel( commandList, surf->ambientCache, geo->indexCache, geo->numVerts, geo->numIndexes );
 				if( blas == NULL )
 				{
 					continue;
 				}
-				AppendInstance( instances, instanceData, blas, surf->space->modelMatrix, surf->ambientCache, surf->indexCache, surf->material );
+				AppendInstance( instances, instanceData, blas, surf->space->modelMatrix, surf->ambientCache, geo->indexCache, surf->material );
 			}
 		}
 	}
@@ -621,11 +644,31 @@ void DdgiAccelStructures::AppendFrontendOccluders( nvrhi::ICommandList* commandL
 			continue;
 		}
 		AppendInstance( instances, instanceData, blas, o.modelMatrix, o.ambientCache, o.indexCache, o.material );
+
+		// debug (r_rtAccelDebug 3): append a PHANTOM copy of the kiosk BLAS floating 300 units
+		// above its original spot. If the phantom casts a ray shadow, arbitrary instance
+		// transforms work and the world-geometry miss is in the BLAS data; if not, the
+		// instance path itself is broken.
+		extern idCVar r_rtAccelDebug;
+		if( r_rtAccelDebug.GetInteger() == 3 && o.material != NULL &&
+				idStr::FindText( o.material->GetName(), "deltakiosk" ) >= 0 )
+		{
+			float phantom[16];
+			memcpy( phantom, o.modelMatrix, sizeof( phantom ) );
+			// park it directly under light 481's projection origin (252,-2026,628) so its
+			// shadow cone unmissably covers the floor band
+			phantom[12] = 150.0f;
+			phantom[13] = -1950.0f;
+			phantom[14] = 460.0f;
+			AppendInstance( instances, instanceData, blas, phantom, o.ambientCache, o.indexCache, o.material );
+		}
 	}
 }
 
 bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef )
 {
+	m_NumShadowBrushInstances = 0;
+
 	std::vector<nvrhi::rt::InstanceDesc> instances;
 	std::vector<DdgiInstanceData> instanceData;
 	instances.reserve( viewDef->numDrawSurfs );
@@ -638,7 +681,11 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 	// diagnostics: how the TLAS is composed this build (see r_rtAccelDebug).
 	int numViewFiltered = 0;
 
-	for( int i = 0; i < viewDef->numDrawSurfs; i++ )
+	// r_rtAccelDebug 2: build the TLAS from the FLOOD OCCLUDERS ONLY (skip the view loop and
+	// light-caster chains) to test whether the flood path's instances actually intersect rays.
+	const bool floodOnly = ( r_rtAccelDebug.GetInteger() == 2 );
+
+	for( int i = 0; !floodOnly && i < viewDef->numDrawSurfs; i++ )
 	{
 		const drawSurf_t* surf = viewDef->drawSurfs[i];
 		if( surf == NULL || surf->numIndexes <= 0 || surf->frontEndGeo == NULL || surf->space == NULL )
@@ -686,9 +733,17 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 	// plus the frontend-gathered static world geometry of the camera's connected areas, so
 	// shadows AND reflections of off-view geometry survive camera rotation. Both deduped
 	// against the view surfaces above (and each other) via the shared seen set.
-	AppendLightShadowCasters( commandList, viewDef, instances, instanceData, seen );
+	if( !floodOnly )
+	{
+		AppendLightShadowCasters( commandList, viewDef, instances, instanceData, seen );
+	}
 	const int numLightCasters = static_cast<int>( instances.size() ) - numViewInstances;
-	AppendFrontendOccluders( commandList, viewDef, instances, instanceData, seen );
+	// Shadows skip the wide flood gather (per-light casters above already cover every occluder
+	// that shadows a visible light); reflections/DDGI keep it for off-view world coverage.
+	if( !m_SkipFrontendOccluders )
+	{
+		AppendFrontendOccluders( commandList, viewDef, instances, instanceData, seen );
+	}
 	const int numOccluders = static_cast<int>( instances.size() ) - numViewInstances - numLightCasters;
 
 	// animated actors: skin + build BLAS per skinned surface and append instances
@@ -696,6 +751,20 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 	const int numSkinned = static_cast<int>( instances.size() ) - numViewInstances - numLightCasters - numOccluders;
 
 	m_NumInstances = static_cast<int>( instances.size() );
+
+	// diagnostics: mapper-placed invisible shadow casters (textures/common/shadow) are load-
+	// bearing for light containment (fake-sun lights etc.) - report whether any made the TLAS.
+	if( r_rtAccelDebug.GetBool() )
+	{
+		// per-INSTANCE last value (this class is instantiated once per RT pass - a shared
+		// function-static would let one pass's print suppress the other's)
+		if( m_NumShadowBrushInstances != m_LastShadowBrushInstances )
+		{
+			common->Printf( "RT accel%s: %i textures/common/shadow instances in TLAS\n",
+							m_ShadowCastersOnly ? " [shadow]" : "", m_NumShadowBrushInstances );
+			m_LastShadowBrushInstances = m_NumShadowBrushInstances;
+		}
+	}
 
 	// Diagnostics: report TLAS composition when it changes. Without this the pass is a
 	// black box - an empty TLAS (e.g. an over-aggressive caster filter dropping every

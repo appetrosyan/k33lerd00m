@@ -51,4 +51,6 @@ struct RtShadowConstants
 	idVec2i		pad;			// x = backface cull, y = debug force/hit-dist mode
 	idVec2i		scissorMin;		// top-left pixel of this light's dispatch rect (screen space)
 	idVec2i		pad2;
+
+	idVec4		cameraOrigin;	// xyz = world-space eye (for the primary-ray TLAS coverage probe, mode 4)
 };

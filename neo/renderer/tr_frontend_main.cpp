@@ -795,7 +795,7 @@ static void R_FindClosestEnvironmentProbes2()
 // switch lives with the accel-struct code; radius bounds the gather to nearby areas.
 extern idCVar r_rtWorldOccluders;
 idCVar r_rtOccluderAreaHops( "r_rtOccluderAreaHops", "6", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT occluders: portal hops out from the camera area to gather static world geometry (0 = camera area only). Larger = fewer off-view shadow/reflection dropouts, more TLAS cost", 0, 64 );
-idCVar r_rtOccluderDebug( "r_rtOccluderDebug", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "print R_GatherRTOccluders stats (flooded areas / gathered surfaces) on each camera-area change" );
+idCVar r_rtOccluderDebug( "r_rtOccluderDebug", "1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "1 = print gather stats; 2 = also dump suspect-surface BLAS inputs; 3 = gather ONLY world area models (debug isolation)", 0, 3 );
 
 /*
 ================
@@ -836,7 +836,13 @@ static void R_GatherRTOccluders( viewDef_t* viewDef )
 	// gather every area.
 	bool* areaVisited = ( bool* )R_ClearedFrameAlloc( world->numPortalAreas * sizeof( bool ) );
 	const int camArea = viewDef->areaNum;
-	if( camArea < 0 || camArea >= world->numPortalAreas )
+	// RT shadows: occlusion-cull NOTHING. Portal flooding (hop cap + PS_BLOCK_VIEW) drops
+	// occluders that stencil still shadows with, so a shadow ray finds no blocker and the
+	// area reads unshadowed. Gather EVERY static occluder in the map into the TLAS when RT is
+	// active; areas where this proves too expensive can be re-culled later, one at a time.
+	extern idCVar r_useRTShadows;
+	const bool gatherEveryArea = ( camArea < 0 || camArea >= world->numPortalAreas ) || r_useRTShadows.GetBool();
+	if( gatherEveryArea )
 	{
 		for( int a = 0; a < world->numPortalAreas; a++ )
 		{
@@ -910,6 +916,13 @@ static void R_GatherRTOccluders( viewDef_t* viewDef )
 			{
 				continue;
 			}
+			// debug (r_rtOccluderDebug 3): gather ONLY the world area models - combined with
+			// r_rtAccelDebug 2 (flood-only TLAS) this isolates whether world-brush geometry
+			// registers ray hits at all.
+			if( r_rtOccluderDebug.GetInteger() == 3 && !ent->parms.hModel->IsStaticWorldModel() )
+			{
+				continue;
+			}
 			ents[numEnts++] = ent;
 		}
 	}
@@ -964,6 +977,24 @@ static void R_GatherRTOccluders( viewDef_t* viewDef )
 					o.numIndexes = tri->numIndexes;
 					o.material = msurf->shader;
 					memcpy( o.modelMatrix, ent->modelMatrix, sizeof( o.modelMatrix ) );
+
+					// diagnostics (r_rtOccluderDebug 2): dump the BLAS inputs of suspect surfaces so a
+					// surface whose rays inexplicably miss can be compared against one that works.
+					if( r_rtOccluderDebug.GetInteger() == 2 && msurf->shader != NULL &&
+							( idStr::FindText( msurf->shader->GetName(), "stetile4" ) >= 0 ||
+							  idStr::FindText( msurf->shader->GetName(), "common/shadow" ) >= 0 ||
+							  idStr::FindText( msurf->shader->GetName(), "deltakiosk" ) >= 0 ) )
+					{
+						const float* m = ent->modelMatrix;
+						common->Printf( "rtOccluder surf model '%s' shader '%s': verts %i idx %i vtxOfs %u idxOfs %u bounds (%.0f %.0f %.0f)-(%.0f %.0f %.0f) mat[row0 %.2f %.2f %.2f %.2f | row1 %.2f %.2f %.2f %.2f | row2 %.2f %.2f %.2f %.2f]\n",
+										ent->parms.hModel->Name(), msurf->shader->GetName(),
+										tri->numVerts, tri->numIndexes,
+										( unsigned )( ( tri->ambientCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK ),
+										( unsigned )( ( tri->indexCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK ),
+										tri->bounds[0].x, tri->bounds[0].y, tri->bounds[0].z,
+										tri->bounds[1].x, tri->bounds[1].y, tri->bounds[1].z,
+										m[0], m[4], m[8], m[12], m[1], m[5], m[9], m[13], m[2], m[6], m[10], m[14] );
+					}
 				}
 			}
 		}

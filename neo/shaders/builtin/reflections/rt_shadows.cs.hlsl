@@ -44,6 +44,7 @@ struct RtShadowConstants
 	int2	pad;
 	int2	scissorMin;		// top-left pixel of this light's dispatch rect
 	int2	pad2;
+	float4	cameraOrigin;	// xyz = world-space eye (primary-ray TLAS coverage probe, mode 4)
 };
 
 // *INDENT-OFF*
@@ -106,20 +107,20 @@ float TraceVisibility( float3 origin, float3 dir, float tmin, float tmax )
 	ray.TMin = tmin;
 	ray.TMax = tmax;
 
-	// Self-intersection avoidance by FRONT-FACE CULLING (the established fix for a shadow
-	// ray traced from a depth-reconstructed gbuffer position - see Wicked Engine
-	// screenspaceshadowCS, which reconstructs P from depth exactly as we do). The shaded
-	// receiver presents a front face to the light-ward ray, so culling front-facing
-	// triangles makes the receiver's own surface an invalid occluder -> self-shadow acne
-	// is structurally impossible at ANY distance, with no bias to tune. A real occluder is
-	// still caught on its far (back) face. pad.x flips to back-face culling to debug any
-	// one-sided world geometry that light-leaks with front culling.
+	// Trace TWO-SIDED by default (no face culling). Doom 3 world geometry is single-sided and
+	// its winding is NOT consistent across surfaces, so ANY face-cull keeps shadow-ray hits on
+	// only one facing: a blocker on the kept facing shadows, a blocker on the culled facing
+	// leaks light - producing a hard straight seam across a continuous receiver (not a soft
+	// geometry-shaped gap). Stencil occludes from the full silhouette regardless of facing;
+	// two-sided rays are the RT equivalent - the unified "cull nothing" occluder set. Self-
+	// occlusion is held off by ray.TMin = bias (origin is the un-offset worldP), tuned via
+	// r_rtShadowBias. pad.x is a debug knob: 0 = two-sided (default), 1 = cull back, 2 = cull front.
 	uint rayFlags = RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
-	if( g_Sh.pad.x != 0 )
+	if( g_Sh.pad.x == 1 )
 	{
 		rayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
 	}
-	else
+	else if( g_Sh.pad.x == 2 )
 	{
 		rayFlags |= RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
 	}
@@ -178,6 +179,37 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const float2 uv = ( float2( pixel ) + 0.5f ) / float2( g_Sh.screenSize );
 	const float3 worldP = ReconstructWorld( uv, depth );
 
+	// TLAS coverage probe (g_Sh.pad.y == 4): trace a PRIMARY ray from the camera eye to this
+	// pixel's depth-reconstructed world point. A correct, complete TLAS holds every visible
+	// surface at its real depth, so the ray hits at ~lengthToP. Output:
+	//   GREEN  = hit at the expected depth (this surface IS in the TLAS, correctly placed)
+	//   BLUE   = hit closer than expected (something else in the TLAS occludes the eye->P ray)
+	//   RED    = no hit within the eye->P span (this VISIBLE surface is MISSING from the TLAS)
+	// Red pixels are literal holes in the TLAS - exactly the geometry rays sail through.
+	if( g_Sh.pad.y == 4 )
+	{
+		const float3 eye = g_Sh.cameraOrigin.xyz;
+		const float3 d = worldP - eye;
+		const float distToP = length( d );
+		RayDesc pr;
+		pr.Origin = eye;
+		pr.Direction = d / max( distToP, 1e-4f );
+		pr.TMin = 1.0f;
+		pr.TMax = distToP * 1.02f + 4.0f;
+		RayQuery<RAY_FLAG_CULL_NON_OPAQUE> pq;
+		pq.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE, 0xFF, pr );
+		pq.Proceed();
+		if( pq.CommittedStatus() != COMMITTED_TRIANGLE_HIT )
+		{
+			u_ShadowMask[pixel] = 0.15f;	// RED-ish via the debug blit (miss = TLAS hole)
+			return;
+		}
+		const float t = pq.CommittedRayT();
+		// encode: >=0.66 hit-at-surface (good), 0.4 too-near (occluded), 0.15 miss
+		u_ShadowMask[pixel] = ( abs( t - distToP ) < 12.0f ) ? 1.0f : 0.4f;
+		return;
+	}
+
 	// Distant / degenerate reconstruction: at the far plane w.w -> 0, so worldP blows up to
 	// huge or NaN values and the shadow ray becomes garbage (the thrashing outdoor mask with
 	// a hard seam at the window's near/far depth cliff). Skip such pixels - very distant
@@ -215,7 +247,8 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const float umbraFloor = g_Sh.params.y;
 
 	// Hit-distance debug (g_Sh.pad.y == 3): instead of 0/1 occlusion, write the shadow
-	// ray's hit distance normalised to 64 world units. Purpose: diagnose the stipple.
+	// ray's hit distance normalised to 2048 world units (room scale). WHITE = ray reached
+	// the light unobstructed; darker = nearer hit. Purpose: show per-pixel WHERE rays hit.
 	//   - DARK (T near 0)  -> the occluder is right on the receiver = self-intersection /
 	//     reconstruction landing inside the surface / coincident geometry. Fix = bias.
 	//   - BRIGHT (T large) -> a genuinely distant occluder = a real geometry / wrong-ray
@@ -231,8 +264,28 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 		dq.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, dray );
 		dq.Proceed();
 		u_ShadowMask[pixel] = ( dq.CommittedStatus() == COMMITTED_TRIANGLE_HIT )
-							  ? saturate( dq.CommittedRayT() / 64.0f )
+							  ? saturate( dq.CommittedRayT() / 2048.0f )
 							  : 1.0f;
+		return;
+	}
+
+	// Bisection probes (pad.y 5/6): plain binary occlusion with a GENEROUS t-range (no bias
+	// subtract, huge TMax) so nothing is masked by a degenerate span. hit = 0 (dark hole in the
+	// red blit), miss = 1 (red). Mode 5 traces toward the light; mode 6 traces straight UP
+	// (+Z) from worldP. If UP hits (ceiling/occluders show as dark) but toward-light misses,
+	// the light DIRECTION/origin is the fault. If UP also misses, traversal from worldP is
+	// broken (origin off-surface / TLAS not reachable from this ray) regardless of direction.
+	if( g_Sh.pad.y == 5 || g_Sh.pad.y == 6 )
+	{
+		RayDesc bray;
+		bray.Origin = worldP;
+		bray.Direction = ( g_Sh.pad.y == 6 ) ? float3( 0.0f, 0.0f, 1.0f ) : L;
+		bray.TMin = 0.5f;
+		bray.TMax = 100000.0f;
+		RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> bq;
+		bq.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, bray );
+		bq.Proceed();
+		u_ShadowMask[pixel] = ( bq.CommittedStatus() == COMMITTED_TRIANGLE_HIT ) ? 0.0f : 1.0f;
 		return;
 	}
 
