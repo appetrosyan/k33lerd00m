@@ -217,16 +217,37 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	constants.screenSize = idVec2i( width, height );
 	constants.pad = idVec2i( r_rtShadowBackfaceCull.GetInteger(), r_rtShadowForce.GetInteger() );
 
-	// Dispatch the mask over the FULL screen. The scissor-rect optimisation limited the mask to
-	// the light's screen rect, but its top-left conversion (height-1-y2) assumes a full-height
-	// viewport, while RenderInteractions reads the mask at (viewport.y2 - y2). When the viewport
-	// is not full-height those disagree, so the mask is written in one band and sampled in
-	// another - the shadow ends at a hard straight rectangle edge with lit floor right past it.
-	// Computing the whole mask makes the read alignment irrelevant (each light overwrites the
-	// shared mask and its scissored interactions sample only their own region). A correctly
-	// aligned scissor dispatch can be restored later as a perf optimisation. r_rtShadowScissor
-	// is retained for A/B testing but no longer gates the dispatch.
+	// Dispatch the trace over ONLY this light's screen-space scissor rect instead of the whole
+	// framebuffer - a light that touches 5% of the screen then costs 5% of the rays. The rect is
+	// mapped to the mask's pixel space EXACTLY as RenderInteractions maps it for its GL_Scissor and
+	// SV_Position mask Load: top-left = ( viewport.x1 + rect.x1, viewport.y2 - rect.y2 ), size =
+	// ( rect.x2+1-rect.x1, rect.y2+1-rect.y1 ). The shader writes u_ShadowMask[dispatchID+scissorMin],
+	// so those pixels line up 1:1 with the fragments that sample them. Using viewport.y2 - rect.y2
+	// (NOT the old height-1-y2, which assumed a full-height viewport) is what makes it correct when
+	// the viewport is offset/supersampled - the misalignment that sank the earlier attempt. Safe
+	// with the shared mask because trace and draw are interleaved per light: each light traces its
+	// rect, then draws its (equally scissored) interactions, before the next light overwrites.
 	int dispX = 0, dispY = 0, dispW = width, dispH = height;
+	if( r_rtShadowScissor.GetBool() && !vLight->scissorRect.IsEmpty() )
+	{
+		const idScreenRect& s = vLight->scissorRect;
+		const idScreenRect& vp = viewDef->viewport;
+		dispX = vp.x1 + s.x1;
+		dispY = vp.y2 - s.y2;
+		dispW = s.x2 + 1 - s.x1;
+		dispH = s.y2 + 1 - s.y1;
+
+		// clamp into the mask so a stray rect never dispatches negative/out-of-bounds threads
+		// (the shader also drops pixel >= screenSize, but scissorMin must not go negative).
+		if( dispX < 0 )		{	dispW += dispX; dispX = 0;	}
+		if( dispY < 0 )		{	dispH += dispY; dispY = 0;	}
+		if( dispX + dispW > width )	{	dispW = width - dispX;	}
+		if( dispY + dispH > height )	{	dispH = height - dispY;	}
+		if( dispW <= 0 || dispH <= 0 )
+		{
+			return false;	// rect fully off the mask - nothing to trace
+		}
+	}
 	constants.scissorMin = idVec2i( dispX, dispY );
 	const idVec3& eye = viewDef->renderView.vieworg;
 	constants.cameraOrigin = idVec4( eye.x, eye.y, eye.z, 0.0f );
