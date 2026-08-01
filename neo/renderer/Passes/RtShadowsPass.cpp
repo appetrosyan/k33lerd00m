@@ -252,6 +252,14 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	const idVec3& eye = viewDef->renderView.vieworg;
 	constants.cameraOrigin = idVec4( eye.x, eye.y, eye.z, 0.0f );
 
+	// Depth-bounds cull: skip rays for pixels outside this light's volume depth extent - they get
+	// zero light from its falloff, so the shadow mask there is unused. r_rtShadowScissor gates it
+	// with the scissor (same "trace only what matters" optimisation); zmin>=zmax disables in-shader.
+	if( r_rtShadowScissor.GetBool() )
+	{
+		constants.lightDepthBounds = idVec4( vLight->scissorRect.zmin, vLight->scissorRect.zmax, 0.0f, 0.0f );
+	}
+
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 
 	// the TLAS handle changes when it is recreated to grow; rebuild the binding set

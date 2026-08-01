@@ -45,6 +45,7 @@ struct RtShadowConstants
 	int2	scissorMin;		// top-left pixel of this light's dispatch rect
 	int2	pad2;
 	float4	cameraOrigin;	// xyz = world-space eye (primary-ray TLAS coverage probe, mode 4)
+	float4	lightDepthBounds;	// x = zmin, y = zmax (hardware depth): skip rays outside the slab
 };
 
 // *INDENT-OFF*
@@ -161,6 +162,20 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	// background / sky pixels have no receiver - fully lit (shadow term 1)
 	const float depth = t_Depth[pixel].r;
 	if( depth >= 1.0f )
+	{
+		u_ShadowMask[pixel] = 1.0f;
+		return;
+	}
+
+	// Depth-bounds cull (normal mode only): scissorRect.zmin/zmax is this light's volume depth
+	// extent. A receiver outside it is outside the light volume, so the light's projection/falloff
+	// contributes ZERO there - the interaction multiplies that zero by the shadow mask, so the mask
+	// value is irrelevant and forcing it to 1 (skip the ray) changes nothing visible. (The draw
+	// side's hardware depth-bounds test is currently disabled, so we rely on the falloff, not it.)
+	// Guarded on zmax > zmin so an unset (0,0) bounds disables it, and on pad.y==0 so the debug
+	// visualisations keep full-screen coverage.
+	if( g_Sh.pad.y == 0 && g_Sh.lightDepthBounds.y > g_Sh.lightDepthBounds.x &&
+		( depth < g_Sh.lightDepthBounds.x || depth > g_Sh.lightDepthBounds.y ) )
 	{
 		u_ShadowMask[pixel] = 1.0f;
 		return;

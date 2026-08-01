@@ -53,4 +53,7 @@ struct RtShadowConstants
 	idVec2i		pad2;
 
 	idVec4		cameraOrigin;	// xyz = world-space eye (for the primary-ray TLAS coverage probe, mode 4)
+	idVec4		lightDepthBounds;	// x = zmin, y = zmax (hardware depth 0..1): skip rays for pixels
+	//								// outside this light's depth slab - the interaction depth-bounds
+	//								// test discards those fragments anyway, so it is pure ray savings.
 };
