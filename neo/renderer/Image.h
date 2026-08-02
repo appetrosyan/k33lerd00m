@@ -629,6 +629,7 @@ public:
 	idImage*			smaaBlendImage;
 	idImage*			gbufferNormalsRoughnessImage;	// cheap G-Buffer replacement, holds normals and surface roughness
 	idImage*			rtShadowMaskImage;				// screen-space ray-traced visibility mask (per light) written by RtShadowsPass
+	idImage*			rtShadowCoarseImage;			// low-res coarse visibility mask (coarse+refine path); render-res image, top-left subregion used
 	idImage*			ambientOcclusionImage[2];		// contain AO and bilateral filtering keys
 	idImage*			hierarchicalZbufferImage;		// zbuffer with mip maps to accelerate screen space ray tracing
 	idImage*			imguiFontImage;

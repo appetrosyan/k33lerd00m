@@ -1659,7 +1659,14 @@ void idCommonLocal::CreateMainMenu()
 		// create main inside an "empty" game level load - so assets get
 		// purged automagically when we transition to a "real" map
 		game->Shell_CreateMenu( false );
-		game->Shell_Show( true );
+
+		// automation path (com_autoLoadGame): create the shell assets but never SHOW the menu -
+		// the Frame retry loop loads the savegame directly (see common_frame.cpp).
+		extern idCVar com_autoLoadGame;
+		if( com_autoLoadGame.GetString()[0] == '\0' )
+		{
+			game->Shell_Show( true );
+		}
 		game->Shell_SyncWithSession();
 
 		// load

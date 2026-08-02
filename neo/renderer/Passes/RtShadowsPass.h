@@ -93,12 +93,21 @@ private:
 
 	nvrhi::ShaderHandle				m_TraceShader;
 	nvrhi::BindingLayoutHandle		m_TraceBindingLayout;
-	nvrhi::BindingSetHandle			m_TraceBindingSet;
 	nvrhi::ComputePipelineHandle	m_TracePipeline;
 
-	// the binding set is rebuilt when the TLAS grows or the mask image resizes
+	// Two binding sets sharing one pipeline/layout (see r_rtShadowCoarse / RenderLight). The legacy
+	// single dispatch (passMode 0) and the refine dispatch (passMode 2) both write the FINAL mask
+	// through u0 and have the coarse image bound at t3 (legacy never reads it - harmless dummy;
+	// refine does) - identical bindings, so one set covers both. The coarse dispatch (passMode 1)
+	// writes the coarse image through u0 instead, with the final mask as its (unread) dummy SRV -
+	// a resource cannot be bound as both UAV and SRV in the same set, hence the swap.
+	nvrhi::BindingSetHandle			m_MaskBindingSet;
+	nvrhi::BindingSetHandle			m_CoarseBindingSet;
+
+	// the binding sets are rebuilt when the TLAS grows or an image handle changes
 	nvrhi::rt::IAccelStruct*	m_BoundTlas;
 	idImage*					m_BoundMask;
+	idImage*					m_BoundCoarse;
 
 	bool					m_ViewReady;
 	bool					rayTracingSupported;

@@ -806,6 +806,8 @@ enum vertexLayoutType_t
 	LAYOUT_UNKNOWN = 0,	// RB: TODO -1
 	LAYOUT_DRAW_VERT,
 	LAYOUT_DRAW_IMGUI_VERT, // unused
+	LAYOUT_DRAW_SHADOW_VERT,			// idShadowVert (stencil shadow volumes)
+	LAYOUT_DRAW_SHADOW_VERT_SKINNED,	// idShadowVertSkinned
 	NUM_VERTEX_LAYOUTS
 };
 
@@ -1376,7 +1378,10 @@ NVRHI helpers
 ====================================================================
 */
 bool R_ReadPixelsRGB8( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, const char* fullname );
-bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, byte** pic, int picWidth, int picHeight );
+bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, byte** pic, int picWidth, int picHeight, bool filterCorruption = true );
+
+// writes the current FP16 scene buffer (pre-tonemap linear HDR) to screenshots/<baseName>.exr
+void R_CaptureHDRScreenshot( const char* baseName );
 
 /*
 ====================================================================

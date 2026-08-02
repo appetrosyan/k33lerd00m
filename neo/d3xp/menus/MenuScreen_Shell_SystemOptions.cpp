@@ -55,6 +55,7 @@ extern idCVar r_useBloom;
 extern idCVar r_ssaaScale;
 extern idCVar r_useDDGI;
 extern idCVar r_useRTShadows;
+extern idCVar r_useStencilShadows;
 float R_SSAAScale();
 
 /*
@@ -847,10 +848,14 @@ void idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings::AdjustFi
 		}
 		case SYSTEM_FIELD_SHADOWS:
 		{
-			// shadow technique: 0 = shadow maps, 1 = ray traced (point + spot)
-			static const int numValues = 2;
-			static const int values[numValues] = { 0, 1 };
-			r_useRTShadows.SetInteger( AdjustOption( r_useRTShadows.GetInteger(), values, numValues, adjustAmount ) );
+			// shadow technique: 0 = shadow maps (default), 1 = volumetric (stencil shadow
+			// volumes), 2 = ray traced (point + spot)
+			static const int numValues = 3;
+			static const int values[numValues] = { 0, 1, 2 };
+			int mode = r_useRTShadows.GetBool() ? 2 : ( r_useStencilShadows.GetBool() ? 1 : 0 );
+			mode = AdjustOption( mode, values, numValues, adjustAmount );
+			r_useStencilShadows.SetInteger( mode == 1 ? 1 : 0 );
+			r_useRTShadows.SetInteger( mode == 2 ? 1 : 0 );
 			break;
 		}
 		case SYSTEM_FIELD_SSAO:
@@ -1130,7 +1135,15 @@ idSWFScriptVar idMenuScreen_Shell_SystemOptions::idMenuDataSource_SystemSettings
 			return r_useDDGI.GetBool() ? "Dynamic (DDGI)" : "Baked";
 
 		case SYSTEM_FIELD_SHADOWS:
-			return r_useRTShadows.GetBool() ? "Ray Traced" : "Shadow Maps";
+			if( r_useRTShadows.GetBool() )
+			{
+				return "Raytraced";
+			}
+			if( r_useStencilShadows.GetBool() )
+			{
+				return "Volumetric";
+			}
+			return "Shadowmaps";
 
 		case SYSTEM_FIELD_BLOOD_REFLECTIONS:
 			if( r_useRTReflections.GetBool() )

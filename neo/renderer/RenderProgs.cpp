@@ -164,8 +164,7 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		.setOffset( offsetof( idDrawVert, color ) )
 		.setElementStride( sizeof( idDrawVert ) ) );
 
-	/*
-	// === Shadow vertex ===
+	// === Shadow vertex === (stencil shadow volumes)
 
 	vertexLayoutDescs[LAYOUT_DRAW_SHADOW_VERT].Append(
 		nvrhi::VertexAttributeDesc()
@@ -190,7 +189,6 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		.setFormat( nvrhi::Format::RGBA8_UNORM )
 		.setOffset( offsetof( idShadowVertSkinned, color ) )
 		.setElementStride( sizeof( idShadowVertSkinned ) ) );
-	*/
 
 	bindingLayouts.SetNum( NUM_BINDING_LAYOUTS );
 
@@ -890,6 +888,9 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 
 		{ BUILTIN_DEPTH, "builtin/depth", "", { { "USE_GPU_SKINNING", "0" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_CONSTANT_BUFFER_ONLY ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_CONSTANT_BUFFER_ONLY },
 		{ BUILTIN_DEPTH_SKINNED, "builtin/depth", "_skinned", { { "USE_GPU_SKINNING", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_CONSTANT_BUFFER_ONLY_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_CONSTANT_BUFFER_ONLY_SKINNED },
+
+		// stencil shadow volume extrusion (idShadowVert input); only the constant buffer is bound
+		{ BUILTIN_SHADOW, "builtin/lighting/shadow", "", { { "USE_GPU_SKINNING", "0" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_CONSTANT_BUFFER_ONLY ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_SHADOW_VERT, BINDING_LAYOUT_CONSTANT_BUFFER_ONLY },
 
 		{ BUILTIN_BLENDLIGHT, "builtin/fog/blendlight", "",  { { "USE_GPU_SKINNING", "0" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_BLENDLIGHT ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_BLENDLIGHT },
 		{ BUILTIN_BLENDLIGHT_SKINNED, "builtin/fog/blendlight", "_skinned",  { { "USE_GPU_SKINNING", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_BLENDLIGHT_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_BLENDLIGHT_SKINNED },

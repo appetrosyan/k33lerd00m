@@ -46,13 +46,19 @@ struct RtShadowConstants
 	int2	pad2;
 	float4	cameraOrigin;	// xyz = world-space eye (primary-ray TLAS coverage probe, mode 4)
 	float4	lightDepthBounds;	// x = zmin, y = zmax (hardware depth): skip rays outside the slab
+	int2	coarseSize;			// coarse+refine: used coarse subregion dims (render / ratio)
+	int2	coarseScissorMin;	// top-left coarse texel of this light's coarse rect
+	int2	coarseParams;		// x = passMode (0 legacy / 1 coarse / 2 refine), y = force-upsample
+	//							// (r_rtShadowCoarse==1 diagnostic: always upsample, never trace)
+	int2	coarsePad;
 };
 
 // *INDENT-OFF*
 RaytracingAccelerationStructure	t_TLAS			: register(t0);
 Texture2D<float4>				t_Depth			: register(t1);	// hardware depth (.r)
 Texture2D<float4>				t_GBufferNormal	: register(t2);	// world normal .rgb (*2-1), roughness .a
-RWTexture2D<float>				u_ShadowMask	: register(u0);	// visibility 0..1
+Texture2D<float4>				t_Coarse		: register(t3);	// coarse+refine: coarse visibility mask (refine pass only; dummy/unread otherwise)
+RWTexture2D<float>				u_ShadowMask	: register(u0);	// visibility 0..1 (coarse pass writes the coarse image here instead)
 
 cbuffer c_RtShadow : register(b1)
 {
@@ -133,9 +139,117 @@ float TraceVisibility( float3 origin, float3 dir, float tmin, float tmax )
 	return ( q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ) ? 0.0f : 1.0f;
 }
 
+// Res-agnostic single-sample hard-shadow visibility, used by the coarse (passMode 1) and refine
+// (passMode 2) dispatches ONLY. samplePixel indexes t_Depth/t_GBufferNormal (the coarse pass derives
+// a coarser sample pixel than its own dispatch pixel); uv is the matching depth-buffer UV used to
+// reconstruct the world position. The driver (RtShadowsPass::RenderLight) forces the legacy
+// passMode 0 single dispatch whenever r_rtShadowForce != 0 or soft shadows (rays > 1) are active,
+// so this never needs the debug-force branches or the soft-shadow disc loop that main() still
+// carries for passMode 0 - duplicating this logic here rather than sharing it with that block keeps
+// the already-verified legacy/debug path untouched.
+float ComputeVisibility( int2 samplePixel, float2 uv )
+{
+	const float depth = t_Depth[samplePixel].r;
+	if( depth >= 1.0f )
+	{
+		return 1.0f;
+	}
+
+	// depth-bounds cull: see the pad.y==0 comment on the legacy path below - same rationale.
+	if( g_Sh.lightDepthBounds.y > g_Sh.lightDepthBounds.x &&
+		( depth < g_Sh.lightDepthBounds.x || depth > g_Sh.lightDepthBounds.y ) )
+	{
+		return 1.0f;
+	}
+
+	const float3 nEnc = t_GBufferNormal[samplePixel].xyz * 2.0f - 1.0f;
+	if( dot( nEnc, nEnc ) < 1e-4f )
+	{
+		return 1.0f;
+	}
+
+	const float3 worldP = ReconstructWorld( uv, depth );
+	if( !all( isfinite( worldP ) ) || dot( worldP, worldP ) > 1.0e14f )
+	{
+		return 1.0f;
+	}
+
+	const float3 toLight = g_Sh.lightOrigin.xyz - worldP;
+	const float lightDist = length( toLight );
+	if( lightDist < 1e-3f )
+	{
+		return 1.0f;
+	}
+	const float3 L = toLight / lightDist;
+
+	const float bias = g_Sh.params.x;
+	const float umbraFloor = g_Sh.params.y;
+	const float tmax = max( 0.0f, lightDist - bias );
+	return max( TraceVisibility( worldP, L, bias, tmax ), umbraFloor );
+}
+
 [numthreads( 8, 8, 1 )]
 void main( uint3 dispatchID : SV_DispatchThreadID )
 {
+	// Coarse + edge-refine (see r_rtShadowCoarse / RtShadowsPass::RenderLight). Both dispatches are
+	// only ever issued when passMode != 0; the driver forces plain passMode 0 (below) whenever debug
+	// force or soft shadows (rays > 1) are active, so these two branches never need to handle them.
+	if( g_Sh.coarseParams.x == 1 )
+	{
+		// COARSE pass: dispatch covers the (over-expanded) coarse rect in COARSE-texel space, not
+		// screen pixels. u_ShadowMask is bound to the coarse image for this dispatch.
+		const int2 cpix = int2( dispatchID.xy ) + g_Sh.coarseScissorMin;
+		if( cpix.x >= g_Sh.coarseSize.x || cpix.y >= g_Sh.coarseSize.y )
+		{
+			return;
+		}
+		const float2 uv = ( float2( cpix ) + 0.5f ) / float2( g_Sh.coarseSize );
+		const int2 samplePixel = int2( uv * float2( g_Sh.screenSize ) );
+		u_ShadowMask[cpix] = ComputeVisibility( samplePixel, uv );
+		return;
+	}
+
+	if( g_Sh.coarseParams.x == 2 )
+	{
+		// REFINE pass: full render-res dispatch over the light's normal (render-space) scissor rect.
+		// u_ShadowMask is bound to the final mask here; t_Coarse holds this light's just-written
+		// coarse mask. Sample the bilinear-interpolation CELL the pixel falls in (the bracket
+		// floor(c)/floor(c)+1, not a fixed NxN tap) - this stays the exact interpolation footprint
+		// at any coarseDiv ratio. If the 4 texels agree, the pixel sits in a flat interior (lit or
+		// umbra) with no boundary passing through - upsample with no ray. Otherwise trace.
+		const int2 pixel = int2( dispatchID.xy ) + g_Sh.scissorMin;
+		if( pixel.x >= g_Sh.screenSize.x || pixel.y >= g_Sh.screenSize.y )
+		{
+			return;
+		}
+		const float2 uv = ( float2( pixel ) + 0.5f ) / float2( g_Sh.screenSize );
+
+		const float2 c = uv * float2( g_Sh.coarseSize ) - 0.5f;
+		const int2 c0 = int2( floor( c ) );
+		const float v00 = t_Coarse[c0 + int2( 0, 0 )].r;
+		const float v10 = t_Coarse[c0 + int2( 1, 0 )].r;
+		const float v01 = t_Coarse[c0 + int2( 0, 1 )].r;
+		const float v11 = t_Coarse[c0 + int2( 1, 1 )].r;
+		const float mn = min( min( v00, v10 ), min( v01, v11 ) );
+		const float mx = max( max( v00, v10 ), max( v01, v11 ) );
+
+		// coarseParams.y != 0 (r_rtShadowCoarse == 1, "coarse-only" diagnostic): always take the
+		// upsample branch, never trace - isolates the coarse dispatch/binding/barrier from the
+		// boundary-detection logic below (soft/blocky shadows are the EXPECTED result in this mode).
+		if( g_Sh.coarseParams.y != 0 || mx - mn <= ( 1.0f / 255.0f ) )
+		{
+			// flat interior (all 4 agree, within R8 quantisation) - no boundary here, no ray
+			u_ShadowMask[pixel] = v00;
+			return;
+		}
+
+		u_ShadowMask[pixel] = ComputeVisibility( pixel, uv );
+		return;
+	}
+
+	// passMode 0: legacy single full-res dispatch - unchanged, also the always-available fallback
+	// (r_rtShadowCoarse 0), and what the debug-force / soft-shadow paths always use.
+	//
 	// The dispatch covers only this light's screen-space scissor rect, not the whole
 	// screen - scissorMin is its top-left pixel. Pixels outside the rect are never lit by
 	// this light (its interactions are scissored to the same rect), so we skip the rays.

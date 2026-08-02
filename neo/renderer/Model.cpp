@@ -601,6 +601,17 @@ bool idRenderModelStatic::LoadBinaryModel( idFile* file, const ID_TIME_T sourceT
 			tri.nextDeferredFree = NULL;
 			tri.indexCache = 0;
 			tri.ambientCache = 0;
+
+			// Stencil shadow volumes: the binary model serializes silIndexes but discards silEdges
+			// (RB's shadow-map-only build stubbed the silEdge read to a throwaway, so tri.silEdges is
+			// left NULL). LoadBinaryModel never runs FinishSurfaces, so nothing else regenerates them.
+			// silEdges are the shared prerequisite for both the interaction shadow-volume build and the
+			// stencil caster gate - without them every shadow volume is silently skipped. Rebuild them
+			// here from the loaded silIndexes (R_IdentifySilEdges needs only silIndexes + numIndexes).
+			if( tri.silIndexes != NULL && tri.silEdges == NULL && tri.numIndexes > 0 )
+			{
+				R_IdentifySilEdges( &tri, true );
+			}
 		}
 	}
 

@@ -1128,9 +1128,16 @@ bool idCommonLocal::LoadGame( const char* saveName )
 		return false;
 	}
 
-	bool found = false;
+	// com_autoLoadGame boots with the shell (menu) suppressed, and savegame enumeration is
+	// shell-driven - so on that path the enumerated list may legitimately be empty. The
+	// enumeration here is only an existence/language pre-check; the actual load below
+	// (session->LoadGameSync) validates the savegame itself. Skip the pre-check when auto-loading.
+	extern idCVar com_autoLoadGame;
+	const bool skipEnumeratedCheck = ( com_autoLoadGame.GetString()[0] != '\0' );
+
+	bool found = skipEnumeratedCheck;
 	const saveGameDetailsList_t& sgdl = session->GetSaveGameManager().GetEnumeratedSavegames();
-	for( int i = 0; i < sgdl.Num(); i++ )
+	for( int i = 0; !skipEnumeratedCheck && i < sgdl.Num(); i++ )
 	{
 		if( sgdl[i].slotName == saveName )
 		{

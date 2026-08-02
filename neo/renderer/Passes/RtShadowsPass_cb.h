@@ -56,4 +56,12 @@ struct RtShadowConstants
 	idVec4		lightDepthBounds;	// x = zmin, y = zmax (hardware depth 0..1): skip rays for pixels
 	//								// outside this light's depth slab - the interaction depth-bounds
 	//								// test discards those fragments anyway, so it is pure ray savings.
+
+	// Coarse + edge-refine path (see r_rtShadowCoarse). screenSize stays render res everywhere.
+	idVec2i		coarseSize;			// used coarse subregion dims (renderRes / ratio)
+	idVec2i		coarseScissorMin;	// top-left coarse texel of this light's (over-expanded) coarse rect
+	idVec2i		coarseParams;		// x = passMode (0 legacy / 1 coarse trace / 2 refine), y = force-
+	//								// upsample (r_rtShadowCoarse==1 diagnostic: refine always
+	//								// upsamples, never traces, regardless of boundary detection)
+	idVec2i		coarsePad;
 };

@@ -184,6 +184,11 @@ private:
 
 	void				RenderInteractions( const drawSurf_t* surfList, const viewLight_t* vLight, int depthFunc, bool performStencilTest, bool useLightDepthBounds );
 
+	// stencil shadow volumes
+	void				StencilShadowPass( const drawSurf_t* drawSurfs, const viewLight_t* vLight );
+	void				StencilSelectLight( const viewLight_t* vLight );
+	void				DrawStencilShadowPass( const drawSurf_t* drawSurf, const bool renderZPass );
+
 	// RB
 	void				AmbientPass( const drawSurf_t* const* drawSurfs, int numDrawSurfs, bool fillGbuffer );
 

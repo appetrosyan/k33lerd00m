@@ -2334,15 +2334,26 @@ void R_CreateStaticBuffersForTri( srfTriangles_t& tri, nvrhi::ICommandList* comm
 	if( tri.verts != NULL )
 	{
 		tri.ambientCache = vertexCache.AllocStaticVertex( tri.verts, tri.numVerts * sizeof( tri.verts[0] ), commandList );
+	}
 
-		// stencil shadow volumes: build the doubled shadow vertex cache (each xyz duplicated
-		// with w=1 for the near cap and w=0 for the projected-to-infinity end cap), so shadow
-		// volume drawSurfs can index into it. Restored from DOOM-3-BFG (idShadowVert::CreateShadowCache).
+	// shadow cache: the doubled idShadowVert buffer stencil shadow volumes index into (each xyz
+	// with w=1 for the near cap and w=0 for the projected-to-infinity end cap). Built statically
+	// so the backend uses the static-buffer path (no per-frame handle). Restored from DOOM-3-BFG.
+	if( tri.preLightShadowVertexes != NULL )
+	{
+		// only for the _prelight<NAME> pre-calculated shadow volumes (no ambient vertices)
 		const int shadowSize = tri.numVerts * 2 * ( int )sizeof( idShadowVert );
-		idShadowVert* shadowVerts = ( idShadowVert* )Mem_Alloc16( shadowSize, TAG_TRI_SHADOW );
-		idShadowVert::CreateShadowCache( shadowVerts, tri.verts, tri.numVerts );
-		tri.shadowCache = vertexCache.AllocStaticVertex( shadowVerts, shadowSize, commandList );
-		Mem_Free16( shadowVerts );
+		tri.shadowCache = vertexCache.AllocStaticVertex( tri.preLightShadowVertexes, shadowSize, commandList );
+	}
+	else if( tri.verts != NULL )
+	{
+		const int shadowSize = tri.numVerts * 2 * ( int )sizeof( idShadowVert );
+		if( tri.staticShadowVertexes == NULL )
+		{
+			tri.staticShadowVertexes = ( idShadowVert* )Mem_Alloc16( shadowSize, TAG_TRI_SHADOW );
+			idShadowVert::CreateShadowCache( tri.staticShadowVertexes, tri.verts, tri.numVerts );
+		}
+		tri.shadowCache = vertexCache.AllocStaticVertex( tri.staticShadowVertexes, shadowSize, commandList );
 	}
 }
 

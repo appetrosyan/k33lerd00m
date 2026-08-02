@@ -67,6 +67,21 @@ idCVar com_noSleep( "com_noSleep", DEFAULT_NO_SLEEP, CVAR_BOOL, "don't sleep if 
 idCVar com_smp( "com_smp", "1", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "run the game and draw code in a separate thread" );
 idCVar com_skipGameDraw( "com_skipGameDraw", "0", CVAR_SYSTEM | CVAR_BOOL, "" );
 
+// Automated capture harness: launch with e.g.
+//   +loadGame quick +set com_autoCapture rt_probe
+// and once the map / savegame has fully loaded and com_autoCaptureDelay in-game frames have
+// rendered, the engine writes screenshots/<name>.exr (linear pre-tonemap HDR scene buffer,
+// R_CaptureHDRScreenshot) plus a normal SDR screenshot, then quits (com_autoCaptureQuit).
+// The trigger lives INSIDE the frame loop on real engine state (mapSpawned + session INGAME),
+// so it cannot misfire at the menu or during loading the way command-buffer "wait" hacks do.
+idCVar com_autoCapture( "com_autoCapture", "", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_NEW, "arm an automated capture: after the map/savegame load completes and com_autoCaptureDelay in-game frames have rendered, write screenshots/<name>.exr (HDR) + an SDR screenshot named <name>, then quit if com_autoCaptureQuit" );
+idCVar com_autoLoadGame( "com_autoLoadGame", "", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_NEW, "load this savegame as soon as the session allows it, retrying until it succeeds. Unlike the one-shot +loadGame command this cannot lose the race against sign-in / savegame enumeration at startup and get stuck at the menu" );
+idCVar com_autoCaptureDelay( "com_autoCaptureDelay", "120", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NEW, "in-game frames to render before the com_autoCapture capture fires" );
+idCVar com_autoCaptureQuit( "com_autoCaptureQuit", "1", CVAR_SYSTEM | CVAR_BOOL | CVAR_NEW, "quit the game after the com_autoCapture capture" );
+
+// renderer-side HDR capture (RenderSystem_init.cpp)
+void R_CaptureHDRScreenshot( const char* baseName );
+
 idCVar com_sleepGame( "com_sleepGame", "0", CVAR_SYSTEM | CVAR_INTEGER, "intentionally add a sleep in the game time" );
 idCVar com_sleepDraw( "com_sleepDraw", "0", CVAR_SYSTEM | CVAR_INTEGER, "intentionally add a sleep in the draw time" );
 idCVar com_sleepRender( "com_sleepRender", "0", CVAR_SYSTEM | CVAR_INTEGER, "intentionally add a sleep in the render time" );
@@ -569,7 +584,12 @@ void idCommonLocal::Frame()
 		// Activate the shell if it's been requested
 		if( showShellRequested && game )
 		{
-			game->Shell_Show( true );
+			// automation path (com_autoLoadGame): keep the menu dead; the retry loop below
+			// loads the savegame directly.
+			if( com_autoLoadGame.GetString()[0] == '\0' )
+			{
+				game->Shell_Show( true );
+			}
 			showShellRequested = false;
 		}
 
@@ -641,6 +661,27 @@ void idCommonLocal::Frame()
 			renderSystem->SwapCommandBuffers_FinishRendering( &time_frontend, &time_backend, &time_moc, &time_gpu, &stats_backend, &stats_frontend );
 		}
 		frameTiming.finishSyncTime = Sys_Microseconds();
+
+		// com_autoCapture: fire once the loaded game has rendered enough settled frames.
+		// Placed right after the swap: the GPU is idle and the HDR scene buffer holds the
+		// completed previous frame. Counts only genuine in-game frames (map spawned AND the
+		// session in INGAME), so menu / loading / dialog frames never advance the trigger.
+		if( com_autoCapture.GetString()[0] != '\0' && mapSpawned && session->GetState() == idSession::INGAME )
+		{
+			static int autoCaptureFrames = 0;
+			autoCaptureFrames++;
+			const int delay = Max( 1, com_autoCaptureDelay.GetInteger() );
+			if( autoCaptureFrames == delay )
+			{
+				R_CaptureHDRScreenshot( com_autoCapture.GetString() );
+				cmdSystem->AppendCommandText( va( "screenshot %s\n", com_autoCapture.GetString() ) );
+			}
+			else if( autoCaptureFrames == delay + 10 && com_autoCaptureQuit.GetBool() )
+			{
+				// a few frames later so the SDR screenshot command above has executed
+				cmdSystem->AppendCommandText( "quit\n" );
+			}
+		}
 
 		// RB: slow down engine in background so it does not eat up so many resources along other 3D tools
 		if( !com_activeApp.GetBool() && !IsServer() /* and not VR */ )
@@ -798,6 +839,25 @@ void idCommonLocal::Frame()
 		session->UpdateSignInManager();
 		session->Pump();
 		session->ProcessSnapAckQueue();
+
+		// com_autoLoadGame: retry the savegame load until the session can actually do it.
+		// LoadGame() returns false silently while the master local user is not signed in yet or
+		// the savegame enumeration has not completed - a one-shot "+loadGame" that fires during
+		// that window just leaves the game sitting at the menu. Retrying on real engine state
+		// makes the launch deterministic; disarmed the moment the load is accepted.
+		if( com_autoLoadGame.GetString()[0] != '\0' && !mapSpawned && !insideExecuteMapChange )
+		{
+			static int autoLoadNextTry = 0;
+			if( idLib::frameNumber >= autoLoadNextTry )
+			{
+				autoLoadNextTry = idLib::frameNumber + 30;	// retry every ~half second
+				if( LoadGame( com_autoLoadGame.GetString() ) )
+				{
+					common->Printf( "com_autoLoadGame: loading '%s'\n", com_autoLoadGame.GetString() );
+					com_autoLoadGame.SetString( "" );	// disarm
+				}
+			}
+		}
 
 		if( session->GetState() == idSession::LOADING )
 		{

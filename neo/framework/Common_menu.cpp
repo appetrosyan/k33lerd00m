@@ -145,6 +145,15 @@ idCommonLocal::StartMainMenu
 */
 void idCommonLocal::StartMenu( bool playIntro )
 {
+	// automation path (com_autoLoadGame): never bring the menu up - the retry loop in
+	// idCommonLocal::Frame loads the savegame directly and the shell would only steal the
+	// boot sequence (menu music, press-start input wait) from a headless/scripted run.
+	extern idCVar com_autoLoadGame;
+	if( com_autoLoadGame.GetString()[0] != '\0' )
+	{
+		return;
+	}
+
 	if( game && game->Shell_IsActive() )
 	{
 		return;

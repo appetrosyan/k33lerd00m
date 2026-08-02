@@ -942,7 +942,7 @@ bool R_ReadPixelsRGB8( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrh
 	return true;
 }
 
-bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, byte** pic, int picWidth, int picHeight )
+bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, byte** pic, int picWidth, int picHeight, bool filterCorruption )
 {
 	nvrhi::TextureDesc desc = texture->getDesc();
 	nvrhi::TextureHandle tempTexture;
@@ -1042,12 +1042,15 @@ bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nv
 
 	// RB: filter out garbage and reset it to black
 	// this is a rare case but with a high visual impact
+	// NOTE: this luminance ceiling is tuned for ENVPROBE captures (~0.5-4.0); a gameplay HDR
+	// frame legitimately exceeds it on any bright emissive, so screenshot-style captures pass
+	// filterCorruption = false to keep the honest pixel values (including NaNs - they are data).
 	bool isCorrupted = false;
 
 	const idVec3 LUMINANCE_LINEAR( 0.299f, 0.587f, 0.144f );
 	idVec3 rgb;
 
-	for( uint32_t i = 0; i < ( desc.width * desc.height ); i++ )
+	for( uint32_t i = 0; filterCorruption && i < ( desc.width * desc.height ); i++ )
 	{
 		rgb.x = F16toF32( outData[ i * 3 + 0 ] );
 		rgb.y = F16toF32( outData[ i * 3 + 1 ] );
@@ -1088,6 +1091,48 @@ bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nv
 	device->unmapStagingTexture( stagingTexture );
 
 	return ( !isCorrupted );
+}
+
+/*
+==================
+R_CaptureHDRScreenshot
+
+Writes the current FP16 scene buffer (pre-tonemap linear HDR) to screenshots/<baseName>.exr.
+This is the capture half of the com_autoCapture harness (common_frame.cpp): unlike the SDR
+"screenshot" command this preserves the real radiance values, so shadow/light output can be
+verified numerically at an exact saved viewpoint without a display or an SDR tonemap in the way.
+==================
+*/
+void R_CaptureHDRScreenshot( const char* baseName )
+{
+	idImage* img = globalImages->currentRenderHDRImage;
+	if( img == NULL || img->GetTextureHandle() == nullptr )
+	{
+		common->Warning( "R_CaptureHDRScreenshot: no HDR render image" );
+		return;
+	}
+
+	const int w = img->GetUploadWidth();
+	const int h = img->GetUploadHeight();
+
+	byte* rgb16f = NULL;
+	if( !R_ReadPixelsRGB16F( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), img->GetTextureHandle(),
+							 nvrhi::ResourceStates::ShaderResource, &rgb16f, w, h, false ) || rgb16f == NULL )
+	{
+		common->Warning( "R_CaptureHDRScreenshot: HDR readback failed" );
+		if( rgb16f != NULL )
+		{
+			R_StaticFree( rgb16f );
+		}
+		return;
+	}
+
+	idStr fileName;
+	fileName.Format( "screenshots/%s.exr", baseName );
+	R_WriteEXR( fileName.c_str(), rgb16f, 3, w, h, "fs_savepath" );
+	R_StaticFree( rgb16f );
+
+	common->Printf( "Wrote HDR capture %s (%ix%i)\n", fileName.c_str(), w, h );
 }
 
 /*

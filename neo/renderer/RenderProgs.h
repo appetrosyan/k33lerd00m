@@ -480,6 +480,8 @@ enum
 	BUILTIN_DEPTH,
 	BUILTIN_DEPTH_SKINNED,
 
+	BUILTIN_SHADOW,				// stencil shadow volume extrusion (static; skinned deferred)
+
 	BUILTIN_BLENDLIGHT,
 	BUILTIN_BLENDLIGHT_SKINNED,
 	BUILTIN_FOG,
@@ -961,6 +963,11 @@ public:
 	void	BindShader_Depth()
 	{
 		BindShader_Builtin( BUILTIN_DEPTH );
+	}
+
+	void	BindShader_Shadow()
+	{
+		BindShader_Builtin( BUILTIN_SHADOW );
 	}
 
 	void	BindShader_DepthSkinned()

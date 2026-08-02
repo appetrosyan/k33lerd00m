@@ -60,6 +60,15 @@ idCVar r_rtShadowSkipWorldFlood( "r_rtShadowSkipWorldFlood", "1", CVAR_RENDERER 
 // instead of the whole framebuffer. A light that touches a small screen region then traces
 // rays for just those pixels (its interactions are scissored to the same rect anyway).
 idCVar r_rtShadowScissor( "r_rtShadowScissor", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT shadows: trace only each light's screen scissor rect (perf). 0 = full-screen dispatch per light" );
+// Perf: the shadow mask is piecewise-constant (flat lit/umbra interiors + thin boundaries), so
+// trace it COARSE first, then refine with a full-res ray only where the coarse mask disagrees
+// (a boundary is nearby) - interiors just upsample, no ray. This decouples the shadow ray budget
+// from render (SSAA) resolution: the coarse divisor is scaled by R_SSAAScale() so it stays a fixed
+// fraction of DISPLAY resolution regardless of supersampling (see r_rtShadowCoarseDiv). Forced off
+// (legacy single dispatch) whenever a debug force mode or soft shadows (rays > 1) are active - see
+// RenderLight.
+idCVar r_rtShadowCoarse( "r_rtShadowCoarse", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: 0 = single full-res dispatch (default); 1 = coarse-only upsample (soft edges, tests the coarse plumbing); 2 = coarse + full-res edge refine (perf, sharp edges). Forced to 0 when r_rtShadowForce != 0 or r_rtShadowRays > 1.", 0, 2 );
+idCVar r_rtShadowCoarseDiv( "r_rtShadowCoarseDiv", "4", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: coarse trace is renderRes / round(this * SSAAScale) - e.g. 4 gives 1/4 res at SSAA 1x, 1/6 at 1.5x, 1/8 at 2x, so the shadow ray budget stays a fixed fraction of DISPLAY res. Live - no vid_restart needed.", 2, 16 );
 extern idCVar r_useScissor;
 
 RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
@@ -67,6 +76,7 @@ RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* common
 	, m_CommonPasses( commonPasses )
 	, m_BoundTlas( nullptr )
 	, m_BoundMask( nullptr )
+	, m_BoundCoarse( nullptr )
 	, m_ViewReady( false )
 	, rayTracingSupported( false )
 	, loggedFirstBuild( false )
@@ -79,16 +89,18 @@ RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* common
 		m_Device->queryFeatureSupport( nvrhi::Feature::RayQuery ) &&
 		m_Device->queryFeatureSupport( nvrhi::Feature::RayTracingAccelStruct );
 
-	// Unlike the other RT passes, RenderLight writes this volatile buffer ONCE PER LIGHT
-	// (each shadow-casting point/spot re-fills the light origin before its dispatch), so
-	// the version ring must cover every such light in a frame - not just one write. 16
-	// (c_MaxRenderPassConstantBufferVersions) overflows on busy maps and nvrhi fatals.
+	// Unlike the other RT passes, RenderLight writes this volatile buffer ONCE (legacy/coarse-only)
+	// or TWICE (coarse+refine, r_rtShadowCoarse 2) PER LIGHT (each shadow-casting point/spot re-
+	// fills the light origin before each of its dispatches), so the version ring must cover every
+	// such write in a frame - not just one per light. 16 (c_MaxRenderPassConstantBufferVersions)
+	// overflows on busy maps and nvrhi fatals; 2048 keeps the original ~1024-light headroom now
+	// that coarse+refine can consume two versions per light instead of one.
 	nvrhi::BufferDesc constantBufferDesc;
 	constantBufferDesc.byteSize = sizeof( RtShadowConstants );
 	constantBufferDesc.debugName = "RtShadowConstants";
 	constantBufferDesc.isConstantBuffer = true;
 	constantBufferDesc.isVolatile = true;
-	constantBufferDesc.maxVersions = 1024;
+	constantBufferDesc.maxVersions = 2048;
 	m_ConstantBuffer = m_Device->createBuffer( constantBufferDesc );
 
 	if( rayTracingSupported )
@@ -133,7 +145,8 @@ void RtShadowsPass::CreateTracePass()
 		nvrhi::BindingLayoutItem::Texture_SRV( 1 ),			// t1 : hardware depth
 		nvrhi::BindingLayoutItem::Texture_SRV( 2 ),			// t2 : gbuffer world normals + roughness
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : RtShadowConstants
-		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : visibility mask
+		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : write target (final mask, or the coarse image for passMode 1)
+		nvrhi::BindingLayoutItem::Texture_SRV( 3 ),			// t3 : coarse+refine - the OTHER of {mask,coarse} not bound at u0 (dummy/unread except in the refine pass)
 	};
 	m_TraceBindingLayout = m_Device->createBindingLayout( layoutDesc );
 
@@ -157,6 +170,19 @@ bool RtShadowsPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t
 	if( !r_useRTShadows.GetBool() || !rayTracingSupported || viewDef == NULL || m_TracePipeline == nullptr )
 	{
 		return false;
+	}
+
+	// Coarse+refine needs the coarse mask image resident. ImageFromFunction images are generated
+	// lazily (on first bind / ReloadImages), and the coarse image is never bound by the legacy
+	// path - so without this it stays null forever and coarse+refine silently never engages.
+	// Force-generate it here, once, when its texture is still null.
+	if( r_rtShadowCoarse.GetInteger() != 0 )
+	{
+		idImage* coarse = globalImages->rtShadowCoarseImage;
+		if( coarse != NULL && coarse->GetTextureHandle() == nullptr )
+		{
+			coarse->Reload( false, commandList );
+		}
 	}
 
 	m_AccelStructs.SetShadowCastersOnly( r_rtShadowCasterFilter.GetBool() );
@@ -189,6 +215,12 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	{
 		return false;
 	}
+
+	// Coarse image may be briefly unavailable right after a resolution change (image function
+	// callbacks run lazily); if so, silently fall back to the legacy single dispatch below rather
+	// than failing the light entirely.
+	idImage* coarse = globalImages->rtShadowCoarseImage;
+	const bool coarseImageReady = ( coarse != NULL && coarse->GetTextureHandle() != nullptr );
 
 	// Run at the render (supersampled) resolution: the mask lines up 1:1 with the
 	// depth / gbuffer it reconstructs from and with the interaction pass's SV_Position.
@@ -260,10 +292,8 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 		constants.lightDepthBounds = idVec4( vLight->scissorRect.zmin, vLight->scissorRect.zmax, 0.0f, 0.0f );
 	}
 
-	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
-
-	// the TLAS handle changes when it is recreated to grow; rebuild the binding set
-	// (also invalidated when the mask image handle changes) to track current resources.
+	// the TLAS handle changes when it is recreated to grow; rebuild the binding sets
+	// (also invalidated when either image handle changes) to track current resources.
 	nvrhi::rt::IAccelStruct* tlas = m_AccelStructs.GetTLAS();
 	if( tlas == nullptr )
 	{
@@ -278,28 +308,167 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 		}
 		return false;
 	}
-	if( m_TraceBindingSet == nullptr || m_BoundTlas != tlas || m_BoundMask != mask )
+
+	// Two binding sets share the same TLAS/depth/normal/CB bindings and only swap which of
+	// {mask, coarse} is the UAV write target vs. the (possibly unread) SRV - see RtShadowsPass.h.
+	// coarseTexture may be null right after a resolution change; bind the mask itself as the dummy
+	// SRV in that case (never read by the shader when the coarse image isn't ready - two-pass mode
+	// is disabled below whenever !coarseImageReady, so m_CoarseBindingSet is simply left unused).
+	if( m_MaskBindingSet == nullptr || m_BoundTlas != tlas || m_BoundMask != mask || m_BoundCoarse != coarse )
 	{
-		nvrhi::BindingSetDesc setDesc;
-		setDesc.bindings =
+		nvrhi::TextureHandle coarseSRV = coarseImageReady ? coarse->GetTextureHandle() : mask->GetTextureHandle();
+
+		nvrhi::BindingSetDesc maskSetDesc;
+		maskSetDesc.bindings =
 		{
 			nvrhi::BindingSetItem::RayTracingAccelStruct( 0, tlas ),
 			nvrhi::BindingSetItem::Texture_SRV( 1, globalImages->currentDepthImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::Texture_SRV( 2, globalImages->gbufferNormalsRoughnessImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 			nvrhi::BindingSetItem::Texture_UAV( 0, mask->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_SRV( 3, coarseSRV ),
 		};
-		m_TraceBindingSet = m_Device->createBindingSet( setDesc, m_TraceBindingLayout );
+		m_MaskBindingSet = m_Device->createBindingSet( maskSetDesc, m_TraceBindingLayout );
+
+		if( coarseImageReady )
+		{
+			nvrhi::BindingSetDesc coarseSetDesc;
+			coarseSetDesc.bindings =
+			{
+				nvrhi::BindingSetItem::RayTracingAccelStruct( 0, tlas ),
+				nvrhi::BindingSetItem::Texture_SRV( 1, globalImages->currentDepthImage->GetTextureHandle() ),
+				nvrhi::BindingSetItem::Texture_SRV( 2, globalImages->gbufferNormalsRoughnessImage->GetTextureHandle() ),
+				nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
+				nvrhi::BindingSetItem::Texture_UAV( 0, coarse->GetTextureHandle() ),
+				nvrhi::BindingSetItem::Texture_SRV( 3, mask->GetTextureHandle() ),
+			};
+			m_CoarseBindingSet = m_Device->createBindingSet( coarseSetDesc, m_TraceBindingLayout );
+		}
+		else
+		{
+			m_CoarseBindingSet = nullptr;
+		}
+
 		m_BoundTlas = tlas;
 		m_BoundMask = mask;
+		m_BoundCoarse = coarse;
 	}
 
-	nvrhi::ComputeState state;
-	state.pipeline = m_TracePipeline;
-	state.bindings = { m_TraceBindingSet };
-	commandList->setComputeState( state );
+	// Coarse + edge-refine (see r_rtShadowCoarse). Disabled - falls back to the legacy single
+	// dispatch - whenever: the coarse image isn't ready yet; a debug force mode is active (they
+	// assume full-screen single-pass coverage, see rt_shadows.cs.hlsl); or soft shadows are active
+	// (rays > 1 makes the coarse mask continuous almost everywhere, so the refine pass would trace
+	// nearly every pixel anyway - pure overhead with no savings).
+	const int coarseMode = r_rtShadowCoarse.GetInteger();
+	const bool debugForceActive = ( r_rtShadowForce.GetInteger() != 0 );
+	const bool softShadowsActive = ( r_rtShadowRays.GetInteger() > 1 );
+	const bool useTwoPass = coarseImageReady && coarseMode != 0 && !debugForceActive && !softShadowsActive;
 
-	commandList->dispatch( ( dispW + 7 ) / 8, ( dispH + 7 ) / 8, 1 );
+	// One-shot gate diagnostic: if coarse+refine "does nothing", this line names the failing
+	// condition (coarseImageReady 0 = coarse mask never generated; rays>1 = soft shadows force
+	// legacy; force!=0 = a debug mode forces legacy).
+	{
+		static bool loggedGate = false;
+		if( !loggedGate )
+		{
+			common->Printf( "RtShadowsPass gate: coarseMode=%i coarseImageReady=%i force=%i rays=%i -> useTwoPass=%i\n",
+							 coarseMode, ( int )coarseImageReady, r_rtShadowForce.GetInteger(), r_rtShadowRays.GetInteger(), ( int )useTwoPass );
+			loggedGate = true;
+		}
+	}
+
+	if( !useTwoPass )
+	{
+		// legacy path: constants.coarseParams is already (0,0) from the memset above.
+		commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
+
+		nvrhi::ComputeState state;
+		state.pipeline = m_TracePipeline;
+		state.bindings = { m_MaskBindingSet };
+		commandList->setComputeState( state );
+
+		commandList->dispatch( ( dispW + 7 ) / 8, ( dispH + 7 ) / 8, 1 );
+		return true;
+	}
+
+	// Coarse resolution: a fixed fraction of DISPLAY (not render) resolution, so SSAA supersampling
+	// does not also multiply the shadow ray budget. ratio = render texels per coarse texel.
+	const int ratio = idMath::ClampInt( 1, 64, idMath::Ftoi( idMath::Rint( ( float )r_rtShadowCoarseDiv.GetInteger() * R_SSAAScale() ) ) );
+	const int coarseW = ( width + ratio - 1 ) / ratio;
+	const int coarseH = ( height + ratio - 1 ) / ratio;
+
+	// Coarse rect: the render-res dispatch rect mapped into coarse-texel space, expanded by 1 texel
+	// on every side and clamped to the coarse image. The refine pass's bilinear bracket can read one
+	// texel beyond a pixel's own coarse cell, so under-expanding here leaves a stale seam at the
+	// scissor border (a previous light's leftover coarse value, since the subregion is shared).
+	int cMinX = dispX / ratio - 1;
+	int cMinY = dispY / ratio - 1;
+	int cMaxX = ( dispX + dispW + ratio - 1 ) / ratio + 1;
+	int cMaxY = ( dispY + dispH + ratio - 1 ) / ratio + 1;
+	cMinX = idMath::ClampInt( 0, coarseW, cMinX );
+	cMinY = idMath::ClampInt( 0, coarseH, cMinY );
+	cMaxX = idMath::ClampInt( 0, coarseW, cMaxX );
+	cMaxY = idMath::ClampInt( 0, coarseH, cMaxY );
+	const int coarseDispW = cMaxX - cMinX;
+	const int coarseDispH = cMaxY - cMinY;
+	if( coarseDispW <= 0 || coarseDispH <= 0 )
+	{
+		// Degenerate coarse rect (should not happen for a non-empty render rect) - fall back to
+		// the legacy single dispatch for this light rather than dropping its shadow entirely.
+		commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
+
+		nvrhi::ComputeState state;
+		state.pipeline = m_TracePipeline;
+		state.bindings = { m_MaskBindingSet };
+		commandList->setComputeState( state );
+
+		commandList->dispatch( ( dispW + 7 ) / 8, ( dispH + 7 ) / 8, 1 );
+		return true;
+	}
+
+	constants.coarseSize = idVec2i( coarseW, coarseH );
+	constants.coarseScissorMin = idVec2i( cMinX, cMinY );
+
+	// One-shot dims log: confirms the coarse-rect mapping/expansion math (r_rtShadowCoarse) without
+	// needing a visually-correct frame - coarseScissorMin must stay >= 0 and coarseScissorMin +
+	// coarseDisp must stay <= coarseSize, and the coarse rect must cover ceil(render rect / ratio).
+	{
+		static bool loggedCoarseDims = false;
+		if( !loggedCoarseDims )
+		{
+			common->Printf( "RtShadowsPass: coarse dims ratio=%i coarseSize=(%i,%i) coarseRect=(%i,%i)+(%i,%i) renderRect=(%i,%i)+(%i,%i)\n",
+							 ratio, coarseW, coarseH, cMinX, cMinY, coarseDispW, coarseDispH, dispX, dispY, dispW, dispH );
+			loggedCoarseDims = true;
+		}
+	}
+
+	// Coarse dispatch: trace one ray per coarse texel over the (over-expanded) coarse rect, write
+	// the coarse image. Strict write -> setState -> dispatch order preserved between the two
+	// dispatches below (do not hoist the writeBuffer calls) - the volatile CB versions on the
+	// bound set at each dispatch, and binding the coarse image as an SRV in the refine dispatch's
+	// set transitions it out of the UAV state this dispatch leaves it in.
+	constants.coarseParams = idVec2i( 1, 0 );
+	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
+	{
+		nvrhi::ComputeState state;
+		state.pipeline = m_TracePipeline;
+		state.bindings = { m_CoarseBindingSet };
+		commandList->setComputeState( state );
+		commandList->dispatch( ( coarseDispW + 7 ) / 8, ( coarseDispH + 7 ) / 8, 1 );
+	}
+
+	// Refine dispatch: full render-res over the light's normal scissor rect. coarseMode == 1 is the
+	// "coarse-only" diagnostic (force-upsample, never trace - see the shader); coarseMode == 2 is
+	// the real edge-refine (trace only where the coarse mask disagrees).
+	constants.coarseParams = idVec2i( 2, coarseMode == 1 ? 1 : 0 );
+	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
+	{
+		nvrhi::ComputeState state;
+		state.pipeline = m_TracePipeline;
+		state.bindings = { m_MaskBindingSet };
+		commandList->setComputeState( state );
+		commandList->dispatch( ( dispW + 7 ) / 8, ( dispH + 7 ) / 8, 1 );
+	}
 
 	return true;
 }

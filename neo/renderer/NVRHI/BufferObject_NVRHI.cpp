@@ -211,11 +211,13 @@ bool idVertexBuffer::AllocBufferObject( const void* data, int allocSize, bufferU
 		vertexBufferDesc.debugName = "Static idDrawVert vertex buffer";
 	}
 
-	// DDGI (M1): static geometry must be usable as ray tracing acceleration
-	// structure build input. Gated on r_useDDGI so the extra buffer usage is
-	// only paid for when DDGI is on; toggling it requires a map reload so the
-	// static vertex cache is reallocated with this capability.
-	if( usage == BU_STATIC && ( r_useDDGI.GetBool() || r_useRTReflections.GetBool() ) )
+	// Static geometry must be usable as ray tracing acceleration-structure build input for any
+	// RT consumer (DDGI, RT reflections, RT shadows). Gate this on the device actually supporting
+	// RT accel structs - NOT on the feature cvars - so the capability is present whenever the
+	// hardware can do it and r_useDDGI / r_useRTReflections / r_useRTShadows can be toggled live
+	// without a map reload. (Gating on the cvars previously meant enabling RT shadows at runtime
+	// fed a flagless buffer into the BLAS build -> nvrhi error -> command-list desync -> crash.)
+	if( usage == BU_STATIC && deviceManager->GetDevice()->queryFeatureSupport( nvrhi::Feature::RayTracingAccelStruct ) )
 	{
 		vertexBufferDesc.isAccelStructBuildInput = true;
 		// The DDGI trace shader also reads hit-triangle positions from this
@@ -491,8 +493,9 @@ bool idIndexBuffer::AllocBufferObject( const void* data, int allocSize, bufferUs
 		indexBufferDesc.debugName = "VertexCache Mapped Index Buffer";
 	}
 
-	// DDGI (M1): see idVertexBuffer::AllocBufferObject above.
-	if( _usage == BU_STATIC && ( r_useDDGI.GetBool() || r_useRTReflections.GetBool() ) )
+	// Ray tracing accel-structure build input - see idVertexBuffer::AllocBufferObject above.
+	// Gated on device RT support (not the feature cvars) so RT shadows/reflections/DDGI toggle live.
+	if( _usage == BU_STATIC && deviceManager->GetDevice()->queryFeatureSupport( nvrhi::Feature::RayTracingAccelStruct ) )
 	{
 		indexBufferDesc.isAccelStructBuildInput = true;
 	}

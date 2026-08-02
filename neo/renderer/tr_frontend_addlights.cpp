@@ -43,6 +43,9 @@ If you have questions concerning this license or the applicable additional terms
 extern idCVar r_useAreasConnectedForShadowCulling;
 extern idCVar r_useParallelAddShadows;
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
+
+// diagnostics: dump the in-view light list each frame (see R_AddLights)
+idCVar r_listViewLights( "r_listViewLights", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "print every in-view light (index, origin, type, shader, caster chains) each frame - for scripted capture runs" );
 extern idCVar r_forceShadowCaps;
 extern idCVar r_useShadowPreciseInsideTest;
 
@@ -605,8 +608,16 @@ static void R_AddSingleLight( viewLight_t* vLight )
 			// RT shadows trace the actual scene: an occluder whose shadow does not land
 			// in the current frame can still be hit by a shadow ray once the camera turns,
 			// so keep it in the caster set (this is what stops lit volumes going bright
-			// when a window / portal to the occluder rotates out of view).
-			if( !r_useRTShadows.GetBool() && idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
+			// when a window / portal to the occluder rotates out of view). Stencil shadow
+			// volumes render into the view and cannot affect it from an off-view caster, so
+			// they MUST cull here - keeping off-view casters paints phantom volumes on distant
+			// surfaces. Keep off-view casters only when RT is the active method, not when the
+			// archived r_useRTShadows cvar merely lingers on alongside stencil shadows.
+			extern idCVar r_useStencilShadows;
+			// Shadow-method precedence: only RT needs off-view casters (its TLAS traces them), so keep
+			// them exactly when RT is the active method; stencil renders into the view and must cull.
+			const bool keepOffViewCasters = r_useRTShadows.GetBool();
+			if( !keepOffViewCasters && idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
 			{
 				continue;
 			}
@@ -692,6 +703,24 @@ void R_AddLights()
 		if( r_showLightScissors.GetBool() )
 		{
 			R_ShowColoredScreenRect( vLight->scissorRect, vLight->lightDef->index );
+		}
+
+		// diagnostics: dump every in-view light to the console so a scripted capture run's log
+		// identifies the lights composing a frame (index for r_singleLight, origin, type, shader,
+		// caster chains). One line per light per frame - use only in auto-capture runs.
+		extern idCVar r_listViewLights;
+		if( r_listViewLights.GetBool() )
+		{
+			common->Printf( "viewLight %i: origin (%.0f %.0f %.0f) %s%s%s shader %s scissor(%i,%i-%i,%i) casters glob=%c loc=%c\n",
+							vLight->lightDef->index,
+							vLight->globalLightOrigin.x, vLight->globalLightOrigin.y, vLight->globalLightOrigin.z,
+							vLight->pointLight ? "point" : "spot",
+							vLight->parallel ? " parallel" : "",
+							vLight->lightShader->IsAmbientLight() ? " ambient" : "",
+							vLight->lightShader->GetName(),
+							vLight->scissorRect.x1, vLight->scissorRect.y1, vLight->scissorRect.x2, vLight->scissorRect.y2,
+							vLight->globalShadows ? 'y' : 'n',
+							vLight->localShadows ? 'y' : 'n' );
 		}
 	}
 }
