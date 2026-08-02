@@ -45,3 +45,11 @@ neo/cmake-build-*/
 neo/bin/
 /tools/
 /RBDoom3BFG
+/__redist/
+/__support/
+/app/
+/base/*.png
+/neo/idlib/libidlib.a
+/goggame-1135892318.hashdb
+/goggame-1135892318.info
+/goggame-1135892318.script
