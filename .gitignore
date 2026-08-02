@@ -74,3 +74,7 @@ neo/bin/
 /neo/shaders/CMakeFiles/
 /neo/shaders/Makefile
 /neo/tools/compilers/rbdmap
+/neo/tools/compilers/Makefile
+/neo/tools/compilers/cmake_install.cmake
+/neo/tools/compilers/CMakeFiles/
+/neo/shaders/cmake_install.cmake
