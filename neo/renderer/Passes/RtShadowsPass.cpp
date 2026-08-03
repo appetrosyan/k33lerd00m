@@ -74,6 +74,12 @@ idCVar r_rtShadowCoarseDiv( "r_rtShadowCoarseDiv", "4", CVAR_RENDERER | CVAR_ARC
 // shadow value is discarded regardless - tracing it was pure waste. Culls the scissor-rect corners
 // a point light's sphere / a spot light's cone never fill. Archived on; toggle to A/B visually.
 idCVar r_rtShadowVolumeCull( "r_rtShadowVolumeCull", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: skip rays for receivers outside the light's projection volume (lossless - the interaction gives zero light there). 0 = trace the whole scissor rect." );
+// TLAS trim: let RT honour the same shadow-bounds-vs-frustum cull stencil uses (tr_frontend_addmodels),
+// instead of keeping EVERY off-view caster. A caster that shadows an in-view receiver still has that
+// receiver inside its shadowBounds -> intersects the frustum -> kept (incl. behind-camera casters), so
+// this should be lossless while dropping casters whose shadow lands nowhere visible. 0 = keep all
+// off-view casters (the previous behaviour) if a missing off-view shadow shows up.
+idCVar r_rtShadowCullOffView( "r_rtShadowCullOffView", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: cull casters whose shadow-bounds miss the view frustum (shrinks the shadow TLAS). 0 = keep every off-view caster." );
 extern idCVar r_useScissor;
 
 RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )

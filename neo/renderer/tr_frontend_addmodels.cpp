@@ -42,6 +42,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Model_local.h"
 
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
+extern idCVar r_rtShadowCullOffView;	// trim the shadow TLAS: cull casters whose shadow misses the view (RtShadowsPass.cpp)
 idCVar r_skipStaticShadows( "r_skipStaticShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip static shadows" );
 idCVar r_skipDynamicShadows( "r_skipDynamicShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip dynamic shadows" );
 idCVar r_useParallelAddModels( "r_useParallelAddModels", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "add all models in parallel with jobs" );
@@ -491,7 +492,13 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				// Shadow-method precedence: RT wins when on, else stencil, else shadow maps. RT is the
 				// only method that needs off-view casters (its TLAS traces them), so keep them exactly
 				// when RT is the active method - stencil renders volumes into the view and must cull.
-				const bool keepOffViewCasters = r_useRTShadows.GetBool();
+				// TLAS trim (r_rtShadowCullOffView): a caster shadowing an in-view receiver has that
+				// receiver inside shadowBounds, so shadowBounds intersects the frustum and survives the
+				// cull below (incl. behind-camera casters) - the only casters dropped are those whose
+				// shadow lands nowhere visible, which RT does not need either. So RT can honour the same
+				// cull stencil uses instead of keeping EVERY off-view caster. Set the cvar 0 to restore
+				// the keep-everything behaviour if a real off-view shadow goes missing.
+				const bool keepOffViewCasters = r_useRTShadows.GetBool() && !r_rtShadowCullOffView.GetBool();
 				if( !keepOffViewCasters && idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
 				{
 					continue;
