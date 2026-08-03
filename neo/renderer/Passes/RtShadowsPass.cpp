@@ -69,6 +69,11 @@ idCVar r_rtShadowScissor( "r_rtShadowScissor", "1", CVAR_RENDERER | CVAR_BOOL | 
 // RenderLight.
 idCVar r_rtShadowCoarse( "r_rtShadowCoarse", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: 0 = single full-res dispatch (default); 1 = coarse-only upsample (soft edges, tests the coarse plumbing); 2 = coarse + full-res edge refine (perf, sharp edges). Forced to 0 when r_rtShadowForce != 0 or r_rtShadowRays > 1.", 0, 2 );
 idCVar r_rtShadowCoarseDiv( "r_rtShadowCoarseDiv", "4", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: coarse trace is renderRes / round(this * SSAAScale) - e.g. 4 gives 1/4 res at SSAA 1x, 1/6 at 1.5x, 1/8 at 2x, so the shadow ray budget stays a fixed fraction of DISPLAY res. Live - no vid_restart needed.", 2, 16 );
+// Lossless ray-count cut: skip the visibility ray for receivers outside the light's projection
+// volume (baseLightProject [0,1] cube). The interaction's falloff/cookie is zero there, so the
+// shadow value is discarded regardless - tracing it was pure waste. Culls the scissor-rect corners
+// a point light's sphere / a spot light's cone never fill. Archived on; toggle to A/B visually.
+idCVar r_rtShadowVolumeCull( "r_rtShadowVolumeCull", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: skip rays for receivers outside the light's projection volume (lossless - the interaction gives zero light there). 0 = trace the whole scissor rect." );
 extern idCVar r_useScissor;
 
 RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
@@ -248,6 +253,16 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 							   ( float )( tr.frameCount & 1023 ) );
 	constants.screenSize = idVec2i( width, height );
 	constants.pad = idVec2i( r_rtShadowBackfaceCull.GetInteger(), r_rtShadowForce.GetInteger() );
+
+	// Light-volume cull: pass baseLightProject rows so the shader can skip rays for receivers
+	// outside the light's projection box (see r_rtShadowVolumeCull). Disabled by the debug force
+	// modes, which want full-screen coverage. Row-major: c[i] = row_i . (worldP,1).
+	const idRenderMatrix& lp = vLight->baseLightProject;
+	constants.lightProject0 = idVec4( lp[0][0], lp[0][1], lp[0][2], lp[0][3] );
+	constants.lightProject1 = idVec4( lp[1][0], lp[1][1], lp[1][2], lp[1][3] );
+	constants.lightProject2 = idVec4( lp[2][0], lp[2][1], lp[2][2], lp[2][3] );
+	constants.lightProject3 = idVec4( lp[3][0], lp[3][1], lp[3][2], lp[3][3] );
+	constants.pad2 = idVec2i( ( r_rtShadowVolumeCull.GetBool() && r_rtShadowForce.GetInteger() == 0 ) ? 1 : 0, 0 );
 
 	// Dispatch the trace over ONLY this light's screen-space scissor rect instead of the whole
 	// framebuffer - a light that touches 5% of the screen then costs 5% of the rays. The rect is

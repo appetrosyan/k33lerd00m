@@ -50,7 +50,7 @@ struct RtShadowConstants
 	idVec2i		screenSize;		// x = width, y = height (pixels, render resolution)
 	idVec2i		pad;			// x = backface cull, y = debug force/hit-dist mode
 	idVec2i		scissorMin;		// top-left pixel of this light's dispatch rect (screen space)
-	idVec2i		pad2;
+	idVec2i		pad2;			// x = light-volume cull enable (r_rtShadowVolumeCull), y = unused
 
 	idVec4		cameraOrigin;	// xyz = world-space eye (for the primary-ray TLAS coverage probe, mode 4)
 	idVec4		lightDepthBounds;	// x = zmin, y = zmax (hardware depth 0..1): skip rays for pixels
@@ -64,4 +64,13 @@ struct RtShadowConstants
 	//								// upsample (r_rtShadowCoarse==1 diagnostic: refine always
 	//								// upsamples, never traces, regardless of boundary detection)
 	idVec2i		coarsePad;
+
+	// Light projection (vLight->baseLightProject), row-major: c[i] = row_i . (worldP,1). A receiver
+	// is inside the light volume iff 0 < c.x,c.y,c.z < c.w (zeroToOne cube, matches
+	// idRenderMatrix::CullPointToMVPbits). Outside it the interaction's falloff/cookie is zero, so
+	// the shadow value there is discarded - we skip the ray. Enabled by pad2.x.
+	idVec4		lightProject0;
+	idVec4		lightProject1;
+	idVec4		lightProject2;
+	idVec4		lightProject3;
 };

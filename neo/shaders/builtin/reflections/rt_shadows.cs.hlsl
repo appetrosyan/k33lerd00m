@@ -51,6 +51,11 @@ struct RtShadowConstants
 	int2	coarseParams;		// x = passMode (0 legacy / 1 coarse / 2 refine), y = force-upsample
 	//							// (r_rtShadowCoarse==1 diagnostic: always upsample, never trace)
 	int2	coarsePad;
+
+	float4	lightProject0;		// baseLightProject rows: inside the light volume iff
+	float4	lightProject1;		// 0 < c.x,c.y,c.z < c.w where c[i] = lightProject[i] . (worldP,1).
+	float4	lightProject2;		// pad2.x enables the cull; outside -> interaction gives zero light.
+	float4	lightProject3;
 };
 
 // *INDENT-OFF*
@@ -77,6 +82,24 @@ float3 ReconstructWorld( float2 uv, float depth )
 	w.z = dot( g_Sh.unprojToWorld2, clip );
 	w.w = dot( g_Sh.unprojToWorld3, clip );
 	return w.xyz / w.w;
+}
+
+// Light-volume cull: true when worldP is OUTSIDE the light's projection box, matching
+// idRenderMatrix::CullPointToMVPbits (zeroToOne). The interaction's falloff/cookie is zero
+// there, so its shadow value is discarded - we can skip the ray. Gated by g_Sh.pad2.x.
+bool OutsideLightVolume( float3 worldP )
+{
+	if( g_Sh.pad2.x == 0 )
+	{
+		return false;
+	}
+	const float4 p = float4( worldP, 1.0f );
+	const float cx = dot( g_Sh.lightProject0, p );
+	const float cy = dot( g_Sh.lightProject1, p );
+	const float cz = dot( g_Sh.lightProject2, p );
+	const float cw = dot( g_Sh.lightProject3, p );
+	// inside iff 0 < cx,cy,cz < cw (implies cw > 0)
+	return !( cx > 0.0f && cx < cw && cy > 0.0f && cy < cw && cz > 0.0f && cz < cw );
 }
 
 // Cheap per-pixel hash -> two uniform randoms, varied by frame for soft shadows.
@@ -170,6 +193,12 @@ float ComputeVisibility( int2 samplePixel, float2 uv )
 
 	const float3 worldP = ReconstructWorld( uv, depth );
 	if( !all( isfinite( worldP ) ) || dot( worldP, worldP ) > 1.0e14f )
+	{
+		return 1.0f;
+	}
+
+	// outside the light volume the interaction gives zero light -> skip the ray
+	if( OutsideLightVolume( worldP ) )
 	{
 		return 1.0f;
 	}
@@ -344,6 +373,16 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	// a hard seam at the window's near/far depth cliff). Skip such pixels - very distant
 	// geometry - rather than trace nonsense. Same failure hits ReconstructWorld in reflections.
 	if( !all( isfinite( worldP ) ) || dot( worldP, worldP ) > 1.0e14f )
+	{
+		u_ShadowMask[pixel] = 1.0f;
+		return;
+	}
+
+	// Light-volume cull (g_Sh.pad2.x, disabled in the debug-force modes above): a receiver outside
+	// the light's projection box gets zero light from the interaction's falloff/cookie, so its
+	// shadow value is discarded - skip the ray. Culls the scissor-rect corners the sphere/cone
+	// never fills. Lossless.
+	if( OutsideLightVolume( worldP ) )
 	{
 		u_ShadowMask[pixel] = 1.0f;
 		return;
