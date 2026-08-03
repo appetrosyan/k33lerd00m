@@ -127,6 +127,17 @@ void idRenderLog::Init()
 		timerQueries.Append( deviceManager->GetDevice()->createTimerQuery() );
 		timerUsed.Append( false );
 	}
+
+	for( int i = 0; i < MAX_SHADOWGEN_SEGMENTS * NUM_FRAME_DATA; i++ )
+	{
+		shadowGenQueries.Append( deviceManager->GetDevice()->createTimerQuery() );
+		shadowGenKind.Append( 0 );
+	}
+	for( int i = 0; i < NUM_FRAME_DATA; i++ )
+	{
+		shadowGenCount[i] = 0;
+	}
+	shadowGenActive = -1;
 }
 
 void idRenderLog::Shutdown()
@@ -136,6 +147,11 @@ void idRenderLog::Shutdown()
 	for( int i = 0; i < MRB_TOTAL * NUM_FRAME_DATA; i++ )
 	{
 		timerQueries[i].Reset();
+	}
+
+	for( int i = 0; i < MAX_SHADOWGEN_SEGMENTS * NUM_FRAME_DATA; i++ )
+	{
+		shadowGenQueries[i].Reset();
 	}
 }
 
@@ -199,6 +215,53 @@ void idRenderLog::CloseMainBlock( int _block )
 			timerUsed[ timerIndex ] = true;
 		}
 	}
+}
+
+/*
+========================
+idRenderLog::BeginShadowGen
+
+Open one shadow-generation timing segment at the current frame parity. Segments are
+summed per kind in FetchGPUTimers. Not nestable: one segment open at a time.
+========================
+*/
+void idRenderLog::BeginShadowGen( renderLogShadowGen_t kind )
+{
+	if( !glConfig.timerQueryAvailable )
+	{
+		return;
+	}
+
+	assert( shadowGenActive < 0 );
+
+	int seg = shadowGenCount[frameParity];
+	if( seg >= MAX_SHADOWGEN_SEGMENTS )
+	{
+		// pool exhausted this frame - leave the rest untimed rather than grow the pool
+		return;
+	}
+
+	int idx = seg + frameParity * MAX_SHADOWGEN_SEGMENTS;
+	shadowGenKind[idx] = ( uint8 )kind;
+	commandList->beginTimerQuery( shadowGenQueries[idx] );
+	shadowGenActive = idx;
+}
+
+/*
+========================
+idRenderLog::EndShadowGen
+========================
+*/
+void idRenderLog::EndShadowGen()
+{
+	if( !glConfig.timerQueryAvailable || shadowGenActive < 0 )
+	{
+		return;
+	}
+
+	commandList->endTimerQuery( shadowGenQueries[shadowGenActive] );
+	shadowGenCount[frameParity]++;
+	shadowGenActive = -1;
 }
 
 /*
@@ -306,6 +369,25 @@ void idRenderLog::FetchGPUTimers( backEndCounters_t& pc )
 		// reset timer
 		timerUsed[timerIndex] = false;
 	}
+
+	// sum the pooled shadow-generation segments for this parity, grouped by kind
+	uint64 shadowGen[RLS_TOTAL] = {};
+	if( glConfig.timerQueryAvailable )
+	{
+		for( int seg = 0; seg < shadowGenCount[frameParity]; seg++ )
+		{
+			int idx = seg + frameParity * MAX_SHADOWGEN_SEGMENTS;
+			double time = deviceManager->GetDevice()->getTimerQueryTime( shadowGenQueries[idx] ) * 1000000.0;
+			shadowGen[shadowGenKind[idx]] += uint64( time );
+		}
+	}
+	pc.gpuStencilShadowMicroSec	= shadowGen[RLS_STENCIL];
+	pc.gpuShadowMapMicroSec		= shadowGen[RLS_SHADOWMAP];
+	pc.gpuRTShadowMaskMicroSec	= shadowGen[RLS_RTMASK];
+
+	// free the pool slots for this parity to be rewritten this frame
+	shadowGenCount[frameParity] = 0;
+	shadowGenActive = -1;
 }
 
 

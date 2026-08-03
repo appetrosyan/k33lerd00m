@@ -367,6 +367,21 @@ public:
 		return stats_backend.gpuInteractionsMicroSec;
 	}
 
+	uint64		GetRendererGpuStencilShadowMicroseconds() const
+	{
+		return stats_backend.gpuStencilShadowMicroSec;
+	}
+
+	uint64		GetRendererGpuShadowMapMicroseconds() const
+	{
+		return stats_backend.gpuShadowMapMicroSec;
+	}
+
+	uint64		GetRendererGpuRTShadowMaskMicroseconds() const
+	{
+		return stats_backend.gpuRTShadowMaskMicroSec;
+	}
+
 	uint64		GetRendererGpuShaderPassMicroseconds() const
 	{
 		return stats_backend.gpuShaderPassMicroSec;

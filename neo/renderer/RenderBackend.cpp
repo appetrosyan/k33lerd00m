@@ -4241,7 +4241,9 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 		// its interactions draw. DrawSingleInteraction then binds the RT variant + mask.
 		if( R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
 		{
+			renderLog.BeginShadowGen( RLS_RTMASK );
 			rtShadowsPass->RenderLight( commandList, _viewDef, vLight );
+			renderLog.EndShadowGen();
 		}
 
 		// RB: render interactions with shadow mapping
@@ -4277,12 +4279,14 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 					sideStop = 0;
 				}
 
+				renderLog.BeginShadowGen( RLS_SHADOWMAP );
 				for( ; side < sideStop ; side++ )
 				{
 					// vLight is const but we make an exception here to store the shadow matrices per vLight
 					// OPTIMIZE: these calculations could be moved to the renderer frontend into the multithreaded job
 					ShadowMapPassFast( vLight->globalShadows, ( viewLight_t* ) vLight, side, false );
 				}
+				renderLog.EndShadowGen();
 
 				// go back to main render target
 				if( previousFramebuffer != NULL )
@@ -4328,9 +4332,11 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 					currentScissor = rect;
 				}
 				GL_State( GLS_DEFAULT );	// make sure the stencil mask passes for the clear
+				renderLog.BeginShadowGen( RLS_STENCIL );
 				GL_Clear( false, false, true, STENCIL_SHADOW_TEST_VALUE, 0.0f, 0.0f, 0.0f, 0.0f, false );
 
 				StencilShadowPass( vLight->globalShadows, vLight );
+				renderLog.EndShadowGen();
 			}
 
 			if( vLight->localInteractions != NULL )
@@ -4342,7 +4348,9 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 
 			if( performStencilTest && vLight->localShadows != NULL )
 			{
+				renderLog.BeginShadowGen( RLS_STENCIL );
 				StencilShadowPass( vLight->localShadows, vLight );
+				renderLog.EndShadowGen();
 			}
 
 			if( vLight->globalInteractions != NULL )

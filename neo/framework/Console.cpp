@@ -305,7 +305,15 @@ float idConsoleLocal::DrawFPS( float y )
 	const uint64 rendererGPU_SSRTime = commonLocal.GetRendererGpuSSRMicroseconds();
 	const uint64 rendererGPUAmbientPassTime = commonLocal.GetRendererGpuAmbientPassMicroseconds();
 	const uint64 rendererGPUShadowAtlasTime = commonLocal.GetRendererGpuShadowAtlasPassMicroseconds();
-	const uint64 rendererGPUInteractionsTime = commonLocal.GetRendererGpuInteractionsMicroseconds();
+	// Interactions timer folds in the shadow-generation work interleaved with lighting; split
+	// it out so the Interactions number is pure lighting and each active shadow path is its own line.
+	const uint64 rendererGPUStencilShadowTime = commonLocal.GetRendererGpuStencilShadowMicroseconds();
+	const uint64 rendererGPUShadowMapTime = commonLocal.GetRendererGpuShadowMapMicroseconds();
+	const uint64 rendererGPURTShadowMaskTime = commonLocal.GetRendererGpuRTShadowMaskMicroseconds();
+	const uint64 rendererGPUShadowGenTime = rendererGPUStencilShadowTime + rendererGPUShadowMapTime + rendererGPURTShadowMaskTime;
+	const uint64 rendererGPUInteractionsTotal = commonLocal.GetRendererGpuInteractionsMicroseconds();
+	// guard against underflow if the shadow segments slightly outweigh the (overlapping) total
+	const uint64 rendererGPUInteractionsTime = rendererGPUInteractionsTotal > rendererGPUShadowGenTime ? rendererGPUInteractionsTotal - rendererGPUShadowGenTime : 0;
 	const uint64 rendererGPUShaderPassesTime = commonLocal.GetRendererGpuShaderPassMicroseconds() + commonLocal.GetRendererGpuFogAllLightsMicroseconds() + commonLocal.GetRendererGpuShaderPassPostMicroseconds() + commonLocal.GetRendererGpuDrawGuiMicroseconds();
 	const uint64 rendererGPU_TAATime = commonLocal.GetRendererGpuMotionVectorsMicroseconds() + commonLocal.GetRendererGpuTAAMicroseconds();
 	const uint64 rendererGPUPostProcessingTime = commonLocal.GetRendererGpuToneMapPassMicroseconds() + commonLocal.GetRendererGpuPostProcessingMicroseconds() + commonLocal.GetRendererGpuCrtPostProcessingMicroseconds();
@@ -341,22 +349,8 @@ float idConsoleLocal::DrawFPS( float y )
 	// RB: use ImGui to show more detailed stats about the scene loads
 	if( ImGuiHook::IsReadyToRender() )
 	{
-		// start smaller
-		int32 statsWindowWidth = 320;
-		int32 statsWindowHeight = 330;
-
-		if( com_showFPS.GetInteger() > 2 )
-		{
-			statsWindowWidth += 230;
-			statsWindowHeight += 140;
-		}
-
-		ImVec2 pos;
-		pos.x = renderSystem->GetWidth() - statsWindowWidth;
-		pos.y = 0;
-
-		ImGui::SetNextWindowPos( pos );
-		ImGui::SetNextWindowSize( ImVec2( statsWindowWidth, statsWindowHeight ) );
+		// anchor top-right corner and auto-size to content so the window is always fully visible
+		ImGui::SetNextWindowPos( ImVec2( renderSystem->GetWidth(), 0 ), ImGuiCond_Always, ImVec2( 1.0f, 0.0f ) );
 
 		static ImVec4 colorBlack	= ImVec4( 0.00f, 0.00f, 0.00f, 1.00f );
 		static ImVec4 colorWhite	= ImVec4( 1.00f, 1.00f, 1.00f, 1.00f );
@@ -376,7 +370,7 @@ float idConsoleLocal::DrawFPS( float y )
 		static ImVec4 colorGold		= ImVec4( 0.68f, 0.63f, 0.36f, 1.00f );
 		static ImVec4 colorPastelMagenta = ImVec4( 1.0f, 0.5f, 1.0f, 1.00f );
 
-		ImGui::Begin( "Performance Stats" );
+		ImGui::Begin( "Performance Stats", NULL, ImGuiWindowFlags_AlwaysAutoResize );
 
 		static const int gfxNumValues = 3;
 
@@ -553,12 +547,25 @@ float idConsoleLocal::DrawFPS( float y )
 		ImGui::TextColored( rendererGPUInteractionsTime > maxTime ? colorRed : colorWhite,	"Sync:    %5lld us   Interactions: %5llu us", frameSyncTime, rendererGPUInteractionsTime );
 		ImGui::TextColored( rendererGPUShaderPassesTime > maxTime ? colorRed : colorWhite,	"                    Shader Pass:  %5llu us", rendererGPUShaderPassesTime );
 #endif
+		// shadow-generation split out of Interactions; only the active path(s) report non-zero
+		if( rendererGPUStencilShadowTime > 0 )
+		{
+			ImGui::TextColored( rendererGPUStencilShadowTime > maxTime ? colorRed : colorWhite, "                    Stencil Shdw: %5llu us", rendererGPUStencilShadowTime );
+		}
+		if( rendererGPUShadowMapTime > 0 )
+		{
+			ImGui::TextColored( rendererGPUShadowMapTime > maxTime ? colorRed : colorWhite,	"                    Shadow Maps:  %5llu us", rendererGPUShadowMapTime );
+		}
+		if( rendererGPURTShadowMaskTime > 0 )
+		{
+			ImGui::TextColored( rendererGPURTShadowMaskTime > maxTime ? colorRed : colorWhite, "                    RT Shdw Mask: %5llu us", rendererGPURTShadowMaskTime );
+		}
 		ImGui::TextColored( rendererGPU_TAATime > maxTime ? colorRed : colorWhite,			"                    TAA:          %5llu us", rendererGPU_TAATime );
 		ImGui::TextColored( rendererGPUPostProcessingTime > maxTime ? colorRed : colorWhite, "                    PostFX:       %5llu us", rendererGPUPostProcessingTime );
 		ImGui::TextColored( frameBusyTime > maxTime || rendererGPUTime > maxTime ? colorRed : colorWhite, "Total:   %5lld us   Total:        %5lld us", frameBusyTime, rendererGPUTime );
 		ImGui::TextColored( colorWhite,														"Idle:    %5lld us   Idle:         %5lld us", frameIdleTime, rendererGPUIdleTime );
 		// SRS - Show CPU and GPU overall usage statistics
-		//ImGui::TextColored( colorWhite,														"Frame:     %3.0f %%    Frame:          %3.0f %%", cpuUsage, gpuUsage );
+		ImGui::TextColored( colorWhite,														"Frame:     %3.0f %%    Frame:          %3.0f %%", cpuUsage, gpuUsage );
 
 		ImGui::End();
 	}

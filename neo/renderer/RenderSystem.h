@@ -170,6 +170,12 @@ struct backEndCounters_t
 	uint64	gpuAmbientPassMicroSec;
 	uint64	gpuShadowAtlasPassMicroSec;
 	uint64	gpuInteractionsMicroSec;
+	// SRS-style per-pass timers, split out of gpuInteractionsMicroSec so the Interactions
+	// number reflects pure lighting; these accumulate the shadow-generation work that is
+	// interleaved with lighting inside the per-light loop (see idRenderBackend::DrawInteractions)
+	uint64	gpuStencilShadowMicroSec;
+	uint64	gpuShadowMapMicroSec;		// per-light shadow maps rendered when the atlas is off
+	uint64	gpuRTShadowMaskMicroSec;
 	uint64	gpuShaderPassMicroSec;
 	uint64	gpuFogAllLightsMicroSec;
 	uint64	gpuBloomMicroSec;

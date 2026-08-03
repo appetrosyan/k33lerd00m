@@ -65,6 +65,22 @@ enum renderLogMainBlock_t
 	MRB_TOTAL_QUERIES = MRB_TOTAL * 2,
 };
 
+// Shadow-generation sub-timers. Unlike the main blocks these are issued many times per
+// frame (once per shadow-casting light, and interleaved with lighting for stencil), so a
+// single begin/end pair can't measure them - we pool a fixed number of query objects and
+// sum the resolved deltas per kind. See idRenderLog::BeginShadowGen.
+enum renderLogShadowGen_t
+{
+	RLS_STENCIL,		// stencil shadow-volume clear + extrusion
+	RLS_SHADOWMAP,		// per-light shadow map (only when the shadow atlas is off)
+	RLS_RTMASK,			// ray-traced shadow visibility mask
+	RLS_TOTAL,
+};
+
+// ponytail: fixed pool, capped per frame. 48 segments covers ~24 stencil lights (2 each);
+// beyond that the extra shadow work goes untimed (undercount) rather than growing the pool.
+static const int MAX_SHADOWGEN_SEGMENTS = 48;
+
 
 
 /*
@@ -88,6 +104,12 @@ private:
 	idStaticList<nvrhi::TimerQueryHandle, MRB_TOTAL* NUM_FRAME_DATA> timerQueries;
 	idStaticList<bool, MRB_TOTAL* NUM_FRAME_DATA> timerUsed;
 
+	// pooled accumulating timers for interleaved shadow-generation work (see renderLogShadowGen_t)
+	idStaticList<nvrhi::TimerQueryHandle, MAX_SHADOWGEN_SEGMENTS* NUM_FRAME_DATA> shadowGenQueries;
+	idStaticList<uint8, MAX_SHADOWGEN_SEGMENTS* NUM_FRAME_DATA> shadowGenKind;
+	int							shadowGenCount[NUM_FRAME_DATA];		// segments issued this cycle, per parity
+	int							shadowGenActive;					// index of the open segment, or -1
+
 public:
 	idRenderLog();
 
@@ -106,6 +128,10 @@ public:
 	void		CloseBlock();
 	void		OpenMainBlock( renderLogMainBlock_t block );
 	void		CloseMainBlock( int block = -1 );
+
+	// bracket a single shadow-generation segment; nesting is not supported (one open at a time)
+	void		BeginShadowGen( renderLogShadowGen_t kind );
+	void		EndShadowGen();
 
 	void		Printf( VERIFY_FORMAT_STRING const char* fmt, ... ) {}
 
