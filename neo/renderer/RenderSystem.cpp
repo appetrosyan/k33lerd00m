@@ -959,6 +959,30 @@ void idRenderSystemLocal::CaptureRenderToImage( const char* imageName, bool clea
 	guiModel->Clear();
 }
 
+/*
+================
+idRenderSystemLocal::EmitFullscreenFXToScene
+
+HDR output (#3): route the pending 2D fullscreen-effect batch into the linear scene
+layer (ldrFBO -> ldrImage) instead of the isolated sRGB GUI buffer. Scene-resampling
+effects (the grabber warp etc.) sample _currentRender, which is a copy of ldrImage
+(linear); drawing them back into ldrImage is linear->linear, so the GUI composite's
+sRGB->linear + paper-white scale never touches them and the "darkened circle" is gone.
+Called after the FX draws and before the HUD; the HUD then accumulates fresh and emits
+to the GUI buffer as usual. No-op in SDR, where the 2D layer already is the scene.
+================
+*/
+void idRenderSystemLocal::EmitFullscreenFXToScene()
+{
+	extern idCVar r_hdrOutput;
+	if( !IsInitialized() || !r_hdrOutput.GetBool() || globalFramebuffers.ldrFBO == NULL )
+	{
+		return;
+	}
+	guiModel->EmitFullScreen( globalFramebuffers.ldrFBO, /*sceneOverlay*/ true );
+	guiModel->Clear();
+}
+
 
 /*
 ==============

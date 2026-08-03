@@ -56,7 +56,10 @@ public:
 	void		BeginFrame();
 
 	void		EmitToCurrentView( float modelMatrix[16], bool depthHack );
-	void		EmitFullScreen( Framebuffer* renderTarget = nullptr );
+	// sceneOverlay: redirect the batch to renderTarget (the render-res scene FBO) but KEEP the
+	// virtual-coordinate full-screen mapping (cropped viewport + virtual screenSize) instead of
+	// remapping coords to the FBO's physical size - for HDR scene-space fullscreen FX (#3).
+	void		EmitFullScreen( Framebuffer* renderTarget = nullptr, bool sceneOverlay = false );
 	void		EmitSurfaces( float modelMatrix[16], float modelViewMatrix[16], bool depthHack, bool allowFullScreenStereoDepth, bool linkAsEntity );
 
 	// RB

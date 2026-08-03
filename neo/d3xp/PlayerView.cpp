@@ -465,6 +465,12 @@ void idPlayerView::SingleView( const renderView_t* view, idMenuHandler_HUD* hudM
 	// process the frame
 	fxManager->Process( &hackedView );
 
+	// HDR (#3): the fullscreen FX above (the RoE grabber warp etc.) resample the linear scene
+	// through _currentRender; flush them into the scene layer now so the HDR GUI composite does
+	// not sRGB-decode + paper-white-scale them into a darkened circle. No-op in SDR. Done before
+	// the HUD/blobs below so those still composite as UI in the GUI layer.
+	renderSystem->EmitFullscreenFXToScene();
+
 	if( !hudManager )
 	{
 		return;

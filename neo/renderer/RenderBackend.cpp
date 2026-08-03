@@ -6640,8 +6640,10 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 
 			// HDR output: composite the isolated 2D UI layer into the linear scRGB
 			// scene (sRGB->linear + paper-white scale) in place, before presenting.
-			// Only for 2D views; the 3D view leaves the GUI layer empty.
-			if( r_hdrOutput.GetBool() && !is3D && hdrGuiCompositePass )
+			// Only for 2D views; the 3D view leaves the GUI layer empty. Skip
+			// targetRender'd 2D views (the scene-space fullscreen FX draw straight
+			// into ldrImage, linear - they must not trigger a GUI-layer composite).
+			if( r_hdrOutput.GetBool() && !is3D && hdrGuiCompositePass && !_viewDef->targetRender )
 			{
 				hdrGuiCompositePass->Render( commandList );
 			}

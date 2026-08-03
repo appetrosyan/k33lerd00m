@@ -220,7 +220,7 @@ idGuiModel::EmitFullScreen
 Creates a view that covers the screen and emit the surfaces
 ================
 */
-void idGuiModel::EmitFullScreen( Framebuffer* renderTarget )
+void idGuiModel::EmitFullScreen( Framebuffer* renderTarget, bool sceneOverlay )
 {
 	if( surfaces[0].numIndexes == 0 )
 	{
@@ -232,7 +232,7 @@ void idGuiModel::EmitFullScreen( Framebuffer* renderTarget )
 	viewDef_t* viewDef = ( viewDef_t* )R_ClearedFrameAlloc( sizeof( *viewDef ), FRAME_ALLOC_VIEW_DEF );
 	viewDef->is2Dgui = true;
 
-	if( renderTarget )
+	if( renderTarget && !sceneOverlay )
 	{
 		viewDef->targetRender = renderTarget;
 		viewDef->viewport.x1 = 0;
@@ -242,6 +242,9 @@ void idGuiModel::EmitFullScreen( Framebuffer* renderTarget )
 	}
 	else
 	{
+		// sceneOverlay redirects the target FBO but keeps the full-screen cropped viewport,
+		// so the 2D draws (authored in virtual coords) fill the screen instead of a corner.
+		viewDef->targetRender = renderTarget;	// NULL in the normal path
 		tr.GetCroppedViewport( &viewDef->viewport );
 	}
 
@@ -263,7 +266,7 @@ void idGuiModel::EmitFullScreen( Framebuffer* renderTarget )
 
 	idVec2 screenSize( renderSystem->GetVirtualWidth(), renderSystem->GetVirtualHeight() );
 
-	if( renderTarget )
+	if( renderTarget && !sceneOverlay )
 	{
 		screenSize.x = renderTarget->GetWidth();
 		screenSize.y = renderTarget->GetHeight();

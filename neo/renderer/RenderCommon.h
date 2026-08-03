@@ -968,6 +968,7 @@ public:
 	virtual void			CropRenderSize( int width, int height );
 	virtual void            CropRenderSize( int x, int y, int width, int height, bool topLeftAncor );
 	virtual void			CaptureRenderToImage( const char* imageName, bool clearColorAfterCopy = false );
+	virtual void			EmitFullscreenFXToScene();
 	virtual void			UnCrop();
 	virtual bool			UploadImage( const char* imageName, const byte* data, int width, int height );
 

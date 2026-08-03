@@ -377,6 +377,12 @@ public:
 	virtual void			CropRenderSize( int width, int height ) = 0;
 	virtual void            CropRenderSize( int x, int y, int width, int height, bool topLeftAncor ) = 0;
 	virtual void			CaptureRenderToImage( const char* imageName, bool clearColorAfterCopy = false ) = 0;
+	// HDR output: flush the pending 2D batch straight into the linear scene layer (ldrImage)
+	// instead of the isolated sRGB GUI buffer, so scene-resampling fullscreen effects (the RoE
+	// grabber warp etc., which sample _currentRender) are composited in scene-linear space and
+	// not double sRGB-decoded by the GUI composite. Call it after the FX draws, before the HUD.
+	// No-op in SDR, where the 2D layer already IS the scene.
+	virtual void			EmitFullscreenFXToScene() = 0;
 	virtual void			UnCrop() = 0;
 
 	// the image has to be already loaded ( most straightforward way would be through a FindMaterial )
