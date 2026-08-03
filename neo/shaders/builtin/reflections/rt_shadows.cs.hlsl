@@ -211,6 +211,12 @@ float ComputeVisibility( int2 samplePixel, float2 uv )
 	}
 	const float3 L = toLight / lightDist;
 
+	// receiver faces away from the light -> zero diffuse -> the mask is discarded; skip the ray
+	if( g_Sh.pad2.y != 0 && dot( nEnc, L ) <= 0.0f )
+	{
+		return 1.0f;
+	}
+
 	const float bias = g_Sh.params.x;
 	const float umbraFloor = g_Sh.params.y;
 	const float tmax = max( 0.0f, lightDist - bias );
@@ -396,6 +402,16 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 		return;
 	}
 	const float3 L = toLight / lightDist;
+
+	// Facing cull (g_Sh.pad2.y, off in debug-force modes): a receiver whose shading normal faces
+	// away from the light has zero diffuse (and ~zero specular), so the interaction's light term is
+	// zero regardless of the shadow value - skip the ray. nEnc is the same gbuffer normal the
+	// interaction lights with, so this matches it. Lossless.
+	if( g_Sh.pad2.y != 0 && dot( nEnc, L ) <= 0.0f )
+	{
+		u_ShadowMask[pixel] = 1.0f;
+		return;
+	}
 
 	// Trace from the reconstructed world position UNoffset - front-face culling (in
 	// TraceVisibility) is what prevents self-occlusion, not an origin push. The earlier

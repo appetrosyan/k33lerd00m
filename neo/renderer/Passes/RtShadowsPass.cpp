@@ -80,6 +80,12 @@ idCVar r_rtShadowVolumeCull( "r_rtShadowVolumeCull", "1", CVAR_RENDERER | CVAR_A
 // this should be lossless while dropping casters whose shadow lands nowhere visible. 0 = keep all
 // off-view casters (the previous behaviour) if a missing off-view shadow shows up.
 idCVar r_rtShadowCullOffView( "r_rtShadowCullOffView", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: cull casters whose shadow-bounds miss the view frustum (shrinks the shadow TLAS). 0 = keep every off-view caster." );
+// Skip the ray for receivers whose (bumped) shading normal faces away from the light: diffuse is
+// max(0,N.L)=0 there and specular ~0, so the interaction's light term is zero regardless of the
+// shadow value. Uses the gbuffer normal (same one the interaction lights with) so it matches - the
+// only caveat is materials that write explicit vertexColor (the gbuffer stores normal*vertexColor),
+// a rare minority. Toggle off if such a surface shows missing light.
+idCVar r_rtShadowFacingCull( "r_rtShadowFacingCull", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: skip rays for receivers facing away from the light (zero diffuse there). 0 = trace regardless of facing." );
 extern idCVar r_useScissor;
 
 RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
@@ -268,7 +274,9 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	constants.lightProject1 = idVec4( lp[1][0], lp[1][1], lp[1][2], lp[1][3] );
 	constants.lightProject2 = idVec4( lp[2][0], lp[2][1], lp[2][2], lp[2][3] );
 	constants.lightProject3 = idVec4( lp[3][0], lp[3][1], lp[3][2], lp[3][3] );
-	constants.pad2 = idVec2i( ( r_rtShadowVolumeCull.GetBool() && r_rtShadowForce.GetInteger() == 0 ) ? 1 : 0, 0 );
+	const bool debugForce = ( r_rtShadowForce.GetInteger() != 0 );
+	constants.pad2 = idVec2i( ( r_rtShadowVolumeCull.GetBool() && !debugForce ) ? 1 : 0,
+							  ( r_rtShadowFacingCull.GetBool() && !debugForce ) ? 1 : 0 );
 
 	// Dispatch the trace over ONLY this light's screen-space scissor rect instead of the whole
 	// framebuffer - a light that touches 5% of the screen then costs 5% of the rays. The rect is

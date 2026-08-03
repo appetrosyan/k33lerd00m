@@ -50,7 +50,7 @@ struct RtShadowConstants
 	idVec2i		screenSize;		// x = width, y = height (pixels, render resolution)
 	idVec2i		pad;			// x = backface cull, y = debug force/hit-dist mode
 	idVec2i		scissorMin;		// top-left pixel of this light's dispatch rect (screen space)
-	idVec2i		pad2;			// x = light-volume cull enable (r_rtShadowVolumeCull), y = unused
+	idVec2i		pad2;			// x = light-volume cull (r_rtShadowVolumeCull), y = facing cull (r_rtShadowFacingCull)
 
 	idVec4		cameraOrigin;	// xyz = world-space eye (for the primary-ray TLAS coverage probe, mode 4)
 	idVec4		lightDepthBounds;	// x = zmin, y = zmax (hardware depth 0..1): skip rays for pixels
