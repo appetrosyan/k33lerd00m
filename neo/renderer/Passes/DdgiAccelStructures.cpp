@@ -83,13 +83,27 @@ void DdgiAccelStructures::EnableBindlessMaterials()
 	bd.maxCapacity = BINDLESS_CAPACITY;
 	bd.addRegisterSpace( nvrhi::BindingLayoutItem::Texture_SRV( 1 ) );	// Texture2D[] : register(t0, space1)
 	m_BindlessLayout = m_Device->createBindlessLayout( bd );
+	if( m_BindlessLayout == nullptr )
+	{
+		common->Warning( "DdgiAccelStructures::EnableBindlessMaterials: createBindlessLayout returned NULL - bindless material sampling DISABLED. GetBindlessLayout()/GetBindlessTable() will be null; every caller MUST guard them or it hits the 'binding set does not match the layout' fatal." );
+		m_BindlessEnabled = false;
+		return;
+	}
 
 	m_BindlessTable = m_Device->createDescriptorTable( m_BindlessLayout );
+	if( m_BindlessTable == nullptr )
+	{
+		common->Warning( "DdgiAccelStructures::EnableBindlessMaterials: createDescriptorTable returned NULL for a %u-slot table - bindless DISABLED. Likely descriptor-pool exhaustion (e.g. a SECOND large bindless table when both RT reflections AND RT shadows enable one). Callers must guard GetBindlessTable().", BINDLESS_CAPACITY );
+		m_BindlessLayout = nullptr;
+		m_BindlessEnabled = false;
+		return;
+	}
 	m_Device->resizeDescriptorTable( m_BindlessTable, BINDLESS_CAPACITY, false );
 
 	m_BindlessMap.clear();
 	m_BindlessNext = 0;
 	m_BindlessEnabled = true;
+	common->Printf( "DdgiAccelStructures: bindless material table enabled (%u slots).\n", BINDLESS_CAPACITY );
 }
 
 /*
@@ -170,6 +184,11 @@ void DdgiAccelStructures::FlushBindlessTable()
 	}
 
 	nvrhi::DescriptorTableHandle fresh = m_Device->createDescriptorTable( m_BindlessLayout );
+	if( fresh == nullptr )
+	{
+		common->Warning( "DdgiAccelStructures::FlushBindlessTable: createDescriptorTable returned NULL (descriptor-pool exhaustion?) - keeping the previous table; this frame's %u new texture registration(s) are dropped.", m_BindlessNext );
+		return;
+	}
 
 	// Every ASSIGNED slot (index < m_BindlessNext) may be referenced by an instance's
 	// diffuseIdx/normalIdx, so every one MUST hold a valid descriptor - the vendored
@@ -184,6 +203,10 @@ void DdgiAccelStructures::FlushBindlessTable()
 		{
 			m_Device->writeDescriptorTable( fresh, nvrhi::BindingSetItem::Texture_SRV( i, fallback ) );
 		}
+	}
+	else
+	{
+		common->Warning( "DdgiAccelStructures::FlushBindlessTable: whiteImage fallback texture is NULL - %u assigned bindless slot(s) left unwritten; sampling them is undefined (GPU fault risk on RADV).", m_BindlessNext );
 	}
 	for( const auto& kv : m_BindlessMap )
 	{
