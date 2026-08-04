@@ -52,8 +52,8 @@ struct ReflectionConstants
 	//							// z = reflection intensity, w = disocclusion eps
 	idVec4		params1;		// x = roughness gate low (full reflect <=),
 	//							// y = roughness gate high (no reflect >=),
-	//							// z = env-fallback mip scale, w unused
+	//							// z = env-fallback mip scale, w = shade shadow-ray bias
 	idVec2i		screenSize;		// x = width, y = height (pixels)
 	idVec2i		debugFlags;		// x = debug mode (0 normal, 1 show reflection,
-	//							// 2 visualise trace), y unused
+	//							// 2 visualise trace), y = numLights (re-shade lights)
 };

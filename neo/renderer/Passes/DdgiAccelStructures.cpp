@@ -63,6 +63,147 @@ nvrhi::IBuffer* DdgiAccelStructures::GetStaticIndexBuffer() const
 
 /*
 ========================
+DdgiAccelStructures::EnableBindlessMaterials
+
+Create the bindless SRV descriptor table (register space 1) that the reflection
+re-shade indexes to sample real material diffuse/normal textures at a ray hit.
+Opt-in: DDGI never binds it, so it is only built when the reflection pass asks.
+========================
+*/
+void DdgiAccelStructures::EnableBindlessMaterials()
+{
+	if( m_BindlessEnabled )
+	{
+		return;
+	}
+
+	nvrhi::BindlessLayoutDesc bd;
+	bd.visibility = nvrhi::ShaderType::Compute;
+	bd.firstSlot = 0;
+	bd.maxCapacity = BINDLESS_CAPACITY;
+	bd.addRegisterSpace( nvrhi::BindingLayoutItem::Texture_SRV( 1 ) );	// Texture2D[] : register(t0, space1)
+	m_BindlessLayout = m_Device->createBindlessLayout( bd );
+
+	m_BindlessTable = m_Device->createDescriptorTable( m_BindlessLayout );
+	m_Device->resizeDescriptorTable( m_BindlessTable, BINDLESS_CAPACITY, false );
+
+	m_BindlessMap.clear();
+	m_BindlessNext = 0;
+	m_BindlessEnabled = true;
+}
+
+/*
+========================
+DdgiAccelStructures::RegisterBindlessTexture
+
+Assign an image its stable bindless index (deduped by idImage*) and mark the table
+dirty; the actual descriptor write is deferred to FlushBindlessTable (writing the
+live, already-bound table is the hazard this avoids). Returns DDGI_BINDLESS_INVALID
+when disabled, the table is full, or the image has no resident GPU texture yet
+(retried next frame - the miss is not cached).
+
+ponytail: dedupe key is the raw idImage*; entries are only reclaimed when the whole
+table is rebuilt (vid_restart recreates the pass). If an image is freed and a new
+one reuses the same pointer within one pass lifetime the index goes stale. Images
+are long-lived and freed on vid_restart, so this does not bite in practice.
+========================
+*/
+uint32_t DdgiAccelStructures::RegisterBindlessTexture( idImage* image )
+{
+	if( !m_BindlessEnabled || image == NULL )
+	{
+		return DDGI_BINDLESS_INVALID;
+	}
+
+	auto it = m_BindlessMap.find( image );
+	if( it != m_BindlessMap.end() )
+	{
+		return it->second;
+	}
+
+	if( image->GetTextureHandle() == nullptr )
+	{
+		return DDGI_BINDLESS_INVALID;	// not resident yet - do not cache, retry next frame
+	}
+
+	if( m_BindlessNext >= BINDLESS_CAPACITY )
+	{
+		return DDGI_BINDLESS_INVALID;	// table full - fall back to flat albedo
+	}
+
+	const uint32_t idx = m_BindlessNext++;
+	m_BindlessMap[image] = idx;
+	m_BindlessDirty = true;			// rebuilt into a fresh table by FlushBindlessTable
+	return idx;
+}
+
+/*
+========================
+DdgiAccelStructures::FlushBindlessTable
+
+When new textures were registered this frame, build a FRESH descriptor table from
+the whole registry and swap it in, retiring the previous table for a few frames so
+any in-flight command buffer that recorded it still resolves. Writing a fresh
+(never-bound) table is always safe; updating the live one is not (no UPDATE_AFTER_BIND
+in the vendored NVRHI). Called once per RebuildFromView, before the dispatch binds it.
+========================
+*/
+void DdgiAccelStructures::FlushBindlessTable()
+{
+	if( !m_BindlessEnabled )
+	{
+		return;
+	}
+
+	// release tables retired long enough ago that no in-flight frame references them
+	for( int i = ( int )m_RetiredTables.size() - 1; i >= 0; i-- )
+	{
+		if( tr.frameCount - m_RetiredTables[i].second >= BINDLESS_RETIRE_FRAMES )
+		{
+			m_RetiredTables.erase( m_RetiredTables.begin() + i );
+		}
+	}
+
+	if( !m_BindlessDirty )
+	{
+		return;
+	}
+
+	nvrhi::DescriptorTableHandle fresh = m_Device->createDescriptorTable( m_BindlessLayout );
+
+	// Every ASSIGNED slot (index < m_BindlessNext) may be referenced by an instance's
+	// diffuseIdx/normalIdx, so every one MUST hold a valid descriptor - the vendored
+	// NVRHI bindless path is only ePartiallyBound, and sampling an unwritten slot is
+	// undefined (garbage texture memory = "oily blotches", and a GPU fault on RADV =
+	// the crash). Prime the whole assigned range with a resident fallback, then
+	// overwrite with the real material textures.
+	nvrhi::TextureHandle fallback = globalImages->whiteImage->GetTextureHandle();
+	if( fallback != nullptr )
+	{
+		for( uint32_t i = 0; i < m_BindlessNext; i++ )
+		{
+			m_Device->writeDescriptorTable( fresh, nvrhi::BindingSetItem::Texture_SRV( i, fallback ) );
+		}
+	}
+	for( const auto& kv : m_BindlessMap )
+	{
+		nvrhi::TextureHandle tex = kv.first->GetTextureHandle();
+		if( tex != nullptr )
+		{
+			m_Device->writeDescriptorTable( fresh, nvrhi::BindingSetItem::Texture_SRV( kv.second, tex ) );
+		}
+	}
+
+	if( m_BindlessTable != nullptr )
+	{
+		m_RetiredTables.push_back( { m_BindlessTable, tr.frameCount } );
+	}
+	m_BindlessTable = fresh;
+	m_BindlessDirty = false;
+}
+
+/*
+========================
 DDGI_MaterialAverageAlbedo
 
 Average diffuse colour used for coloured probe bounce. Diffuse GI is
@@ -138,6 +279,13 @@ void DdgiAccelStructures::Shutdown()
 	m_NumInstances = 0;
 	m_InstanceDataBuffer = nullptr;
 	m_InstanceDataCapacity = 0;
+	m_BindlessTable = nullptr;
+	m_BindlessLayout = nullptr;
+	m_BindlessMap.clear();
+	m_BindlessNext = 0;
+	m_BindlessDirty = false;
+	m_RetiredTables.clear();
+	m_BindlessEnabled = false;
 
 	m_SkinnedBlas.clear();
 	m_PosedBuffer = nullptr;
@@ -474,13 +622,16 @@ void DdgiAccelStructures::BuildSkinnedInstances( nvrhi::ICommandList* commandLis
 		DdgiInstanceData data;
 		data.vertexByteOffset = 0;
 		data.indexByteOffset = 0;
-		data.pad0 = 0;
-		data.pad1 = 0;
+		// skinned geometry lives in the posed position-only pool (no UV/normal), so the
+		// reflection re-shade cannot reconstruct or texture it: flag flat (albedo.w = 0)
+		// and force the flat-albedo path (no bindless textures).
+		data.diffuseIdx = DDGI_BINDLESS_INVALID;
+		data.normalIdx = DDGI_BINDLESS_INVALID;
 		const idVec3 albedo = DDGI_MaterialAverageAlbedo( surf->material );
 		data.albedo[0] = albedo.x;
 		data.albedo[1] = albedo.y;
 		data.albedo[2] = albedo.z;
-		data.albedo[3] = 0.0f;
+		data.albedo[3] = 0.0f;	// skinned/no-vertex: reflection re-shade uses flat albedo
 		instanceData.push_back( data );
 	}
 }
@@ -524,13 +675,15 @@ void DdgiAccelStructures::AppendInstance( std::vector<nvrhi::rt::InstanceDesc>& 
 	DdgiInstanceData data;
 	data.vertexByteOffset = static_cast<uint32_t>( ambientCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
 	data.indexByteOffset = static_cast<uint32_t>( indexCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK;
-	data.pad0 = 0;
-	data.pad1 = 0;
+	// real vertex data present -> the trace can fetch UV/normal from the static cache
+	// and, if the material has fast-path textures, sample them via the bindless table.
+	data.diffuseIdx = ( material != NULL ) ? RegisterBindlessTexture( material->GetFastPathDiffuseImage() ) : DDGI_BINDLESS_INVALID;
+	data.normalIdx = ( material != NULL ) ? RegisterBindlessTexture( material->GetFastPathBumpImage() ) : DDGI_BINDLESS_INVALID;
 	const idVec3 albedo = DDGI_MaterialAverageAlbedo( material );
 	data.albedo[0] = albedo.x;
 	data.albedo[1] = albedo.y;
 	data.albedo[2] = albedo.z;
-	data.albedo[3] = 0.0f;
+	data.albedo[3] = 1.0f;	// static: reflection re-shade may reconstruct the hit triangle
 	instanceData.push_back( data );
 }
 
@@ -825,5 +978,9 @@ bool DdgiAccelStructures::RebuildFromView( nvrhi::ICommandList* commandList, con
 	}
 
 	commandList->buildTopLevelAccelStruct( m_Tlas, instances.data(), instances.size() );
+
+	// swap in a fresh descriptor table if AppendInstance registered new material
+	// textures this frame (before any dispatch binds it)
+	FlushBindlessTable();
 	return true;
 }

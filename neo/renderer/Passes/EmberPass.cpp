@@ -403,6 +403,22 @@ void EmberPass::Render( nvrhi::ICommandList* commandList, const viewDef_t* viewD
 		return;
 	}
 
+	// This pass runs seed/sim COMPUTE dispatches that leave the command list in compute
+	// state; it MUST reach the draw loop below to restore graphics state, or the next
+	// pass's drawIndexed trips "graphics state is not set" (setting compute state
+	// invalidates the graphics state) -> fatal. So bail here - BEFORE any compute - if
+	// we cannot draw this frame, never after having dispatched. (Exposed once RT
+	// reflections started feeding the posed-vertex pool, so embers actually run.)
+	if( hdrFramebuffer == NULL )
+	{
+		return;
+	}
+	EnsureRenderPipeline( hdrFramebuffer );
+	if( m_RenderPipeline == nullptr )
+	{
+		return;
+	}
+
 	const int nowMs = viewDef->renderView.time[0];
 	float dt = ( m_LastTimeMs == 0 ) ? 0.0f : ( nowMs - m_LastTimeMs ) * 0.001f;
 	m_LastTimeMs = nowMs;
@@ -623,17 +639,8 @@ void EmberPass::Render( nvrhi::ICommandList* commandList, const viewDef_t* viewD
 		}
 	}
 
-	// 4. draw embers additively into the HDR scene target
-	if( hdrFramebuffer == NULL )
-	{
-		return;
-	}
-	EnsureRenderPipeline( hdrFramebuffer );
-	if( m_RenderPipeline == nullptr )
-	{
-		return;
-	}
-
+	// 4. draw embers additively into the HDR scene target (framebuffer + render
+	// pipeline were verified up front, before any compute, so we always draw here)
 	RenderCB rc;
 	memcpy( rc.vp0, viewDef->worldSpace.mvp[0], 16 * sizeof( float ) );
 	const idMat3& va = viewDef->renderView.viewaxis;

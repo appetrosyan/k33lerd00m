@@ -54,6 +54,7 @@ Doom 3 BFG Edition Source Code.  If not, see <http://www.gnu.org/licenses/>.
 struct viewDef_t;
 struct drawSurf_t;
 class idMaterial;
+class idImage;
 
 // Per-TLAS-instance shading data, indexed by the ray hit's InstanceID in the
 // trace shader. Layout must match DdgiInstanceData in probe_trace.cs.hlsl.
@@ -62,10 +63,12 @@ struct DdgiInstanceData
 {
 	uint32_t	vertexByteOffset;	// start of this surface's idDrawVert run
 	uint32_t	indexByteOffset;	// start of this surface's index run (R16)
-	uint32_t	pad0;
-	uint32_t	pad1;
-	float		albedo[4];			// average diffuse rgb (+ pad)
+	uint32_t	diffuseIdx;			// bindless index of the fast-path diffuse image (0xFFFFFFFF = none)
+	uint32_t	normalIdx;			// bindless index of the fast-path bump/normal image (0xFFFFFFFF = none)
+	float		albedo[4];			// average diffuse rgb; .w = 1 static (real vertex data), 0 skinned/no-vertex
 };
+
+static const uint32_t DDGI_BINDLESS_INVALID = 0xFFFFFFFFu;
 
 class DdgiAccelStructures
 {
@@ -119,6 +122,20 @@ public:
 	// (ByteAddressBuffer) so the trace shader can fetch hit-triangle positions.
 	nvrhi::IBuffer*	GetStaticVertexBuffer() const;
 	nvrhi::IBuffer*	GetStaticIndexBuffer() const;
+
+	// Textured re-shade (RT reflections): opt in to registering each surface's
+	// fast-path diffuse/normal images into a bindless descriptor table, so a ray
+	// hit can sample the real material instead of only the average albedo. Off by
+	// default (DDGI does not need it); the reflection pass calls this at startup.
+	void			EnableBindlessMaterials();
+	nvrhi::IBindingLayout*	GetBindlessLayout() const
+	{
+		return m_BindlessLayout;
+	}
+	nvrhi::IDescriptorTable*	GetBindlessTable() const
+	{
+		return m_BindlessTable;
+	}
 
 	// Ember dissolve: expose the posed-position pool + the per-surface ranges skinned
 	// this frame, so the ember pass can seed particles from the posed mesh vertices.
@@ -193,6 +210,32 @@ private:
 
 	nvrhi::BufferHandle				m_InstanceDataBuffer;
 	size_t							m_InstanceDataCapacity;	// in instances
+
+	// --- bindless material textures (RT reflection re-shade; see EnableBindlessMaterials) ---
+	// Assign a fast-path image its stable table index (deduped by idImage*), marking
+	// the table dirty so FlushBindlessTable rebuilds it. Returns DDGI_BINDLESS_INVALID
+	// when disabled, full, or the image has no resident GPU texture yet (retried next
+	// frame - the miss is not cached). Does NOT touch the live descriptor table: writing
+	// a table already bound by an in-flight frame is a Vulkan hazard (the vendored NVRHI
+	// bindless path has no UPDATE_AFTER_BIND), which crashed on new geometry appearing.
+	uint32_t		RegisterBindlessTexture( idImage* image );
+
+	// Rebuild the descriptor table from the registry into a FRESH (never-bound) table
+	// when dirty, retiring the previous one on a frame-stamped guard so in-flight frames
+	// that recorded it keep a valid set (NVRHI does not track descriptor tables). Called
+	// at the end of RebuildFromView, before any dispatch binds the table.
+	void			FlushBindlessTable();
+
+	bool							m_BindlessEnabled = false;
+	bool							m_BindlessDirty = false;
+	nvrhi::BindingLayoutHandle		m_BindlessLayout;
+	nvrhi::DescriptorTableHandle	m_BindlessTable;
+	std::unordered_map<idImage*, uint32_t>	m_BindlessMap;
+	uint32_t						m_BindlessNext = 0;
+	// previous tables kept alive until in-flight frames that recorded them retire
+	std::vector<std::pair<nvrhi::DescriptorTableHandle, int>>	m_RetiredTables;
+	static const uint32_t			BINDLESS_CAPACITY = 4096;
+	static const int				BINDLESS_RETIRE_FRAMES = 4;
 
 	// BLAS cache keyed by the static ambientCache handle (unique per surface).
 	std::unordered_map<vertCacheHandle_t, nvrhi::rt::AccelStructHandle> m_BlasCache;

@@ -98,10 +98,17 @@ private:
 	nvrhi::BindingLayoutHandle		m_TraceBindingLayout;
 	nvrhi::BindingSetHandle			m_TraceBindingSet;
 	nvrhi::ComputePipelineHandle	m_TracePipeline;
-	nvrhi::SamplerHandle			m_LinearSampler;
+	nvrhi::SamplerHandle			m_LinearSampler;	// clamp: env probe + gbuffers
+	nvrhi::SamplerHandle			m_MaterialSampler;	// wrap+aniso: bindless material textures
 
-	// the binding set is rebuilt when any of these change (TLAS grows / image resizes)
+	// per-frame projected-light buffer for the world-space hit re-shade (mirrors
+	// DdgiPass's light buffer; reflections build their own so they work with DDGI off).
+	nvrhi::BufferHandle				m_LightBuffer;
+
+	// the binding set is rebuilt when any of these change (TLAS grows / image resizes /
+	// instance-data buffer grows)
 	nvrhi::rt::IAccelStruct*	m_BoundTlas;
+	nvrhi::IBuffer*				m_BoundInstanceData;
 	idImage*					m_ReflectionImage;
 	int							m_ImageWidth;
 	int							m_ImageHeight;

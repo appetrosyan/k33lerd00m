@@ -41,11 +41,94 @@ idCVar r_rtReflectionDisoccEps( "r_rtReflectionDisoccEps", "8.0", CVAR_RENDERER 
 idCVar r_rtReflectionGateLo( "r_rtReflectionGateLo", "0.1", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: roughness at/below which a surface fully mirrors", 0.0f, 1.0f );
 idCVar r_rtReflectionGateHi( "r_rtReflectionGateHi", "0.45", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT reflections: roughness at/above which a surface does not reflect", 0.0f, 1.0f );
 idCVar r_rtReflectionDebug( "r_rtReflectionDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT reflections: 1 = show reflections at full strength, 2 = visualise trace (red=hit, green=valid on-screen sample)", 0, 2 );
+idCVar r_rtReflectionShadeBias( "r_rtReflectionShadeBias", "1.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: shadow-ray origin bias (world units) for the re-shaded hit" );
+idCVar r_rtReflectionReshade( "r_rtReflectionReshade", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT reflections: 1 = re-shade hit from material+lights, 0 = flat average albedo only (diagnostic: isolates bindless/shadow-ray cost)" );
+idCVar r_rtReflectionShadows( "r_rtReflectionShadows", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT reflections: 1 = trace a shadow ray per light in the re-shade, 0 = skip (diagnostic / perf)" );
+
+// direct light gathered from the view for the world-space hit re-shade. Layout must
+// match RtLight in reflection_trace.cs.hlsl (and DdgiLight in DdgiPass.cpp).
+static const int RT_REFL_MAX_LIGHTS = 64;
+struct ReflLight
+{
+	float	projectS[4];
+	float	projectT[4];
+	float	projectQ[4];
+	float	projectFalloff[4];
+	float	color[4];		// rgb (+ pad)
+	float	origin[4];		// world origin xyz (+ pad)
+};
+
+extern idCVar r_lightScale;
+
+/*
+========================
+R_GatherReflectionLights
+
+Collect the view's real illuminating lights into RtLight records for the hit
+re-shade. Mirrors DdgiPass's gather (interaction colour = sum of light-shader
+stage colours * lightScale; the four texgen planes drive the projected shape),
+minus the DDGI dynamic/static classification the reflection trace does not need.
+========================
+*/
+static int R_GatherReflectionLights( const viewDef_t* viewDef, ReflLight* out, int maxLights )
+{
+	const float lightScale = r_lightScale.GetFloat();
+	int numLights = 0;
+	for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL && numLights < maxLights; vLight = vLight->next )
+	{
+		const idMaterial* lightShader = vLight->lightShader;
+		if( lightShader == NULL || vLight->shaderRegisters == NULL )
+		{
+			continue;
+		}
+		if( lightShader->IsFogLight() || lightShader->IsBlendLight() )
+		{
+			continue;
+		}
+
+		const float* lightRegs = vLight->shaderRegisters;
+		idVec3 color( 0.0f, 0.0f, 0.0f );
+		for( int s = 0; s < lightShader->GetNumStages(); s++ )
+		{
+			const shaderStage_t* stage = lightShader->GetStage( s );
+			if( !lightRegs[ stage->conditionRegister ] )
+			{
+				continue;
+			}
+			color.x += lightScale * lightRegs[ stage->color.registers[0] ];
+			color.y += lightScale * lightRegs[ stage->color.registers[1] ];
+			color.z += lightScale * lightRegs[ stage->color.registers[2] ];
+		}
+		if( color.LengthSqr() <= 0.0f )
+		{
+			continue;
+		}
+
+		ReflLight& L = out[numLights++];
+		for( int p = 0; p < 4; p++ )
+		{
+			L.projectS[p]       = vLight->lightProject[0][p];
+			L.projectT[p]       = vLight->lightProject[1][p];
+			L.projectQ[p]       = vLight->lightProject[2][p];
+			L.projectFalloff[p] = vLight->lightProject[3][p];
+		}
+		L.color[0] = color.x;
+		L.color[1] = color.y;
+		L.color[2] = color.z;
+		L.color[3] = 0.0f;
+		L.origin[0] = vLight->globalLightOrigin.x;
+		L.origin[1] = vLight->globalLightOrigin.y;
+		L.origin[2] = vLight->globalLightOrigin.z;
+		L.origin[3] = 0.0f;
+	}
+	return numLights;
+}
 
 ReflectionsPass::ReflectionsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
 	, m_CommonPasses( commonPasses )
 	, m_BoundTlas( nullptr )
+	, m_BoundInstanceData( nullptr )
 	, m_ReflectionImage( nullptr )
 	, m_ImageWidth( 0 )
 	, m_ImageHeight( 0 )
@@ -71,6 +154,9 @@ ReflectionsPass::ReflectionsPass( nvrhi::IDevice* device, CommonRenderPasses* co
 	if( rayTracingSupported )
 	{
 		common->Printf( "ReflectionsPass: ray tracing supported, RT reflections available.\n" );
+		// opt in to the bindless material table BEFORE CreateTracePass so the reflection
+		// pipeline can reference its layout; the trace re-shades hits from real textures.
+		m_AccelStructs.EnableBindlessMaterials();
 		CreateTracePass();
 	}
 	else
@@ -107,13 +193,18 @@ void ReflectionsPass::CreateTracePass()
 	layoutDesc.bindings =
 	{
 		nvrhi::BindingLayoutItem::RayTracingAccelStruct( 0 ),	// t0 : world TLAS
-		nvrhi::BindingLayoutItem::Texture_SRV( 1 ),			// t1 : resolved lit scene colour
+		nvrhi::BindingLayoutItem::Texture_SRV( 1 ),			// t1 : resolved lit scene colour (base/passthrough)
 		nvrhi::BindingLayoutItem::Texture_SRV( 2 ),			// t2 : hardware depth
 		nvrhi::BindingLayoutItem::Texture_SRV( 3 ),			// t3 : gbuffer world normals + roughness
-		nvrhi::BindingLayoutItem::Texture_SRV( 4 ),			// t4 : env radiance (off-screen fallback)
+		nvrhi::BindingLayoutItem::Texture_SRV( 4 ),			// t4 : env radiance (miss fallback)
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 5 ),	// t5 : per-instance shading data
+		nvrhi::BindingLayoutItem::RawBuffer_SRV( 6 ),			// t6 : static idDrawVert cache
+		nvrhi::BindingLayoutItem::RawBuffer_SRV( 7 ),			// t7 : static R16 index cache
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 8 ),	// t8 : projected lights
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : ReflectionConstants
 		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : composited output
-		nvrhi::BindingLayoutItem::Sampler( 0 ),				// s0 : linear-clamp sampler
+		nvrhi::BindingLayoutItem::Sampler( 0 ),				// s0 : linear-clamp (env / gbuffers)
+		nvrhi::BindingLayoutItem::Sampler( 1 ),				// s1 : linear-wrap (material textures)
 	};
 	m_TraceBindingLayout = m_Device->createBindingLayout( layoutDesc );
 
@@ -122,8 +213,24 @@ void ReflectionsPass::CreateTracePass()
 	samplerDesc.setAllAddressModes( nvrhi::SamplerAddressMode::Clamp );
 	m_LinearSampler = m_Device->createSampler( samplerDesc );
 
+	nvrhi::SamplerDesc matSamplerDesc;
+	matSamplerDesc.setAllFilters( true );
+	matSamplerDesc.setAllAddressModes( nvrhi::SamplerAddressMode::Wrap );
+	matSamplerDesc.setMaxAnisotropy( 8 );
+	m_MaterialSampler = m_Device->createSampler( matSamplerDesc );
+
+	// per-frame projected-light buffer for the hit re-shade
+	nvrhi::BufferDesc lightDesc;
+	lightDesc.byteSize = ( uint64_t )RT_REFL_MAX_LIGHTS * sizeof( ReflLight );
+	lightDesc.structStride = sizeof( ReflLight );
+	lightDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+	lightDesc.keepInitialState = true;
+	lightDesc.debugName = "RTReflections/Lights";
+	m_LightBuffer = m_Device->createBuffer( lightDesc );
+
 	nvrhi::ComputePipelineDesc pipelineDesc;
-	pipelineDesc.bindingLayouts = { m_TraceBindingLayout };
+	// second layout: the bindless material-texture table (register space 1)
+	pipelineDesc.bindingLayouts = { m_TraceBindingLayout, m_AccelStructs.GetBindlessLayout() };
 	pipelineDesc.CS = m_TraceShader;
 	m_TracePipeline = m_Device->createComputePipeline( pipelineDesc );
 }
@@ -204,6 +311,14 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 	}
 	EnsureReflectionImage( width, height );
 
+	// gather the view's direct lights for the world-space hit re-shade
+	ReflLight lights[RT_REFL_MAX_LIGHTS];
+	const int numLights = R_GatherReflectionLights( viewDef, lights, RT_REFL_MAX_LIGHTS );
+	if( numLights > 0 )
+	{
+		commandList->writeBuffer( m_LightBuffer, lights, ( size_t )numLights * sizeof( ReflLight ) );
+	}
+
 	ReflectionConstants constants;
 	memset( &constants, 0, sizeof( constants ) );
 
@@ -220,25 +335,30 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 	constants.worldToClip3 = idVec4( w2c[3][0], w2c[3][1], w2c[3][2], w2c[3][3] );
 
 	const idVec3 eye = viewDef->renderView.vieworg;
-	constants.eyePos = idVec4( eye.x, eye.y, eye.z, 0.0f );
+	// eyePos.w carries the shadow-ray toggle for the re-shade (0 = skip shadow rays)
+	constants.eyePos = idVec4( eye.x, eye.y, eye.z, r_rtReflectionShadows.GetBool() ? 1.0f : 0.0f );
 
+	// params0.w was the (now-removed) screen-reprojection disocclusion eps; it now
+	// carries the re-shade toggle (0 = flat average albedo, no bindless / no lights)
 	constants.params0 = idVec4( r_rtReflectionMaxDist.GetFloat(),
 								r_rtReflectionBias.GetFloat(),
 								r_rtReflectionIntensity.GetFloat(),
-								r_rtReflectionDisoccEps.GetFloat() );
-	// env-fallback mip scale: roughness -> mip over the radiance probe's LOD range
+								r_rtReflectionReshade.GetBool() ? 1.0f : 0.0f );
+	// env-fallback mip scale: roughness -> mip over the radiance probe's LOD range;
+	// w = shadow-ray bias for the re-shade
 	constants.params1 = idVec4( r_rtReflectionGateLo.GetFloat(),
 								r_rtReflectionGateHi.GetFloat(),
-								6.0f, 0.0f );
+								6.0f, r_rtReflectionShadeBias.GetFloat() );
 	constants.screenSize = idVec2i( width, height );
-	constants.debugFlags = idVec2i( r_rtReflectionDebug.GetInteger(), 0 );
+	constants.debugFlags = idVec2i( r_rtReflectionDebug.GetInteger(), numLights );
 
 	commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 
 	// the TLAS handle changes when it is recreated to grow; rebuild the binding
 	// set (also invalidated on image resize) to point at the current resources.
 	nvrhi::rt::IAccelStruct* tlas = m_AccelStructs.GetTLAS();
-	if( m_TraceBindingSet == nullptr || m_BoundTlas != tlas )
+	nvrhi::IBuffer* instanceData = m_AccelStructs.GetInstanceDataBuffer();
+	if( m_TraceBindingSet == nullptr || m_BoundTlas != tlas || m_BoundInstanceData != instanceData )
 	{
 		nvrhi::BindingSetDesc setDesc;
 		setDesc.bindings =
@@ -248,17 +368,23 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 			nvrhi::BindingSetItem::Texture_SRV( 2, globalImages->currentDepthImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::Texture_SRV( 3, globalImages->gbufferNormalsRoughnessImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::Texture_SRV( 4, globalImages->defaultUACRadianceCube->GetTextureHandle() ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 5, instanceData ),
+			nvrhi::BindingSetItem::RawBuffer_SRV( 6, m_AccelStructs.GetStaticVertexBuffer() ),
+			nvrhi::BindingSetItem::RawBuffer_SRV( 7, m_AccelStructs.GetStaticIndexBuffer() ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 8, m_LightBuffer ),
 			nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
 			nvrhi::BindingSetItem::Texture_UAV( 0, m_ReflectionImage->GetTextureHandle() ),
 			nvrhi::BindingSetItem::Sampler( 0, m_LinearSampler ),
+			nvrhi::BindingSetItem::Sampler( 1, m_MaterialSampler ),
 		};
 		m_TraceBindingSet = m_Device->createBindingSet( setDesc, m_TraceBindingLayout );
 		m_BoundTlas = tlas;
+		m_BoundInstanceData = instanceData;
 	}
 
 	nvrhi::ComputeState state;
 	state.pipeline = m_TracePipeline;
-	state.bindings = { m_TraceBindingSet };
+	state.bindings = { m_TraceBindingSet, m_AccelStructs.GetBindlessTable() };
 	commandList->setComputeState( state );
 
 	commandList->dispatch( ( width + 7 ) / 8, ( height + 7 ) / 8, 1 );
