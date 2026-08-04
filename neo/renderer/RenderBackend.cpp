@@ -66,6 +66,7 @@ idCVar r_skipEnvProbeSpecular( "r_skipEnvProbeSpecular", "0", CVAR_RENDERER | CV
 idCVar r_skipEnvProbeDiffuse( "r_skipEnvProbeDiffuse", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "diagnostic: force env-probe diffuse irradiance IBL to black (isolates the single-nearest-probe diffuse swap)" );
 extern idCVar r_useRTShadows;		// runtime RT shadows toggle (RenderSystem_init.cpp)
 extern idCVar r_useStencilShadows;	// stencil shadow volumes toggle (tr_frontend_addmodels.cpp)
+extern idCVar r_useSoftShadowVolumes;	// soft shadow volumes / penumbra wedges (RenderSystem_init.cpp)
 extern idCVar r_hdrOutput;			// HDR display output toggle (RenderSystem_init.cpp)
 
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
@@ -4347,6 +4348,67 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			currentPipeline = nullptr;
 		}
 
+		// soft shadow volumes (M1b): stamp the hard umbra into the light visibility buffer.
+		// Bind the LVB (colour = rtShadowMaskImage, depth-stencil = shared scene depth), clear it
+		// to 1 (lit) over the light's scissor, stamp both shadow-volume sets into the stencil
+		// exactly as the hard path does, then a fullscreen fill writes 0 (umbra) everywhere the
+		// stencil says shadowed (!= 128). Wedges lighten the penumbra band into this same buffer
+		// later (M1c/d); the interaction multiplies it in (M1e). Validate now with r_rtShadowShowMask.
+		if( r_useSoftShadowVolumes.GetBool() && globalFramebuffers.softShadowMaskFBO
+				&& ( vLight->globalShadows != NULL || vLight->localShadows != NULL ) )
+		{
+			renderLog.OpenBlock( "SoftShadowVolume Umbra", colorBlue );
+
+			globalFramebuffers.softShadowMaskFBO->Bind();
+
+			// scissor to the light's S-cull-tile-aligned rect (same rounding as the hard stencil path)
+			idScreenRect rect;
+			rect.x1 = ( vLight->scissorRect.x1 +  0 ) & ~15;
+			rect.y1 = ( vLight->scissorRect.y1 +  0 ) & ~15;
+			rect.x2 = ( vLight->scissorRect.x2 + 15 ) & ~15;
+			rect.y2 = ( vLight->scissorRect.y2 + 15 ) & ~15;
+			GL_Scissor( viewDef->viewport.x1 + rect.x1,
+						viewDef->viewport.y2 - rect.y2,
+						rect.x2 + 1 - rect.x1,
+						rect.y2 + 1 - rect.y1 );
+			currentScissor = rect;
+
+			// clear the mask to lit (1) and the stencil to the unshadowed reference (128); keep depth
+			GL_State( GLS_DEFAULT );
+			GL_Clear( true, false, true, STENCIL_SHADOW_TEST_VALUE, 1.0f, 1.0f, 1.0f, 1.0f, false );
+
+			// stamp both shadow-volume sets into the stencil (PASS_INCR -> shadowed pixels != 128)
+			StencilShadowPass( vLight->globalShadows, vLight );
+			StencilShadowPass( vLight->localShadows, vLight );
+
+			// fullscreen fill: write 0 (umbra floor) into the mask wherever stencil != 128 (shadowed).
+			// Don't touch depth (DEPTHMASK) or stencil (default OP = KEEP); DEPTHFUNC_ALWAYS so the
+			// screen quad always passes.
+			GL_State( GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS | GLS_CULL_TWOSIDED |
+					  GLS_STENCIL_FUNC_NOTEQUAL |
+					  GLS_STENCIL_MAKE_REF( STENCIL_SHADOW_TEST_VALUE ) |
+					  GLS_STENCIL_MAKE_MASK( STENCIL_SHADOW_MASK_VALUE ) );
+			GL_Color( 0, 0, 0, 0 );
+			renderProgManager.BindShader_Color();
+			currentSpace = NULL;
+			RB_SetMVP( renderMatrix_fullscreen );
+			DrawElementsWithCounters( &unitSquareSurface );
+
+			// restore the scene render target; invalidate the graphics-state cache (FBO + heavy state churn)
+			if( previousFramebuffer != NULL )
+			{
+				previousFramebuffer->Bind();
+			}
+			else
+			{
+				Framebuffer::Unbind();
+			}
+			renderProgManager.Unbind();
+			currentPipeline = nullptr;
+
+			renderLog.CloseBlock();
+		}
+
 		// RB: render interactions with shadow mapping
 		{
 			// RT-shadowed lights sample the RT mask, not a shadow map - skip the (non-atlas)
@@ -6428,7 +6490,7 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	// registration against the lit geometry is visible (red = lit, dark = shadowed).
 	{
 		extern idCVar r_rtShadowShowMask;
-		if( is3D && r_rtShadowShowMask.GetBool() && rtShadowsActiveThisView )
+		if( is3D && r_rtShadowShowMask.GetBool() && ( rtShadowsActiveThisView || r_useSoftShadowVolumes.GetBool() ) )
 		{
 			commonPasses.BlitTexture(
 				commandList,
