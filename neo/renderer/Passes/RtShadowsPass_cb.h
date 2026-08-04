@@ -73,4 +73,10 @@ struct RtShadowConstants
 	idVec4		lightProject1;
 	idVec4		lightProject2;
 	idVec4		lightProject3;
+
+	// Analytic (deterministic PCSS) penumbra - a stable-in-motion alternative to the stochastic
+	// disc sampling (see r_rtShadowAnalyticPenumbra). x = enable, y = focal length in pixels
+	// (world->screen size scale), z = max penumbra radius (pixels, also the denoise window),
+	// w = penumbra art-scale multiplier.
+	idVec4		analytic;
 };

@@ -39,6 +39,14 @@ idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVA
 idCVar r_rtShadowDenoise( "r_rtShadowDenoise", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: spatial edge-aware denoise of the soft-shadow penumbra (only active with r_rtShadowRays > 1)" );
 idCVar r_rtShadowDenoiseRadius( "r_rtShadowDenoiseRadius", "6", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT shadows: soft-shadow penumbra denoise radius in pixels (0 = off)", 0.0f, 16.0f );
 idCVar r_rtShadowDenoiseDepthSigma( "r_rtShadowDenoiseDepthSigma", "0.001", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: penumbra denoise depth edge-stop sigma (hardware-depth units)" );
+// Analytic (deterministic PCSS) penumbra: instead of N stochastic disc rays + denoise (which
+// swims under motion - screen-locked jitter with no TAA to resolve it), trace ONE hard ray for
+// exact visibility, derive a PCSS penumbra width from the blocker distance, and let the denoise
+// pass blur the hard mask by that width. Deterministic -> stable in motion; width tracks blocker
+// distance -> still contact-hardens. Overrides r_rtShadowRays soft sampling when on.
+idCVar r_rtShadowAnalyticPenumbra( "r_rtShadowAnalyticPenumbra", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: deterministic PCSS penumbra (1 hard ray + width-sized blur) - stable in motion, unlike the stochastic soft path. 0 = stochastic disc sampling (r_rtShadowRays)." );
+idCVar r_rtShadowPenumbraScale( "r_rtShadowPenumbraScale", "1.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT shadows: art-scale multiplier on the analytic penumbra width (>1 = softer/wider).", 0.0f, 8.0f );
+idCVar r_rtShadowPenumbraMaxRadius( "r_rtShadowPenumbraMaxRadius", "16", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT shadows: max analytic penumbra radius in pixels (also the denoise blur window - cost is O(r^2), keep modest).", 1.0f, 48.0f );
 
 // C++ side of the shadow-denoise constant buffer; must match ShadowDenoiseConstants in rt_shadow_denoise.cs.hlsl.
 struct ShadowDenoiseConstants
@@ -333,6 +341,15 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	constants.pad2 = idVec2i( ( r_rtShadowVolumeCull.GetBool() && !debugForce ) ? 1 : 0,
 							  ( r_rtShadowFacingCull.GetBool() && !debugForce ) ? 1 : 0 );
 
+	// Analytic penumbra: focalPx converts a world-space penumbra width at the receiver to screen
+	// pixels ( px = worldSize * focalPx / distToEye ). focalPx = 0.5 * width / tan( fovX/2 ).
+	const float fovX = viewDef->renderView.fov_x;
+	const float focalPx = ( fovX > 0.1f ) ? ( 0.5f * ( float )width / idMath::Tan( fovX * ( idMath::PI / 360.0f ) ) ) : ( float )width;
+	constants.analytic = idVec4( ( r_rtShadowAnalyticPenumbra.GetBool() && !debugForce ) ? 1.0f : 0.0f,
+								 focalPx,
+								 r_rtShadowPenumbraMaxRadius.GetFloat(),
+								 r_rtShadowPenumbraScale.GetFloat() );
+
 	// Dispatch the trace over ONLY this light's screen-space scissor rect instead of the whole
 	// framebuffer - a light that touches 5% of the screen then costs 5% of the rays. The rect is
 	// mapped to the mask's pixel space EXACTLY as RenderInteractions maps it for its GL_Scissor and
@@ -484,7 +501,12 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 	const int coarseMode = r_rtShadowCoarse.GetInteger();
 	const bool debugForceActive = ( r_rtShadowForce.GetInteger() != 0 );
 	const bool softShadowsActive = ( r_rtShadowRays.GetInteger() > 1 );
-	const bool useTwoPass = coarseImageReady && coarseMode != 0 && !debugForceActive && !softShadowsActive;
+	// Analytic penumbra: 1 hard ray to the raw mask (penumbra-encoded), then the denoise pass
+	// blurs it by the per-pixel width. Forces the legacy raw+denoise path (never coarse+refine),
+	// and always denoises (the blur IS the penumbra) regardless of rays / r_rtShadowDenoise.
+	const bool analyticActive = r_rtShadowAnalyticPenumbra.GetBool() && !debugForceActive &&
+								m_DenoisePipeline != nullptr && m_RawMaskBindingSet != nullptr && m_DenoiseBindingSet != nullptr;
+	const bool useTwoPass = coarseImageReady && coarseMode != 0 && !debugForceActive && !softShadowsActive && !analyticActive;
 
 	// One-shot gate diagnostic: if coarse+refine "does nothing", this line names the failing
 	// condition (coarseImageReady 0 = coarse mask never generated; rays>1 = soft shadows force
@@ -507,9 +529,10 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 		// soft shadows: trace the raw (noisy) penumbra to m_RawMaskImage, then spatially
 		// denoise it into the final mask. Hard shadows (rays == 1) are pixel-exact and
 		// skip the denoise entirely (trace straight to the final mask).
-		const bool doDenoise = softShadowsActive && m_DenoisePipeline != nullptr &&
-							   m_RawMaskBindingSet != nullptr && m_DenoiseBindingSet != nullptr &&
-							   r_rtShadowDenoise.GetBool() && r_rtShadowDenoiseRadius.GetFloat() > 0.0f;
+		const bool doDenoise = analyticActive ||
+							   ( softShadowsActive && m_DenoisePipeline != nullptr &&
+								 m_RawMaskBindingSet != nullptr && m_DenoiseBindingSet != nullptr &&
+								 r_rtShadowDenoise.GetBool() && r_rtShadowDenoiseRadius.GetFloat() > 0.0f );
 
 		nvrhi::ComputeState state;
 		state.pipeline = m_TracePipeline;
@@ -524,7 +547,18 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 			dc.screenSize = constants.screenSize;
 			dc.scissorMin = constants.scissorMin;
 			dc.scissorMax = idVec2i( constants.scissorMin.x + dispW - 1, constants.scissorMin.y + dispH - 1 );
-			dc.params = idVec4( r_rtShadowDenoiseRadius.GetFloat(), r_rtShadowDenoiseDepthSigma.GetFloat(), 0.0f, 0.0f );
+			// Analytic mode (pad0.x = 1): params.z = max penumbra radius (px, blur window), params.w =
+			// umbra floor. Stochastic mode: params.x = denoise radius, y = depth sigma (z/w unused).
+			if( analyticActive )
+			{
+				dc.pad0 = idVec2i( 1, 0 );
+				dc.params = idVec4( 0.0f, r_rtShadowDenoiseDepthSigma.GetFloat(),
+									r_rtShadowPenumbraMaxRadius.GetFloat(), r_rtShadowUmbra.GetFloat() );
+			}
+			else
+			{
+				dc.params = idVec4( r_rtShadowDenoiseRadius.GetFloat(), r_rtShadowDenoiseDepthSigma.GetFloat(), 0.0f, 0.0f );
+			}
 			commandList->writeBuffer( m_DenoiseConstantBuffer, &dc, sizeof( dc ) );
 
 			nvrhi::ComputeState dnState;

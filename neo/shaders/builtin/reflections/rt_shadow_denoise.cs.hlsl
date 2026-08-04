@@ -64,6 +64,61 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	}
 
 	const float centerVis = t_RawMask[pixel];
+
+	// Analytic (deterministic PCSS) mode (g_D.pad0.x): the raw mask is NOT a noisy visibility but
+	// an ENCODED penumbra - lit = 1.0, occluded = penumbra radius (px) normalised by maxRadiusPx.
+	// Scatter each occluded pixel's shadow over a disc of its own penumbra radius: the umbra core
+	// (radius reached at distance 0) stays dark, the shadow fades out to lit at the radius edge.
+	// Deterministic (no random taps) -> stable in motion; width tracks blocker distance ->
+	// contact-hardening. Geometry edge-stop (normal + depth) keeps it from bleeding across cliffs.
+	if( g_D.pad0.x >= 1 )
+	{
+		const int maxR = ( int )g_D.params.z;
+		const float umbra = g_D.params.w;
+		if( maxR <= 0 )
+		{
+			u_Out[pixel] = ( centerVis >= 0.995f ) ? 1.0f : umbra;	// no window: hard decode
+			return;
+		}
+		const float cDepth = t_Depth[pixel].r;
+		const float3 cN = DecodeNormal( pixel );
+		const float depthSigma = g_D.params.y;
+
+		float shadowCov = 0.0f;
+		for( int dy = -maxR; dy <= maxR; dy++ )
+		{
+			for( int dx = -maxR; dx <= maxR; dx++ )
+			{
+				const int2 q = pixel + int2( dx, dy );
+				if( q.x < g_D.scissorMin.x || q.y < g_D.scissorMin.y ||
+						q.x > g_D.scissorMax.x || q.y > g_D.scissorMax.y )
+				{
+					continue;
+				}
+				const float r = t_RawMask[q];
+				if( r >= 0.995f )
+				{
+					continue;					// lit tap casts no shadow
+				}
+				const float P = max( r * g_D.params.z, 0.5f );		// this occluder's penumbra radius (px)
+				const float d = sqrt( float( dx * dx + dy * dy ) );
+				if( d > P )
+				{
+					continue;					// outside this occluder's penumbra
+				}
+				// geometry edge-stop: do not spread shadow onto surfaces at a different depth/orientation
+				const float3 nN = DecodeNormal( q );
+				const float wn = pow( saturate( dot( cN, nN ) ), 32.0f );
+				const float sd = t_Depth[q].r;
+				const float wd = exp( -abs( sd - cDepth ) / max( depthSigma, 1e-6f ) );
+				const float cov = ( 1.0f - smoothstep( 0.0f, P, d ) ) * wn * wd;
+				shadowCov = max( shadowCov, cov );	// union of penumbrae (darkest wins)
+			}
+		}
+		u_Out[pixel] = max( 1.0f - shadowCov, umbra );
+		return;
+	}
+
 	const int radius = ( int )g_D.params.x;
 	if( radius <= 0 )
 	{

@@ -56,6 +56,8 @@ struct RtShadowConstants
 	float4	lightProject1;		// 0 < c.x,c.y,c.z < c.w where c[i] = lightProject[i] . (worldP,1).
 	float4	lightProject2;		// pad2.x enables the cull; outside -> interaction gives zero light.
 	float4	lightProject3;
+
+	float4	analytic;			// x = enable, y = focalPx, z = maxRadiusPx, w = penumbra art-scale
 };
 
 // *INDENT-OFF*
@@ -470,6 +472,44 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 		bq.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, bray );
 		bq.Proceed();
 		u_ShadowMask[pixel] = ( bq.CommittedStatus() == COMMITTED_TRIANGLE_HIT ) ? 0.0f : 1.0f;
+		return;
+	}
+
+	// Analytic (deterministic PCSS) penumbra. The stochastic disc sampling below cannot be
+	// temporally stable without TAA - its per-pixel jitter is screen-locked, so it swims under
+	// motion. Instead trace ONE hard ray for exact visibility, read the blocker distance, and
+	// derive a PCSS penumbra width; rt_shadow_denoise then blurs the hard mask by that width.
+	// No random sampling -> no noise -> stable in motion, and the width scales with blocker
+	// distance so the penumbra still contact-hardens (sharp at contact, wide far away).
+	//
+	// R8 raw-mask encoding for the denoise: lit = 1.0 (sentinel); occluded = penumbra radius in
+	// pixels, normalised to [0, 0.99] by maxRadiusPx (analytic.z). The denoise decodes and
+	// scatters each occluded pixel's shadow over a disc of that radius.
+	if( g_Sh.analytic.x >= 0.5f )
+	{
+		const float tmax = max( 0.0f, lightDist - bias );
+		if( TraceVisibility( origin, L, bias, tmax ) > 0.5f )
+		{
+			u_ShadowMask[pixel] = 1.0f;			// lit (sentinel)
+			return;
+		}
+		// blocker distance: re-trace to fetch the committed hit T (receiver -> occluder).
+		RayDesc aray;
+		aray.Origin = origin;
+		aray.Direction = L;
+		aray.TMin = bias;
+		aray.TMax = tmax;
+		RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> aq;
+		aq.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, aray );
+		aq.Proceed();
+		const float tHit = ( aq.CommittedStatus() == COMMITTED_TRIANGLE_HIT ) ? aq.CommittedRayT() : ( lightDist * 0.5f );
+		// PCSS width ~ lightRadius * (occluder->receiver) / (light->occluder). tHit is
+		// receiver->occluder, so light->occluder = lightDist - tHit.
+		const float lightRadius = g_Sh.lightOrigin.w;
+		const float penumbraWorld = lightRadius * tHit / max( lightDist - tHit, 0.01f ) * g_Sh.analytic.w;
+		const float distToEye = length( worldP - g_Sh.cameraOrigin.xyz );
+		const float penumbraPx = penumbraWorld * g_Sh.analytic.y / max( distToEye, 0.01f );
+		u_ShadowMask[pixel] = clamp( penumbraPx / max( g_Sh.analytic.z, 1.0f ), 0.0f, 0.99f );
 		return;
 	}
 
