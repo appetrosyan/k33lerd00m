@@ -357,6 +357,10 @@ void R_FreeStaticTriSurf( srfTriangles_t* tri )
 	{
 		Mem_Free( tri->staticShadowVertexes );
 	}
+	if( tri->posedShadowVerts != NULL )
+	{
+		Mem_Free( tri->posedShadowVerts );
+	}
 
 	// clear the tri out so we don't retain stale data
 	memset( tri, 0, sizeof( srfTriangles_t ) );
@@ -2148,6 +2152,10 @@ deformInfo_t* R_BuildDeformInfo( int numVerts, const idDrawVert* verts, int numI
 
 	R_RangeCheckIndexes( &tri );
 	R_CreateSilIndexes( &tri );
+	// Stencil shadow volumes: build the silhouette-edge topology now so animated casters can grow a
+	// per-frame shadow volume off it. omitCoplanarEdges = false: a deforming mesh can bend a coplanar
+	// edge into a real silhouette, so keep them all (static models omit them, they can't deform).
+	R_IdentifySilEdges( &tri, false );
 	R_DuplicateMirroredVertexes( &tri );		// split mirror points into multiple points
 	R_CreateDupVerts( &tri );
 	if( useUnsmoothedTangents )
@@ -2166,6 +2174,9 @@ deformInfo_t* R_BuildDeformInfo( int numVerts, const idDrawVert* verts, int numI
 	deform->indexes = tri.indexes;
 
 	deform->silIndexes = tri.silIndexes;
+
+	deform->numSilEdges = tri.numSilEdges;
+	deform->silEdges = tri.silEdges;
 
 	deform->numMirroredVerts = tri.numMirroredVerts;
 	deform->mirroredVerts = tri.mirroredVerts;
@@ -2217,6 +2228,10 @@ void R_FreeDeformInfo( deformInfo_t* deformInfo )
 	if( deformInfo->silIndexes != NULL )
 	{
 		Mem_Free( deformInfo->silIndexes );
+	}
+	if( deformInfo->silEdges != NULL )
+	{
+		Mem_Free( deformInfo->silEdges );
 	}
 	if( deformInfo->mirroredVerts != NULL )
 	{

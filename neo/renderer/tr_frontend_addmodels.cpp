@@ -43,6 +43,10 @@ If you have questions concerning this license or the applicable additional terms
 
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
 extern idCVar r_rtShadowCullOffView;	// trim the shadow TLAS: cull casters whose shadow misses the view (RtShadowsPass.cpp)
+// dynamic stencil shadow volume for moved / non-static casters, built per-frame from the
+// model's static silEdges + doubled shadowCache against the current light (defined in Interaction.cpp).
+srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light );
+
 idCVar r_skipStaticShadows( "r_skipStaticShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip static shadows" );
 idCVar r_skipDynamicShadows( "r_skipDynamicShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip dynamic shadows" );
 idCVar r_useParallelAddModels( "r_useParallelAddModels", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "add all models in parallel with jobs" );
@@ -1223,6 +1227,69 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					shadowDrawSurf->linkChain = shader->TestMaterialFlag( MF_NOSELFSHADOW ) ? &vLight->localShadows : &vLight->globalShadows;
 					shadowDrawSurf->nextOnLight = vEntity->drawSurfs;
 					vEntity->drawSurfs = shadowDrawSurf;
+				}
+				else if( surfInter == NULL && tri->silEdges != NULL )
+				{
+					// Moved / dynamic / animated caster: no baked static interaction exists (surfInter
+					// == NULL), so this surface's silhouette against the light changes every frame.
+					// Rebuild the shadow-volume index set on the fly from the model's silEdges + doubled
+					// shadowCache and upload it to the frame index cache. This is what makes moving props
+					// AND animated characters cast a stencil shadow that tracks them, instead of silently
+					// dropping out (the old "static casters only" punt that left moved objects shadowless).
+					// ponytail: per-frame R_CreateInteractionShadowVolume does a malloc+free; fine for
+					// the moving casters in a scene, revisit if one throws hundreds.
+
+					// Ensure a shadow vertex cache for this pose. Rigid movers carry a static shadowCache
+					// (always current). Animated (MD5) casters get PERSISTENT posed verts in UpdateSurface;
+					// rebuild the per-frame shadow cache from them whenever it's stale - crucially this
+					// covers a settled ragdoll, whose cached dynamic model stops calling UpdateSurface, so
+					// its frame shadow cache from an earlier frame has expired (that was the corpse whose
+					// shadow vanished on settling). facing/cull use the posed override transparently.
+					if( !vertexCache.CacheIsCurrent( tri->shadowCache ) )
+					{
+						const idDrawVert* posed = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
+						if( posed != NULL && tri->numVerts > 0 )
+						{
+							const int numShadowVerts = tri->numVerts * 2;
+							idShadowVert* shadowVerts = ( idShadowVert* )R_FrameAlloc( numShadowVerts * ( int )sizeof( idShadowVert ), FRAME_ALLOC_UNKNOWN );
+							idShadowVert::CreateShadowCache( shadowVerts, posed, tri->numVerts );
+							tri->shadowCache = vertexCache.AllocVertex( shadowVerts, numShadowVerts, sizeof( idShadowVert ) );
+						}
+					}
+
+					srfTriangles_t* shadowTri = vertexCache.CacheIsCurrent( tri->shadowCache ) ? R_CreateInteractionShadowVolume( entityDef, tri, lightDef ) : NULL;
+					if( shadowTri != NULL )
+					{
+						vertCacheHandle_t shadowIndexCache = vertexCache.AllocIndex( shadowTri->indexes, shadowTri->numIndexes );
+
+						drawSurf_t* shadowDrawSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *shadowDrawSurf ), FRAME_ALLOC_DRAW_SURFACE );
+
+						const bool viewMaybeInside = R_ViewPotentiallyInsideInfiniteShadowVolume(
+								tri->bounds, localLightOrigin, localViewOrigin,
+								r_znear.GetFloat() * INSIDE_SHADOW_VOLUME_EXTRA_STRETCH );
+						// opaque casters can drop the caps when the view is safely outside the volume;
+						// perforated ones already fold caps in (numShadowIndexesNoCaps == numIndexes there).
+						shadowDrawSurf->numIndexes = viewMaybeInside ? shadowTri->numIndexes
+								: ( shader->Coverage() == MC_OPAQUE ? shadowTri->numShadowIndexesNoCaps : shadowTri->numIndexes );
+						shadowDrawSurf->indexCache = shadowIndexCache;
+						shadowDrawSurf->shadowCache = tri->shadowCache;
+						shadowDrawSurf->ambientCache = 0;
+						shadowDrawSurf->jointCache = 0;
+						shadowDrawSurf->frontEndGeo = NULL;
+						shadowDrawSurf->space = vEntity;
+						shadowDrawSurf->material = NULL;
+						shadowDrawSurf->extraGLState = 0;
+						shadowDrawSurf->scissorRect = vLight->scissorRect;
+						shadowDrawSurf->sort = 0.0f;
+						shadowDrawSurf->renderZFail = viewMaybeInside ? 1 : 0;
+						shadowDrawSurf->shaderRegisters = NULL;
+
+						shadowDrawSurf->linkChain = shader->TestMaterialFlag( MF_NOSELFSHADOW ) ? &vLight->localShadows : &vLight->globalShadows;
+						shadowDrawSurf->nextOnLight = vEntity->drawSurfs;
+						vEntity->drawSurfs = shadowDrawSurf;
+
+						R_FreeStaticTriSurf( shadowTri );
+					}
 				}
 
 				continue;	// stencil mode never uses the shadow-map occluder path

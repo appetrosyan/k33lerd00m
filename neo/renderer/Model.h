@@ -89,6 +89,13 @@ struct srfTriangles_t
 	int							numVerts;				// number of vertices
 	idDrawVert* 				verts;					// vertices, allocated with special allocator
 
+	// Optional CPU-posed positions for stencil shadow-volume facing/cull + shadow cache, used when
+	// 'verts' holds bind-pose geometry (GPU skinning) but the shadow volume must be built against the
+	// animated pose. NULL means use 'verts'. Owned (freed with the tri) and PERSISTENT across frames:
+	// a cached dynamic model (e.g. a settled ragdoll) stops calling UpdateSurface, so the frontend
+	// rebuilds the frame shadow cache from these every frame the model is drawn.
+	idDrawVert*					posedShadowVerts;
+
 	int							numIndexes;				// for shadows, this has both front and rear end caps and silhouette planes
 	triIndex_t* 				indexes;				// indexes, allocated with special allocator
 

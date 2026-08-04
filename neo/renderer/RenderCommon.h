@@ -1741,6 +1741,9 @@ struct deformInfo_t
 
 	triIndex_t* 		silIndexes;				// indexes changed to be the first vertex with same XYZ, ignoring normal and texcoords
 
+	int					numSilEdges;			// silhouette edges (topology, pose-independent) - stencil shadow volumes
+	silEdge_t*			silEdges;				// built once here so animated casters can build a per-frame shadow volume
+
 	int					numMirroredVerts;		// this many verts at the end of the vert list are tangent mirrors
 	int* 				mirroredVerts;			// tri->mirroredVerts[0] is the mirror of tri->numVerts - tri->numMirroredVerts + 0
 

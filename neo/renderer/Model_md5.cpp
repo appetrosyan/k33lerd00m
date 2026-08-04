@@ -513,6 +513,9 @@ void idMD5Mesh::UpdateSurface( const struct renderEntity_s* ent, const idJointMa
 
 	srfTriangles_t* tri = surf->geometry;
 
+	// cleared each frame; set below only when this animated surface builds a stencil shadow volume
+	tri->posedShadowVerts = NULL;
+
 	// note that some of the data is referenced, and should not be freed
 	tri->referencedIndexes = true;
 	tri->numIndexes = deformInfo->numIndexes;
@@ -553,6 +556,35 @@ void idMD5Mesh::UpdateSurface( const struct renderEntity_s* ent, const idJointMa
 	tri->tangentsCalculated = true;
 
 	CalculateBounds( entJoints, tri->bounds );
+
+	// Stencil shadow volumes for animated casters. The shadow vertex shader is position-only (no GPU
+	// skinning), so an animated model needs CPU-posed shadow geometry for the current pose. Hand the
+	// frontend the silhouette topology (built once in the deform info) plus PERSISTENT posed positions;
+	// the frontend builds the per-frame shadow cache + per-light volume from them. Persistent because a
+	// cached dynamic model (a settled ragdoll) stops calling UpdateSurface, but the frontend still runs
+	// every frame - without persistence the shadow would vanish the moment the corpse comes to rest.
+	// Gated on stencil shadows being the active method so animated rendering is untouched otherwise.
+	extern idCVar r_useStencilShadows;
+	extern idCVar r_useRTShadows;
+	if( r_useStencilShadows.GetBool() && !r_useRTShadows.GetBool() &&
+			shader->SurfaceCastsShadow() && deformInfo->silEdges != NULL )
+	{
+		tri->numSilEdges = deformInfo->numSilEdges;
+		tri->silEdges = deformInfo->silEdges;
+
+		// Under GPU skinning tri->verts is bind pose, so pose a copy by the joints into the owned,
+		// persistent posedShadowVerts (leaving tri->verts, which rendering references, untouched).
+		// Without GPU skinning tri->verts is already posed and persistent, so use it directly.
+		if( r_useGPUSkinning.GetBool() )
+		{
+			if( tri->posedShadowVerts == NULL )
+			{
+				tri->posedShadowVerts = ( idDrawVert* )Mem_Alloc16( deformInfo->numOutputVerts * sizeof( idDrawVert ), TAG_MODEL );
+			}
+			memcpy( tri->posedShadowVerts, deformInfo->verts, deformInfo->numOutputVerts * sizeof( idDrawVert ) );	// texcoords etc.
+			TransformVertsAndTangents( tri->posedShadowVerts, deformInfo->numOutputVerts, deformInfo->verts, entJointsInverted );
+		}
+	}
 }
 
 /*
@@ -835,6 +867,13 @@ bool idRenderModelMD5::LoadBinaryModel( idFile* file, const ID_TIME_T sourceTime
 			file->ReadBigArray( deform.dupVerts, deform.numDupVerts * 2 );
 		}
 // jmarshall - compatibility
+		// The binary model still stores the old silEdges, but RB's shadow-map-only build discarded
+		// them (read into stubs just to advance the stream). Stencil shadow VOLUMES need silEdges, so
+		// after skipping the stale ones rebuild the silhouette-edge topology from the loaded silIndexes
+		// - exactly as R_BuildDeformInfo does for freshly-parsed models. Without this, cached MD5
+		// models (the normal case) have no silEdges and animated casters never build a shadow volume,
+		// e.g. the marine corpse cast no shadow. omitCoplanarEdges = false: a deforming mesh can bend a
+		// coplanar edge into a real silhouette.
 		if( numSilEdges > 0 )
 		{
 			for( int j = 0; j < numSilEdges; j++ )
@@ -845,6 +884,17 @@ bool idRenderModelMD5::LoadBinaryModel( idFile* file, const ID_TIME_T sourceTime
 				file->ReadBig( stub );
 				file->ReadBig( stub );
 			}
+		}
+
+		if( deform.silIndexes != NULL && deform.numIndexes > 0 )
+		{
+			tri.numVerts = deform.numOutputVerts;
+			tri.numIndexes = deform.numIndexes;
+			tri.numDupVerts = deform.numDupVerts;
+			// tri.verts / tri.indexes / tri.silIndexes / tri.dupVerts already point at deform's arrays
+			R_IdentifySilEdges( &tri, false );
+			deform.numSilEdges = tri.numSilEdges;
+			deform.silEdges = tri.silEdges;
 		}
 // jmarshall end
 

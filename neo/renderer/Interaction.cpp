@@ -65,12 +65,15 @@ void R_CalcInteractionFacing( const idRenderEntityLocal* ent, const srfTriangles
 	const int numFaces = tri->numIndexes / 3;
 	cullInfo.facing = ( byte* ) R_StaticAlloc( ( numFaces + 1 ) * sizeof( cullInfo.facing[0] ), TAG_RENDER_INTERACTION );
 
+	// animated casters carry bind-pose 'verts' (GPU skinning) but a CPU-posed override for shadows
+	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
+
 	// exact geometric cull against face
 	for( int i = 0, face = 0; i < tri->numIndexes; i += 3, face++ )
 	{
-		const idDrawVert& v0 = tri->verts[tri->indexes[i + 0]];
-		const idDrawVert& v1 = tri->verts[tri->indexes[i + 1]];
-		const idDrawVert& v2 = tri->verts[tri->indexes[i + 2]];
+		const idDrawVert& v0 = verts[tri->indexes[i + 0]];
+		const idDrawVert& v1 = verts[tri->indexes[i + 1]];
+		const idDrawVert& v2 = verts[tri->indexes[i + 2]];
 
 		const idPlane plane( v0.xyz, v1.xyz, v2.xyz );
 		const float d = plane.Distance( localLightOrigin );
@@ -126,6 +129,9 @@ void R_CalcInteractionCullBits( const idRenderEntityLocal* ent, const srfTriangl
 	cullInfo.cullBits = ( byte* ) R_StaticAlloc( tri->numVerts * sizeof( cullInfo.cullBits[0] ), TAG_RENDER_INTERACTION );
 	memset( cullInfo.cullBits, 0, tri->numVerts * sizeof( cullInfo.cullBits[0] ) );
 
+	// animated casters carry bind-pose 'verts' (GPU skinning) but a CPU-posed override for shadows
+	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
+
 	for( int i = 0; i < 6; i++ )
 	{
 		// if completely infront of this clipping plane
@@ -135,7 +141,7 @@ void R_CalcInteractionCullBits( const idRenderEntityLocal* ent, const srfTriangl
 		}
 		for( int j = 0; j < tri->numVerts; j++ )
 		{
-			float d = cullInfo.localClipPlanes[i].Distance( tri->verts[j].xyz );
+			float d = cullInfo.localClipPlanes[i].Distance( verts[j].xyz );
 			cullInfo.cullBits[j] |= ( d < LIGHT_CLIP_EPSILON ) << i;
 		}
 	}
@@ -171,7 +177,7 @@ Creates a static shadow volume triangle surface (indexes into the doubled
 idShadowVert cache of the ambient surface). Restored verbatim from DOOM-3-BFG.
 =====================
 */
-static srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent,
+srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent,
 		const srfTriangles_t* tri, const idRenderLightLocal* light )
 {
 	SCOPED_PROFILE_EVENT( "R_CreateInteractionShadowVolume" );
