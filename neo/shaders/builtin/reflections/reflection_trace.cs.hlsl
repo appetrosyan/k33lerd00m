@@ -236,6 +236,155 @@ float3 RtShadeHit( float3 P, float3 N )
 	return lit;
 }
 
+// ---- glossy reflection: GGX VNDF importance sampling ----
+
+// Van der Corput radical inverse + Hammersley low-discrepancy 2D point.
+float RtRadicalInverse( uint bits )
+{
+	bits = reversebits( bits );
+	return float( bits ) * 2.3283064365386963e-10f;
+}
+float2 RtHammersley( uint i, uint n )
+{
+	return float2( float( i ) / float( n ), RtRadicalInverse( i ) );
+}
+
+// Per-pixel decorrelation offset. Static (no frame index) so the reflection noise
+// is a fixed spatial dither that does NOT crawl frame-to-frame - no temporal
+// accumulation, matching the no-TAA rendering philosophy.
+uint RtHashU( uint x )
+{
+	x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+	return x;
+}
+float2 RtPixelRand( int2 p )
+{
+	uint h = RtHashU( uint( p.x ) + RtHashU( uint( p.y ) ) );
+	uint h2 = RtHashU( h );
+	return float2( float( h ), float( h2 ) ) * 2.3283064365386963e-10f;
+}
+
+// Heitz 2018, "Sampling the GGX Distribution of Visible Normals". Ve in tangent
+// space (z = surface normal); returns a microfacet normal H (tangent space).
+float3 RtSampleGGXVNDF( float3 Ve, float alpha, float2 u )
+{
+	const float3 Vh = normalize( float3( alpha * Ve.x, alpha * Ve.y, Ve.z ) );
+	const float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+	const float3 T1 = ( lensq > 0.0f ) ? ( float3( -Vh.y, Vh.x, 0.0f ) * rsqrt( lensq ) ) : float3( 1.0f, 0.0f, 0.0f );
+	const float3 T2 = cross( Vh, T1 );
+	const float r = sqrt( u.x );
+	const float phi = 2.0f * 3.14159265358979f * u.y;
+	const float t1 = r * cos( phi );
+	float t2 = r * sin( phi );
+	const float s = 0.5f * ( 1.0f + Vh.z );
+	t2 = ( 1.0f - s ) * sqrt( saturate( 1.0f - t1 * t1 ) ) + s * t2;
+	const float3 Nh = t1 * T1 + t2 * T2 + sqrt( saturate( 1.0f - t1 * t1 - t2 * t2 ) ) * Vh;
+	return normalize( float3( alpha * Nh.x, alpha * Nh.y, max( 0.0f, Nh.z ) ) );
+}
+
+// Smith masking term; VNDF-sampled GGX weight reduces to G2(V,L)/G1(V) (height-correlated).
+float RtSmithLambda( float cosTheta, float alpha )
+{
+	const float c2 = cosTheta * cosTheta;
+	const float tan2 = max( 0.0f, 1.0f - c2 ) / max( c2, 1e-6f );
+	return 0.5f * ( -1.0f + sqrt( 1.0f + alpha * alpha * tan2 ) );
+}
+float RtSmithG2overG1( float NoV, float NoL, float alpha )
+{
+	const float lv = RtSmithLambda( NoV, alpha );
+	const float ll = RtSmithLambda( NoL, alpha );
+	return ( 1.0f + lv ) / ( 1.0f + lv + ll );
+}
+
+// Trace one reflection ray and return its incoming radiance: on a hit, re-shade the
+// surface in world space (material + lights); on a miss, the environment probe.
+// didHit reports geometry vs env (for the debug viz).
+float3 TraceAndShade( float3 origin, float3 dir, float roughness, out bool didHit )
+{
+	didHit = false;
+
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = dir;
+	ray.TMin = 0.0f;
+	ray.TMax = g_Refl.params0.x;
+
+	RayQuery<RAY_FLAG_CULL_NON_OPAQUE> q;
+	q.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE, 0xFF, ray );
+	q.Proceed();
+
+	if( q.CommittedStatus() != COMMITTED_TRIANGLE_HIT )
+	{
+		return SampleEnv( dir, roughness );	// escaped into open space
+	}
+
+	didHit = true;
+	const float rayT = q.CommittedRayT();
+	const float3 hitPos = origin + dir * rayT;
+	const RtInstanceData inst = t_InstanceData[q.CommittedInstanceID()];
+
+	// params0.w gates the full re-shade (diagnostic): 0 = flat average albedo.
+	if( g_Refl.params0.w < 0.5f )
+	{
+		return inst.albedo.rgb;
+	}
+
+	float3 shadeN;
+	float3 albedoRGB;
+	if( inst.albedo.w < 0.5f )
+	{
+		// skinned / no-vertex instance: no UV or vertex normal, shade flat + face the ray
+		shadeN = normalize( -dir );
+		albedoRGB = inst.albedo.rgb;
+	}
+	else
+	{
+		// reconstruct the hit triangle's vertex attributes from the static cache
+		const uint triBase = inst.indexByteOffset + q.CommittedPrimitiveIndex() * 6u;	// 3 * R16
+		const uint i0 = RtLoadIndex16( triBase + 0u );
+		const uint i1 = RtLoadIndex16( triBase + 2u );
+		const uint i2 = RtLoadIndex16( triBase + 4u );
+		const uint b0 = inst.vertexByteOffset + i0 * RT_DRAWVERT_STRIDE;
+		const uint b1 = inst.vertexByteOffset + i1 * RT_DRAWVERT_STRIDE;
+		const uint b2 = inst.vertexByteOffset + i2 * RT_DRAWVERT_STRIDE;
+
+		const float2 bc = q.CommittedTriangleBarycentrics();
+		const float3 bw = float3( 1.0f - bc.x - bc.y, bc.x, bc.y );
+
+		const float2 hitUV = RtLoadST( b0 ) * bw.x + RtLoadST( b1 ) * bw.y + RtLoadST( b2 ) * bw.z;
+		const float3 nObj = RtLoadNormal( b0 ) * bw.x + RtLoadNormal( b1 ) * bw.y + RtLoadNormal( b2 ) * bw.z;
+		const float4 tObj = RtLoadTangent( b0 ) * bw.x + RtLoadTangent( b1 ) * bw.y + RtLoadTangent( b2 ) * bw.z;
+
+		const float3x4 o2w = q.CommittedObjectToWorld3x4();
+		float3 Nw = normalize( mul( o2w, float4( nObj, 0.0f ) ) );
+		if( dot( Nw, dir ) > 0.0f )
+		{
+			Nw = -Nw;	// face the incoming ray
+		}
+
+		const float lod = clamp( log2( 1.0f + rayT / 256.0f ), 0.0f, 8.0f );
+
+		if( inst.normalIdx != RT_BINDLESS_INVALID )
+		{
+			float3 Tw = normalize( mul( o2w, float4( tObj.xyz, 0.0f ) ) );
+			Tw = normalize( Tw - Nw * dot( Nw, Tw ) );			// Gram-Schmidt
+			const float3 Bw = cross( Nw, Tw ) * tObj.w;			// tangent.w = bitangent sign
+			const float3 nm = t_BindlessTex[NonUniformResourceIndex( inst.normalIdx )].SampleLevel( s_LinearWrap, hitUV, lod ).xyz;
+			float3 tn;
+			tn.xy = nm.xy * 2.0f - 1.0f;
+			tn.z = sqrt( saturate( 1.0f - dot( tn.xy, tn.xy ) ) );
+			Nw = normalize( Tw * tn.x + Bw * tn.y + Nw * tn.z );
+		}
+
+		shadeN = Nw;
+		albedoRGB = ( inst.diffuseIdx != RT_BINDLESS_INVALID )
+					? t_BindlessTex[NonUniformResourceIndex( inst.diffuseIdx )].SampleLevel( s_LinearWrap, hitUV, lod ).rgb
+					: inst.albedo.rgb;
+	}
+
+	return albedoRGB * RtShadeHit( hitPos, shadeN );
+}
+
 [numthreads( 8, 8, 1 )]
 void main( uint3 dispatchID : SV_DispatchThreadID )
 {
@@ -279,114 +428,59 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const float3 worldP = ReconstructWorld( uv, depth );
 
 	const float3 V = normalize( worldP - g_Refl.eyePos.xyz );	// eye -> surface (incident)
-	const float3 R = normalize( reflect( V, N ) );
+	const float3 Vo = -V;										// surface -> eye (BRDF view dir)
 
-	// trace the reflection ray against the world TLAS
-	RayDesc ray;
-	ray.Origin = worldP + N * g_Refl.params0.y;
-	ray.Direction = R;
-	ray.TMin = 0.0f;
-	ray.TMax = g_Refl.params0.x;
+	// GLOSSY reflection via GGX VNDF importance sampling. A surface is not a perfect
+	// mirror: its true reflection is the specular BRDF lobe integrated over incoming
+	// directions. Sampling that lobe (instead of the single delta mirror ray) is both
+	// the optically accurate answer AND the fix for the "teleporting" sharp highlight -
+	// a small bright source becomes a soft lobe that glides instead of a sub-pixel dot
+	// that pops. roughness -> 0 collapses to one near-mirror ray automatically.
 
-	RayQuery<RAY_FLAG_CULL_NON_OPAQUE> q;
-	q.TraceRayInline( t_TLAS, RAY_FLAG_CULL_NON_OPAQUE, 0xFF, ray );
-	q.Proceed();
+	// orthonormal tangent basis around N (isotropic GGX needs no surface UV)
+	const float3 T = ( abs( N.z ) < 0.999f ) ? normalize( cross( float3( 0.0f, 0.0f, 1.0f ), N ) ) : float3( 1.0f, 0.0f, 0.0f );
+	const float3 B = cross( N, T );
+	const float3 Vt = float3( dot( Vo, T ), dot( Vo, B ), dot( Vo, N ) );
 
-	float3 reflColor;
-	bool   didHit = false;	// ray hit real geometry (re-shaded), vs miss (env fallback)
+	// GGX roughness -> alpha (Disney/UE: alpha = roughness^2), clamped off the delta
+	// so the VNDF sampler stays well-defined.
+	const float alpha = clamp( roughness * roughness, 1e-3f, 1.0f );
 
-	if( q.CommittedStatus() == COMMITTED_TRIANGLE_HIT )
+	// roughness-adaptive sample count: a mirror needs one ray, a wider lobe a few.
+	// Variance stays bounded because the pass is roughness-gated to smooth surfaces
+	// (broad lobes never reach here). maxSamples in worldToClip0.x (dead since the
+	// screen-reprojection was removed with the re-shade).
+	const int maxSamples = max( 1, ( int )g_Refl.worldToClip0.x );
+	const int M = clamp( ( int )ceil( lerp( 1.0f, float( maxSamples ), saturate( roughness / max( g_Refl.params1.y, 1e-3f ) ) ) ), 1, maxSamples );
+
+	const float2 pr = RtPixelRand( pixel );
+	const float3 origin = worldP + N * g_Refl.params0.y;
+
+	float3 sum = float3( 0.0f, 0.0f, 0.0f );
+	bool   anyHit = false;
+	for( int i = 0; i < M; i++ )
 	{
-		// STRUCTURAL re-shade: the reflection colour is a pure function of the world
-		// hit (material texture + world lighting), NOT the camera's framebuffer. This
-		// is what removes the camera-coupled "teleport" of the old screen-colour reuse.
-		didHit = true;
-		const float rayT = q.CommittedRayT();
-		const float3 hitPos = ray.Origin + R * rayT;
-		const RtInstanceData inst = t_InstanceData[q.CommittedInstanceID()];
-
-		float3 shadeN;
-		float3 albedoRGB;
-
-		// params0.w gates the full re-shade (diagnostic): 0 = flat average albedo,
-		// no bindless sampling and no lights - isolates the re-shade cost/correctness.
-		if( g_Refl.params0.w < 0.5f )
+		const float2 u = frac( RtHammersley( ( uint )i, ( uint )M ) + pr );
+		const float3 Ht = RtSampleGGXVNDF( Vt, alpha, u );
+		const float3 Lt = reflect( -Vt, Ht );				// tangent-space reflected dir
+		if( Lt.z <= 0.0f )
 		{
-			reflColor = inst.albedo.rgb;
+			continue;										// below the surface: invalid, contributes 0
 		}
-		else
-		{
-		if( inst.albedo.w < 0.5f )
-		{
-			// skinned / no-vertex instance: no UV or vertex normal available, so shade
-			// flat with a face-the-ray normal (see DdgiAccelStructures skinned path).
-			shadeN = normalize( -R );
-			albedoRGB = inst.albedo.rgb;
-		}
-		else
-		{
-			// reconstruct the hit triangle's vertex attributes from the static cache
-			const uint triBase = inst.indexByteOffset + q.CommittedPrimitiveIndex() * 6u;	// 3 * R16
-			const uint i0 = RtLoadIndex16( triBase + 0u );
-			const uint i1 = RtLoadIndex16( triBase + 2u );
-			const uint i2 = RtLoadIndex16( triBase + 4u );
-			const uint b0 = inst.vertexByteOffset + i0 * RT_DRAWVERT_STRIDE;
-			const uint b1 = inst.vertexByteOffset + i1 * RT_DRAWVERT_STRIDE;
-			const uint b2 = inst.vertexByteOffset + i2 * RT_DRAWVERT_STRIDE;
-
-			// barycentric interpolation of UV, object-space normal + tangent
-			const float2 bc = q.CommittedTriangleBarycentrics();
-			const float3 bw = float3( 1.0f - bc.x - bc.y, bc.x, bc.y );
-
-			const float2 uv = RtLoadST( b0 ) * bw.x + RtLoadST( b1 ) * bw.y + RtLoadST( b2 ) * bw.z;
-			const float3 nObj = RtLoadNormal( b0 ) * bw.x + RtLoadNormal( b1 ) * bw.y + RtLoadNormal( b2 ) * bw.z;
-			const float4 tObj = RtLoadTangent( b0 ) * bw.x + RtLoadTangent( b1 ) * bw.y + RtLoadTangent( b2 ) * bw.z;
-
-			// object -> world (w = 0: rotate the direction, drop translation). TLAS
-			// instance transforms are rigid so the 3x3 needs no inverse-transpose.
-			const float3x4 o2w = q.CommittedObjectToWorld3x4();
-			float3 Nw = normalize( mul( o2w, float4( nObj, 0.0f ) ) );
-			if( dot( Nw, R ) > 0.0f )
-			{
-				Nw = -Nw;	// face the incoming reflection ray
-			}
-
-			// distance-driven mip so far reflections do not alias/shimmer.
-			// ponytail: simple footprint heuristic (doubles every 256u), tune if needed.
-			const float lod = clamp( log2( 1.0f + rayT / 256.0f ), 0.0f, 8.0f );
-
-			if( inst.normalIdx != RT_BINDLESS_INVALID )
-			{
-				float3 Tw = normalize( mul( o2w, float4( tObj.xyz, 0.0f ) ) );
-				Tw = normalize( Tw - Nw * dot( Nw, Tw ) );			// Gram-Schmidt
-				const float3 Bw = cross( Nw, Tw ) * tObj.w;			// tangent.w = bitangent sign
-				float3 nm = t_BindlessTex[NonUniformResourceIndex( inst.normalIdx )].SampleLevel( s_LinearWrap, uv, lod ).xyz;
-				float3 tn;
-				tn.xy = nm.xy * 2.0f - 1.0f;
-				tn.z = sqrt( saturate( 1.0f - dot( tn.xy, tn.xy ) ) );
-				Nw = normalize( Tw * tn.x + Bw * tn.y + Nw * tn.z );
-			}
-
-			shadeN = Nw;
-			albedoRGB = ( inst.diffuseIdx != RT_BINDLESS_INVALID )
-						? t_BindlessTex[NonUniformResourceIndex( inst.diffuseIdx )].SampleLevel( s_LinearWrap, uv, lod ).rgb
-						: inst.albedo.rgb;
-		}
-
-		reflColor = albedoRGB * RtShadeHit( hitPos, shadeN );
-		}
+		const float3 wi = normalize( Lt.x * T + Lt.y * B + Lt.z * N );
+		bool hit;
+		const float3 Ls = TraceAndShade( origin, wi, roughness, hit );
+		anyHit = anyHit || hit;
+		// VNDF-sampled GGX: the estimator reduces to G2(V,L)/G1(V) (Fresnel applied
+		// once via the macro composite weight below, valid for these tight lobes).
+		sum += Ls * RtSmithG2overG1( Vt.z, Lt.z, alpha );
 	}
-	else
-	{
-		// ray escaped into open space: environment radiance probe along R
-		reflColor = SampleEnv( R, roughness );
-	}
+	float3 reflColor = sum / float( M );
 
-	// debug mode 2: visualise the trace pipeline (brightness-independent proof).
-	// green = hit geometry (world re-shade), blue = miss (env fallback)
+	// debug mode 2: green = at least one sample hit geometry, blue = all missed (env)
 	if( g_Refl.debugFlags.x == 2 )
 	{
-		const float3 dbg = didHit ? float3( 0.0f, 1.0f, 0.0f ) : float3( 0.0f, 0.0f, 1.0f );
+		const float3 dbg = anyHit ? float3( 0.0f, 1.0f, 0.0f ) : float3( 0.0f, 0.0f, 1.0f );
 		u_Reflection[pixel] = float4( dbg, 1.0f );
 		return;
 	}

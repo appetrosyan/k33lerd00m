@@ -44,6 +44,7 @@ idCVar r_rtReflectionDebug( "r_rtReflectionDebug", "0", CVAR_RENDERER | CVAR_INT
 idCVar r_rtReflectionShadeBias( "r_rtReflectionShadeBias", "1.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: shadow-ray origin bias (world units) for the re-shaded hit" );
 idCVar r_rtReflectionReshade( "r_rtReflectionReshade", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT reflections: 1 = re-shade hit from material+lights, 0 = flat average albedo only (diagnostic: isolates bindless/shadow-ray cost)" );
 idCVar r_rtReflectionShadows( "r_rtReflectionShadows", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT reflections: 1 = trace a shadow ray per light in the re-shade, 0 = skip (diagnostic / perf)" );
+idCVar r_rtReflectionSamples( "r_rtReflectionSamples", "8", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT reflections: max GGX VNDF glossy samples per pixel (roughness-adaptive; 1 = perfect mirror)", 1, 64 );
 
 // direct light gathered from the view for the world-space hit re-shade. Layout must
 // match RtLight in reflection_trace.cs.hlsl (and DdgiLight in DdgiPass.cpp).
@@ -328,11 +329,10 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 	constants.unprojToWorld2 = idVec4( u2w[2][0], u2w[2][1], u2w[2][2], u2w[2][3] );
 	constants.unprojToWorld3 = idVec4( u2w[3][0], u2w[3][1], u2w[3][2], u2w[3][3] );
 
-	const idRenderMatrix& w2c = viewDef->worldSpace.mvp;
-	constants.worldToClip0 = idVec4( w2c[0][0], w2c[0][1], w2c[0][2], w2c[0][3] );
-	constants.worldToClip1 = idVec4( w2c[1][0], w2c[1][1], w2c[1][2], w2c[1][3] );
-	constants.worldToClip2 = idVec4( w2c[2][0], w2c[2][1], w2c[2][2], w2c[2][3] );
-	constants.worldToClip3 = idVec4( w2c[3][0], w2c[3][1], w2c[3][2], w2c[3][3] );
+	// worldToClip is no longer used by the shader (screen reprojection was removed with
+	// the world-space re-shade). Repurpose worldToClip0.x to carry the glossy VNDF max
+	// sample count; the rest stays zero.
+	constants.worldToClip0 = idVec4( ( float )r_rtReflectionSamples.GetInteger(), 0.0f, 0.0f, 0.0f );
 
 	const idVec3 eye = viewDef->renderView.vieworg;
 	// eyePos.w carries the shadow-ray toggle for the re-shade (0 = skip shadow rays)

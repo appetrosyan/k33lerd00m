@@ -39,8 +39,8 @@ struct ReflectionConstants
 	idVec4		unprojToWorld2;
 	idVec4		unprojToWorld3;
 
-	// world -> clip rows (reproject a world-space ray hit back to a screen pixel
-	// so its lit colour can be sampled from the resolved scene colour).
+	// (was world->clip reprojection rows, removed with the world-space re-shade)
+	// worldToClip0.x now carries the glossy VNDF max sample count; the rest is unused.
 	idVec4		worldToClip0;
 	idVec4		worldToClip1;
 	idVec4		worldToClip2;
