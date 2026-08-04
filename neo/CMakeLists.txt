@@ -1463,6 +1463,16 @@ else()
 	endif()
 endif()
 
+# Enforce a SINGLE binary. The executable is produced in the build directory only. A stale
+# copy at the repository root (CMAKE_SOURCE_DIR is neo/, so its parent is the repo root) -
+# left by an old in-source build or a manual copy - would silently shadow the fresh build and
+# cause "which binary am I actually running?" confusion during testing. Delete it after every
+# link so exactly one binary (the freshly built one) ever exists. Portable, no-op when absent.
+add_custom_command(TARGET ${APP_NAME} POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E rm -f "${CMAKE_SOURCE_DIR}/../${APP_NAME}"
+	COMMENT "Enforce single binary: remove stale repo-root ${APP_NAME}"
+)
+
 if(USE_DX12)
 	target_compile_definitions(${APP_NAME} PUBLIC USE_DX12=1)
 	target_link_libraries(${APP_NAME} nvrhi_d3d12)
