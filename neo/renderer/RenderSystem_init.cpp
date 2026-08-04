@@ -300,6 +300,14 @@ idCVar r_useDDGI( "r_useDDGI", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | C
 idCVar r_useRTReflections( "r_useRTReflections", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "ray-traced reflections for low-roughness surfaces (requires ray query support; set at startup)" );
 idCVar r_useRTShadows( "r_useRTShadows", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "ray-traced hard shadows instead of shadow maps for point + spot lights (requires ray query support; live toggle)" );
 
+// Soft shadow VOLUMES (penumbra wedges, Assarsson & Akenine-Moller) - a world-space, view-
+// independent penumbra grown off the stencil silhouette. The hard stencil volume stamps the
+// umbra into the light visibility buffer (globalImages->rtShadowMaskImage); a wedge per
+// silhouette edge writes the fractional penumbra coverage; the interaction multiplies the
+// buffer. Default OFF (WIP): nothing touches the baseline shadow paths until it is proven.
+idCVar r_useSoftShadowVolumes( "r_useSoftShadowVolumes", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "soft shadow volumes (penumbra wedges off the stencil silhouette) - world-space penumbra, no RT, no crawl (WIP)" );
+idCVar r_shadowPenumbraSize( "r_shadowPenumbraSize", "8", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "soft shadow volumes: light source size in world units driving penumbra width (M1 global; per-light later)", 0.0f, 128.0f );
+
 idCVar r_exposure( "r_exposure", "0.5", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "HDR exposure or LDR brightness [-4.0 .. 4.0]", -4.0f, 4.0f );
 idCVar r_emissiveScale( "r_emissiveScale", "2.5", CVAR_ARCHIVE | CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "brightness multiplier applied to additive (blend add) material stages so emissive FX exceed unit brightness for HDR glow/bloom; 1.0 = off", 1.0f, 16.0f );
 
