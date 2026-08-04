@@ -71,6 +71,16 @@ struct renderParmSet9_t
 	float4 rpJitterTexOffset;
 	float4 rpPSXDistortions;
 	float4 rpCascadeDistances;
+
+	// probe world origins for the per-pixel env-probe blend (rpTexGen0S.w = valid flag)
+	float4 rpTexGen0S;
+	float4 rpTexGen0T;
+	float4 rpTexGen0Q;
+
+	// probe-area bounding box for parallax reflection correction (rpWobbleSkyX.w = valid)
+	float4 rpWobbleSkyX;	// bounds min
+	float4 rpWobbleSkyY;	// bounds max
+	float4 rpWobbleSkyZ;	// bounds center (unused by the per-probe path)
 };
 
 #if USE_PUSH_CONSTANTS

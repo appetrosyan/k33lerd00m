@@ -58,6 +58,12 @@ extern idCVar stereoRender_swapEyes;
 extern idCVar r_ddgiDebug;			// DDGI probe atlas overlay (Passes/DdgiPass.cpp)
 extern idCVar r_useDDGI;			// runtime DDGI toggle (RenderSystem_init.cpp)
 extern idCVar r_useRTReflections;	// runtime RT reflections toggle (RenderSystem_init.cpp)
+
+// DIAGNOSTIC: zero the env-probe specular IBL contribution (rpSpecularModifier) in the
+// ambient passes, to confirm whether the "teleporting reflections" come from env-probe
+// specular selection. If the teleport vanishes with this 1, that path is the source.
+idCVar r_skipEnvProbeSpecular( "r_skipEnvProbeSpecular", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "diagnostic: force env-probe specular IBL to black" );
+idCVar r_skipEnvProbeDiffuse( "r_skipEnvProbeDiffuse", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "diagnostic: force env-probe diffuse irradiance IBL to black (isolates the single-nearest-probe diffuse swap)" );
 extern idCVar r_useRTShadows;		// runtime RT shadows toggle (RenderSystem_init.cpp)
 extern idCVar r_useStencilShadows;	// stencil shadow volumes toggle (tr_frontend_addmodels.cpp)
 extern idCVar r_hdrOutput;			// HDR display output toggle (RenderSystem_init.cpp)
@@ -440,8 +446,47 @@ void idRenderBackend::PrepareStageTexturing( const shaderStage_t* pStage,  const
 		SetVertexParm( RENDERPARM_TEXGEN_0_T, viewDef->probePositions[1].ToFloatPtr() );
 		SetVertexParm( RENDERPARM_TEXGEN_0_Q, viewDef->probePositions[2].ToFloatPtr() );
 
-		// specular cubemap blend weights
+		// RT reflections replace the env-probe cubemap specular entirely: RT traces the
+		// reflection from real geometry (no cubemap, so nothing to swap/teleport) and the
+		// ReflectionsPass composites it over the scene. So when RT reflections are on, the
+		// env-probe specular IBL is a redundant, teleporting cubemap - zero it out. (Also
+		// honours the r_skipEnvProbeSpecular diagnostic.) Diffuse ambient is untouched.
+		if( r_useRTReflections.GetBool() || r_skipEnvProbeSpecular.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_SPECULARMODIFIER, zero.ToFloatPtr() );
+		}
+		if( r_skipEnvProbeDiffuse.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_DIFFUSEMODIFIER, zero.ToFloatPtr() );
+		}
+
+		// specular cubemap blend weights (camera-based fallback; the shader prefers
+		// per-pixel weights computed from the probe origins below)
 		renderProgManager.SetUniformValue( RENDERPARM_LOCALLIGHTORIGIN, viewDef->radianceImageBlends.ToFloatPtr() );
+
+		// probe world origins for the shader's per-pixel probe blend (kills the
+		// camera-boundary specular teleport). .w = 1 marks a valid probe triangle.
+		SetVertexParm( RENDERPARM_TEXGEN_0_S, viewDef->probePositions[0].ToFloatPtr() );
+		SetVertexParm( RENDERPARM_TEXGEN_0_T, viewDef->probePositions[1].ToFloatPtr() );
+		SetVertexParm( RENDERPARM_TEXGEN_0_Q, viewDef->probePositions[2].ToFloatPtr() );
+
+		// RT reflections replace the env-probe cubemap specular entirely: RT traces the
+		// reflection from real geometry (no cubemap, so nothing to swap/teleport) and the
+		// ReflectionsPass composites it over the scene. So when RT reflections are on, the
+		// env-probe specular IBL is a redundant, teleporting cubemap - zero it out. (Also
+		// honours the r_skipEnvProbeSpecular diagnostic.) Diffuse ambient is untouched.
+		if( r_useRTReflections.GetBool() || r_skipEnvProbeSpecular.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_SPECULARMODIFIER, zero.ToFloatPtr() );
+		}
+		if( r_skipEnvProbeDiffuse.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_DIFFUSEMODIFIER, zero.ToFloatPtr() );
+		}
 
 		// general SSR parms
 		idVec4 ssrParms;
@@ -1254,8 +1299,31 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		probeSize[3] = float( lightGrid.imageSingleProbeSize - lightGrid.imageBorderSize ) / lightGrid.imageSingleProbeSize;
 		renderProgManager.SetUniformValue( RENDERPARM_SCREENCORRECTIONFACTOR, probeSize.ToFloatPtr() ); // rpScreenCorrectionFactor
 
-		// specular cubemap blend weights
+		// specular cubemap blend weights (camera-based fallback; the shader prefers
+		// per-pixel weights computed from the probe origins below)
 		renderProgManager.SetUniformValue( RENDERPARM_LOCALLIGHTORIGIN, viewDef->radianceImageBlends.ToFloatPtr() );
+
+		// probe world origins for the shader's per-pixel probe blend (kills the
+		// camera-boundary specular teleport). .w = 1 marks a valid probe triangle.
+		SetVertexParm( RENDERPARM_TEXGEN_0_S, viewDef->probePositions[0].ToFloatPtr() );
+		SetVertexParm( RENDERPARM_TEXGEN_0_T, viewDef->probePositions[1].ToFloatPtr() );
+		SetVertexParm( RENDERPARM_TEXGEN_0_Q, viewDef->probePositions[2].ToFloatPtr() );
+
+		// RT reflections replace the env-probe cubemap specular entirely: RT traces the
+		// reflection from real geometry (no cubemap, so nothing to swap/teleport) and the
+		// ReflectionsPass composites it over the scene. So when RT reflections are on, the
+		// env-probe specular IBL is a redundant, teleporting cubemap - zero it out. (Also
+		// honours the r_skipEnvProbeSpecular diagnostic.) Diffuse ambient is untouched.
+		if( r_useRTReflections.GetBool() || r_skipEnvProbeSpecular.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_SPECULARMODIFIER, zero.ToFloatPtr() );
+		}
+		if( r_skipEnvProbeDiffuse.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_DIFFUSEMODIFIER, zero.ToFloatPtr() );
+		}
 
 		if( specUsage == TD_SPECULAR_PBR_RMAO || specUsage == TD_SPECULAR_PBR_RMAOD )
 		{
@@ -1362,8 +1430,31 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		SetVertexParm( RENDERPARM_WOBBLESKY_Y, probeMaxs.ToFloatPtr() );
 		SetVertexParm( RENDERPARM_WOBBLESKY_Z, probeCenter.ToFloatPtr() );
 
-		// specular cubemap blend weights
+		// specular cubemap blend weights (camera-based fallback; the shader prefers
+		// per-pixel weights computed from the probe origins below)
 		renderProgManager.SetUniformValue( RENDERPARM_LOCALLIGHTORIGIN, viewDef->radianceImageBlends.ToFloatPtr() );
+
+		// probe world origins for the shader's per-pixel probe blend (kills the
+		// camera-boundary specular teleport). .w = 1 marks a valid probe triangle.
+		SetVertexParm( RENDERPARM_TEXGEN_0_S, viewDef->probePositions[0].ToFloatPtr() );
+		SetVertexParm( RENDERPARM_TEXGEN_0_T, viewDef->probePositions[1].ToFloatPtr() );
+		SetVertexParm( RENDERPARM_TEXGEN_0_Q, viewDef->probePositions[2].ToFloatPtr() );
+
+		// RT reflections replace the env-probe cubemap specular entirely: RT traces the
+		// reflection from real geometry (no cubemap, so nothing to swap/teleport) and the
+		// ReflectionsPass composites it over the scene. So when RT reflections are on, the
+		// env-probe specular IBL is a redundant, teleporting cubemap - zero it out. (Also
+		// honours the r_skipEnvProbeSpecular diagnostic.) Diffuse ambient is untouched.
+		if( r_useRTReflections.GetBool() || r_skipEnvProbeSpecular.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_SPECULARMODIFIER, zero.ToFloatPtr() );
+		}
+		if( r_skipEnvProbeDiffuse.GetBool() )
+		{
+			idVec4 zero( 0.0f, 0.0f, 0.0f, 0.0f );
+			SetFragmentParm( RENDERPARM_DIFFUSEMODIFIER, zero.ToFloatPtr() );
+		}
 
 		if( specUsage == TD_SPECULAR_PBR_RMAO || specUsage == TD_SPECULAR_PBR_RMAOD )
 		{
@@ -4244,6 +4335,16 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			renderLog.BeginShadowGen( RLS_RTMASK );
 			rtShadowsPass->RenderLight( commandList, _viewDef, vLight );
 			renderLog.EndShadowGen();
+
+			// RenderLight issued compute dispatch(es), and nvrhi's setComputeState
+			// invalidates the graphics state. DrawElementsWithCounters only re-issues
+			// setGraphicsState when its OWN dirty tracking (pipeline / bindings / scissor)
+			// says the state changed - it cannot see the compute clobber. Normally the
+			// per-light scissor change masks this, but when two consecutive RT-shadowed
+			// lights share a scissor rect the next interaction draw skips setGraphicsState
+			// and drawIndexed hits dead state ("Graphics state is not set before a
+			// drawIndexed call"). Force the cache dirty so the next draw fully re-sets.
+			currentPipeline = nullptr;
 		}
 
 		// RB: render interactions with shadow mapping
@@ -4606,6 +4707,16 @@ int idRenderBackend::DrawShaderPasses( const drawSurf_t* const* const drawSurfs,
 
 			// skip the stages involved in lighting
 			if( pStage->lighting != SL_AMBIENT )
+			{
+				continue;
+			}
+
+			// RT reflections are the only reflection when enabled: skip every material
+			// cubemap-reflection stage so no static/env cube is drawn. The RT pass then
+			// composites the traced reflection over these surfaces (they are in the
+			// g-buffer). This removes the last cubemap source - the "texgen reflect" path.
+			if( r_useRTReflections.GetBool() &&
+					( pStage->texture.texgen == TG_REFLECT_CUBE || pStage->texture.texgen == TG_REFLECT_CUBE2 ) )
 			{
 				continue;
 			}

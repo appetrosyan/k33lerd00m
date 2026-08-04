@@ -484,6 +484,20 @@ public:
 	}
 };
 
+// Env-probe selection hysteresis. The 3 nearest probes are picked by CAMERA distance,
+// so crossing a probe-cell boundary reshuffles the set and the whole specular/diffuse
+// reflection swaps in one step (the "teleport"). This discount makes a probe already
+// selected last frame "stick": a challenger must be closer than incumbent*(1-frac) to
+// displace it, so a small camera move keeps the same triangle and the barycentric blend
+// varies continuously instead of snapping. 0 = off (original behaviour).
+idCVar r_envProbeHysteresis( "r_envProbeHysteresis", "0.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_ARCHIVE | CVAR_NEW, "env-probe selection stickiness [0..0.9]: challenger must be this fraction closer to replace a selected probe (reduces the one-step reflection teleport)", 0.0f, 0.9f );
+
+// NUKE the teleport: 0 = skip per-view env-probe selection entirely and keep the stable
+// global cubes, so the specular/diffuse reflection can NEVER swap as the camera crosses
+// a probe cell (zero teleport, at the cost of local reflection detail). 1 = select local
+// probes per view (original behaviour; use r_envProbeHysteresis to stabilise them).
+idCVar r_envProbeReflections( "r_envProbeReflections", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_ARCHIVE | CVAR_NEW, "0 = disable per-view env-probe selection (stable global cube, no reflection teleport); 1 = local probes per view" );
+
 static void R_FindClosestEnvironmentProbes()
 {
 	// set safe defaults
@@ -494,6 +508,19 @@ static void R_FindClosestEnvironmentProbes()
 	for( int i = 0; i < 3; i++ )
 	{
 		tr.viewDef->radianceImages[i] = globalImages->defaultUACRadianceCube;
+	}
+	// .w = 0 tells the shader there is no valid probe triangle -> use the camera blend
+	for( int i = 0; i < 3; i++ )
+	{
+		tr.viewDef->probePositions[i].Set( 0.0f, 0.0f, 0.0f, 0.0f );
+	}
+
+	// NUKE the reflection teleport (default): keep the stable global cubes set above and
+	// skip per-view probe selection entirely, so the reflection never swaps between
+	// probes as the camera moves. r_envProbeReflections 1 restores local probes.
+	if( !r_envProbeReflections.GetBool() )
+	{
+		return;
 	}
 
 	// early out
@@ -528,6 +555,61 @@ static void R_FindClosestEnvironmentProbes()
 	// sort by distance
 	// RB: each Doom 3 level has ~50 - 150 probes so this should be ok for each frame
 	viewEnvprobes.SortWithTemplate( idSort_CompareEnvprobe( testOrigin ) );
+
+	// Hysteresis (see r_envProbeHysteresis): keep the probes selected last frame in the
+	// top 3 so a small camera move does not reshuffle the set and teleport the whole
+	// reflection. Compared by origin (not pointer) so it survives map reloads. Only the
+	// primary view reaches here (subviews early-out above), so a static is safe.
+	static idVec3 s_lastProbeOrigins[3];
+	static bool s_lastProbesValid = false;
+	const float hyst = r_envProbeHysteresis.GetFloat();
+	if( hyst > 0.0f && s_lastProbesValid && viewEnvprobes.Num() > 3 )
+	{
+		const float d3 = ( viewEnvprobes[2]->parms.origin - testOrigin ).Length();
+		const float keepDist = d3 / Max( 1e-3f, 1.0f - hyst );
+
+		// promote each incumbent still near enough back into the top 3
+		for( int inc = 0; inc < 3; inc++ )
+		{
+			int found = -1;
+			for( int j = 3; j < viewEnvprobes.Num(); j++ )
+			{
+				if( ( viewEnvprobes[j]->parms.origin - s_lastProbeOrigins[inc] ).LengthSqr() < 1.0f )
+				{
+					found = j;
+					break;
+				}
+			}
+			if( found < 0 )
+			{
+				continue;	// incumbent already in the top 3, or gone from view
+			}
+			if( ( viewEnvprobes[found]->parms.origin - testOrigin ).Length() <= keepDist )
+			{
+				RenderEnvprobeLocal* tmp = viewEnvprobes[2];
+				viewEnvprobes[2] = viewEnvprobes[found];
+				viewEnvprobes[found] = tmp;
+			}
+		}
+
+		// keep the single-nearest (diffuse irradiance) sticky too, if still in the top 3
+		for( int j = 1; j < 3; j++ )
+		{
+			if( ( viewEnvprobes[j]->parms.origin - s_lastProbeOrigins[0] ).LengthSqr() < 1.0f &&
+					( viewEnvprobes[j]->parms.origin - testOrigin ).Length() <= keepDist )
+			{
+				RenderEnvprobeLocal* tmp = viewEnvprobes[0];
+				viewEnvprobes[0] = viewEnvprobes[j];
+				viewEnvprobes[j] = tmp;
+				break;
+			}
+		}
+	}
+	for( int i = 0; i < 3; i++ )
+	{
+		s_lastProbeOrigins[i] = viewEnvprobes[ ( i < viewEnvprobes.Num() ) ? i : ( viewEnvprobes.Num() - 1 ) ]->parms.origin;
+	}
+	s_lastProbesValid = true;
 
 	RenderEnvprobeLocal* nearest = viewEnvprobes[0];
 	tr.viewDef->globalProbeBounds = nearest->globalProbeBounds;
@@ -596,6 +678,7 @@ static void R_FindClosestEnvironmentProbes()
 	{
 		// this didn't work so this is the way to tell the backend and avoid blood reflections
 		tr.viewDef->globalProbeBounds.Clear();
+		tr.viewDef->probePositions[0].w = 0.0f;	// invalidate the per-pixel probe blend too
 	}
 }
 
@@ -610,6 +693,19 @@ static void R_FindClosestEnvironmentProbes2()
 	for( int i = 0; i < 3; i++ )
 	{
 		tr.viewDef->radianceImages[i] = globalImages->defaultUACRadianceCube;
+	}
+	// .w = 0 tells the shader there is no valid probe triangle -> use the camera blend
+	for( int i = 0; i < 3; i++ )
+	{
+		tr.viewDef->probePositions[i].Set( 0.0f, 0.0f, 0.0f, 0.0f );
+	}
+
+	// NUKE the reflection teleport (default): keep the stable global cubes set above and
+	// skip per-view probe selection entirely, so the reflection never swaps between
+	// probes as the camera moves. r_envProbeReflections 1 restores local probes.
+	if( !r_envProbeReflections.GetBool() )
+	{
+		return;
 	}
 
 	// early out
@@ -644,6 +740,61 @@ static void R_FindClosestEnvironmentProbes2()
 	// sort by distance
 	// RB: each Doom 3 level has ~50 - 150 probes so this should be ok for each frame
 	viewEnvprobes.SortWithTemplate( idSort_CompareEnvprobe( testOrigin ) );
+
+	// Hysteresis (see r_envProbeHysteresis): keep the probes selected last frame in the
+	// top 3 so a small camera move does not reshuffle the set and teleport the whole
+	// reflection. Compared by origin (not pointer) so it survives map reloads. Only the
+	// primary view reaches here (subviews early-out above), so a static is safe.
+	static idVec3 s_lastProbeOrigins[3];
+	static bool s_lastProbesValid = false;
+	const float hyst = r_envProbeHysteresis.GetFloat();
+	if( hyst > 0.0f && s_lastProbesValid && viewEnvprobes.Num() > 3 )
+	{
+		const float d3 = ( viewEnvprobes[2]->parms.origin - testOrigin ).Length();
+		const float keepDist = d3 / Max( 1e-3f, 1.0f - hyst );
+
+		// promote each incumbent still near enough back into the top 3
+		for( int inc = 0; inc < 3; inc++ )
+		{
+			int found = -1;
+			for( int j = 3; j < viewEnvprobes.Num(); j++ )
+			{
+				if( ( viewEnvprobes[j]->parms.origin - s_lastProbeOrigins[inc] ).LengthSqr() < 1.0f )
+				{
+					found = j;
+					break;
+				}
+			}
+			if( found < 0 )
+			{
+				continue;	// incumbent already in the top 3, or gone from view
+			}
+			if( ( viewEnvprobes[found]->parms.origin - testOrigin ).Length() <= keepDist )
+			{
+				RenderEnvprobeLocal* tmp = viewEnvprobes[2];
+				viewEnvprobes[2] = viewEnvprobes[found];
+				viewEnvprobes[found] = tmp;
+			}
+		}
+
+		// keep the single-nearest (diffuse irradiance) sticky too, if still in the top 3
+		for( int j = 1; j < 3; j++ )
+		{
+			if( ( viewEnvprobes[j]->parms.origin - s_lastProbeOrigins[0] ).LengthSqr() < 1.0f &&
+					( viewEnvprobes[j]->parms.origin - testOrigin ).Length() <= keepDist )
+			{
+				RenderEnvprobeLocal* tmp = viewEnvprobes[0];
+				viewEnvprobes[0] = viewEnvprobes[j];
+				viewEnvprobes[j] = tmp;
+				break;
+			}
+		}
+	}
+	for( int i = 0; i < 3; i++ )
+	{
+		s_lastProbeOrigins[i] = viewEnvprobes[ ( i < viewEnvprobes.Num() ) ? i : ( viewEnvprobes.Num() - 1 ) ]->parms.origin;
+	}
+	s_lastProbesValid = true;
 
 	RenderEnvprobeLocal* nearest = viewEnvprobes[0];
 	tr.viewDef->globalProbeBounds = nearest->globalProbeBounds;
@@ -787,6 +938,7 @@ static void R_FindClosestEnvironmentProbes2()
 	{
 		// this didn't work so this is the way to tell the backend and avoid blood reflections
 		tr.viewDef->globalProbeBounds.Clear();
+		tr.viewDef->probePositions[0].w = 0.0f;	// invalidate the per-pixel probe blend too
 	}
 }
 // RB end

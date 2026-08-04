@@ -68,11 +68,11 @@ public:
 	// true when the image holds a valid composited frame to blit back.
 	bool			Render( nvrhi::ICommandList* commandList, const viewDef_t* viewDef );
 
-	// The composited (base lit colour + reflection) image, blitted back over the
-	// HDR scene target by the backend.
+	// The composited (base lit colour + denoised reflection) image, blitted back over
+	// the HDR scene target by the backend. This is the denoise pass output.
 	idImage*		GetReflectionImage() const
 	{
-		return m_ReflectionImage;
+		return m_DenoisedImage;
 	}
 
 	// Ember dissolve seeds from the posed-vertex pool this pass just built.
@@ -83,7 +83,8 @@ public:
 
 private:
 	void			CreateTracePass();
-	// (Re)create the screen-sized output image when the render resolution changes.
+	void			CreateDenoisePass();
+	// (Re)create the screen-sized output images when the render resolution changes.
 	void			EnsureReflectionImage( int width, int height );
 
 	nvrhi::DeviceHandle		m_Device;
@@ -104,6 +105,15 @@ private:
 	// per-frame projected-light buffer for the world-space hit re-shade (mirrors
 	// DdgiPass's light buffer; reflections build their own so they work with DDGI off).
 	nvrhi::BufferHandle				m_LightBuffer;
+
+	// spatial denoise + composite (reads the raw reflection m_ReflectionImage, writes the
+	// composited m_DenoisedImage that the backend blits)
+	nvrhi::ShaderHandle				m_DenoiseShader;
+	nvrhi::BindingLayoutHandle		m_DenoiseBindingLayout;
+	nvrhi::BindingSetHandle			m_DenoiseBindingSet;
+	nvrhi::ComputePipelineHandle	m_DenoisePipeline;
+	nvrhi::BufferHandle				m_DenoiseConstantBuffer;
+	idImage*						m_DenoisedImage;
 
 	// the binding set is rebuilt when any of these change (TLAS grows / image resizes /
 	// instance-data buffer grows)

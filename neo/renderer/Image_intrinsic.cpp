@@ -1163,6 +1163,7 @@ void idImageManager::CreateIntrinsicImages()
 
 	gbufferNormalsRoughnessImage = ImageFromFunction( "_currentNormals", R_GeometryBufferImage_ResNative );
 	rtShadowMaskImage = ImageFromFunction( "_rtShadowMask", R_RTShadowMaskImage_ResNative );
+	rtShadowMaskRawImage = ImageFromFunction( "_rtShadowMaskRaw", R_RTShadowMaskImage_ResNative );
 	rtShadowCoarseImage = ImageFromFunction( "_rtShadowCoarse", R_RTShadowCoarseImage_ResNative );
 
 	ambientOcclusionImage[0] = ImageFromFunction( "_ao0", R_AmbientOcclusionImage_ResNative );

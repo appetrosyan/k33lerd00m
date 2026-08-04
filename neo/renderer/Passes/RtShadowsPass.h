@@ -82,6 +82,7 @@ public:
 
 private:
 	void			CreateTracePass();
+	void			CreateDenoisePass();
 
 	nvrhi::DeviceHandle		m_Device;
 	CommonRenderPasses*		m_CommonPasses;
@@ -104,10 +105,21 @@ private:
 	nvrhi::BindingSetHandle			m_MaskBindingSet;
 	nvrhi::BindingSetHandle			m_CoarseBindingSet;
 
+	// soft-shadow penumbra denoise: the trace writes the RAW noisy mask, this pass filters
+	// it into the final mask the interaction reads (per light, over its scissor rect).
+	idImage*						m_RawMaskImage;
+	nvrhi::BindingSetHandle			m_RawMaskBindingSet;	// trace variant: u0 = raw mask
+	nvrhi::ShaderHandle				m_DenoiseShader;
+	nvrhi::BindingLayoutHandle		m_DenoiseBindingLayout;
+	nvrhi::ComputePipelineHandle	m_DenoisePipeline;
+	nvrhi::BindingSetHandle			m_DenoiseBindingSet;
+	nvrhi::BufferHandle				m_DenoiseConstantBuffer;
+
 	// the binding sets are rebuilt when the TLAS grows or an image handle changes
 	nvrhi::rt::IAccelStruct*	m_BoundTlas;
 	idImage*					m_BoundMask;
 	idImage*					m_BoundCoarse;
+	idImage*					m_BoundRawMask;
 
 	bool					m_ViewReady;
 	bool					rayTracingSupported;

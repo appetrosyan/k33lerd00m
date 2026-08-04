@@ -255,9 +255,51 @@ void main( PS_IN fragment, out PS_OUT result )
 
 	normalizedOctCoordZeroOne = OctTexCoord( reflectionVector );
 
-	float3 radiance = t_RadianceCubeMap1.SampleLevel( s_LinearClamp, normalizedOctCoordZeroOne, mip ).rgb * pc.rpLocalLightOrigin.x;
-	radiance += t_RadianceCubeMap2.SampleLevel( s_LinearClamp, normalizedOctCoordZeroOne, mip ).rgb * pc.rpLocalLightOrigin.y;
-	radiance += t_RadianceCubeMap3.SampleLevel( s_LinearClamp, normalizedOctCoordZeroOne, mip ).rgb * pc.rpLocalLightOrigin.z;
+	// Per-pixel probe blend weights: weight the 3 area probes by the SHADED fragment's
+	// world position (rpTexGen0S/T/Q = probe origins), not the camera. Falls back to the
+	// camera weights when there is no valid probe triangle (rpTexGen0S.w == 0).
+	float3 probeBlend;
+	if( pc.rpTexGen0S.w > 0.5 )
+	{
+		float3 dP0 = globalPosition - pc.rpTexGen0S.xyz;
+		float3 dP1 = globalPosition - pc.rpTexGen0T.xyz;
+		float3 dP2 = globalPosition - pc.rpTexGen0Q.xyz;
+		float3 w = 1.0f / ( float3( dot( dP0, dP0 ), dot( dP1, dP1 ), dot( dP2, dP2 ) ) + 1.0f );
+		probeBlend = w / max( w.x + w.y + w.z, 1e-6f );
+	}
+	else
+	{
+		probeBlend = pc.rpLocalLightOrigin.xyz;
+	}
+
+	// Parallax box correction: reproject the reflection ray through the probe area's
+	// bounding box and sample EACH probe from its OWN origin, so all 3 probes show the
+	// same world features for this surface point. This is what stops the whole reflection
+	// "teleporting" when the nearest probe swaps: the swap is a CONTENT change that
+	// reweighting alone cannot fix. With parallax the 3 probes agree and the per-pixel
+	// weights crossfade them smoothly. Degrades to the shared reflection when invalid.
+	float2 oct1 = normalizedOctCoordZeroOne;
+	float2 oct2 = normalizedOctCoordZeroOne;
+	float2 oct3 = normalizedOctCoordZeroOne;
+	if( pc.rpWobbleSkyX.w > 0.5f && pc.rpTexGen0S.w > 0.5f )
+	{
+		float3 bounds[2];
+		bounds[0] = pc.rpWobbleSkyX.xyz;
+		bounds[1] = pc.rpWobbleSkyY.xyz;
+		float3 rayStart = globalPosition + reflectionVector * 10000.0f;
+		float hitScale = 0.0f;
+		if( AABBRayIntersection( bounds, rayStart, -reflectionVector, hitScale ) )
+		{
+			float3 hitPoint = rayStart - reflectionVector * hitScale;
+			oct1 = OctTexCoord( hitPoint - pc.rpTexGen0S.xyz );
+			oct2 = OctTexCoord( hitPoint - pc.rpTexGen0T.xyz );
+			oct3 = OctTexCoord( hitPoint - pc.rpTexGen0Q.xyz );
+		}
+	}
+
+	float3 radiance = t_RadianceCubeMap1.SampleLevel( s_LinearClamp, oct1, mip ).rgb * probeBlend.x;
+	radiance += t_RadianceCubeMap2.SampleLevel( s_LinearClamp, oct2, mip ).rgb * probeBlend.y;
+	radiance += t_RadianceCubeMap3.SampleLevel( s_LinearClamp, oct3, mip ).rgb * probeBlend.z;
 	//radiance = float3( 0.0 );
 
 	float2 envBRDF  = t_BrdfLut.Sample( s_LinearClamp, float2( max( vDotN, 0.0 ), roughness ) ).rg;

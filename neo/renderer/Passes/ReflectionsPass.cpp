@@ -43,8 +43,25 @@ idCVar r_rtReflectionGateHi( "r_rtReflectionGateHi", "0.45", CVAR_RENDERER | CVA
 idCVar r_rtReflectionDebug( "r_rtReflectionDebug", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT reflections: 1 = show reflections at full strength, 2 = visualise trace (red=hit, green=valid on-screen sample)", 0, 2 );
 idCVar r_rtReflectionShadeBias( "r_rtReflectionShadeBias", "1.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: shadow-ray origin bias (world units) for the re-shaded hit" );
 idCVar r_rtReflectionReshade( "r_rtReflectionReshade", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT reflections: 1 = re-shade hit from material+lights, 0 = flat average albedo only (diagnostic: isolates bindless/shadow-ray cost)" );
-idCVar r_rtReflectionShadows( "r_rtReflectionShadows", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "RT reflections: 1 = trace a shadow ray per light in the re-shade, 0 = skip (diagnostic / perf)" );
+// Default OFF: the re-shade's per-light shadow ray is the ONLY heavy per-light op (a BVH
+// traversal), and it runs overlappingLights x M-samples times per reflective pixel - the
+// source of the "perf scales inversely with dynamic light count" behaviour and the high-
+// sample TDR. Reflections read as optically accurate without it (a reflected surface lit
+// as-if-unshadowed is imperceptible in a secondary bounce), so the shadow rays buy noise
+// and a light-count-squared cost for no visible gain. 1 restores them (diagnostic).
+idCVar r_rtReflectionShadows( "r_rtReflectionShadows", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT reflections: 1 = trace a shadow ray per light in the re-shade (cost ~ lights x samples per pixel), 0 = skip (default; optically ~identical, far cheaper)" );
 idCVar r_rtReflectionSamples( "r_rtReflectionSamples", "8", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT reflections: max GGX VNDF glossy samples per pixel (roughness-adaptive; 1 = perfect mirror)", 1, 64 );
+idCVar r_rtReflectionDenoise( "r_rtReflectionDenoise", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT reflections: spatial edge-aware denoise of the traced reflection (0 = composite only, no blur)" );
+idCVar r_rtReflectionDenoiseRadius( "r_rtReflectionDenoiseRadius", "5", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT reflections: max denoise blur radius in pixels (scaled down by roughness; mirrors stay sharp)", 0.0f, 16.0f );
+idCVar r_rtReflectionDenoiseDepthSigma( "r_rtReflectionDenoiseDepthSigma", "0.001", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT reflections: denoise depth edge-stop sigma (hardware-depth units)" );
+
+// C++ side of the denoise constant buffer; must match DenoiseConstants in reflection_denoise.cs.hlsl.
+struct DenoiseConstants
+{
+	idVec2i	screenSize;
+	idVec2i	pad0;
+	idVec4	params;		// x = gateLo, y = gateHi, z = maxRadius, w = depthSigma
+};
 
 // direct light gathered from the view for the world-space hit re-shade. Layout must
 // match RtLight in reflection_trace.cs.hlsl (and DdgiLight in DdgiPass.cpp).
@@ -128,6 +145,7 @@ static int R_GatherReflectionLights( const viewDef_t* viewDef, ReflLight* out, i
 ReflectionsPass::ReflectionsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
 	, m_CommonPasses( commonPasses )
+	, m_DenoisedImage( nullptr )
 	, m_BoundTlas( nullptr )
 	, m_BoundInstanceData( nullptr )
 	, m_ReflectionImage( nullptr )
@@ -159,6 +177,7 @@ ReflectionsPass::ReflectionsPass( nvrhi::IDevice* device, CommonRenderPasses* co
 		// pipeline can reference its layout; the trace re-shades hits from real textures.
 		m_AccelStructs.EnableBindlessMaterials();
 		CreateTracePass();
+		CreateDenoisePass();
 	}
 	else
 	{
@@ -238,6 +257,55 @@ void ReflectionsPass::CreateTracePass()
 
 /*
 ========================
+ReflectionsPass::CreateDenoisePass
+
+Spatial edge-aware denoise + composite: reads the raw reflection (m_ReflectionImage),
+filters it (roughness-scaled, normal/depth guided) and composites over the scene into
+m_DenoisedImage, which the backend blits. Non-temporal.
+========================
+*/
+void ReflectionsPass::CreateDenoisePass()
+{
+	idList<shaderMacro_t> macros;
+	const int shaderIdx = renderProgManager.FindShader( "builtin/reflections/reflection_denoise", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT );
+	m_DenoiseShader = renderProgManager.GetShader( shaderIdx );
+	if( m_DenoiseShader == nullptr )
+	{
+		common->Warning( "ReflectionsPass: reflection_denoise compute shader failed to load (idx %i) - RT reflections disabled.", shaderIdx );
+		rayTracingSupported = false;
+		return;
+	}
+
+	nvrhi::BufferDesc cbDesc;
+	cbDesc.byteSize = sizeof( DenoiseConstants );
+	cbDesc.debugName = "ReflectionDenoiseConstants";
+	cbDesc.isConstantBuffer = true;
+	cbDesc.isVolatile = true;
+	cbDesc.maxVersions = c_MaxRenderPassConstantBufferVersions;
+	m_DenoiseConstantBuffer = m_Device->createBuffer( cbDesc );
+
+	nvrhi::BindingLayoutDesc layoutDesc;
+	layoutDesc.visibility = nvrhi::ShaderType::Compute;
+	layoutDesc.bindings =
+	{
+		nvrhi::BindingLayoutItem::Texture_SRV( 0 ),			// t0 : raw reflection (rgb + weight)
+		nvrhi::BindingLayoutItem::Texture_SRV( 1 ),			// t1 : scene colour (composite base)
+		nvrhi::BindingLayoutItem::Texture_SRV( 2 ),			// t2 : depth
+		nvrhi::BindingLayoutItem::Texture_SRV( 3 ),			// t3 : gbuffer normals + roughness
+		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1 : DenoiseConstants
+		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : composited output
+		nvrhi::BindingLayoutItem::Sampler( 0 ),				// s0
+	};
+	m_DenoiseBindingLayout = m_Device->createBindingLayout( layoutDesc );
+
+	nvrhi::ComputePipelineDesc pipelineDesc;
+	pipelineDesc.bindingLayouts = { m_DenoiseBindingLayout };
+	pipelineDesc.CS = m_DenoiseShader;
+	m_DenoisePipeline = m_Device->createComputePipeline( pipelineDesc );
+}
+
+/*
+========================
 ReflectionsPass::EnsureReflectionImage
 
 The composited output is a screen-sized HDR image (RGBA16F, UAV + sampleable so
@@ -253,15 +321,21 @@ void ReflectionsPass::EnsureReflectionImage( int width, int height )
 
 	if( m_ReflectionImage == nullptr )
 	{
-		m_ReflectionImage = globalImages->AllocStandaloneImage( "_rtReflection" );
+		m_ReflectionImage = globalImages->AllocStandaloneImage( "_rtReflection" );		// raw reflection + weight
+	}
+	if( m_DenoisedImage == nullptr )
+	{
+		m_DenoisedImage = globalImages->AllocStandaloneImage( "_rtReflectionDenoised" );	// denoised + composited
 	}
 
 	m_ReflectionImage->GenerateImage( NULL, width, height, TF_LINEAR, TR_CLAMP, TD_RGBA16F, nullptr, true, true );
+	m_DenoisedImage->GenerateImage( NULL, width, height, TF_LINEAR, TR_CLAMP, TD_RGBA16F, nullptr, true, true );
 	m_ImageWidth = width;
 	m_ImageHeight = height;
 
-	// force the binding set to rebuild against the new image handle
+	// force the binding sets to rebuild against the new image handles
 	m_TraceBindingSet = nullptr;
+	m_DenoiseBindingSet = nullptr;
 }
 
 /*
@@ -387,6 +461,40 @@ bool ReflectionsPass::Render( nvrhi::ICommandList* commandList, const viewDef_t*
 	state.bindings = { m_TraceBindingSet, m_AccelStructs.GetBindlessTable() };
 	commandList->setComputeState( state );
 
+	commandList->dispatch( ( width + 7 ) / 8, ( height + 7 ) / 8, 1 );
+
+	// ---- spatial denoise + composite ----
+	// filters the raw reflection (m_ReflectionImage) and composites it over the scene into
+	// m_DenoisedImage (which the backend blits). NVRHI inserts the UAV->SRV barrier on
+	// m_ReflectionImage between the two dispatches.
+	DenoiseConstants dc;
+	memset( &dc, 0, sizeof( dc ) );
+	dc.screenSize = idVec2i( width, height );
+	const float denoiseRadius = r_rtReflectionDenoise.GetBool() ? r_rtReflectionDenoiseRadius.GetFloat() : 0.0f;
+	dc.params = idVec4( r_rtReflectionGateLo.GetFloat(), r_rtReflectionGateHi.GetFloat(),
+						denoiseRadius, r_rtReflectionDenoiseDepthSigma.GetFloat() );
+	commandList->writeBuffer( m_DenoiseConstantBuffer, &dc, sizeof( dc ) );
+
+	if( m_DenoiseBindingSet == nullptr )
+	{
+		nvrhi::BindingSetDesc setDesc;
+		setDesc.bindings =
+		{
+			nvrhi::BindingSetItem::Texture_SRV( 0, m_ReflectionImage->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_SRV( 1, globalImages->currentRenderImage->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_SRV( 2, globalImages->currentDepthImage->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Texture_SRV( 3, globalImages->gbufferNormalsRoughnessImage->GetTextureHandle() ),
+			nvrhi::BindingSetItem::ConstantBuffer( 1, m_DenoiseConstantBuffer ),
+			nvrhi::BindingSetItem::Texture_UAV( 0, m_DenoisedImage->GetTextureHandle() ),
+			nvrhi::BindingSetItem::Sampler( 0, m_LinearSampler ),
+		};
+		m_DenoiseBindingSet = m_Device->createBindingSet( setDesc, m_DenoiseBindingLayout );
+	}
+
+	nvrhi::ComputeState denoiseState;
+	denoiseState.pipeline = m_DenoisePipeline;
+	denoiseState.bindings = { m_DenoiseBindingSet };
+	commandList->setComputeState( denoiseState );
 	commandList->dispatch( ( width + 7 ) / 8, ( height + 7 ) / 8, 1 );
 
 	return true;

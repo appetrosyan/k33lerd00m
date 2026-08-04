@@ -315,7 +315,9 @@ float3 TraceAndShade( float3 origin, float3 dir, float roughness, out bool didHi
 
 	if( q.CommittedStatus() != COMMITTED_TRIANGLE_HIT )
 	{
-		return SampleEnv( dir, roughness );	// escaped into open space
+		// Ray escaped: traced-only, no cubemap fallback (miss contributes nothing).
+		didHit = false;
+		return float3( 0.0f, 0.0f, 0.0f );
 	}
 
 	didHit = true;
@@ -394,13 +396,14 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 		return;
 	}
 
-	const float3 base = t_SceneColor[pixel].rgb;
+	// This pass now outputs the RAW reflection (rgb) + composite weight (a); the denoise
+	// pass filters it and composites over the scene. Non-reflective pixels write weight 0.
 
-	// background / sky pixels have no reflective surface - pass the lit colour through
+	// background / sky pixels have no reflective surface -> no reflection (weight 0)
 	const float depth = t_Depth[pixel].r;
 	if( depth >= 1.0f )
 	{
-		u_Reflection[pixel] = float4( base, 1.0f );
+		u_Reflection[pixel] = float4( 0.0f, 0.0f, 0.0f, 0.0f );	// no reflection here: weight 0
 		return;
 	}
 
@@ -408,7 +411,7 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const float3 nEnc = t_GBufferNormal[pixel].xyz * 2.0f - 1.0f;
 	if( dot( nEnc, nEnc ) < 1e-4f )
 	{
-		u_Reflection[pixel] = float4( base, 1.0f );
+		u_Reflection[pixel] = float4( 0.0f, 0.0f, 0.0f, 0.0f );	// no reflection here: weight 0
 		return;
 	}
 	const float3 N = normalize( nEnc );
@@ -420,7 +423,7 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const float gate = 1.0f - smoothstep( g_Refl.params1.x, g_Refl.params1.y, roughness );
 	if( gate <= 0.0f && g_Refl.debugFlags.x == 0 )
 	{
-		u_Reflection[pixel] = float4( base, 1.0f );
+		u_Reflection[pixel] = float4( 0.0f, 0.0f, 0.0f, 0.0f );	// no reflection here: weight 0
 		return;
 	}
 
@@ -457,7 +460,8 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	const float3 origin = worldP + N * g_Refl.params0.y;
 
 	float3 sum = float3( 0.0f, 0.0f, 0.0f );
-	bool   anyHit = false;
+	int    hitCount = 0;
+	int    validCount = 0;
 	for( int i = 0; i < M; i++ )
 	{
 		const float2 u = frac( RtHammersley( ( uint )i, ( uint )M ) + pr );
@@ -465,22 +469,30 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 		const float3 Lt = reflect( -Vt, Ht );				// tangent-space reflected dir
 		if( Lt.z <= 0.0f )
 		{
-			continue;										// below the surface: invalid, contributes 0
+			continue;										// below the surface: invalid
 		}
+		validCount++;
 		const float3 wi = normalize( Lt.x * T + Lt.y * B + Lt.z * N );
 		bool hit;
 		const float3 Ls = TraceAndShade( origin, wi, roughness, hit );
-		anyHit = anyHit || hit;
-		// VNDF-sampled GGX: the estimator reduces to G2(V,L)/G1(V) (Fresnel applied
-		// once via the macro composite weight below, valid for these tight lobes).
-		sum += Ls * RtSmithG2overG1( Vt.z, Lt.z, alpha );
+		if( hit )
+		{
+			hitCount++;
+			// VNDF-sampled GGX: the estimator reduces to G2(V,L)/G1(V) (Fresnel applied
+			// once via the macro composite weight below, valid for these tight lobes).
+			sum += Ls * RtSmithG2overG1( Vt.z, Lt.z, alpha );
+		}
 	}
-	float3 reflColor = sum / float( M );
+	// Average the TRACED radiance over the rays that hit, and scale the reflection by the
+	// hit fraction (coverage). Rays that escape contribute nothing, so a surface whose
+	// reflection sees only open space shows its base shading - never a cubemap.
+	const float coverage = ( validCount > 0 ) ? ( float( hitCount ) / float( validCount ) ) : 0.0f;
+	float3 reflColor = ( hitCount > 0 ) ? ( sum / float( hitCount ) ) : float3( 0.0f, 0.0f, 0.0f );
 
-	// debug mode 2: green = at least one sample hit geometry, blue = all missed (env)
+	// debug mode 2: green = rays hit traced geometry, blue = escaped (no reflection)
 	if( g_Refl.debugFlags.x == 2 )
 	{
-		const float3 dbg = anyHit ? float3( 0.0f, 1.0f, 0.0f ) : float3( 0.0f, 0.0f, 1.0f );
+		const float3 dbg = ( hitCount > 0 ) ? float3( 0.0f, 1.0f, 0.0f ) : float3( 0.0f, 0.0f, 1.0f );
 		u_Reflection[pixel] = float4( dbg, 1.0f );
 		return;
 	}
@@ -489,13 +501,17 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	// scaled by the roughness gate so only smooth surfaces mirror.
 	const float NdotV = saturate( dot( N, -V ) );
 	const float fres = 0.04f + 0.96f * pow( 1.0f - NdotV, 5.0f );
-	float weight = saturate( fres * g_Refl.params0.z ) * gate;
+	// coverage scales the reflection by the traced-hit fraction: escaped rays add nothing,
+	// so open-sky reflections fade to base shading instead of a cube.
+	float weight = saturate( fres * g_Refl.params0.z ) * gate * coverage;
 
-	// debug mode 1: show the reflection at full strength on every gated surface
+	// debug mode 1: show the traced reflection at full strength where rays actually hit
 	if( g_Refl.debugFlags.x == 1 )
 	{
-		weight = ( gate > 0.0f ) ? 1.0f : 0.0f;
+		weight = ( gate > 0.0f ) ? coverage : 0.0f;
 	}
 
-	u_Reflection[pixel] = float4( lerp( base, reflColor, weight ), 1.0f );
+	// Output RAW reflection (rgb) + composite weight (a). The denoise pass filters rgb
+	// (roughness-scaled, edge-aware) and composites lerp( scene, refl, weight ).
+	u_Reflection[pixel] = float4( reflColor, weight );
 }

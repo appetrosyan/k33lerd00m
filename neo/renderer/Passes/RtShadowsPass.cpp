@@ -35,7 +35,20 @@ extern idCVar r_useRTShadows;
 
 // Pass-local tuning cvars (mirrors the ReflectionsPass convention of file-scope statics).
 idCVar r_rtShadowBias( "r_rtShadowBias", "1.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: ray origin bias along the surface normal (self-intersection)" );
-idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: visibility rays per pixel (1 = hard shadow; >1 = brute-force soft, no denoiser)", 1, 16 );
+idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: visibility rays per pixel (1 = hard shadow; >1 = brute-force soft, spatial-denoised)", 1, 16 );
+idCVar r_rtShadowDenoise( "r_rtShadowDenoise", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: spatial edge-aware denoise of the soft-shadow penumbra (only active with r_rtShadowRays > 1)" );
+idCVar r_rtShadowDenoiseRadius( "r_rtShadowDenoiseRadius", "6", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT shadows: soft-shadow penumbra denoise radius in pixels (0 = off)", 0.0f, 16.0f );
+idCVar r_rtShadowDenoiseDepthSigma( "r_rtShadowDenoiseDepthSigma", "0.001", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: penumbra denoise depth edge-stop sigma (hardware-depth units)" );
+
+// C++ side of the shadow-denoise constant buffer; must match ShadowDenoiseConstants in rt_shadow_denoise.cs.hlsl.
+struct ShadowDenoiseConstants
+{
+	idVec2i	screenSize;
+	idVec2i	scissorMin;
+	idVec2i	scissorMax;
+	idVec2i	pad0;
+	idVec4	params;		// x = radius, y = depthSigma
+};
 idCVar r_rtShadowSoftRadius( "r_rtShadowSoftRadius", "12.0", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: light radius in world units used for soft penumbra when r_rtShadowRays > 1" );
 idCVar r_rtShadowBackfaceCull( "r_rtShadowBackfaceCull", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "RT shadows ray face culling (debug). 0 = two-sided, occlude regardless of facing (default; matches stencil, no facing seam on single-sided world geometry); 1 = cull back faces; 2 = cull front faces. NOT archived - two-sided is the correct default.", 0, 2 );
 // Keep lights that portal-culling would drop (a light reachable only through a hidden
@@ -91,9 +104,11 @@ extern idCVar r_useScissor;
 RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* commonPasses )
 	: m_Device( device )
 	, m_CommonPasses( commonPasses )
+	, m_RawMaskImage( nullptr )
 	, m_BoundTlas( nullptr )
 	, m_BoundMask( nullptr )
 	, m_BoundCoarse( nullptr )
+	, m_BoundRawMask( nullptr )
 	, m_ViewReady( false )
 	, rayTracingSupported( false )
 	, loggedFirstBuild( false )
@@ -124,6 +139,7 @@ RtShadowsPass::RtShadowsPass( nvrhi::IDevice* device, CommonRenderPasses* common
 	{
 		common->Printf( "RtShadowsPass: ray tracing supported, RT shadows available.\n" );
 		CreateTracePass();
+		CreateDenoisePass();
 	}
 	else
 	{
@@ -171,6 +187,51 @@ void RtShadowsPass::CreateTracePass()
 	pipelineDesc.bindingLayouts = { m_TraceBindingLayout };
 	pipelineDesc.CS = m_TraceShader;
 	m_TracePipeline = m_Device->createComputePipeline( pipelineDesc );
+}
+
+/*
+========================
+RtShadowsPass::CreateDenoisePass
+
+Spatial edge-aware scalar denoise of the soft-shadow penumbra. Filters the raw noisy
+mask the trace writes into the final mask (per light, over its scissor rect). Non-temporal.
+========================
+*/
+void RtShadowsPass::CreateDenoisePass()
+{
+	idList<shaderMacro_t> macros;
+	const int shaderIdx = renderProgManager.FindShader( "builtin/reflections/rt_shadow_denoise", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT );
+	m_DenoiseShader = renderProgManager.GetShader( shaderIdx );
+	if( m_DenoiseShader == nullptr )
+	{
+		common->Warning( "RtShadowsPass: rt_shadow_denoise compute shader failed to load (idx %i) - soft-shadow denoise disabled.", shaderIdx );
+		return;	// hard/soft shadows still work; the penumbra denoise just won't run
+	}
+
+	nvrhi::BufferDesc cbDesc;
+	cbDesc.byteSize = sizeof( ShadowDenoiseConstants );
+	cbDesc.debugName = "RtShadowDenoiseConstants";
+	cbDesc.isConstantBuffer = true;
+	cbDesc.isVolatile = true;
+	cbDesc.maxVersions = 2048;	// one per light per frame, like the trace CB
+	m_DenoiseConstantBuffer = m_Device->createBuffer( cbDesc );
+
+	nvrhi::BindingLayoutDesc layoutDesc;
+	layoutDesc.visibility = nvrhi::ShaderType::Compute;
+	layoutDesc.bindings =
+	{
+		nvrhi::BindingLayoutItem::Texture_SRV( 0 ),			// t0 : raw mask
+		nvrhi::BindingLayoutItem::Texture_SRV( 1 ),			// t1 : depth
+		nvrhi::BindingLayoutItem::Texture_SRV( 2 ),			// t2 : gbuffer normals
+		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 1 ),	// b1
+		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),			// u0 : denoised mask
+	};
+	m_DenoiseBindingLayout = m_Device->createBindingLayout( layoutDesc );
+
+	nvrhi::ComputePipelineDesc pipelineDesc;
+	pipelineDesc.bindingLayouts = { m_DenoiseBindingLayout };
+	pipelineDesc.CS = m_DenoiseShader;
+	m_DenoisePipeline = m_Device->createComputePipeline( pipelineDesc );
 }
 
 /*
@@ -378,6 +439,44 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 			m_CoarseBindingSet = nullptr;
 		}
 
+		// soft-shadow penumbra denoise: (re)create the raw mask + the trace-to-raw and
+		// raw-to-final binding sets. The raw image is only regenerated on a resolution
+		// change (mask handle change), not on every TLAS growth.
+		if( m_DenoisePipeline != nullptr )
+		{
+			// raw mask is a global image (created by the image system at init/resize, NOT
+			// mid-frame - generating a texture during command-list recording opens a second
+			// command list and crashes). Its handle changes with the mask handle on resize,
+			// which is exactly when this rebuild block runs (m_BoundMask != mask).
+			idImage* const rawMask = globalImages->rtShadowMaskRawImage;
+
+			// trace variant: same bindings as the mask set but writes the RAW mask at u0
+			nvrhi::BindingSetDesc rawSetDesc;
+			rawSetDesc.bindings =
+			{
+				nvrhi::BindingSetItem::RayTracingAccelStruct( 0, tlas ),
+				nvrhi::BindingSetItem::Texture_SRV( 1, globalImages->currentDepthImage->GetTextureHandle() ),
+				nvrhi::BindingSetItem::Texture_SRV( 2, globalImages->gbufferNormalsRoughnessImage->GetTextureHandle() ),
+				nvrhi::BindingSetItem::ConstantBuffer( 1, m_ConstantBuffer ),
+				nvrhi::BindingSetItem::Texture_UAV( 0, rawMask->GetTextureHandle() ),
+				nvrhi::BindingSetItem::Texture_SRV( 3, mask->GetTextureHandle() ),	// coarse dummy (unread in the soft/legacy path)
+			};
+			m_RawMaskBindingSet = m_Device->createBindingSet( rawSetDesc, m_TraceBindingLayout );
+
+			// denoise: raw mask -> final mask
+			nvrhi::BindingSetDesc dnSetDesc;
+			dnSetDesc.bindings =
+			{
+				nvrhi::BindingSetItem::Texture_SRV( 0, rawMask->GetTextureHandle() ),
+				nvrhi::BindingSetItem::Texture_SRV( 1, globalImages->currentDepthImage->GetTextureHandle() ),
+				nvrhi::BindingSetItem::Texture_SRV( 2, globalImages->gbufferNormalsRoughnessImage->GetTextureHandle() ),
+				nvrhi::BindingSetItem::ConstantBuffer( 1, m_DenoiseConstantBuffer ),
+				nvrhi::BindingSetItem::Texture_UAV( 0, mask->GetTextureHandle() ),
+			};
+			m_DenoiseBindingSet = m_Device->createBindingSet( dnSetDesc, m_DenoiseBindingLayout );
+			m_BoundRawMask = rawMask;
+		}
+
 		m_BoundTlas = tlas;
 		m_BoundMask = mask;
 		m_BoundCoarse = coarse;
@@ -411,12 +510,36 @@ bool RtShadowsPass::RenderLight( nvrhi::ICommandList* commandList, const viewDef
 		// legacy path: constants.coarseParams is already (0,0) from the memset above.
 		commandList->writeBuffer( m_ConstantBuffer, &constants, sizeof( constants ) );
 
+		// soft shadows: trace the raw (noisy) penumbra to m_RawMaskImage, then spatially
+		// denoise it into the final mask. Hard shadows (rays == 1) are pixel-exact and
+		// skip the denoise entirely (trace straight to the final mask).
+		const bool doDenoise = softShadowsActive && m_DenoisePipeline != nullptr &&
+							   m_RawMaskBindingSet != nullptr && m_DenoiseBindingSet != nullptr &&
+							   r_rtShadowDenoise.GetBool() && r_rtShadowDenoiseRadius.GetFloat() > 0.0f;
+
 		nvrhi::ComputeState state;
 		state.pipeline = m_TracePipeline;
-		state.bindings = { m_MaskBindingSet };
+		state.bindings = { doDenoise ? m_RawMaskBindingSet : m_MaskBindingSet };
 		commandList->setComputeState( state );
-
 		commandList->dispatch( ( dispW + 7 ) / 8, ( dispH + 7 ) / 8, 1 );
+
+		if( doDenoise )
+		{
+			ShadowDenoiseConstants dc;
+			memset( &dc, 0, sizeof( dc ) );
+			dc.screenSize = constants.screenSize;
+			dc.scissorMin = constants.scissorMin;
+			dc.scissorMax = idVec2i( constants.scissorMin.x + dispW - 1, constants.scissorMin.y + dispH - 1 );
+			dc.params = idVec4( r_rtShadowDenoiseRadius.GetFloat(), r_rtShadowDenoiseDepthSigma.GetFloat(), 0.0f, 0.0f );
+			commandList->writeBuffer( m_DenoiseConstantBuffer, &dc, sizeof( dc ) );
+
+			nvrhi::ComputeState dnState;
+			dnState.pipeline = m_DenoisePipeline;
+			dnState.bindings = { m_DenoiseBindingSet };
+			commandList->setComputeState( dnState );
+			commandList->dispatch( ( dispW + 7 ) / 8, ( dispH + 7 ) / 8, 1 );
+		}
+
 		return true;
 	}
 

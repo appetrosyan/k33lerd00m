@@ -482,21 +482,49 @@ void main( uint3 dispatchID : SV_DispatchThreadID )
 	}
 
 	// soft shadow: N rays to jittered points on a disc of the light radius, facing
-	// the receiver. Brute force, no denoiser - honest per-frame penumbra noise.
+	// the receiver. The disc jitter is STATIC per pixel (no frame term) so the penumbra
+	// noise is a fixed spatial dither that does NOT crawl frame-to-frame - which is what
+	// lets the spatial denoise (rt_shadow_denoise) resolve it without any temporal
+	// accumulation. (Frame-varied jitter would move under the filter and fight it.)
 	float3 t, b;
 	OrthoBasis( L, t, b );
 	const float radius = g_Sh.lightOrigin.w;
-	const uint frame = uint( g_Sh.params.w );
 
+	// Penumbra-adaptive early-out: only the thin penumbra band needs the full ray budget.
+	// Fully-lit and fully-shadowed interiors - most of a light's screen rect - return the
+	// same visibility for every disc sample, so tracing all N there is pure waste. Trace a
+	// few spread probes first; if they UNANIMOUSLY agree, the pixel is a flat interior and
+	// the remaining rays are skipped (16 rays -> 4 on interiors). The probes are the first
+	// samples of the same sequence, so they still count toward the average when we continue
+	// into the penumbra. A missed thin sliver (all probes land one side of a ~50/50 split)
+	// only nudges an already near-interior pixel and is smoothed by the spatial denoise.
+	const int probeCount = min( rays, 4 );
 	float vis = 0.0f;
-	for( int i = 0; i < rays; i++ )
+	int i = 0;
+	for( ; i < probeCount; i++ )
 	{
-		float2 r = Hash23( uint2( pixel ), frame * 17u + uint( i ) * 101u );
-		// concentric-ish disc sample
+		float2 r = Hash23( uint2( pixel ), uint( i ) * 101u );
 		const float rr = sqrt( r.x ) * radius;
 		const float ang = 6.2831853f * r.y;
 		const float3 target = g_Sh.lightOrigin.xyz + ( t * cos( ang ) + b * sin( ang ) ) * rr;
+		const float3 d = target - worldP;
+		const float dist = length( d );
+		vis += TraceVisibility( origin, d / max( dist, 1e-4f ), bias, max( 0.0f, dist - bias ) );
+	}
+	if( vis == 0.0f || vis == float( probeCount ) )
+	{
+		// unanimous probes -> flat interior: skip the rest, write the agreed 0/1.
+		u_ShadowMask[pixel] = max( ( vis > 0.0f ) ? 1.0f : 0.0f, umbraFloor );
+		return;
+	}
 
+	// penumbra: probes disagreed, so trace the remaining rays for a smooth gradient.
+	for( ; i < rays; i++ )
+	{
+		float2 r = Hash23( uint2( pixel ), uint( i ) * 101u );
+		const float rr = sqrt( r.x ) * radius;
+		const float ang = 6.2831853f * r.y;
+		const float3 target = g_Sh.lightOrigin.xyz + ( t * cos( ang ) + b * sin( ang ) ) * rr;
 		const float3 d = target - worldP;
 		const float dist = length( d );
 		vis += TraceVisibility( origin, d / max( dist, 1e-4f ), bias, max( 0.0f, dist - bias ) );
