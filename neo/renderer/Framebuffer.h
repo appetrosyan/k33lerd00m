@@ -155,6 +155,7 @@ struct globalFramebuffers_t
 	Framebuffer*				ambientOcclusionFBO[MAX_SSAO_BUFFERS];
 	Framebuffer*				csDepthFBO[MAX_HIERARCHICAL_ZBUFFERS];
 	Framebuffer*				geometryBufferFBO;
+	Framebuffer*				softShadowMaskFBO;	// soft shadow volumes: LVB colour (rtShadowMaskImage) + shared depth-stencil
 	Framebuffer*				smaaInputFBO;
 	Framebuffer*				smaaEdgesFBO;
 	Framebuffer*				smaaBlendFBO;

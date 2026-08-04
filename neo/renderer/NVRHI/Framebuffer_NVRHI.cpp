@@ -193,6 +193,14 @@ void Framebuffer::ResizeFramebuffers( bool reloadImages )
 			.addColorAttachment( globalImages->gbufferNormalsRoughnessImage->texture )
 			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
 
+	// Soft shadow volumes: the light visibility buffer (rtShadowMaskImage as colour) shares the
+	// scene depth-stencil so the hard shadow-volume stencil stamped into currentDepthImage gates
+	// the umbra fill, and the wedge pass can depth-test against the scene.
+	globalFramebuffers.softShadowMaskFBO = new Framebuffer( "_softShadowMask",
+			nvrhi::FramebufferDesc()
+			.addColorAttachment( globalImages->rtShadowMaskImage->texture )
+			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
+
 	globalFramebuffers.smaaInputFBO = new Framebuffer( "_smaaInput",
 			nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->smaaInputImage->texture ) );
