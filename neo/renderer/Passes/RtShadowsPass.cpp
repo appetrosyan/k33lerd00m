@@ -250,18 +250,12 @@ bool RtShadowsPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t
 		return false;
 	}
 
-	// Coarse+refine needs the coarse mask image resident. ImageFromFunction images are generated
-	// lazily (on first bind / ReloadImages), and the coarse image is never bound by the legacy
-	// path - so without this it stays null forever and coarse+refine silently never engages.
-	// Force-generate it here, once, when its texture is still null.
-	if( r_rtShadowCoarse.GetInteger() != 0 )
-	{
-		idImage* coarse = globalImages->rtShadowCoarseImage;
-		if( coarse != NULL && coarse->GetTextureHandle() == nullptr )
-		{
-			coarse->Reload( false, commandList );
-		}
-	}
+	// NOTE: do NOT force-generate the coarse image here. Materialising a texture mid-frame
+	// (during command-list recording) opens a second command list and crashes - the same
+	// anti-pattern the raw-mask image was fixed for. If the coarse image is not resident,
+	// coarse+refine simply stays dormant (coarseImageReady is false in RenderLight -> legacy
+	// dispatch); it is disabled at r_rtShadowRays > 1 anyway. Re-enabling coarse+refine needs
+	// the image materialised safely at init/resize, not here.
 
 	m_AccelStructs.SetShadowCastersOnly( r_rtShadowCasterFilter.GetBool() );
 	m_AccelStructs.SetSkipFrontendOccluders( r_rtShadowSkipWorldFlood.GetBool() );
