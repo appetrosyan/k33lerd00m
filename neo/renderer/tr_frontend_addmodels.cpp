@@ -42,6 +42,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Model_local.h"
 
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
+extern idCVar r_useSoftShadowVolumes;	// soft shadow volumes reuse the stencil shadow-volume geometry (RenderSystem_init.cpp)
 extern idCVar r_rtShadowCullOffView;	// trim the shadow TLAS: cull casters whose shadow misses the view (RtShadowsPass.cpp)
 // dynamic stencil shadow volume for moved / non-static casters, built per-frame from the
 // model's static silEdges + doubled shadowCache against the current light (defined in Interaction.cpp).
@@ -1166,7 +1167,9 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 			// shadow chain, then skip the shadow-map occluder path. M2: static casters only (their
 			// shadowCache is a static buffer); always z-fail with caps (z-pass + cap selection is a
 			// later optimisation). Dynamic / GPU-skinned casters fall through to shadow maps for now.
-			if( r_useStencilShadows.GetBool() && !r_useRTShadows.GetBool() )	// RT takes precedence when both are on
+			// Soft shadow volumes reuse the very same shadow-VOLUME geometry (the umbra is stamped from
+			// it into the light visibility buffer), so build it for either method.
+			if( ( r_useStencilShadows.GetBool() || r_useSoftShadowVolumes.GetBool() ) && !r_useRTShadows.GetBool() )	// RT takes precedence when both are on
 			{
 				// stencil mode: build a shadow-VOLUME drawSurf if this static caster has one. Crucially
 				// we NEVER build a shadow-MAP occluder in this mode - those carry ambientCache, not

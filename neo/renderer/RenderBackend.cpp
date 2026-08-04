@@ -93,6 +93,26 @@ static ID_INLINE bool R_LightUsesRTShadows( bool rtShadowsActiveThisView, const 
 		   && !vLight->lightShader->IsAmbientLight();
 }
 
+// The interaction samples the screen-space shadow mask (rtShadowMaskImage) for TWO methods that both
+// write it: ray-traced shadows (traced into it) and soft shadow VOLUMES (umbra stamped into it, then
+// penumbra wedges lighten it). The mask bind + interaction shader-variant must fire for either; only
+// the RT *trace* pass stays gated on R_LightUsesRTShadows. Same light set / exclusions as stencil.
+static ID_INLINE bool R_LightUsesShadowMask( bool rtShadowsActiveThisView, const viewLight_t* vLight )
+{
+	if( vLight == NULL )
+	{
+		return false;
+	}
+	if( R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
+	{
+		return true;
+	}
+	return r_useSoftShadowVolumes.GetBool()
+		   && ( vLight->globalShadows != NULL || vLight->localShadows != NULL )
+		   && !vLight->parallel
+		   && !vLight->lightShader->IsAmbientLight();
+}
+
 /*
 ================
 SetVertexParm
@@ -1770,8 +1790,8 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 	// Ray-traced shadows override: replace the shadow-map interaction variant chosen
 	// above with the RT-visibility variant, which Loads the screen-space mask bound at
 	// texunit 5 instead of projecting into a shadow map. Point + spot only; the predicate
-	// matches R_LightUsesRTShadows so the mask bind and the shader agree.
-	if( R_LightUsesRTShadows( rtShadowsActiveThisView, din->vLight ) )
+	// matches R_LightUsesShadowMask so the mask bind and the shader agree (RT or soft shadow volumes).
+	if( R_LightUsesShadowMask( rtShadowsActiveThisView, din->vLight ) )
 	{
 		const bool pbr = ( specUsage == TD_SPECULAR_PBR_RMAO || specUsage == TD_SPECULAR_PBR_RMAOD );
 		const bool skinned = ( din->surf->jointCache != 0 );
@@ -2090,7 +2110,7 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 		// texture 5 will be the shadow maps array (or the RT visibility mask, which the
 		// RT interaction variant Loads in screen space instead of projecting)
 		GL_SelectTexture( INTERACTION_TEXUNIT_SHADOWMAPS );
-		if( R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
+		if( R_LightUsesShadowMask( rtShadowsActiveThisView, vLight ) )
 		{
 			globalImages->rtShadowMaskImage->Bind();
 		}
@@ -4476,7 +4496,11 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			// -> global-interactions so noSelfShadow (local) surfaces are lit before their own
 			// shadow is stamped. Clearing per light can't be scissored, so reset the light's
 			// S-Cull-tile-aligned rect to 128.
+			// Soft shadow volumes replace the hardware stencil test with the visibility-buffer multiply
+			// (the umbra was stamped into the mask above), so suppress the HW stencil test to avoid
+			// double-shadowing - the interaction reads the mask via R_LightUsesShadowMask instead.
 			const bool performStencilTest = r_useStencilShadows.GetBool() && !r_useRTShadows.GetBool()	// RT takes precedence when both on
+											&& !r_useSoftShadowVolumes.GetBool()
 											&& ( vLight->globalShadows != NULL || vLight->localShadows != NULL );
 			if( performStencilTest )
 			{
