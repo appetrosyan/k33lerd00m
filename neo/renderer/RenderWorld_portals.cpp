@@ -111,6 +111,14 @@ viewEntity_t* R_SetEntityDefViewEntity( idRenderEntityLocal* def )
 	viewEntity_t* vModel = ( viewEntity_t* )R_ClearedFrameAlloc( sizeof( *vModel ), FRAME_ALLOC_VIEW_ENTITY );
 	vModel->entityDef = def;
 
+	// Snapshot the entityDef fields the back end reads, while we are on the front-end thread and the
+	// def is alive. The back end must not dereference the live entityDef under SMP (the game thread
+	// can FreeEntityDef it mid-render); see the viewEntity_t comment.
+	vModel->index = def->index;
+	vModel->xrayIndex = def->parms.xrayIndex;
+	vModel->emberStartTime = def->parms.emberStartTime;
+	vModel->emberDir = def->parms.emberDir;
+
 	// the scissorRect will be expanded as the model bounds is accepted into visible portal chains
 	// It will remain clear if the model is only needed for shadows.
 	vModel->scissorRect.Clear();

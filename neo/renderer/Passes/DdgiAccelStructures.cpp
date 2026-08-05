@@ -519,7 +519,7 @@ void DdgiAccelStructures::BuildSkinnedInstances( nvrhi::ICommandList* commandLis
 
 		// record the posed range so the ember pass can seed from this surface
 		PosedRange pr;
-		pr.entityIndex = ( surf->space->entityDef != NULL ) ? surf->space->entityDef->index : -1;
+		pr.entityIndex = ( surf->space->entityDef != NULL ) ? surf->space->index : -1;	// snapshot; no live-def deref (SMP)
 		pr.outVertBase = s.outVertBase;
 		pr.numVerts = s.numVerts;
 		memcpy( pr.modelMatrix, surf->space->modelMatrix, sizeof( pr.modelMatrix ) );

@@ -410,16 +410,16 @@ void DdgiPass::DispatchProbeTrace( nvrhi::ICommandList* commandList, const viewD
 		float radius = 0.0f;
 		if( vLight->lightDef != NULL )
 		{
-			const idRenderLightLocal* lightDef = vLight->lightDef;
+			// snapshots on the viewLight; the back end must not deref the live lightDef (SMP)
 			const int holdFrames = r_ddgiDynamicHoldFrames.GetInteger();
-			isDynamic = lightDef->lightHasMoved ||
-						( lightDef->lastModifiedFrameNum >= tr.frameCount - holdFrames );
+			isDynamic = vLight->lightHasMoved ||
+						( vLight->lastModifiedFrameNum >= tr.frameCount - holdFrames );
 
 			// conservative spherical influence: farthest bounds corner from the origin
 			// (works for point and projected lights; parms.lightRadius is often 0 for
 			// projected lights such as the flashlight, so it is not used).
 			idVec3 corners[8];
-			lightDef->globalLightBounds.ToPoints( corners );
+			vLight->globalLightBounds.ToPoints( corners );
 			for( int c = 0; c < 8; c++ )
 			{
 				const float d = ( corners[c] - vLight->globalLightOrigin ).Length();

@@ -357,6 +357,12 @@ struct viewLight_t
 	byte* 					entityInteractionState;		// [numEntities]
 
 	idVec3					globalLightOrigin;			// global light origin used by backend
+	// Snapshots of lightDef fields the back end reads. The back end must NOT deref the live lightDef
+	// (the game thread can FreeLightDef it mid-render -> use-after-free); see tr_frontend_addlights.
+	bool					noSpecular;					// lightDef->parms.noSpecular
+	bool					lightHasMoved;				// lightDef->lightHasMoved (DDGI)
+	int						lastModifiedFrameNum;		// lightDef->lastModifiedFrameNum (DDGI)
+	idBounds				globalLightBounds;			// lightDef->globalLightBounds (DDGI)
 	idPlane					lightProject[4];			// light project used by backend
 	idPlane					fogPlane;					// fog plane for backend fog volume rendering
 	// RB: added for shadow mapping
@@ -400,6 +406,14 @@ struct viewEntity_t
 
 	// back end should NOT reference the entityDef, because it can change when running SMP
 	idRenderEntityLocal*		entityDef;
+
+	// Snapshots of entityDef fields the back end reads. Per the rule above, the back end must not
+	// dereference the live entityDef (the game thread can FreeEntityDef it mid-render -> use-after-
+	// free); it reads these frame-safe copies instead. Set in R_SetEntityDefViewEntity.
+	int							index;				// entityDef->index
+	int							xrayIndex;			// entityDef->parms.xrayIndex
+	int							emberStartTime;		// entityDef->parms.emberStartTime
+	idVec3						emberDir;			// entityDef->parms.emberDir
 
 	// for scissor clipping, local inside renderView viewport
 	// scissorRect.Empty() is true if the viewEntity_t was never actually

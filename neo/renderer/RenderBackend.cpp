@@ -2087,7 +2087,7 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 		// turn this back to 1.0
 		idVec4 specularColor = lightColor * 1.0f;
 // jmarshall
-		if( vLight->lightDef->parms.noSpecular )
+		if( vLight->noSpecular )
 		{
 			specularColor.Zero();
 		}
@@ -2360,7 +2360,7 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 					case SL_SPECULAR:
 					{
 						// ignore stage that fails the condition
-						if( !surfaceRegs[ surfaceStage->conditionRegister ] || vLight->lightDef->parms.noSpecular ) // SRS - From RB forums
+						if( !surfaceRegs[ surfaceStage->conditionRegister ] || vLight->noSpecular ) // SRS - From RB forums (snapshot; backend must not deref the live lightDef)
 						{
 							break;
 						}
@@ -4669,7 +4669,7 @@ int idRenderBackend::DrawShaderPasses( const drawSurf_t* const* const drawSurfs,
 
 		if( viewDef->isXraySubview && surf->space->entityDef )
 		{
-			if( surf->space->entityDef->parms.xrayIndex != 2 )
+			if( surf->space->xrayIndex != 2 )	// snapshot; back end must not deref the live entityDef (SMP)
 			{
 				continue;
 			}

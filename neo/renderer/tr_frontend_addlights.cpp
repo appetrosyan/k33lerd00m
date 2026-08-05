@@ -202,6 +202,15 @@ static void R_AddSingleLight( viewLight_t* vLight )
 	// copy data used by backend
 	//--------------------------------------------
 	vLight->globalLightOrigin = light->globalLightOrigin;
+	// Snapshot parms the backend reads. The backend (a separate SMP thread) must NOT dereference the
+	// live lightDef: under com_smp the game thread can FreeLightDef() a light while the backend is
+	// still rendering the previous frame that references it - a use-after-free (ASan-confirmed at
+	// RenderBackend.cpp interaction draw). Soft shadow volumes lengthen the backend and widen that
+	// window, but the hazard is general. globalLightOrigin etc. are already copied for this reason.
+	vLight->noSpecular = light->parms.noSpecular;
+	vLight->lightHasMoved = light->lightHasMoved;
+	vLight->lastModifiedFrameNum = light->lastModifiedFrameNum;
+	vLight->globalLightBounds = light->globalLightBounds;
 	vLight->lightProject[0] = light->lightProject[0];
 	vLight->lightProject[1] = light->lightProject[1];
 	vLight->lightProject[2] = light->lightProject[2];

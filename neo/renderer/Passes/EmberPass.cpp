@@ -453,13 +453,13 @@ void EmberPass::Render( nvrhi::ICommandList* commandList, const viewDef_t* viewD
 				{
 					continue;
 				}
-				const idRenderEntityLocal* ed = surf->space->entityDef;
-				const int st = ed->parms.emberStartTime;
+				// snapshots on the viewEntity; the back end must not deref the live entityDef (SMP)
+				const int st = surf->space->emberStartTime;
 				if( st <= 0 || st > nowMs || ( nowMs - st ) > windowMs )
 				{
 					continue;
 				}
-				const int idx = ed->index;
+				const int idx = surf->space->index;
 				if( triggered.count( idx ) || AlreadySeeded( idx, st ) )
 				{
 					continue;
@@ -490,7 +490,7 @@ void EmberPass::Render( nvrhi::ICommandList* commandList, const viewDef_t* viewD
 				const EmberImpactSet& impSet = itImp->second;
 				const int numImpacts = impSet.num;
 
-				idVec3 dir = ed->parms.emberDir;
+				idVec3 dir = surf->space->emberDir;
 				if( dir.LengthSqr() < 1e-4f )
 				{
 					dir.Set( 0, 0, 1 );
