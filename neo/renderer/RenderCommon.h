@@ -387,6 +387,7 @@ struct viewLight_t
 	drawSurf_t* 			localShadows;				// don't shadow local surfaces
 	drawSurf_t* 			globalInteractions;			// get shadows from everything
 	drawSurf_t* 			translucentInteractions;	// translucent interactions don't get shadows
+	drawSurf_t* 			softShadowWedges;			// analytic soft shadows: penumbra wedge surfs (idSoftWedgeVert) accumulated into the coverage buffer
 
 	bool					ImageAtlasPlaced() const
 	{
@@ -822,6 +823,7 @@ enum vertexLayoutType_t
 	LAYOUT_DRAW_IMGUI_VERT, // unused
 	LAYOUT_DRAW_SHADOW_VERT,			// idShadowVert (stencil shadow volumes)
 	LAYOUT_DRAW_SHADOW_VERT_SKINNED,	// idShadowVertSkinned
+	LAYOUT_SOFT_WEDGE_VERT,				// idSoftWedgeVert (analytic soft shadow penumbra wedges)
 	NUM_VERTEX_LAYOUTS
 };
 

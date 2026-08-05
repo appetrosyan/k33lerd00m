@@ -381,6 +381,14 @@ static void R_RTShadowMaskImage_ResNative( idImage* image, nvrhi::ICommandList* 
 	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_R8F, nullptr, true, true );
 }
 
+// Soft shadow volumes: the analytic penumbra accumulation buffer. Two-sided wedges add/subtract
+// signed coverage, so it must be a signed float that can overshoot [0,1] before the resolve to
+// visibility - hence R32F (no single-channel R16F in the enum; R32F is the safe drop-in).
+static void R_SoftShadowAccumImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
+{
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_R32F, nullptr, true, true );
+}
+
 // coarse+refine RT shadows: allocated at full render res, but the pass only ever writes/reads its
 // top-left coarseW x coarseH subregion (coarseW = renderW / round(r_rtShadowCoarseDiv * SSAA)), so
 // the divisor stays a live runtime cvar with no realloc. Same R8F + render-target + UAV as the mask.
@@ -1165,6 +1173,7 @@ void idImageManager::CreateIntrinsicImages()
 	rtShadowMaskImage = ImageFromFunction( "_rtShadowMask", R_RTShadowMaskImage_ResNative );
 	rtShadowMaskRawImage = ImageFromFunction( "_rtShadowMaskRaw", R_RTShadowMaskImage_ResNative );
 	rtShadowCoarseImage = ImageFromFunction( "_rtShadowCoarse", R_RTShadowCoarseImage_ResNative );
+	softShadowAccumImage = ImageFromFunction( "_softShadowAccum", R_SoftShadowAccumImage_ResNative );
 
 	ambientOcclusionImage[0] = ImageFromFunction( "_ao0", R_AmbientOcclusionImage_ResNative );
 	ambientOcclusionImage[1] = ImageFromFunction( "_ao1", R_AmbientOcclusionImage_ResNative );

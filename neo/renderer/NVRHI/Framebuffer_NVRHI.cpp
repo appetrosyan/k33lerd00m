@@ -201,6 +201,19 @@ void Framebuffer::ResizeFramebuffers( bool reloadImages )
 			.addColorAttachment( globalImages->rtShadowMaskImage->texture )
 			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
 
+	// Analytic soft shadow volumes accumulate signed coverage into softShadowAccumImage (R32F).
+	// The baseline hard-shadow pass needs the scene depth-stencil attached (stencil stamp + depth
+	// test); the wedge pass instead READS the scene depth as a shader resource to reconstruct the
+	// receiver, so it uses a colour-only target (the same accum image can't be DSV and SRV at once).
+	globalFramebuffers.softShadowAccumFBO = new Framebuffer( "_softShadowAccum",
+			nvrhi::FramebufferDesc()
+			.addColorAttachment( globalImages->softShadowAccumImage->texture )
+			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
+
+	globalFramebuffers.softShadowWedgeFBO = new Framebuffer( "_softShadowWedge",
+			nvrhi::FramebufferDesc()
+			.addColorAttachment( globalImages->softShadowAccumImage->texture ) );
+
 	globalFramebuffers.smaaInputFBO = new Framebuffer( "_smaaInput",
 			nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->smaaInputImage->texture ) );

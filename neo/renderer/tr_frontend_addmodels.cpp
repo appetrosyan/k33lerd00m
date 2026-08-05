@@ -43,10 +43,16 @@ If you have questions concerning this license or the applicable additional terms
 
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
 extern idCVar r_useSoftShadowVolumes;	// soft shadow volumes reuse the stencil shadow-volume geometry (RenderSystem_init.cpp)
+extern idCVar r_softShadowKeepOffViewCasters;	// keep off-view casters whose PENUMBRA reaches the view (RenderSystem_init.cpp)
 extern idCVar r_rtShadowCullOffView;	// trim the shadow TLAS: cull casters whose shadow misses the view (RtShadowsPass.cpp)
 // dynamic stencil shadow volume for moved / non-static casters, built per-frame from the
 // model's static silEdges + doubled shadowCache against the current light (defined in Interaction.cpp).
 srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light );
+// analytic soft shadow volumes: per-silhouette-edge penumbra wedge geometry (defined in Interaction.cpp).
+void R_CreatePenumbraWedges( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light, float penumbraSize,
+							 const idRenderMatrix& modelToClip, const float* modelToWorld,
+							 idSoftWedgeVert** outVerts, triIndex_t** outIndexes, int* outNumVerts, int* outNumIndexes );
+extern idCVar r_shadowPenumbraSize;	// soft shadow volumes: light source radius (RenderSystem_init.cpp)
 
 idCVar r_skipStaticShadows( "r_skipStaticShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip static shadows" );
 idCVar r_skipDynamicShadows( "r_skipDynamicShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip dynamic shadows" );
@@ -503,7 +509,14 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				// shadow lands nowhere visible, which RT does not need either. So RT can honour the same
 				// cull stencil uses instead of keeping EVERY off-view caster. Set the cvar 0 to restore
 				// the keep-everything behaviour if a real off-view shadow goes missing.
-				const bool keepOffViewCasters = r_useRTShadows.GetBool() && !r_rtShadowCullOffView.GetBool();
+				// R_ShadowBounds bounds the HARD shadow (umbra). A soft penumbra flares BEYOND it, so an
+					// off-view caster whose umbra bounds miss the frustum but whose penumbra reaches into the
+					// view is wrongly culled here - and as the camera moves such casters cross this coarse
+					// boundary and their whole penumbra wedge pops in/out (the "flicker all over the screen").
+					// Soft shadows, like RT, therefore need off-view casters; the wedge pixel shader gates
+					// coverage analytically, so keeping them paints no phantom on distant surfaces. 0 to A/B.
+					const bool keepOffViewCasters = ( r_useRTShadows.GetBool() && !r_rtShadowCullOffView.GetBool() )
+							|| ( r_useSoftShadowVolumes.GetBool() && r_softShadowKeepOffViewCasters.GetBool() );
 				if( !keepOffViewCasters && idRenderMatrix::CullBoundsToMVP( viewDef->worldSpace.mvp, shadowBounds ) )
 				{
 					continue;
@@ -1295,6 +1308,39 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					}
 				}
 
+				// Analytic soft shadow volumes: grow penumbra wedges off this caster's silhouette and
+				// link them into the light's wedge chain. The backend accumulates their signed coverage
+				// into the R32F buffer and resolves it to visibility. Same silhouette as the umbra.
+				if( r_useSoftShadowVolumes.GetBool() && tri->silEdges != NULL )
+				{
+					idSoftWedgeVert* wverts = NULL;
+					triIndex_t* windexes = NULL;
+					int nverts = 0, nindexes = 0;
+					R_CreatePenumbraWedges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
+											vEntity->mvp, vEntity->modelMatrix, &wverts, &windexes, &nverts, &nindexes );
+					if( nverts > 0 && nindexes > 0 )
+					{
+						drawSurf_t* wedgeSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *wedgeSurf ), FRAME_ALLOC_DRAW_SURFACE );
+						wedgeSurf->numIndexes = nindexes;
+						wedgeSurf->indexCache = vertexCache.AllocIndex( windexes, nindexes );
+						wedgeSurf->ambientCache = vertexCache.AllocVertex( wverts, nverts, sizeof( idSoftWedgeVert ) );
+						wedgeSurf->shadowCache = 0;
+						wedgeSurf->jointCache = 0;
+						wedgeSurf->frontEndGeo = NULL;
+						wedgeSurf->space = vEntity;
+						wedgeSurf->material = NULL;
+						wedgeSurf->extraGLState = 0;
+						wedgeSurf->scissorRect = vLight->scissorRect;
+						wedgeSurf->sort = 0.0f;
+						wedgeSurf->renderZFail = 0;
+						wedgeSurf->shaderRegisters = NULL;
+
+						wedgeSurf->linkChain = &vLight->softShadowWedges;
+						wedgeSurf->nextOnLight = vEntity->drawSurfs;
+						vEntity->drawSurfs = wedgeSurf;
+					}
+				}
+
 				continue;	// stencil mode never uses the shadow-map occluder path
 			}
 
@@ -1478,6 +1524,38 @@ void R_AddModels()
 
 	// RB: already done in R_FillMaskedOcclusionBufferWithModels
 	// tr.viewDef->viewEntitys = R_SortViewEntities( tr.viewDef->viewEntitys );
+
+	// Diagnostic (r_softShadowDebugHash): the fingerprint must accumulate across ALL views of a frame
+	// (there are typically 2: world + weapon), so reset/compare only at a FRAME boundary, not per
+	// R_AddModels call. Comparing per-call would just alternate between the two views' partial sums.
+	extern idSysInterlockedInteger tr_softWedgeGeomHash;
+	extern idSysInterlockedInteger tr_softWedgeEdgeCount;
+	extern idCVar r_softShadowDebugHash;
+	if( r_softShadowDebugHash.GetInteger() >= 1 )
+	{
+		static int s_lastFrame = -1;
+		static int s_prevTotal = 0;
+		static int s_prevCount = 0;
+		if( tr.frameCount != s_lastFrame )
+		{
+			const int total = tr_softWedgeGeomHash.GetValue();	// completed frame (all its views)
+			const int count = tr_softWedgeEdgeCount.GetValue();
+			if( s_lastFrame >= 0 && total != s_prevTotal )
+			{
+				// count delta => the SET of contributing edges changed (caster/light/view set);
+				// count same => the per-edge WORLD values changed (pose/matrix), which is camera-independent
+				// by construction and so should never move under a still scene + moving camera.
+				common->Printf( "softwedge fingerprint DRIFT frame %i: %08x -> %08x  edges %i -> %i  (%s)\n",
+								tr.frameCount, ( unsigned )s_prevTotal, ( unsigned )total, s_prevCount, count,
+								count != s_prevCount ? "SET changed" : "VALUES changed" );
+			}
+			s_prevTotal = total;
+			s_prevCount = count;
+			tr_softWedgeGeomHash.SetValue( 0 );	// reset for the new frame
+			tr_softWedgeEdgeCount.SetValue( 0 );
+			s_lastFrame = tr.frameCount;
+		}
+	}
 
 	//-------------------------------------------------
 	// Go through each view entity that is either visible to the view, or to

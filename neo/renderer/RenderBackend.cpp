@@ -67,6 +67,10 @@ idCVar r_skipEnvProbeDiffuse( "r_skipEnvProbeDiffuse", "0", CVAR_RENDERER | CVAR
 extern idCVar r_useRTShadows;		// runtime RT shadows toggle (RenderSystem_init.cpp)
 extern idCVar r_useStencilShadows;	// stencil shadow volumes toggle (tr_frontend_addmodels.cpp)
 extern idCVar r_useSoftShadowVolumes;	// soft shadow volumes / penumbra wedges (RenderSystem_init.cpp)
+extern idCVar r_shadowPenumbraSize;		// soft shadow volumes: light source radius (RenderSystem_init.cpp)
+extern idCVar r_shadowPenumbraMinWidth;	// soft shadow volumes: penumbra half-width floor (RenderSystem_init.cpp)
+extern idCVar r_softShadowTwoSided;		// soft shadow volumes: two-sided vs single-sided wedge raster (RenderSystem_init.cpp)
+extern idCVar r_softShadowShowMask;		// soft shadow volumes: blit the raw signed accumulator (RenderSystem_init.cpp)
 extern idCVar r_hdrOutput;			// HDR display output toggle (RenderSystem_init.cpp)
 
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
@@ -4368,48 +4372,128 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			currentPipeline = nullptr;
 		}
 
-		// soft shadow volumes (M1b): stamp the hard umbra into the light visibility buffer.
-		// Bind the LVB (colour = rtShadowMaskImage, depth-stencil = shared scene depth), clear it
-		// to 1 (lit) over the light's scissor, stamp both shadow-volume sets into the stencil
-		// exactly as the hard path does, then a fullscreen fill writes 0 (umbra) everywhere the
-		// stencil says shadowed (!= 128). Wedges lighten the penumbra band into this same buffer
-		// later (M1c/d); the interaction multiplies it in (M1e). Validate now with r_rtShadowShowMask.
-		if( r_useSoftShadowVolumes.GetBool() && globalFramebuffers.softShadowMaskFBO
-				&& ( vLight->globalShadows != NULL || vLight->localShadows != NULL ) )
+		// Analytic soft shadow volumes. Three passes into the R32F coverage buffer:
+		//  1. baseline - stamp the hard shadow volume and seed occlusion = 1 inside the projection;
+		//  2. wedges   - accumulate each silhouette edge's SIGNED analytic coverage delta (f - hard);
+		//  3. resolve  - visibility = 1 - saturate(occlusion) into the LVB the interaction samples.
+		// The umbra is emergent (wherever occlusion saturates to 1), never stamped, so lights larger
+		// than the caster correctly produce no umbra.
+		// Mutually exclusive with RT shadows: both resolve into rtShadowMaskImage, and the RT block
+		// above already traced this light's mask. Without this guard the resolve clobbers it and RT
+		// shadows silently vanish whenever both features are enabled.
+		if( r_useSoftShadowVolumes.GetBool() && globalFramebuffers.softShadowAccumFBO
+				&& ( vLight->globalShadows != NULL || vLight->localShadows != NULL )
+				&& !R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
 		{
-			renderLog.OpenBlock( "SoftShadowVolume Umbra", colorBlue );
+			renderLog.OpenBlock( "SoftShadowVolume Analytic", colorBlue );
 
-			globalFramebuffers.softShadowMaskFBO->Bind();
-
-			// scissor to the light's S-cull-tile-aligned rect (same rounding as the hard stencil path)
 			idScreenRect rect;
 			rect.x1 = ( vLight->scissorRect.x1 +  0 ) & ~15;
 			rect.y1 = ( vLight->scissorRect.y1 +  0 ) & ~15;
 			rect.x2 = ( vLight->scissorRect.x2 + 15 ) & ~15;
 			rect.y2 = ( vLight->scissorRect.y2 + 15 ) & ~15;
-			GL_Scissor( viewDef->viewport.x1 + rect.x1,
-						viewDef->viewport.y2 - rect.y2,
-						rect.x2 + 1 - rect.x1,
-						rect.y2 + 1 - rect.y1 );
+			const int scX = viewDef->viewport.x1 + rect.x1;
+			const int scY = viewDef->viewport.y2 - rect.y2;
+			const int scW = rect.x2 + 1 - rect.x1;
+			const int scH = rect.y2 + 1 - rect.y1;
+
+			// ---- pass 1: baseline hard occlusion (accum + scene depth-stencil attached) ----
+			globalFramebuffers.softShadowAccumFBO->Bind();
+			GL_Scissor( scX, scY, scW, scH );
 			currentScissor = rect;
 
-			// clear the mask to lit (1) and the stencil to the unshadowed reference (128); keep depth
 			GL_State( GLS_DEFAULT );
-			GL_Clear( true, false, true, STENCIL_SHADOW_TEST_VALUE, 1.0f, 1.0f, 1.0f, 1.0f, false );
-
-			// stamp both shadow-volume sets into the stencil (PASS_INCR -> shadowed pixels != 128)
+			GL_Clear( true, false, true, STENCIL_SHADOW_TEST_VALUE, 0.0f, 0.0f, 0.0f, 0.0f, false );	// accum 0, stencil 128
 			StencilShadowPass( vLight->globalShadows, vLight );
 			StencilShadowPass( vLight->localShadows, vLight );
 
-			// fullscreen fill: write 0 (umbra floor) into the mask wherever stencil != 128 (shadowed).
-			// Don't touch depth (DEPTHMASK) or stencil (default OP = KEEP); DEPTHFUNC_ALWAYS so the
-			// screen quad always passes.
 			GL_State( GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS | GLS_CULL_TWOSIDED |
 					  GLS_STENCIL_FUNC_NOTEQUAL |
 					  GLS_STENCIL_MAKE_REF( STENCIL_SHADOW_TEST_VALUE ) |
 					  GLS_STENCIL_MAKE_MASK( STENCIL_SHADOW_MASK_VALUE ) );
-			GL_Color( 0, 0, 0, 0 );
+			GL_Color( 1.0f, 1.0f, 1.0f, 1.0f );	// occlusion = 1 in the hard shadow
 			renderProgManager.BindShader_Color();
+			currentSpace = NULL;
+			RB_SetMVP( renderMatrix_fullscreen );
+			DrawElementsWithCounters( &unitSquareSurface );
+
+			// ---- pass 2: accumulate wedge coverage (colour-only target, scene depth as SRV) ----
+			if( vLight->softShadowWedges != NULL )
+			{
+				// Pass 2 additively blends into softShadowAccumImage, which pass 1 just wrote through a
+				// DIFFERENT framebuffer - a read-modify-write on the same render target across a render-
+				// pass boundary. nvrhi's automatic barriers do NOT synchronise render-target -> render-
+				// target, so without this the blend races pass 1's writes on the GPU: a per-frame,
+				// load-dependent hazard, independent of the coverage values. Forcing the accum image
+				// through ShaderResource inserts a full barrier so pass 1 completes first.
+				commandList->setTextureState( globalImages->softShadowAccumImage->GetTextureHandle(), nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+				// Same class of hazard on the DEPTH image: pass 1 attached currentDepthImage as depth-stencil
+				// and StencilShadowPass wrote its stencil; pass 2 READS currentDepthImage as an SRV to
+				// reconstruct the receiver. That DepthStencil->ShaderResource transition was unbarriered (the
+				// manual barrier only covered accum), so pass 2's depth read can race pass 1's stencil write.
+				// Barrier it - a real read/write hazard regardless of whether it fully explains the flicker.
+				commandList->setTextureState( globalImages->currentDepthImage->GetTextureHandle(), nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+				commandList->commitBarriers();
+
+				globalFramebuffers.softShadowWedgeFBO->Bind();
+				GL_Scissor( scX, scY, scW, scH );
+
+				GL_SelectTexture( 0 );
+				globalImages->currentDepthImage->Bind();
+
+				// depth->world reconstruction params + the area light (origin.xyz, radius in .w)
+				float windowCoordParm[4];
+				windowCoordParm[0] = 1.0f / renderSystem->GetRenderWidth();
+				windowCoordParm[1] = 1.0f / renderSystem->GetRenderHeight();
+				windowCoordParm[2] = ( float )renderSystem->GetRenderWidth();
+				windowCoordParm[3] = ( float )renderSystem->GetRenderHeight();
+				SetVertexParm( RENDERPARM_WINDOWCOORD, windowCoordParm );
+				SetVertexParms( RENDERPARM_PROJMATRIX_X, viewDef->projectionRenderMatrix[0], 4 );
+				SetVertexParms( RENDERPARM_MODELMATRIX_X, viewDef->unprojectionToWorldRenderMatrix[0], 4 );
+
+				float lightParm[4];
+				lightParm[0] = vLight->globalLightOrigin.x;
+				lightParm[1] = vLight->globalLightOrigin.y;
+				lightParm[2] = vLight->globalLightOrigin.z;
+				lightParm[3] = r_shadowPenumbraSize.GetFloat();
+				SetVertexParm( RENDERPARM_JITTERTEXSCALE, lightParm );
+
+				// .x = penumbra half-width floor (caps coverage gradient near contact). .y = per-invocation
+				// coverage scale: two-sided rasterises a convex prism as front+back = 2 invocations so we
+				// halve (0.5); single-sided is 1 invocation so full (1.0).
+				const bool wedgeTwoSided = r_softShadowTwoSided.GetBool();
+				float wedgeParm[4] = { r_shadowPenumbraMinWidth.GetFloat(), wedgeTwoSided ? 0.5f : 1.0f, 0.0f, 0.0f };
+				SetVertexParm( RENDERPARM_JITTERTEXOFFSET, wedgeParm );
+
+				// Signed additive accumulation. Two-sided was adopted to stop whole wedge volumes blinking
+				// in/out (single-sided depends on the hand-wound prism facing consistently and never being
+				// near-plane clipped) - but that flicker was later found to be a use-after-free, so the
+				// choice is now re-evaluable: r_softShadowTwoSided toggles it against single-sided.
+				uint64 wedgeCull = wedgeTwoSided ? GLS_CULL_TWOSIDED : GLS_CULL_FRONTSIDED;
+				GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS | wedgeCull );
+				renderProgManager.BindShader_SoftShadowWedge();
+				currentSpace = NULL;
+				for( const drawSurf_t* w = vLight->softShadowWedges; w != NULL; w = w->nextOnLight )
+				{
+					DrawElementsWithCounters( w );
+				}
+
+				GL_SelectTexture( 0 );
+			}
+
+			// ---- pass 3: resolve occlusion -> visibility into the LVB ----
+			// accum was just written as a render target (pass 1 stamp, pass 2 wedge blend); pass 3 reads it
+			// as an SRV. Barrier the RenderTarget->ShaderResource transition explicitly - the same manual
+			// sync this wrapper needs and nvrhi's auto-barriers miss across these render passes.
+			commandList->setTextureState( globalImages->softShadowAccumImage->GetTextureHandle(), nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+			commandList->commitBarriers();
+
+			globalFramebuffers.softShadowMaskFBO->Bind();
+			GL_Scissor( scX, scY, scW, scH );
+			GL_SelectTexture( 0 );
+			globalImages->softShadowAccumImage->Bind();
+			GL_State( GLS_DEPTHMASK | GLS_DEPTHFUNC_ALWAYS | GLS_CULL_TWOSIDED );
+			renderProgManager.BindShader_SoftShadowResolve();
 			currentSpace = NULL;
 			RB_SetMVP( renderMatrix_fullscreen );
 			DrawElementsWithCounters( &unitSquareSurface );
@@ -6520,6 +6604,16 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 				commandList,
 				globalFramebuffers.hdrFBO->GetApiObject(),
 				globalImages->rtShadowMaskImage->GetTextureHandle(),
+				&bindingCache );
+		}
+		// raw signed wedge accumulator (pre-resolve): isolates whether whole-volume toggling lives in the
+		// accumulation/raster or downstream in the resolve. Positive coverage shows bright; sign is clamped.
+		if( is3D && r_softShadowShowMask.GetBool() && r_useSoftShadowVolumes.GetBool() )
+		{
+			commonPasses.BlitTexture(
+				commandList,
+				globalFramebuffers.hdrFBO->GetApiObject(),
+				globalImages->softShadowAccumImage->GetTextureHandle(),
 				&bindingCache );
 		}
 	}

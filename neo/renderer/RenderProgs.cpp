@@ -190,6 +190,27 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		.setOffset( offsetof( idShadowVertSkinned, color ) )
 		.setElementStride( sizeof( idShadowVertSkinned ) ) );
 
+	// === Soft shadow wedge vertex === (analytic penumbra wedges)
+	// POSITION = wedge geometry; TEXCOORD0/1 = the silhouette edge endpoints (flat in the shader).
+
+	vertexLayoutDescs[LAYOUT_SOFT_WEDGE_VERT].Append(
+		nvrhi::VertexAttributeDesc()
+		.setName( "POSITION" )
+		.setFormat( nvrhi::Format::RGBA32_FLOAT )
+		.setOffset( offsetof( idSoftWedgeVert, clipPos ) )
+		.setElementStride( sizeof( idSoftWedgeVert ) ) );
+
+	// edge0/edge1 are contiguous, exposed as TEXCOORD0/TEXCOORD1 via an array attribute (as COLOR does).
+	// RGBA32: xyz is the world-space endpoint, edge0.w carries the silhouette weight [0,1] that fades
+	// the wedge in/out to stop it popping as edges cross the silhouette threshold.
+	vertexLayoutDescs[LAYOUT_SOFT_WEDGE_VERT].Append(
+		nvrhi::VertexAttributeDesc()
+		.setName( "TEXCOORD" )
+		.setArraySize( 2 )
+		.setFormat( nvrhi::Format::RGBA32_FLOAT )
+		.setOffset( offsetof( idSoftWedgeVert, edge0 ) )
+		.setElementStride( sizeof( idSoftWedgeVert ) ) );
+
 	bindingLayouts.SetNum( NUM_BINDING_LAYOUTS );
 
 	// SRS - Check to make sure renderparm subsets are within push constant size limits
@@ -496,9 +517,14 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 
 	bindingLayouts[BINDING_LAYOUT_DRAW_AO] = { device->createBindingLayout( aoLayoutDesc ), samplerOneBindingLayout };
 
+	// BINDING_LAYOUT_DRAW_AO1 is used ONLY by the soft-shadow wedge/resolve passes, which issue many
+	// draws per frame. Push constants must be re-set after every setGraphicsState - a multi-draw loop
+	// can't satisfy that, and leaving stale push-constant state also corrupts later draws (e.g. ImGui).
+	// So force a plain volatile constant buffer for this layout instead of the shared aoLayoutItem.
+	layoutTypeAttributes[BINDING_LAYOUT_DRAW_AO1].pcEnabled = false;
 	auto aoLayoutDesc2 = nvrhi::BindingLayoutDesc()
 						 .setVisibility( nvrhi::ShaderType::All )
-						 .addItem( aoLayoutItem )
+						 .addItem( nvrhi::BindingLayoutItem::VolatileConstantBuffer( 0 ) )
 						 .addItem( nvrhi::BindingLayoutItem::Texture_SRV( 0 ) );
 
 	bindingLayouts[BINDING_LAYOUT_DRAW_AO1] = { device->createBindingLayout( aoLayoutDesc2 ), samplerOneBindingLayout };
@@ -958,6 +984,13 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		{ BUILTIN_HISTOGRAM_TEX_ARRAY_CS, "builtin/post/histogram", "_tex_array", { { "HISTOGRAM_BINS", "256" }, { "SOURCE_ARRAY", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_HISTOGRAM ) } }, false, SHADER_STAGE_COMPUTE, LAYOUT_UNKNOWN, BINDING_LAYOUT_HISTOGRAM },
 		{ BUILTIN_EXPOSURE_CS, "builtin/post/exposure", "", { { "HISTOGRAM_BINS", "256" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_EXPOSURE ) } }, false, SHADER_STAGE_COMPUTE, LAYOUT_UNKNOWN, BINDING_LAYOUT_EXPOSURE },
 		// SP end
+
+		// analytic soft shadow volumes. MUST stay at the end: renderProgs is indexed by table POSITION,
+		// and passes fetch programs by BUILTIN_ enum value, so table position must equal enum value.
+		// penumbra wedge coverage (sphere model); custom vertex carries the edge, AO1 layout binds depth
+		{ BUILTIN_SOFT_WEDGE_SPHERE, "builtin/lighting/softwedge", "", { { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_AO1 ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_SOFT_WEDGE_VERT, BINDING_LAYOUT_DRAW_AO1 },
+		// resolve accumulated coverage -> visibility (fullscreen, reads the R32F accum)
+		{ BUILTIN_SOFT_WEDGE_RESOLVE, "builtin/lighting/softwedge_resolve", "", { { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_AO1 ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_AO1 },
 	};
 	int numBuiltins = sizeof( builtins ) / sizeof( builtins[0] );
 
@@ -965,6 +998,17 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 
 	for( int i = 0; i < numBuiltins; i++ )
 	{
+		// renderProgs is indexed by table POSITION, but passes fetch programs with
+		// GetProgramInfo( BUILTIN_x ) using the enum value directly - so table position MUST equal the
+		// enum value (strict enum order, no gaps). A mismatch silently hands the wrong shader to a pass
+		// (wrong-coloured materials, null-compute crashes). Fail loudly and name the offender instead.
+		if( builtins[i].index != i )
+		{
+			common->FatalError( "builtin shader table out of order at %d: '%s' has enum value %d - "
+								"table position must equal the BUILTIN_ enum value; add new entries at the END of both the enum and the table",
+								i, builtins[i].name, builtins[i].index );
+		}
+
 		renderProg_t& prog = renderProgs[i];
 
 		prog.name = builtins[i].name;

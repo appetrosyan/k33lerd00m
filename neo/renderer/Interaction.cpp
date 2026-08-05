@@ -310,6 +310,237 @@ srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent,
 }
 
 /*
+=====================
+R_CreatePenumbraWedges
+
+Analytic soft shadow volumes: for each silhouette edge emit a penumbra wedge - a prism from the
+edge, extruded away from the light and flared by the penumbra width, that conservatively covers the
+edge's penumbra band on the receivers. Each vertex carries its clip-space position (model->clip, so
+the vertex shader is a passthrough) and the edge endpoints in WORLD space (model->world) that the
+pixel shader needs to evaluate the analytic coverage. The pixel shader clamps coverage to zero
+outside the band, so the geometry only has to be conservative, not exact.
+
+Frame-allocated; outputs are NULL / zero if the caster has no silhouette against this light.
+=====================
+*/
+// Diagnostic (r_softShadowDebugHash): order-independent, world-space-only fingerprint of a frame's
+// penumbra-wedge geometry. Reset each frame before model processing (R_AddModels), compared after.
+// A static scene must reproduce the same total every frame; drift => non-deterministic generation.
+idSysInterlockedInteger tr_softWedgeGeomHash;
+// Companion count of emitted silhouette edges this frame. Disambiguates a fingerprint drift: if the
+// count changes the SET of contributing edges changed (view culling / caster set); if the count holds
+// but the hash drifts the per-edge WORLD values changed (pose / matrix), camera-independent by design.
+idSysInterlockedInteger tr_softWedgeEdgeCount;
+
+void R_CreatePenumbraWedges( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
+		const idRenderLightLocal* light, float penumbraSize,
+		const idRenderMatrix& modelToClip, const float* modelToWorld,
+		idSoftWedgeVert** outVerts, triIndex_t** outIndexes, int* outNumVerts, int* outNumIndexes )
+{
+	*outVerts = NULL;
+	*outIndexes = NULL;
+	*outNumVerts = 0;
+	*outNumIndexes = 0;
+
+	if( tri->silEdges == NULL || tri->numSilEdges == 0 || penumbraSize <= 0.0f )
+	{
+		return;
+	}
+
+	srfCullInfo_t cullInfo = {};
+	R_CalcInteractionFacing( ent, tri, light, cullInfo );
+	const byte* facing = cullInfo.facing;
+
+	idVec3 localLight;
+	R_GlobalPointToLocal( ent->modelMatrix, light->globalLightOrigin, localLight );
+
+	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
+
+	int numSil = 0;
+	for( int i = 0; i < tri->numSilEdges; i++ )
+	{
+		if( facing[tri->silEdges[i].p1] ^ facing[tri->silEdges[i].p2] )
+		{
+			numSil++;
+		}
+	}
+	if( numSil == 0 )
+	{
+		R_FreeInteractionCullInfo( cullInfo );
+		return;
+	}
+
+	const int vertsPerEdge = 6;
+	const int indexesPerEdge = 24;		// 8 triangles forming the prism boundary
+	idSoftWedgeVert* wv = ( idSoftWedgeVert* )R_FrameAlloc( numSil * vertsPerEdge * sizeof( idSoftWedgeVert ), FRAME_ALLOC_UNKNOWN );
+	triIndex_t* wi = ( triIndex_t* )R_FrameAlloc( numSil * indexesPerEdge * sizeof( triIndex_t ), FRAME_ALLOC_UNKNOWN );
+
+	// How far to extrude the wedge along the light rays (model units). The pixel shader now gates
+	// coverage analytically (occlusion test + umbra plane), so the geometry only has to conservatively
+	// COVER the penumbra's screen pixels - it does not need to reach 4000 units. Bounding it to the
+	// light's actual reach is what stops the "wedges flicker in and out" pop: a fixed 4000-unit
+	// extrusion swings the far cap behind the camera, the near plane clips the back face this pass
+	// culls to, and the wedge vanishes for a frame. Receivers only exist inside the light volume, so
+	// extrude no farther than its diagonal (with a small floor so tiny lights still get a band).
+	const float lightReach = 2.0f * light->globalLightBounds.GetRadius();
+	const float wedgeFar = Max( lightReach, penumbraSize * 4.0f );
+
+	// prism boundary: verts 0=E0 1=E1 2=inner0 3=outer0 4=inner1 5=outer1
+	static const triIndex_t prism[24] =
+	{
+		0, 1, 4,  0, 4, 2,		// inner side
+		0, 3, 5,  0, 5, 1,		// outer side
+		2, 4, 5,  2, 5, 3,		// far cap
+		0, 2, 3,				// end at E0
+		1, 5, 4					// end at E1
+	};
+
+	int v = 0, idx = 0;
+	for( int i = 0; i < tri->numSilEdges; i++ )
+	{
+		const silEdge_t& sil = tri->silEdges[i];
+		if( !( facing[sil.p1] ^ facing[sil.p2] ) )
+		{
+			continue;
+		}
+
+		idVec3 E0 = verts[sil.v1].xyz;
+		idVec3 E1 = verts[sil.v2].xyz;
+
+		// Consistent silhouette winding. The stencil path orders each sil quad by which adjacent
+		// face is lit (see the v2^f1 / v1^f2 index tricks above); we must match it, so the pixel
+		// shader's plane normal cross(edge0-P, edge1-P) points to the SAME side of every silhouette
+		// edge. The coverage delta is antisymmetric in that normal (flipping the edge negates it),
+		// so an inconsistent order gives each edge a random sign -> the accumulator is noise ->
+		// the mask flickers across the whole shadow. facing[sil.p1] picks the canonical orientation.
+		if( !facing[sil.p1] )
+		{
+			idVec3 tmp = E0;
+			E0 = E1;
+			E1 = tmp;
+		}
+
+		idVec3 d0 = E0 - localLight;
+		idVec3 d1 = E1 - localLight;
+		const float dist0 = d0.Normalize();
+		const float dist1 = d1.Normalize();
+
+		// Skip silhouette edges sitting right on top of the light (typically the light-fixture geometry
+		// itself). Closer than a light radius the penumbra model is undefined and the extrusion
+		// direction normalize(E-light) is hypersensitive to any light motion - the flicker that stays
+		// pinned to the light sources. A real occluder is at least a light-radius away.
+		if( dist0 < penumbraSize || dist1 < penumbraSize )
+		{
+			continue;
+		}
+
+		idVec3 edgeDir = E1 - E0;
+		edgeDir.Normalize();
+		idVec3 perp0 = edgeDir.Cross( d0 );
+		perp0.Normalize();
+		idVec3 perp1 = edgeDir.Cross( d1 );
+		perp1.Normalize();
+
+		// Penumbra flare grows with distance along the ray (contact hardening). Clamp it to the
+		// extrusion length: for a silhouette edge very close to the light the raw 1/dist term
+		// explodes into a far cap thousands of units to the side, which projects wildly and pops.
+		const float w0 = Min( penumbraSize * wedgeFar / Max( dist0, 1.0f ), wedgeFar );
+		const float w1 = Min( penumbraSize * wedgeFar / Max( dist1, 1.0f ), wedgeFar );
+
+		const idVec3 cf0 = E0 + d0 * wedgeFar;
+		const idVec3 cf1 = E1 + d1 * wedgeFar;
+		const idVec3 mpos[6] =
+		{
+			E0, E1,
+			cf0 + perp0 * w0, cf0 - perp0 * w0,
+			cf1 + perp1 * w1, cf1 - perp1 * w1
+		};
+
+		idVec3 worldE0, worldE1;
+		R_LocalPointToGlobal( modelToWorld, E0, worldE0 );
+		R_LocalPointToGlobal( modelToWorld, E1, worldE1 );
+
+		// Continuous silhouette weight. The silhouette test is binary (one adjacent face lit, the other
+		// not), so an edge snaps in and out of the set as it crosses grazing - and its whole penumbra
+		// wedge pops with it. Weight the wedge by how firmly this edge is a silhouette: |plane distance
+		// from the light| / (light->edge distance) is ~sin(grazing angle) for each adjacent face; take
+		// the smaller (the face nearer to flipping) and ramp 0..1 over the last ~9 degrees. An edge just
+		// entering the silhouette contributes ~0 and grows in smoothly instead of appearing all at once.
+		extern idCVar r_softShadowWedgeFade;
+		float silWeight = 1.0f;
+		const int numFaces = tri->numIndexes / 3;
+		if( r_softShadowWedgeFade.GetBool() && sil.p1 < numFaces && sil.p2 < numFaces )
+		{
+			const idPlane pa( verts[tri->indexes[sil.p1 * 3 + 0]].xyz, verts[tri->indexes[sil.p1 * 3 + 1]].xyz, verts[tri->indexes[sil.p1 * 3 + 2]].xyz );
+			const idPlane pb( verts[tri->indexes[sil.p2 * 3 + 0]].xyz, verts[tri->indexes[sil.p2 * 3 + 1]].xyz, verts[tri->indexes[sil.p2 * 3 + 2]].xyz );
+			const float distL = 0.5f * ( dist0 + dist1 );
+			const float graze = Min( idMath::Fabs( pa.Distance( localLight ) ), idMath::Fabs( pb.Distance( localLight ) ) ) / Max( distL, 1.0f );
+			silWeight = idMath::ClampFloat( 0.0f, 1.0f, graze / 0.15f );
+		}
+
+		for( int k = 0; k < 6; k++ )
+		{
+			idVec4 clip;
+			modelToClip.TransformPoint( mpos[k], clip );
+			wv[v + k].clipPos = clip;
+			wv[v + k].edge0 = idVec4( worldE0.x, worldE0.y, worldE0.z, silWeight );
+			wv[v + k].edge1 = idVec4( worldE1.x, worldE1.y, worldE1.z, 0.0f );
+		}
+
+		// Diagnostic fingerprint: fold this edge's WORLD-space data (camera excluded) into the frame
+		// total. Order-independent (a sum), so parallel generation order can't change it. A static
+		// scene must reproduce the same total every frame; drift = non-deterministic generation.
+		{
+			const float fp[7] = { worldE0.x, worldE0.y, worldE0.z, worldE1.x, worldE1.y, worldE1.z, silWeight };
+			const byte* fpb = ( const byte* )fp;
+			uint32 h = 2166136261u;
+			for( int b = 0; b < ( int )sizeof( fp ); b++ )
+			{
+				h = ( h ^ fpb[b] ) * 16777619u;
+			}
+			tr_softWedgeGeomHash.Add( ( int )h );
+			tr_softWedgeEdgeCount.Add( 1 );
+		}
+
+		for( int k = 0; k < 24; k++ )
+		{
+			wi[idx + k] = ( triIndex_t )( v + prism[k] );
+		}
+
+		v += 6;
+		idx += 24;
+	}
+
+	R_FreeInteractionCullInfo( cullInfo );
+
+	// Diagnostic (r_softShadowDebugHash 2): identify which caster/light feeds the per-frame drift.
+	extern idCVar r_softShadowDebugHash;
+	if( r_softShadowDebugHash.GetInteger() >= 2 && v > 0 )
+	{
+		uint32 vh = 2166136261u;
+		const byte* vb = ( const byte* )verts;
+		for( int b = 0; b < tri->numVerts * ( int )sizeof( idDrawVert ); b++ )
+		{
+			vh = ( vh ^ vb[b] ) * 16777619u;
+		}
+		uint32 mh = 2166136261u;
+		const byte* mb = ( const byte* )modelToWorld;
+		for( int b = 0; b < 16 * ( int )sizeof( float ); b++ )
+		{
+			mh = ( mh ^ mb[b] ) * 16777619u;
+		}
+		common->Printf( "wedge ent=%i light=%i nv=%i numSil=%i vertHash=%08x mtxHash=%08x org=(%.3f %.3f %.3f)\n",
+						ent->index, light->index, tri->numVerts, numSil, ( unsigned )vh, ( unsigned )mh,
+						modelToWorld[12], modelToWorld[13], modelToWorld[14] );
+	}
+
+	*outVerts = wv;
+	*outIndexes = wi;
+	*outNumVerts = v;
+	*outNumIndexes = idx;
+}
+
+/*
 ====================
 R_CreateInteractionLightTris
 

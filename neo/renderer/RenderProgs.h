@@ -545,6 +545,10 @@ enum
 	BUILTIN_EXPOSURE_CS,
 	// SP End
 
+	// analytic soft shadow volumes: per-silhouette-edge penumbra coverage (sphere model)
+	BUILTIN_SOFT_WEDGE_SPHERE,
+	BUILTIN_SOFT_WEDGE_RESOLVE,		// accum coverage -> visibility (1 - saturate)
+
 	MAX_BUILTINS
 };
 
@@ -601,6 +605,16 @@ public:
 	void	BindShader_VertexColor()
 	{
 		BindShader_Builtin( BUILTIN_VERTEX_COLOR );
+	}
+
+	void	BindShader_SoftShadowWedge()
+	{
+		BindShader_Builtin( BUILTIN_SOFT_WEDGE_SPHERE );
+	}
+
+	void	BindShader_SoftShadowResolve()
+	{
+		BindShader_Builtin( BUILTIN_SOFT_WEDGE_RESOLVE );
 	}
 
 	void	BindShader_ImageBasedLighting()

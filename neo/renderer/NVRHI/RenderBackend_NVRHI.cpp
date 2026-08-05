@@ -453,10 +453,16 @@ void idRenderBackend::DrawElementsWithCounters( const drawSurf_t* surf, bool sha
 
 		bool uniformsLayoutChanged = prevBindingLayoutType >= 0 ? ( *layouts )[0] != ( *renderProgManager.GetBindingLayout( prevBindingLayoutType ) )[0] : true;
 
+		// When the binding-layout TYPE changes, every slot's binding set must be rebuilt against the new
+		// layout - even a slot whose desc coincidentally matches the previous type's. Reusing it leaves
+		// that set bound to the OLD layout object while the new pipeline expects the new one, which nvrhi
+		// validation reports as "binding set in slot N does not match the layout in pipeline slot N" and
+		// which, with validation off, feeds the GPU a mismatched descriptor set -> memory corruption.
+		const bool layoutTypeChanged = ( bindingLayoutType != prevBindingLayoutType );
 		for( int i = 0; i < layouts->Num(); i++ )
 		{
 			// SRS - Update currentBindingSets[0] if uniforms binding layout has changed, can happen with push constants even if binding set descriptions match
-			if( !currentBindingSets[i] || *currentBindingSets[i]->getDesc() != pendingBindingSetDescs[bindingLayoutType][i] || ( uniformsLayoutChanged && i == 0 ) )
+			if( !currentBindingSets[i] || layoutTypeChanged || *currentBindingSets[i]->getDesc() != pendingBindingSetDescs[bindingLayoutType][i] || ( uniformsLayoutChanged && i == 0 ) )
 			{
 				currentBindingSets[i] = bindingCache.GetOrCreateBindingSet( pendingBindingSetDescs[bindingLayoutType][i], ( *layouts )[i] );
 				changeState = true;
@@ -540,6 +546,17 @@ void idRenderBackend::DrawElementsWithCounters( const drawSurf_t* surf, bool sha
 		else
 		{
 			state.viewport.addScissorRect( nvrhi::Rect( viewport ) );
+		}
+
+		{
+			extern idCVar r_softShadowDebugHash;
+			if( r_softShadowDebugHash.GetInteger() >= 3 )
+			{
+				common->Printf( "draw prog='%s' progType=%i memberType=%i nLayouts=%i nBind=%i\n",
+								renderProgManager.renderProgs[program].name.c_str(),
+								( int )renderProgManager.renderProgs[program].bindingLayoutType, bindingLayoutType,
+								layouts->Num(), ( int )state.bindings.size() );
+			}
 		}
 
 		commandList->setGraphicsState( state );
@@ -800,6 +817,12 @@ void idRenderBackend::DrawStencilShadowPass( const drawSurf_t* drawSurf, const b
 		//}
 
 		commandList->setGraphicsState( state );
+
+		// nvrhi requires push constants to be (re)set after every setGraphicsState. The normal draw
+		// path does this (see the interaction path), but this stencil-shadow draw path omitted it - a
+		// no-op when push constants are disabled (e.g. AMD), but on GPUs where CONSTANT_BUFFER_ONLY
+		// uses push constants the shadow draw ran with none set and faulted. Commit them here too.
+		renderProgManager.CommitPushConstants( commandList, renderProgManager.BindingLayoutType() );
 	}
 
 	//
@@ -1164,6 +1187,36 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 		else
 		{
 			desc[1].bindings[0] = nvrhi::BindingSetItem::Sampler( 0, commonPasses.m_PointWrapSampler );
+		}
+	}
+	else if( type == BINDING_LAYOUT_DRAW_AO1 )
+	{
+		// analytic soft shadow volumes (wedge + resolve): constant buffer + one bound texture (scene
+		// depth for the wedge pass, the coverage accum for the resolve pass) + a sampler slot.
+		if( desc[0].bindings.empty() )
+		{
+			desc[0].bindings =
+			{
+				uniformsBindingSetItem,
+				nvrhi::BindingSetItem::Texture_SRV( 0, ( nvrhi::ITexture* )GetImageAt( 0 )->GetTextureID() )
+			};
+		}
+		else
+		{
+			desc[0].bindings[0] = uniformsBindingSetItem;
+			desc[0].bindings[1].resourceHandle = ( nvrhi::ITexture* )GetImageAt( 0 )->GetTextureID();
+		}
+
+		if( desc[1].bindings.empty() )
+		{
+			desc[1].bindings =
+			{
+				nvrhi::BindingSetItem::Sampler( 0, commonPasses.m_PointClampSampler )
+			};
+		}
+		else
+		{
+			desc[1].bindings[0] = nvrhi::BindingSetItem::Sampler( 0, commonPasses.m_PointClampSampler );
 		}
 	}
 	else if( type == BINDING_LAYOUT_DRAW_INTERACTION )

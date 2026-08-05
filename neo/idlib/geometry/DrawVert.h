@@ -819,6 +819,24 @@ ID_INLINE void idShadowVert::Clear()
 
 /*
 ===============================================================================
+Soft Shadow Wedge Vertex (analytic penumbra wedges)
+
+xyz is the wedge geometry position (world space); edge0/edge1 carry the silhouette
+edge's endpoints (world space, flat-interpolated in the shader) so the pixel shader
+can compute that edge's analytic coverage of the area light at the receiver it
+reconstructs from the depth buffer.
+===============================================================================
+*/
+class idSoftWedgeVert
+{
+public:
+	idVec4			clipPos;	// pre-transformed clip space (world->clip on CPU; GPU still divides + clips)
+	idVec4			edge0;		// xyz = silhouette edge endpoint 0 (world), w = silhouette weight [0,1]
+	idVec4			edge1;		// xyz = silhouette edge endpoint 1 (world), w unused
+};
+
+/*
+===============================================================================
 Skinned Shadow Vertex
 ===============================================================================
 */
