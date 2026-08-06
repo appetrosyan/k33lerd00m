@@ -165,6 +165,10 @@ idCVar idConsoleLocal::con_notifyTime( "con_notifyTime", "3", CVAR_SYSTEM, "time
 	idCVar idConsoleLocal::con_noPrint( "con_noPrint", "1", CVAR_BOOL | CVAR_SYSTEM | CVAR_NOCHEAT, "print on the console but not onscreen when console is pulled up" );
 #endif
 
+// showFPS perf overlay: the numbers are a running average over this many milliseconds and only
+// refresh that often, so a value holds still long enough to read instead of flickering every frame.
+idCVar com_perfAvgMS( "com_perfAvgMS", "500", CVAR_SYSTEM | CVAR_INTEGER | CVAR_ARCHIVE, "showFPS perf overlay: running-average window / refresh interval in milliseconds", 50, 5000 );
+
 /*
 =============================================================================
 
@@ -349,6 +353,70 @@ float idConsoleLocal::DrawFPS( float y )
 	previousCpuUsage[( index - 1 ) % FPS_FRAMES] = float( rendererCPUBusyTime ) / float( frameBusyTime + frameIdleTime ) * 100.0;
 	previousGpuUsage[( index - 1 ) % FPS_FRAMES] = float( rendererGPUTime ) / float( rendererGPUTime + rendererGPUIdleTime ) * 100.0;
 
+	// Windowed running average of every perf number: accumulate each frame, but only refresh the
+	// SHOWN values every com_perfAvgMS. The raw per-frame values jitter too fast to read; the shown
+	// values hold still for the window and update a couple of times a second. All widgets below read
+	// paShown[...] (window average), never the raw per-frame value.
+	enum
+	{
+		PA_GAMERF, PA_GAME, PA_RF, PA_RB, PA_SYNC, PA_MOC, PA_ENCODE,
+		PA_EARLYZ, PA_SSAO, PA_SSR, PA_AMBIENT, PA_INTER, PA_SOFTGPU,
+		PA_STENCIL, PA_SHADOWMAP, PA_RTMASK, PA_SHADERPASS, PA_TAA, PA_POSTFX,
+		PA_TOTCPU, PA_TOTGPU, PA_IDLECPU, PA_IDLEGPU, PA_CPUUSE, PA_GPUUSE,
+		PA_SW_COLLECT, PA_SW_LIGHTS, PA_SW_CASTERS, PA_SW_EDGES, PA_SW_MAXEDGES, PA_SW_EPC, PA_SW_DROPPED,
+		PA_COUNT
+	};
+	static double paAccum[PA_COUNT] = {};
+	static double paAccumSq[PA_COUNT] = {};
+	static double paShown[PA_COUNT] = {};	// window mean (what the widgets print)
+	static double paStd[PA_COUNT] = {};		// window standard deviation
+	static int    paFrames = 0;
+	static int    paLastMs = 0;
+
+	const int swCasters = commonLocal.stats_frontend.c_softShadowCasters;
+	const double paIn[PA_COUNT] =
+	{
+		double( gameThreadTotalTime ), double( gameThreadGameTime ), double( gameThreadRenderTime ),
+		double( rendererBackEndTime ), double( frameSyncTime ), double( rendererMaskedOcclusionCullingTime ),
+#if defined(__APPLE__) && defined( USE_MoltenVK )
+		double( rendererMvkEncodeTime ),
+#else
+		0.0,
+#endif
+		double( rendererGPUEarlyZTime ), double( rendererGPU_SSAOTime ), double( rendererGPU_SSRTime ),
+		double( rendererGPUAmbientPassTime ), double( rendererGPUInteractionsTime ), double( rendererGPUSoftShadowTime ),
+		double( rendererGPUStencilShadowTime ), double( rendererGPUShadowMapTime ), double( rendererGPURTShadowMaskTime ),
+		double( rendererGPUShaderPassesTime ), double( rendererGPU_TAATime ), double( rendererGPUPostProcessingTime ),
+		double( frameBusyTime ), double( rendererGPUTime ), double( frameIdleTime ), double( rendererGPUIdleTime ),
+		double( cpuUsage ), double( gpuUsage ),
+		double( commonLocal.stats_frontend.softShadowMicroSec ),
+		double( commonLocal.stats_frontend.c_softShadowLights ), double( swCasters ),
+		double( commonLocal.stats_frontend.c_softShadowEdges ), double( commonLocal.stats_frontend.c_softShadowMaxEdgesPerLight ),
+		double( swCasters > 0 ? commonLocal.stats_frontend.c_softShadowEdges / swCasters : 0 ),
+		double( commonLocal.stats_frontend.c_softShadowDroppedEdges )
+	};
+	for( int i = 0; i < PA_COUNT; i++ )
+	{
+		paAccum[i] += paIn[i];
+		paAccumSq[i] += paIn[i] * paIn[i];
+	}
+	paFrames++;
+	const int paNowMs = Sys_Milliseconds();
+	if( paNowMs - paLastMs >= com_perfAvgMS.GetInteger() && paFrames > 0 )
+	{
+		for( int i = 0; i < PA_COUNT; i++ )
+		{
+			const double mean = paAccum[i] / paFrames;
+			const double var = paAccumSq[i] / paFrames - mean * mean;	// E[x^2] - E[x]^2
+			paShown[i] = mean;
+			paStd[i] = var > 0.0 ? idMath::Sqrt( ( float )var ) : 0.0;
+			paAccum[i] = 0.0;
+			paAccumSq[i] = 0.0;
+		}
+		paFrames = 0;
+		paLastMs = paNowMs;
+	}
+
 	// RB: use ImGui to show more detailed stats about the scene loads
 	if( ImGuiHook::IsReadyToRender() )
 	{
@@ -518,20 +586,16 @@ float idConsoleLocal::DrawFPS( float y )
 			//  - edges + max/light = the per-fragment loop length driving GPU cost (cull / collection).
 			//  - dropped = load lost to the frame budget (raising it trades memory for coverage).
 			//  - edges/caster = silhouette granularity; casters = how many groups the shader unions.
-			if( commonLocal.stats_frontend.c_softShadowEdges > 0 || commonLocal.stats_frontend.softShadowMicroSec > 0 )
+			// values are window mean +- std (0-padded); std matters on the us timings, counts are steady.
+			if( paShown[PA_SW_EDGES] > 0.0 || paShown[PA_SW_COLLECT] > 0.0 )
 			{
-				const int swCasters = commonLocal.stats_frontend.c_softShadowCasters;
-				const int swEdgesPerCaster = swCasters > 0 ? commonLocal.stats_frontend.c_softShadowEdges / swCasters : 0;
-				ImGui::TextColored( colorOrange, "SOFT SHADOWS  CPU collect:%llu us   GPU draw:%llu us",
-									commonLocal.stats_frontend.softShadowMicroSec,
-									rendererGPUSoftShadowTime );
-				ImGui::TextColored( colorOrange, "   lights:%i casters:%i edges:%i  max/light:%i (loop len)  edges/caster:%i  dropped:%i",
-									commonLocal.stats_frontend.c_softShadowLights,
-									swCasters,
-									commonLocal.stats_frontend.c_softShadowEdges,
-									commonLocal.stats_frontend.c_softShadowMaxEdgesPerLight,
-									swEdgesPerCaster,
-									commonLocal.stats_frontend.c_softShadowDroppedEdges );
+				ImGui::TextColored( colorOrange, "SOFT SHADOWS  CPU collect:%06.0f+-%05.0f us   GPU draw:%06.0f+-%05.0f us",
+									paShown[PA_SW_COLLECT], paStd[PA_SW_COLLECT],
+									paShown[PA_SOFTGPU], paStd[PA_SOFTGPU] );
+				ImGui::TextColored( colorOrange, "   lights:%02.0f casters:%04.0f edges:%06.0f  max/light:%05.0f+-%04.0f (loop len)  edges/caster:%03.0f  dropped:%05.0f",
+									paShown[PA_SW_LIGHTS], paShown[PA_SW_CASTERS], paShown[PA_SW_EDGES],
+									paShown[PA_SW_MAXEDGES], paStd[PA_SW_MAXEDGES],
+									paShown[PA_SW_EPC], paShown[PA_SW_DROPPED] );
 			}
 
 			ImGui::TextColored( colorLtGrey, "viewEntities:%-3i  shadowEntities:%-3i  viewLights:%i\n",	commonLocal.stats_frontend.c_visibleViewEntities,
@@ -562,42 +626,42 @@ float idConsoleLocal::DrawFPS( float y )
 
 		ImGui::Spacing();
 
-		// CPU thread timings - core stages always shown; optional stages only when they ran this frame.
-		ImGui::TextColored( colorMdGrey, "CPU" );
-		ImGui::TextColored( gameThreadTotalTime > maxTime ? colorRed : colorWhite,	"  Game+RF: %5llu us", gameThreadTotalTime );
-		ImGui::TextColored( gameThreadGameTime > maxTime ? colorRed : colorWhite,	"  Game:    %5llu us", gameThreadGameTime );
-		ImGui::TextColored( gameThreadRenderTime > maxTime ? colorRed : colorWhite,	"  RF:      %5llu us", gameThreadRenderTime );
-		ImGui::TextColored( rendererBackEndTime > maxTime ? colorRed : colorWhite,	"  RB:      %5llu us", rendererBackEndTime );
+		// CPU thread timings - core stages always shown; optional stages only when they ran.
+		// Every number is the window MEAN +- STANDARD DEVIATION, 0-padded, refreshed every com_perfAvgMS.
+		ImGui::TextColored( colorMdGrey, "CPU  (mean+-std us)" );
+		ImGui::TextColored( paShown[PA_GAMERF] > maxTime ? colorRed : colorWhite,	"  Game+RF: %06.0f+-%05.0f", paShown[PA_GAMERF], paStd[PA_GAMERF] );
+		ImGui::TextColored( paShown[PA_GAME] > maxTime ? colorRed : colorWhite,		"  Game:    %06.0f+-%05.0f", paShown[PA_GAME], paStd[PA_GAME] );
+		ImGui::TextColored( paShown[PA_RF] > maxTime ? colorRed : colorWhite,		"  RF:      %06.0f+-%05.0f", paShown[PA_RF], paStd[PA_RF] );
+		ImGui::TextColored( paShown[PA_RB] > maxTime ? colorRed : colorWhite,		"  RB:      %06.0f+-%05.0f", paShown[PA_RB], paStd[PA_RB] );
 #if defined(__APPLE__) && defined( USE_MoltenVK )
-		// Vulkan -> Metal encoding thread time (macOS / MoltenVK only)
-		ImGui::TextColored( rendererMvkEncodeTime > maxTime ? colorRed : colorWhite,	"  Encode:  %5lld us", rendererMvkEncodeTime );
+		ImGui::TextColored( paShown[PA_ENCODE] > maxTime ? colorRed : colorWhite,	"  Encode:  %06.0f+-%05.0f", paShown[PA_ENCODE], paStd[PA_ENCODE] );
 #endif
-		if( rendererMaskedOcclusionCullingTime > 0 )
+		if( paShown[PA_MOC] > 0.0 )
 		{
-			ImGui::TextColored( rendererMaskedOcclusionCullingTime > maxTime ? colorRed : colorWhite, "  MOC:     %5llu us", rendererMaskedOcclusionCullingTime );
+			ImGui::TextColored( paShown[PA_MOC] > maxTime ? colorRed : colorWhite,	"  MOC:     %06.0f+-%05.0f", paShown[PA_MOC], paStd[PA_MOC] );
 		}
-		ImGui::TextColored( frameSyncTime > maxTime ? colorRed : colorWhite,			"  Sync:    %5lld us", frameSyncTime );
+		ImGui::TextColored( paShown[PA_SYNC] > maxTime ? colorRed : colorWhite,		"  Sync:    %06.0f+-%05.0f", paShown[PA_SYNC], paStd[PA_SYNC] );
 
-		// GPU pass timings - a pass that is disabled reads 0 and is omitted, so only active work shows.
-		// (Interactions is the whole lighting pass; "of which Soft" is the soft-shadowed-lights subset of it.)
-		ImGui::TextColored( colorMdGrey, "GPU" );
-		if( rendererGPUEarlyZTime > 0 )			{ ImGui::TextColored( rendererGPUEarlyZTime > maxTime ? colorRed : colorWhite,		"  EarlyZ:        %5llu us", rendererGPUEarlyZTime ); }
-		if( rendererGPU_SSAOTime > 0 )			{ ImGui::TextColored( rendererGPU_SSAOTime > maxTime ? colorRed : colorWhite,		"  SSAO:          %5llu us", rendererGPU_SSAOTime ); }
-		if( rendererGPU_SSRTime > 0 )			{ ImGui::TextColored( rendererGPU_SSRTime > maxTime ? colorRed : colorWhite,			"  SSR:           %5llu us", rendererGPU_SSRTime ); }
-		if( rendererGPUAmbientPassTime > 0 )	{ ImGui::TextColored( rendererGPUAmbientPassTime > maxTime ? colorRed : colorWhite,	"  Ambient Pass:  %5llu us", rendererGPUAmbientPassTime ); }
-		if( rendererGPUInteractionsTime > 0 )	{ ImGui::TextColored( rendererGPUInteractionsTime > maxTime ? colorRed : colorWhite,	"  Interactions:  %5llu us", rendererGPUInteractionsTime ); }
-		if( rendererGPUSoftShadowTime > 0 )		{ ImGui::TextColored( rendererGPUSoftShadowTime > maxTime ? colorRed : colorOrange,	"    of wh. Soft: %5llu us", rendererGPUSoftShadowTime ); }
-		if( rendererGPUStencilShadowTime > 0 )	{ ImGui::TextColored( rendererGPUStencilShadowTime > maxTime ? colorRed : colorWhite,	"  Stencil Shdw:  %5llu us", rendererGPUStencilShadowTime ); }
-		if( rendererGPUShadowMapTime > 0 )		{ ImGui::TextColored( rendererGPUShadowMapTime > maxTime ? colorRed : colorWhite,	"  Shadow Maps:   %5llu us", rendererGPUShadowMapTime ); }
-		if( rendererGPURTShadowMaskTime > 0 )	{ ImGui::TextColored( rendererGPURTShadowMaskTime > maxTime ? colorRed : colorWhite,	"  RT Shdw Mask:  %5llu us", rendererGPURTShadowMaskTime ); }
-		if( rendererGPUShaderPassesTime > 0 )	{ ImGui::TextColored( rendererGPUShaderPassesTime > maxTime ? colorRed : colorWhite,	"  Shader Pass:   %5llu us", rendererGPUShaderPassesTime ); }
-		if( rendererGPU_TAATime > 0 )			{ ImGui::TextColored( rendererGPU_TAATime > maxTime ? colorRed : colorWhite,			"  TAA:           %5llu us", rendererGPU_TAATime ); }
-		if( rendererGPUPostProcessingTime > 0 )	{ ImGui::TextColored( rendererGPUPostProcessingTime > maxTime ? colorRed : colorWhite,	"  PostFX:        %5llu us", rendererGPUPostProcessingTime ); }
+		// GPU pass timings - a disabled pass averages 0 and is omitted, so only active work shows.
+		// (Interactions is the whole lighting pass; "of wh. Soft" is the soft-shadowed-lights subset.)
+		ImGui::TextColored( colorMdGrey, "GPU  (mean+-std us)" );
+		if( paShown[PA_EARLYZ] > 0.0 )		{ ImGui::TextColored( paShown[PA_EARLYZ] > maxTime ? colorRed : colorWhite,		"  EarlyZ:        %06.0f+-%05.0f", paShown[PA_EARLYZ], paStd[PA_EARLYZ] ); }
+		if( paShown[PA_SSAO] > 0.0 )		{ ImGui::TextColored( paShown[PA_SSAO] > maxTime ? colorRed : colorWhite,		"  SSAO:          %06.0f+-%05.0f", paShown[PA_SSAO], paStd[PA_SSAO] ); }
+		if( paShown[PA_SSR] > 0.0 )			{ ImGui::TextColored( paShown[PA_SSR] > maxTime ? colorRed : colorWhite,			"  SSR:           %06.0f+-%05.0f", paShown[PA_SSR], paStd[PA_SSR] ); }
+		if( paShown[PA_AMBIENT] > 0.0 )		{ ImGui::TextColored( paShown[PA_AMBIENT] > maxTime ? colorRed : colorWhite,		"  Ambient Pass:  %06.0f+-%05.0f", paShown[PA_AMBIENT], paStd[PA_AMBIENT] ); }
+		if( paShown[PA_INTER] > 0.0 )		{ ImGui::TextColored( paShown[PA_INTER] > maxTime ? colorRed : colorWhite,		"  Interactions:  %06.0f+-%05.0f", paShown[PA_INTER], paStd[PA_INTER] ); }
+		if( paShown[PA_SOFTGPU] > 0.0 )		{ ImGui::TextColored( paShown[PA_SOFTGPU] > maxTime ? colorRed : colorOrange,	"    of wh. Soft: %06.0f+-%05.0f", paShown[PA_SOFTGPU], paStd[PA_SOFTGPU] ); }
+		if( paShown[PA_STENCIL] > 0.0 )		{ ImGui::TextColored( paShown[PA_STENCIL] > maxTime ? colorRed : colorWhite,		"  Stencil Shdw:  %06.0f+-%05.0f", paShown[PA_STENCIL], paStd[PA_STENCIL] ); }
+		if( paShown[PA_SHADOWMAP] > 0.0 )	{ ImGui::TextColored( paShown[PA_SHADOWMAP] > maxTime ? colorRed : colorWhite,	"  Shadow Maps:   %06.0f+-%05.0f", paShown[PA_SHADOWMAP], paStd[PA_SHADOWMAP] ); }
+		if( paShown[PA_RTMASK] > 0.0 )		{ ImGui::TextColored( paShown[PA_RTMASK] > maxTime ? colorRed : colorWhite,		"  RT Shdw Mask:  %06.0f+-%05.0f", paShown[PA_RTMASK], paStd[PA_RTMASK] ); }
+		if( paShown[PA_SHADERPASS] > 0.0 )	{ ImGui::TextColored( paShown[PA_SHADERPASS] > maxTime ? colorRed : colorWhite,	"  Shader Pass:   %06.0f+-%05.0f", paShown[PA_SHADERPASS], paStd[PA_SHADERPASS] ); }
+		if( paShown[PA_TAA] > 0.0 )			{ ImGui::TextColored( paShown[PA_TAA] > maxTime ? colorRed : colorWhite,			"  TAA:           %06.0f+-%05.0f", paShown[PA_TAA], paStd[PA_TAA] ); }
+		if( paShown[PA_POSTFX] > 0.0 )		{ ImGui::TextColored( paShown[PA_POSTFX] > maxTime ? colorRed : colorWhite,		"  PostFX:        %06.0f+-%05.0f", paShown[PA_POSTFX], paStd[PA_POSTFX] ); }
 
 		// overall busy / idle / utilisation
-		ImGui::TextColored( frameBusyTime > maxTime || rendererGPUTime > maxTime ? colorRed : colorWhite, "Total:  CPU %5lld us   GPU %5llu us", frameBusyTime, rendererGPUTime );
-		ImGui::TextColored( colorWhite,	"Idle:   CPU %5lld us   GPU %5lld us", frameIdleTime, rendererGPUIdleTime );
-		ImGui::TextColored( colorWhite,	"Frame:  CPU %3.0f %%    GPU %3.0f %%", cpuUsage, gpuUsage );
+		ImGui::TextColored( ( paShown[PA_TOTCPU] > maxTime || paShown[PA_TOTGPU] > maxTime ) ? colorRed : colorWhite, "Total:  CPU %06.0f+-%05.0f   GPU %06.0f+-%05.0f us", paShown[PA_TOTCPU], paStd[PA_TOTCPU], paShown[PA_TOTGPU], paStd[PA_TOTGPU] );
+		ImGui::TextColored( colorWhite,	"Idle:   CPU %06.0f+-%05.0f   GPU %06.0f+-%05.0f us", paShown[PA_IDLECPU], paStd[PA_IDLECPU], paShown[PA_IDLEGPU], paStd[PA_IDLEGPU] );
+		ImGui::TextColored( colorWhite,	"Frame:  CPU %03.0f+-%02.0f    GPU %03.0f+-%02.0f %%", paShown[PA_CPUUSE], paStd[PA_CPUUSE], paShown[PA_GPUUSE], paStd[PA_GPUUSE] );
 
 		ImGui::End();
 	}
