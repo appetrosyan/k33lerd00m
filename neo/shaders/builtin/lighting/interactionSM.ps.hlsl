@@ -210,24 +210,13 @@ void main( PS_IN fragment, out PS_OUT result )
 
 	float swOcc = 0.0;				// max occlusion across casters
 	float swArea = 0.0;				// signed disk-intersection area for the current caster
-	float curCaster = -1.0;
+	bool  haveCaster = false;		// opened a caster (seen its header record) yet?
 	bool  swSkip = false;			// current caster culled: its bounding sphere can't reach the light disk
+	const float swEps = 1e-3;
 	for( int se = 0; se < swN; se++ )
 	{
 		float4 e0 = t_SoftEdges[swFirstElem + se * 2 + 0];
 		float4 e1 = t_SoftEdges[swFirstElem + se * 2 + 1];
-		float  id = e1.w;
-		if( id != curCaster )
-		{
-			if( curCaster >= 0.0 )
-			{
-				swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
-				if( swOcc >= 0.999 ) { break; }		// fully occluded: no remaining caster can raise the max past 1
-			}
-			curCaster = id;
-			swArea = 0.0;
-			swSkip = false;
-		}
 		// Per-caster bounding-sphere cull. The header record (e0.w < 0, one per caster from the frontend
 		// flatten) carries the caster's world bounding sphere: centre e0.xyz, radius e1.x. Only the DEPTH
 		// reject is applied: skip the caster when its sphere lies entirely behind the receiver or entirely
@@ -242,12 +231,20 @@ void main( PS_IN fragment, out PS_OUT result )
 		// vertex at dn->0 projects to radius proportional to 1/dn, so an angularly-off caster can still sweep
 		// a winding sector across the disk; angular-culling it there drops real penumbra (the corruption AO-4
 		// fixed). So we apply the angular reject only in the safe (fully-in-front) regime.
-		if( e0.w < 0.0 )
+		if( e0.w < 0.0 )		// header record = caster boundary: finalize the previous caster here (no per-edge id compare)
 		{
+			if( haveCaster )
+			{
+				swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
+				if( swOcc >= 0.999 ) { break; }		// fully occluded: no remaining caster can raise the max past 1
+			}
+			haveCaster = true;
+			swArea = 0.0;
+			swSkip = false;
 			float3 dCv  = e0.xyz - swP;
 			float  cRad = e1.x;
 			float  dCn  = dot( dCv, swNrm );						// sphere-centre depth along receiver->light
-			if( dCn + cRad < 1e-3 || dCn - cRad > swDistPL )		// wholly behind receiver, or wholly beyond light
+			if( dCn + cRad < swEps || dCn - cRad > swDistPL )		// wholly behind receiver, or wholly beyond light
 			{
 				swSkip = true;
 				continue;
@@ -274,22 +271,24 @@ void main( PS_IN fragment, out PS_OUT result )
 		// edge fully behind the receiver, or fully BEYOND the light, can't occlude - and a beyond-light
 		// caster's silhouette spuriously encloses the disk (uniform over-occlusion). Clipping keeps the
 		// loop closed at both planes.
-		float3 A = e0.xyz, B = e1.xyz;
-		float  dnA = dot( A - swP, swNrm );
-		float  dnB = dot( B - swP, swNrm );
-		const float swEps = 1e-3;
+		// Receiver-relative coords a=A-swP, b=B-swP: computed ONCE and reused for both the slab depth (dot with
+		// swNrm) and the disk projection (dot with swU/swV), instead of re-subtracting swP inside the projection.
+		// Clipping is affine so it is identical in this space; projection is (swDistPL/dn)*(dot(a,swU),dot(a,swV))
+		// because dot(L-P,swNrm) == swDistPL and the disk basis (swU,swV) is perpendicular to swNrm.
+		float3 a = e0.xyz - swP;
+		float3 b = e1.xyz - swP;
+		float  dnA = dot( a, swNrm );
+		float  dnB = dot( b, swNrm );
 		if( ( dnA < swEps && dnB < swEps ) || ( dnA > swDistPL && dnB > swDistPL ) ) { continue; }
-		if( dnA < swEps )     { A = A + ( ( swEps - dnA ) / ( dnB - dnA ) ) * ( B - A ); dnA = swEps; }
-		if( dnB < swEps )     { B = B + ( ( swEps - dnB ) / ( dnA - dnB ) ) * ( A - B ); dnB = swEps; }
-		if( dnA > swDistPL )  { A = A + ( ( swDistPL - dnA ) / ( dnB - dnA ) ) * ( B - A ); dnA = swDistPL; }
-		if( dnB > swDistPL )  { B = B + ( ( swDistPL - dnB ) / ( dnA - dnB ) ) * ( A - B ); dnB = swDistPL; }
-		// Both endpoints are slab-clipped to dn in [swEps, swDistPL], so the projection is always valid and
-		// finite - use the fast clipped projection (no bool, no Q/rel, no dot(L-P,n)) and skip the NaN guard.
-		float2 qa = SoftDisk_ProjClipped( A, swP, dnA, swDistPL, swU, swV );
-		float2 qb = SoftDisk_ProjClipped( B, swP, dnB, swDistPL, swU, swV );
+		if( dnA < swEps )     { a = a + ( ( swEps - dnA ) / ( dnB - dnA ) ) * ( b - a ); dnA = swEps; }
+		if( dnB < swEps )     { b = b + ( ( swEps - dnB ) / ( dnA - dnB ) ) * ( a - b ); dnB = swEps; }
+		if( dnA > swDistPL )  { a = a + ( ( swDistPL - dnA ) / ( dnB - dnA ) ) * ( b - a ); dnA = swDistPL; }
+		if( dnB > swDistPL )  { b = b + ( ( swDistPL - dnB ) / ( dnA - dnB ) ) * ( a - b ); dnB = swDistPL; }
+		float2 qa = ( swDistPL / dnA ) * float2( dot( a, swU ), dot( a, swV ) );
+		float2 qb = ( swDistPL / dnB ) * float2( dot( b, swU ), dot( b, swV ) );
 		swArea += SoftDisk_CircleTriArea( qa, qb, swR );
 	}
-	if( curCaster >= 0.0 ) { swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) ); }	// last caster
+	if( haveCaster ) { swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) ); }	// last caster
 	float shadow = 1.0 - saturate( swOcc );
 	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
 #elif USE_RT_SHADOW
