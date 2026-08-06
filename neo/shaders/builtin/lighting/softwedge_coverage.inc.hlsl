@@ -46,6 +46,19 @@ bool SoftDisk_Project( float3 A, float3 P, float3 L, float3 n, float3 u, float3 
 	return true;
 }
 
+// Fast path for a vertex that the caller has ALREADY slab-clipped: its depth dn = dot(A-P,n) is known and
+// guaranteed in [swEps, distPL], so the projection can never fail (no bool) and never produce NaN/Inf. Two
+// identities collapse the general Project: (1) dot(L-P,n) is exactly distPL because n = (L-P)/|L-P|, so
+// s = distPL/dn - no re-derivation; (2) the disk basis (u,v) is perpendicular to n, so dot(L-P,u)=dot(L-P,v)=0
+// and the disk-plane offset is simply s*(dot(dir,u), dot(dir,v)) - no Q/rel reconstruction. Algebraically
+// identical to SoftDisk_Project, just far fewer ops on the hot per-edge path.
+float2 SoftDisk_ProjClipped( float3 A, float3 P, float dn, float distPL, float3 u, float3 v )
+{
+	float3 dir = A - P;
+	float  s   = distPL / dn;
+	return s * float2( dot( dir, u ), dot( dir, v ) );
+}
+
 // Signed area of the disk (centre origin, radius r) intersected with the triangle (origin, A, B). Summed
 // over a closed loop's directed edges this yields the signed area of disk INTERSECT polygon. Handles the
 // four clip cases: both endpoints in; one in one out; segment crossing; segment entirely outside (a pure

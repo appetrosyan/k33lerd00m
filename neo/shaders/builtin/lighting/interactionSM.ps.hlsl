@@ -204,6 +204,9 @@ void main( PS_IN fragment, out PS_OUT result )
 	float3 swU   = normalize( cross( swUp, swNrm ) );
 	float3 swV   = cross( swNrm, swU );
 	float  swDiskArea = PI * swR * swR;
+	float  swInvDiskArea = 1.0 / swDiskArea;					// hoisted: per-caster finalize multiplies instead of divides
+	float  swSinA     = saturate( swR / swDistPL );				// sin of the light-disk half-angle from P (caster-invariant)
+	float  swCosA     = sqrt( 1.0 - swSinA * swSinA );			// cos of it; used by the cheap per-caster angular cull
 
 	float swOcc = 0.0;				// max occlusion across casters
 	float swArea = 0.0;				// signed disk-intersection area for the current caster
@@ -218,7 +221,7 @@ void main( PS_IN fragment, out PS_OUT result )
 		{
 			if( curCaster >= 0.0 )
 			{
-				swOcc = max( swOcc, saturate( abs( swArea ) / swDiskArea ) );
+				swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
 				if( swOcc >= 0.999 ) { break; }		// fully occluded: no remaining caster can raise the max past 1
 			}
 			curCaster = id;
@@ -226,26 +229,39 @@ void main( PS_IN fragment, out PS_OUT result )
 			swSkip = false;
 		}
 		// Per-caster bounding-sphere cull. The header record (e0.w < 0, one per caster from the frontend
-		// flatten) carries the caster's world bounding sphere: centre e0.xyz, radius e1.x. Skip the whole
-		// caster (unit-test verified conservative) when it cannot occlude this fragment's light disk, by
-		// two cheap rejects: (1) DEPTH - the sphere lies entirely behind the receiver or entirely beyond
-		// the light plane (matches the per-edge slab clip below at caster granularity, so lossless); and
-		// (2) ANGLE - the sphere's angular extent from the receiver can't reach the disk's angular extent.
+		// flatten) carries the caster's world bounding sphere: centre e0.xyz, radius e1.x. Only the DEPTH
+		// reject is applied: skip the caster when its sphere lies entirely behind the receiver or entirely
+		// beyond the light plane. Provably lossless vs the full loop - a sphere wholly behind the receiver
+		// has every vertex dn < swEps, one wholly beyond the light has every vertex dn > swDistPL, so the
+		// per-edge slab clip below drops every one of that caster's edges anyway (identical zero contribution).
+		// The ANGULAR "sphere cone misses the disk" reject is GATED (AO-4): it is only conservative when the
+		// sphere is fully in FRONT of the receiver near-plane (dCn - cRad > swEps). There every silhouette
+		// vertex has dn > swEps, so its disk-plane projection radius is bounded (no 1/dn blowup) and the
+		// sphere's angular cone genuinely bounds the silhouette's projection - a cone entirely off the disk
+		// gives a loop that winds zero disk area (0 coverage). When the sphere STRADDLES the near-plane a
+		// vertex at dn->0 projects to radius proportional to 1/dn, so an angularly-off caster can still sweep
+		// a winding sector across the disk; angular-culling it there drops real penumbra (the corruption AO-4
+		// fixed). So we apply the angular reject only in the safe (fully-in-front) regime.
 		if( e0.w < 0.0 )
 		{
-			float3 dCv   = e0.xyz - swP;
-			float  cRad  = e1.x;
-			float  dCn   = dot( dCv, swNrm );						// sphere-centre depth along receiver->light
+			float3 dCv  = e0.xyz - swP;
+			float  cRad = e1.x;
+			float  dCn  = dot( dCv, swNrm );						// sphere-centre depth along receiver->light
 			if( dCn + cRad < 1e-3 || dCn - cRad > swDistPL )		// wholly behind receiver, or wholly beyond light
 			{
 				swSkip = true;
 				continue;
 			}
-			float  dClen = max( length( dCv ), 1e-4 );
-			float  alpha = asin( saturate( swR / swDistPL ) );		// light-disk angular radius from P
-			float  beta  = asin( saturate( cRad / dClen ) );		// caster-sphere angular radius from P
-			float  ang   = acos( clamp( dot( dCv / dClen, swNrm ), -1.0, 1.0 ) );
-			swSkip = ( ang > alpha + beta + 1e-3 );
+			if( dCn - cRad > 1e-3 )									// sphere fully in front of the near-plane: angular reject is safe
+			{
+				// Cull when the caster-sphere cone and the light-disk cone are angularly disjoint (ang >
+				// alpha+beta), computed WITHOUT transcendentals: cos(ang) < cos(alpha+beta), both sides x dClen
+				// -> dCn < cosA*sqrt(dClen^2 - cRad^2) - sinA*cRad. sinA/cosA (the disk half-angle) are
+				// caster-invariant and hoisted (swSinA/swCosA). One sqrt, no asin/acos, so a MISS is ~free -
+				// the test no longer taxes the casters it fails to cull. Gate above keeps it conservative.
+				float front = max( dot( dCv, dCv ) - cRad * cRad, 0.0 );
+				swSkip = ( dCn < swCosA * sqrt( front ) - swSinA * cRad );
+			}
 			continue;
 		}
 		if( swSkip ) { continue; }
@@ -267,15 +283,13 @@ void main( PS_IN fragment, out PS_OUT result )
 		if( dnB < swEps )     { B = B + ( ( swEps - dnB ) / ( dnA - dnB ) ) * ( A - B ); dnB = swEps; }
 		if( dnA > swDistPL )  { A = A + ( ( swDistPL - dnA ) / ( dnB - dnA ) ) * ( B - A ); dnA = swDistPL; }
 		if( dnB > swDistPL )  { B = B + ( ( swDistPL - dnB ) / ( dnA - dnB ) ) * ( A - B ); dnB = swDistPL; }
-		float2 qa, qb;
-		if( SoftDisk_Project( A, swP, swL, swNrm, swU, swV, qa ) &&
-			SoftDisk_Project( B, swP, swL, swNrm, swU, swV, qb ) )
-		{
-			float edgeArea = SoftDisk_CircleTriArea( qa, qb, swR );
-			if( !isnan( edgeArea ) && !isinf( edgeArea ) ) { swArea += edgeArea; }
-		}
+		// Both endpoints are slab-clipped to dn in [swEps, swDistPL], so the projection is always valid and
+		// finite - use the fast clipped projection (no bool, no Q/rel, no dot(L-P,n)) and skip the NaN guard.
+		float2 qa = SoftDisk_ProjClipped( A, swP, dnA, swDistPL, swU, swV );
+		float2 qb = SoftDisk_ProjClipped( B, swP, dnB, swDistPL, swU, swV );
+		swArea += SoftDisk_CircleTriArea( qa, qb, swR );
 	}
-	if( curCaster >= 0.0 ) { swOcc = max( swOcc, saturate( abs( swArea ) / swDiskArea ) ); }	// last caster
+	if( curCaster >= 0.0 ) { swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) ); }	// last caster
 	float shadow = 1.0 - saturate( swOcc );
 	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
 #elif USE_RT_SHADOW
