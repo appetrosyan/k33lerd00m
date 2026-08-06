@@ -389,6 +389,9 @@ private:
 	nvrhi::BindingLayoutHandle		currentBindingLayout;
 	nvrhi::IBuffer*					currentJointBuffer;
 	uint							currentJointOffset;
+	nvrhi::IBuffer*					currentSoftEdgeBuffer;	// analytic soft shadows: this light's silhouette-edge buffer (t12)
+	uint							currentSoftEdgeOffset;
+	int								currentSoftEdgeCount;
 	nvrhi::GraphicsPipelineHandle	currentPipeline;
 
 	idStaticList<nvrhi::BindingSetHandle, nvrhi::c_MaxBindingLayouts> currentBindingSets;

@@ -87,6 +87,11 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 		rpLayoutItem = nvrhi::BindingLayoutItem::PushConstants( 0, layoutTypeAttributes[layoutType].rpBufSize );
 	}
 
+	// Analytic soft shadows: the SM_SOFT layouts carry this light's silhouette-edge StructuredBuffer at
+	// t12 (the interaction pixel shader loops it against the exact receiver position). Isolated from the
+	// shared SM layout so shadow-mapped lights are untouched.
+	const bool soft = ( layoutType == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT ) || ( layoutType == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED );
+
 	// SRS - Create and return uniforms layout based on above choices and skinning enablement
 	if( skinning )
 	{
@@ -94,6 +99,10 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 								  .setVisibility( nvrhi::ShaderType::All )
 								  .addItem( rpLayoutItem )
 								  .addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 11 ) ); // joint buffer;
+		if( soft )
+		{
+			skinningLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 12 ) ); // soft-shadow edges
+		}
 
 		return device->createBindingLayout( skinningLayoutDesc );
 	}
@@ -102,6 +111,10 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 		auto uniformsLayoutDesc = nvrhi::BindingLayoutDesc()
 								  .setVisibility( nvrhi::ShaderType::All )
 								  .addItem( rpLayoutItem );
+		if( soft )
+		{
+			uniformsLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 12 ) ); // soft-shadow edges
+		}
 
 		return device->createBindingLayout( uniformsLayoutDesc );
 	}
@@ -570,6 +583,16 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 	{
 		uniformsLayout( BINDING_LAYOUT_DRAW_INTERACTION_SM_SKINNED, true ), defaultMaterialLayout, interactionSmBindingLayout, samplerFourBindingLayout
 	};
+	// Analytic soft shadows: same texture/sampler layout as SM, but the uniforms set carries the
+	// silhouette-edge StructuredBuffer at t12 (added inside uniformsLayout for the SOFT types).
+	bindingLayouts[BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT] =
+	{
+		uniformsLayout( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT, false ), defaultMaterialLayout, interactionSmBindingLayout, samplerFourBindingLayout
+	};
+	bindingLayouts[BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED] =
+	{
+		uniformsLayout( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED, true ), defaultMaterialLayout, interactionSmBindingLayout, samplerFourBindingLayout
+	};
 
 	auto fogBindingLayoutDesc = nvrhi::BindingLayoutDesc()
 								.setVisibility( nvrhi::ShaderType::Pixel )
@@ -991,6 +1014,14 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		{ BUILTIN_SOFT_WEDGE_SPHERE, "builtin/lighting/softwedge", "", { { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_AO1 ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_SOFT_WEDGE_VERT, BINDING_LAYOUT_DRAW_AO1 },
 		// resolve accumulated coverage -> visibility (fullscreen, reads the R32F accum)
 		{ BUILTIN_SOFT_WEDGE_RESOLVE, "builtin/lighting/softwedge_resolve", "", { { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_AO1 ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_AO1 },
+
+		// analytic soft shadows: per-fragment silhouette-edge coverage (USE_SOFT_WEDGE), own binding layout (edge buffer at t12). Appended at END to keep builtins[i].index == i.
+		{ BUILTIN_INTERACTION_SOFT_WEDGE_SPOT, "builtin/lighting/interactionSM", "_softwedge_spot", { { "USE_GPU_SKINNING", "0" }, { "LIGHT_POINT", "0" }, { "LIGHT_PARALLEL", "0" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT },
+		{ BUILTIN_INTERACTION_SOFT_WEDGE_SPOT_SKINNED, "builtin/lighting/interactionSM", "_softwedge_spot_skinned", { { "USE_GPU_SKINNING", "1" }, { "LIGHT_POINT", "0" }, { "LIGHT_PARALLEL", "0" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED },
+		{ BUILTIN_INTERACTION_SOFT_WEDGE_POINT, "builtin/lighting/interactionSM", "_softwedge_point", { { "USE_GPU_SKINNING", "0" }, { "LIGHT_POINT", "1" }, { "LIGHT_PARALLEL", "0" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT },
+		{ BUILTIN_INTERACTION_SOFT_WEDGE_POINT_SKINNED, "builtin/lighting/interactionSM", "_softwedge_point_skinned", { { "USE_GPU_SKINNING", "1" }, { "LIGHT_POINT", "1" }, { "LIGHT_PARALLEL", "0" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED },
+		{ BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL, "builtin/lighting/interactionSM", "_softwedge_parallel", { { "USE_GPU_SKINNING", "0" }, { "LIGHT_POINT", "0" }, { "LIGHT_PARALLEL", "1" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT },
+		{ BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL_SKINNED, "builtin/lighting/interactionSM", "_softwedge_parallel_skinned", { { "USE_GPU_SKINNING", "1" }, { "LIGHT_POINT", "0" }, { "LIGHT_PARALLEL", "1" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED },
 	};
 	int numBuiltins = sizeof( builtins ) / sizeof( builtins[0] );
 

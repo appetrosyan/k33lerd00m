@@ -52,6 +52,17 @@ SamplerState 			s_Lighting : register( s1 VK_DESCRIPTOR_SET( 3 ) ); // for sampl
 SamplerComparisonState  s_Shadow   : register( s2 VK_DESCRIPTOR_SET( 3 ) ); // for the depth shadow map sampler with a compare function
 SamplerState 			s_Jitter   : register( s3 VK_DESCRIPTOR_SET( 3 ) ); // for sampling the jitter
 
+#if USE_SOFT_WEDGE
+// Analytic soft shadows (per-fragment path): this light's silhouette edges, evaluated against the
+// EXACT receiver world position. StructuredBuffer at t12 in the uniforms set (mirrors the joint
+// buffer at t11). rpJitterTexScale carries (R, minWidth, numEdges) for the soft path.
+#include "softwedge_coverage.inc.hlsl"
+// The buffer is the vertex-cache joint buffer, whose struct stride is sizeof(float4)=16. So read it as
+// float4 elements: each edge is TWO consecutive float4 (e0 = xyz world endpoint 0 + w silWeight; e1 =
+// xyz endpoint 1). Edge se lives at elements [se*2], [se*2+1].
+StructuredBuffer<float4> t_SoftEdges : register( t12 VK_DESCRIPTOR_SET( 0 ) );
+#endif
+
 struct PS_IN
 {
 	float4 position		: SV_Position;
@@ -163,7 +174,81 @@ void main( PS_IN fragment, out PS_OUT result )
 	//
 	// shadow mapping
 	//
-#if USE_RT_SHADOW
+#if USE_SOFT_WEDGE
+	// Analytic soft shadows: sum this light's silhouette-edge coverage against the EXACT receiver world
+	// position (model position texcoord7 -> world by the receiver's model matrix). No screen-space depth
+	// reconstruction, so no grazing instability; the umbra emerges where the summed occlusion saturates.
+	float4 swMP = float4( fragment.texcoord7.xyz, 1.0 );
+	float3 swP;
+	swP.x = dot4( pc.rpModelMatrixX, swMP );
+	swP.y = dot4( pc.rpModelMatrixY, swMP );
+	swP.z = dot4( pc.rpModelMatrixZ, swMP );
+
+	float3 swL    = pc.rpGlobalLightOrigin.xyz;
+	float  swR    = max( pc.rpJitterTexScale.x, 1e-2 );	// light disk radius (penumbra); floored so pi*r^2 != 0
+	int    swN    = int( pc.rpJitterTexScale.z );
+
+	// nvrhi doesn't apply the structured-buffer range byteOffset to the shader index, so index from an
+	// explicit first element (this light's edges start here), passed in rpJitterTexOffset.x.
+	int swFirstElem = int( pc.rpJitterTexOffset.x );
+
+	// Light-disk coverage combine. Build the area light's disk (centre swL, radius swR) facing the receiver
+	// and a 2D basis (swU,swV). For each caster (edges tagged with a group id in e1.w) accumulate the signed
+	// area of disk INTERSECT its projected silhouette; the occluded fraction is |area| / (pi r^2). This is
+	// winding-correct -> exact for NON-CONVEX casters (unlike a per-edge MIN). Casters union by max. A caster
+	// with any vertex not toward the light (receiver in front of it) can't cleanly shadow P -> contributes 0.
+	float3 swToL    = swL - swP;
+	float  swDistPL = max( length( swToL ), 1e-4 );		// receiver->light distance; casters beyond it can't occlude
+	float3 swNrm = swToL / swDistPL;
+	float3 swUp  = ( abs( swNrm.z ) > 0.9 ) ? float3( 0.0, 1.0, 0.0 ) : float3( 0.0, 0.0, 1.0 );
+	float3 swU   = normalize( cross( swUp, swNrm ) );
+	float3 swV   = cross( swNrm, swU );
+	float  swDiskArea = PI * swR * swR;
+
+	float swOcc = 0.0;				// max occlusion across casters
+	float swArea = 0.0;				// signed disk-intersection area for the current caster
+	float curCaster = -1.0;
+	for( int se = 0; se < swN; se++ )
+	{
+		float4 e0 = t_SoftEdges[swFirstElem + se * 2 + 0];
+		float4 e1 = t_SoftEdges[swFirstElem + se * 2 + 1];
+		float  id = e1.w;
+		if( id != curCaster )
+		{
+			if( curCaster >= 0.0 ) { swOcc = max( swOcc, saturate( abs( swArea ) / swDiskArea ) ); }
+			curCaster = id;
+			swArea = 0.0;
+		}
+		// Near-plane clip. A silhouette vertex behind the receiver (dn<=0, receiver in front of it) can't be
+		// projected onto the light disk. Do NOT skip the edge - that opens the loop and the shoelace closes
+		// the gap with a chord that spuriously encloses the disk (over-occlusion). Instead CLIP the edge to
+		// the near plane: the clipped endpoint lands on the disk horizon, which CircleTriArea treats as a
+		// boundary sector, keeping the loop closed. An edge entirely behind is dropped (that arc is beyond P).
+		// Clip the edge to the slab BETWEEN the receiver and the light plane (swEps < dn < swDistPL). An
+		// edge fully behind the receiver, or fully BEYOND the light, can't occlude - and a beyond-light
+		// caster's silhouette spuriously encloses the disk (uniform over-occlusion). Clipping keeps the
+		// loop closed at both planes.
+		float3 A = e0.xyz, B = e1.xyz;
+		float  dnA = dot( A - swP, swNrm );
+		float  dnB = dot( B - swP, swNrm );
+		const float swEps = 1e-3;
+		if( ( dnA < swEps && dnB < swEps ) || ( dnA > swDistPL && dnB > swDistPL ) ) { continue; }
+		if( dnA < swEps )     { A = A + ( ( swEps - dnA ) / ( dnB - dnA ) ) * ( B - A ); dnA = swEps; }
+		if( dnB < swEps )     { B = B + ( ( swEps - dnB ) / ( dnA - dnB ) ) * ( A - B ); dnB = swEps; }
+		if( dnA > swDistPL )  { A = A + ( ( swDistPL - dnA ) / ( dnB - dnA ) ) * ( B - A ); dnA = swDistPL; }
+		if( dnB > swDistPL )  { B = B + ( ( swDistPL - dnB ) / ( dnA - dnB ) ) * ( A - B ); dnB = swDistPL; }
+		float2 qa, qb;
+		if( SoftDisk_Project( A, swP, swL, swNrm, swU, swV, qa ) &&
+			SoftDisk_Project( B, swP, swL, swNrm, swU, swV, qb ) )
+		{
+			float edgeArea = SoftDisk_CircleTriArea( qa, qb, swR );
+			if( !isnan( edgeArea ) && !isinf( edgeArea ) ) { swArea += edgeArea; }
+		}
+	}
+	if( curCaster >= 0.0 ) { swOcc = max( swOcc, saturate( abs( swArea ) / swDiskArea ) ); }	// last caster
+	float shadow = 1.0 - saturate( swOcc );
+	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
+#elif USE_RT_SHADOW
 	// Ray-traced visibility: RtShadowsPass wrote a screen-space mask for this light.
 	// SV_Position matches the mask 1:1 (both at render resolution), so a direct Load
 	// replaces the entire light-space projection + PCF path below. t_ShadowAtlas is
@@ -486,8 +571,14 @@ void main( PS_IN fragment, out PS_OUT result )
 
 #endif // USE_RT_SHADOW
 
+#if !USE_SOFT_WEDGE
 	// allow shadows to fade out
+	// NOTE: the soft-wedge path repurposes rpJitterTexScale.z as the edge count (swN, read at the
+	// top of this file), so this fade floor MUST NOT run there - max( 1-swOcc, edgeCount ) saturates
+	// to 1.0 and clobbers every soft fragment to fully-lit (no shadow anywhere while the coverage
+	// loop still runs). The soft path's shadow = 1 - saturate(swOcc) flows straight to the combine.
 	shadow = saturate( max( shadow, pc.rpJitterTexScale.z ) );
+#endif
 
 	float3 halfAngleVector = normalize( lightVector + viewVector );
 	float hdotN = clamp( dot3( halfAngleVector, localNormal ), 0.0, 1.0 );
@@ -581,4 +672,16 @@ void main( PS_IN fragment, out PS_OUT result )
 
 	result.color.rgb = color;
 	result.color.a = 1.0;
+
+#if USE_SOFT_WEDGE
+	// DIAGNOSTIC (swDbg = rpJitterTexScale.w, set by r_softShadowDebugShader):
+	//   7 = solid red IF the debug PARAM arrived (red -> params reach the shader; normal scene -> they don't)
+	//   2 = receiver world position as RGB (smooth colour gradient -> swP valid; flat -> swP garbage)
+	//   6 = coverage: red = summed occlusion swOcc, green = -swOcc (any colour -> edges produce coverage)
+	//   0 = real shadows.
+	if( swDbg == 7 )      { result.color = float4( 1.0, 0.0, 0.0, 1.0 ); }				// solid red for any soft-lit fragment (does the soft path run?)
+	else if( swDbg == 2 ) { result.color = float4( frac( swP / 64.0 ), 1.0 ); }			// receiver world pos (smooth gradient => swP valid)
+	else if( swDbg == 6 ) { result.color = float4( saturate( swOcc ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
+	else if( swDbg == 9 ) { result.color = float4( frac( float( swFirstElem ) / 256.0 ), frac( float( swN ) / 64.0 ), 0.0, 1.0 ); }	// R = first-element param, G = edge count param
+#endif
 }

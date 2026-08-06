@@ -37,7 +37,7 @@ If you have questions concerning this license or the applicable additional terms
 
 	const int VERTCACHE_INDEX_MEMORY_PER_FRAME = 31 * 1024 * 1024;
 	const int VERTCACHE_VERTEX_MEMORY_PER_FRAME = 31 * 1024 * 1024;
-	const int VERTCACHE_JOINT_MEMORY_PER_FRAME = 256 * 1024;
+	const int VERTCACHE_JOINT_MEMORY_PER_FRAME = 64 * 1024 * 1024;	// holds skinning joints + per-frame soft-shadow edges
 
 	// there are a lot more static indexes than vertexes, because interactions are just new
 	// index lists that reference existing vertexes
@@ -64,7 +64,7 @@ If you have questions concerning this license or the applicable additional terms
 
 	const int VERTCACHE_INDEX_MEMORY_PER_FRAME = 31 * 1024 * 1024;
 	const int VERTCACHE_VERTEX_MEMORY_PER_FRAME = 31 * 1024 * 1024;
-	const int VERTCACHE_JOINT_MEMORY_PER_FRAME = 256 * 1024;
+	const int VERTCACHE_JOINT_MEMORY_PER_FRAME = 64 * 1024 * 1024;	// holds skinning joints + per-frame soft-shadow edges
 
 	// there are a lot more static indexes than vertexes, because interactions are just new
 	// index lists that reference existing vertexes

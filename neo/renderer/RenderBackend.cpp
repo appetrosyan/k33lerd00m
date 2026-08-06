@@ -111,7 +111,14 @@ static ID_INLINE bool R_LightUsesShadowMask( bool rtShadowsActiveThisView, const
 	{
 		return true;
 	}
+	// Soft VOLUMES: only route to the mask/soft-wedge variant when this light actually has silhouette
+	// edges this frame. A shadow-caster with softEdgeCount == 0 (produced no penumbra edges, or was
+	// dropped past the per-frame edge budget) would otherwise select the RT-mask interaction variant
+	// and sample a mask nothing wrote (the screen-space stamp is disabled, stencil is suppressed under
+	// soft mode) -> it renders unshadowed AND pays the mask-sample cost. Falling through to the plain
+	// lit interaction is the correct unshadowed result for such a light.
 	return r_useSoftShadowVolumes.GetBool()
+		   && vLight->softEdgeCount > 0
 		   && ( vLight->globalShadows != NULL || vLight->localShadows != NULL )
 		   && !vLight->parallel
 		   && !vLight->lightShader->IsAmbientLight();
@@ -1685,7 +1692,35 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 				{
 					// RB: we have shadow mapping enabled and shadow maps so do a shadow compare
 
-					if( r_useShadowAtlas.GetBool() )
+					// Analytic soft shadows: if this light has silhouette edges, evaluate penumbra coverage
+					// per fragment against the exact receiver position (no screen-space mask/reconstruction).
+					if( r_useSoftShadowVolumes.GetBool() && din->vLight->softEdgeCount > 0 )
+					{
+						extern idCVar r_shadowPenumbraSize;
+						extern idCVar r_shadowPenumbraMinWidth;
+
+						const vertCacheHandle_t eh = din->vLight->softEdgeCache;
+						currentSoftEdgeOffset = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+						currentSoftEdgeBuffer = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+						currentSoftEdgeCount = din->vLight->softEdgeCount;
+
+						float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), ( float )currentSoftEdgeCount, 0.0f };
+						SetVertexParm( RENDERPARM_JITTERTEXSCALE, swParm );
+
+						if( din->vLight->parallel )
+						{
+							renderProgManager.BindShader_Builtin( din->surf->jointCache ? BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL_SKINNED : BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL );
+						}
+						else if( din->vLight->pointLight )
+						{
+							renderProgManager.BindShader_Builtin( din->surf->jointCache ? BUILTIN_INTERACTION_SOFT_WEDGE_POINT_SKINNED : BUILTIN_INTERACTION_SOFT_WEDGE_POINT );
+						}
+						else
+						{
+							renderProgManager.BindShader_Builtin( din->surf->jointCache ? BUILTIN_INTERACTION_SOFT_WEDGE_SPOT_SKINNED : BUILTIN_INTERACTION_SOFT_WEDGE_SPOT );
+						}
+					}
+					else if( r_useShadowAtlas.GetBool() )
 					{
 						if( din->vLight->ImageAtlasPlaced() )
 						{
@@ -1800,6 +1835,30 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		const bool pbr = ( specUsage == TD_SPECULAR_PBR_RMAO || specUsage == TD_SPECULAR_PBR_RMAOD );
 		const bool skinned = ( din->surf->jointCache != 0 );
 
+		// Analytic soft shadows: this light carries silhouette edges, so evaluate penumbra coverage per
+		// fragment against the EXACT receiver position (no screen-space mask). Bind the edge buffer (the
+		// SRV-capable joint buffer) + (R, minWidth, numEdges), and pick the soft-wedge interaction variant
+		// below instead of the RT-mask variant. Overrides the mask path for soft lights.
+		const bool isSoftWedge = r_useSoftShadowVolumes.GetBool() && din->vLight->softEdgeCount > 0;
+		if( isSoftWedge )
+		{
+			extern idCVar r_shadowPenumbraSize;
+			extern idCVar r_shadowPenumbraMinWidth;
+			extern idCVar r_softShadowDebugShader;
+			const vertCacheHandle_t eh = din->vLight->softEdgeCache;
+			currentSoftEdgeOffset = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+			currentSoftEdgeBuffer = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+			currentSoftEdgeCount = din->vLight->softEdgeCount;
+
+			float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), ( float )currentSoftEdgeCount, ( float )r_softShadowDebugShader.GetInteger() };
+			SetFragmentParm( RENDERPARM_JITTERTEXSCALE, swParm );	// the pixel shader reads rpJitterTexScale from the FRAGMENT bank
+
+			// first edge element in the joint buffer (structStride 16 bytes) - the shader indexes from here
+			// because nvrhi doesn't apply the structured-buffer range byteOffset to the shader index.
+			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), 0.0f, 0.0f, 0.0f };
+			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
+		}
+
 		// Depth-hacked surfaces (the view weapon, some particle models) write a squashed,
 		// non-physical depth so they never clip into walls - so world-position reconstruction
 		// from that depth is garbage, and the RT mask value at their screen pixels is wrong
@@ -1822,7 +1881,12 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		}
 		else if( din->vLight->pointLight )
 		{
-			if( pbr )
+			if( isSoftWedge )
+			{
+				skinned ? renderProgManager.BindShader_Builtin( BUILTIN_INTERACTION_SOFT_WEDGE_POINT_SKINNED )
+				: renderProgManager.BindShader_Builtin( BUILTIN_INTERACTION_SOFT_WEDGE_POINT );
+			}
+			else if( pbr )
 			{
 				skinned ? renderProgManager.BindShader_PBR_Interaction_RTShadow_Point_Skinned()
 				: renderProgManager.BindShader_PBR_Interaction_RTShadow_Point();
@@ -1835,7 +1899,12 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		}
 		else
 		{
-			if( pbr )
+			if( isSoftWedge )
+			{
+				skinned ? renderProgManager.BindShader_Builtin( BUILTIN_INTERACTION_SOFT_WEDGE_SPOT_SKINNED )
+				: renderProgManager.BindShader_Builtin( BUILTIN_INTERACTION_SOFT_WEDGE_SPOT );
+			}
+			else if( pbr )
 			{
 				skinned ? renderProgManager.BindShader_PBR_Interaction_RTShadow_Spot_Skinned()
 				: renderProgManager.BindShader_PBR_Interaction_RTShadow_Spot();
@@ -4381,7 +4450,11 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 		// Mutually exclusive with RT shadows: both resolve into rtShadowMaskImage, and the RT block
 		// above already traced this light's mask. Without this guard the resolve clobbers it and RT
 		// shadows silently vanish whenever both features are enabled.
-		if( r_useSoftShadowVolumes.GetBool() && globalFramebuffers.softShadowAccumFBO
+		// DISABLED: the screen-space wedge accumulate/resolve is obsolete - soft shadows are now evaluated
+		// per fragment in the interaction pixel shader (exact receiver position, no mask). The edge-carrier
+		// surfs in softShadowWedges hold only CPU edge data (no vertex/index cache), so drawing them here
+		// spams vertexBuffer==NULL and crashes. Kept #if 0 for reference until the per-fragment path settles.
+		if( false && r_useSoftShadowVolumes.GetBool() && globalFramebuffers.softShadowAccumFBO
 				&& ( vLight->globalShadows != NULL || vLight->localShadows != NULL )
 				&& !R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
 		{

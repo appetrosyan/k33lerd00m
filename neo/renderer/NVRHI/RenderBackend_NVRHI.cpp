@@ -260,6 +260,9 @@ void idRenderBackend::Init()
 	currentVertexBuffer = nullptr;
 	currentIndexBuffer = nullptr;
 	currentJointBuffer = nullptr;
+	currentSoftEdgeBuffer = nullptr;
+	currentSoftEdgeOffset = 0;
+	currentSoftEdgeCount = 0;
 	currentVertexOffset = 0;
 	currentIndexOffset = 0;
 	currentJointOffset = 0;
@@ -390,6 +393,10 @@ void idRenderBackend::DrawElementsWithCounters( const drawSurf_t* surf, bool sha
 	//
 	const vertCacheHandle_t jointHandle = surf->jointCache;
 	currentJointBuffer = nullptr;
+	// NB: do NOT reset currentSoftEdge* here. Unlike the joint buffer (re-derived from surf->jointCache
+	// just below), the soft-shadow edge handle lives on the LIGHT, so DrawSingleInteraction sets it right
+	// before the draw and it is consumed only by the SM_SOFT binding case. Resetting it here nulls the
+	// buffer the pixel shader reads -> zero coverage.
 	currentJointOffset = 0;
 
 #if 0
@@ -700,6 +707,8 @@ void idRenderBackend::DrawStencilShadowPass( const drawSurf_t* drawSurf, const b
 	//
 	const vertCacheHandle_t jointHandle = drawSurf->jointCache;
 	currentJointBuffer = nullptr;
+	// NB: do NOT reset currentSoftEdge* here (see the sibling draw path) - the edge handle is light-level,
+	// set by DrawSingleInteraction before the draw; nulling it here starves the SM_SOFT pixel shader.
 	currentJointOffset = 0;
 
 	if( jointHandle )
@@ -1588,6 +1597,61 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 				bindings[3].resourceHandle = commonPasses.m_PointWrapSampler;
 			}
 		}
+	}
+	else if( type == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT || type == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED )
+	{
+		// Analytic soft shadows: SM textures/samplers + the silhouette-edge StructuredBuffer at t12
+		// (and the joint buffer at t11 when skinned). softShadowEdge_t = 2 * idVec4 = 32 bytes.
+		const bool sw_skinned = ( type == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED );
+		// Bind from element 0 (offset 0): nvrhi does NOT apply a structured-buffer BufferRange byteOffset
+		// to the shader's element index, so the shader indexes with an explicit first-element (offset/16)
+		// passed via rpJitterTexOffset.x instead. Range must still reach past the edges.
+		const nvrhi::BufferRange sw_range( 0, ( size_t )currentSoftEdgeOffset + ( size_t )sizeof( idVec4 ) * 2 * currentSoftEdgeCount );
+
+		// renderparms + edge buffer (+ joints): 0
+		if( sw_skinned )
+		{
+			desc[0].bindings =
+			{
+				uniformsBindingSetItem,
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 11, currentJointBuffer, nvrhi::Format::UNKNOWN, nvrhi::BufferRange( currentJointOffset, sizeof( idVec4 ) * numBoneMatrices ) ),
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range )
+			};
+		}
+		else
+		{
+			desc[0].bindings =
+			{
+				uniformsBindingSetItem,
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range )
+			};
+		}
+
+		// materials: 1
+		desc[1].bindings =
+		{
+			nvrhi::BindingSetItem::Texture_SRV( 0, ( nvrhi::ITexture* )GetImageAt( 0 )->GetTextureID() ),
+			nvrhi::BindingSetItem::Texture_SRV( 1, ( nvrhi::ITexture* )GetImageAt( 1 )->GetTextureID() ),
+			nvrhi::BindingSetItem::Texture_SRV( 2, ( nvrhi::ITexture* )GetImageAt( 2 )->GetTextureID() )
+		};
+
+		// light projection: 2
+		desc[2].bindings =
+		{
+			nvrhi::BindingSetItem::Texture_SRV( 3, ( nvrhi::ITexture* )GetImageAt( 3 )->GetTextureID() ),
+			nvrhi::BindingSetItem::Texture_SRV( 4, ( nvrhi::ITexture* )GetImageAt( 4 )->GetTextureID() ),
+			nvrhi::BindingSetItem::Texture_SRV( 5, ( nvrhi::ITexture* )GetImageAt( 5 )->GetTextureID() ),
+			nvrhi::BindingSetItem::Texture_SRV( 6, ( nvrhi::ITexture* )GetImageAt( 6 )->GetTextureID() )
+		};
+
+		// samplers: 3
+		desc[3].bindings =
+		{
+			nvrhi::BindingSetItem::Sampler( 0, R_UsePixelatedLook() ? commonPasses.m_PointWrapSampler : commonPasses.m_AnisotropicWrapSampler ),
+			nvrhi::BindingSetItem::Sampler( 1, commonPasses.m_LinearBorderSampler ),
+			nvrhi::BindingSetItem::Sampler( 2, commonPasses.m_LinearClampCompareSampler ),
+			nvrhi::BindingSetItem::Sampler( 3, commonPasses.m_PointWrapSampler )  // blue noise
+		};
 	}
 	else if( type == BINDING_LAYOUT_FOG )
 	{
@@ -2762,6 +2826,9 @@ void idRenderBackend::ClearCaches()
 	currentVertexBuffer = nullptr;
 	currentIndexBuffer = nullptr;
 	currentJointBuffer = nullptr;
+	currentSoftEdgeBuffer = nullptr;
+	currentSoftEdgeOffset = 0;
+	currentSoftEdgeCount = 0;
 	currentIndexOffset = -1;
 	currentVertexOffset = -1;
 	currentBindingLayout = nullptr;

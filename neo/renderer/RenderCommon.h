@@ -86,9 +86,21 @@ struct viewEnvprobe_t;
 // unique srfTriangles_t
 // drawSurf_t are always allocated and freed every frame, they are never cached
 
+// Analytic soft shadows: one silhouette edge of a caster, in WORLD space, ready for per-fragment
+// coverage evaluation in the interaction pixel shader. e0.xyz/e1.xyz are the edge endpoints; e0.w is
+// the silhouette weight [0,1]. Winding is baked (edges ordered by facing) so the signed coverage sums
+// consistently around a caster's loop and the umbra emerges where the total saturates.
+struct softShadowEdge_t
+{
+	idVec4					e0;					// xyz = world endpoint 0, w = silhouette weight
+	idVec4					e1;					// xyz = world endpoint 1
+};
+
 struct drawSurf_t
 {
 	const srfTriangles_t* 	frontEndGeo;		// don't use on the back end, it may be updated by the front end!
+	const softShadowEdge_t*	softEdges;			// analytic soft shadows: this caster's silhouette edges (frame mem), NULL otherwise
+	int						numSoftEdges;		// count for softEdges
 	int						numIndexes;
 	vertCacheHandle_t		indexCache;			// triIndex_t
 	vertCacheHandle_t		ambientCache;		// idDrawVert
@@ -387,7 +399,9 @@ struct viewLight_t
 	drawSurf_t* 			localShadows;				// don't shadow local surfaces
 	drawSurf_t* 			globalInteractions;			// get shadows from everything
 	drawSurf_t* 			translucentInteractions;	// translucent interactions don't get shadows
-	drawSurf_t* 			softShadowWedges;			// analytic soft shadows: penumbra wedge surfs (idSoftWedgeVert) accumulated into the coverage buffer
+	drawSurf_t* 			softShadowWedges;			// analytic soft shadows: per-caster surfs carrying this light's silhouette edges (softEdges)
+	vertCacheHandle_t		softEdgeCache;				// analytic soft shadows: this light's silhouette edges flattened into the vertex cache (softShadowEdge_t)
+	int						softEdgeCount;				// analytic soft shadows: number of edges in softEdgeCache
 
 	bool					ImageAtlasPlaced() const
 	{
@@ -896,6 +910,10 @@ enum bindingLayoutType_t
 	BINDING_LAYOUT_TONEMAP,
 	BINDING_LAYOUT_HISTOGRAM,
 	BINDING_LAYOUT_EXPOSURE,
+
+	// analytic soft shadows: appended at the END so no existing binding-layout value shifts
+	BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT,			// SM layout + silhouette-edge StructuredBuffer at t12
+	BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED,
 
 	NUM_BINDING_LAYOUTS
 };

@@ -48,10 +48,10 @@ extern idCVar r_rtShadowCullOffView;	// trim the shadow TLAS: cull casters whose
 // dynamic stencil shadow volume for moved / non-static casters, built per-frame from the
 // model's static silEdges + doubled shadowCache against the current light (defined in Interaction.cpp).
 srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light );
-// analytic soft shadow volumes: per-silhouette-edge penumbra wedge geometry (defined in Interaction.cpp).
-void R_CreatePenumbraWedges( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light, float penumbraSize,
-							 const idRenderMatrix& modelToClip, const float* modelToWorld,
-							 idSoftWedgeVert** outVerts, triIndex_t** outIndexes, int* outNumVerts, int* outNumIndexes );
+// analytic soft shadows: per-silhouette-edge world-space edges for per-fragment coverage (Interaction.cpp).
+void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
+							 float penumbraSize, const float* modelToWorld,
+							 softShadowEdge_t** outEdges, int* outNumEdges );
 extern idCVar r_shadowPenumbraSize;	// soft shadow volumes: light source radius (RenderSystem_init.cpp)
 
 idCVar r_skipStaticShadows( "r_skipStaticShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip static shadows" );
@@ -1308,36 +1308,29 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					}
 				}
 
-				// Analytic soft shadow volumes: grow penumbra wedges off this caster's silhouette and
-				// link them into the light's wedge chain. The backend accumulates their signed coverage
-				// into the R32F buffer and resolves it to visibility. Same silhouette as the umbra.
+				// Analytic soft shadows: collect this caster's silhouette EDGES in world space and link a
+				// carrier surf into the light's chain. The interaction pixel shader evaluates coverage per
+				// fragment against the exact receiver position (no screen-space reconstruction); the umbra
+				// emerges from summing the edges. Same silhouette/winding as the stencil path.
+				//
 				if( r_useSoftShadowVolumes.GetBool() && tri->silEdges != NULL )
 				{
-					idSoftWedgeVert* wverts = NULL;
-					triIndex_t* windexes = NULL;
-					int nverts = 0, nindexes = 0;
-					R_CreatePenumbraWedges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
-											vEntity->mvp, vEntity->modelMatrix, &wverts, &windexes, &nverts, &nindexes );
-					if( nverts > 0 && nindexes > 0 )
+					softShadowEdge_t* sedges = NULL;
+					int nedges = 0;
+					R_CollectPenumbraEdges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
+											vEntity->modelMatrix, &sedges, &nedges );
+					if( nedges > 0 )
 					{
-						drawSurf_t* wedgeSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *wedgeSurf ), FRAME_ALLOC_DRAW_SURFACE );
-						wedgeSurf->numIndexes = nindexes;
-						wedgeSurf->indexCache = vertexCache.AllocIndex( windexes, nindexes );
-						wedgeSurf->ambientCache = vertexCache.AllocVertex( wverts, nverts, sizeof( idSoftWedgeVert ) );
-						wedgeSurf->shadowCache = 0;
-						wedgeSurf->jointCache = 0;
-						wedgeSurf->frontEndGeo = NULL;
-						wedgeSurf->space = vEntity;
-						wedgeSurf->material = NULL;
-						wedgeSurf->extraGLState = 0;
-						wedgeSurf->scissorRect = vLight->scissorRect;
-						wedgeSurf->sort = 0.0f;
-						wedgeSurf->renderZFail = 0;
-						wedgeSurf->shaderRegisters = NULL;
+						drawSurf_t* edgeSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *edgeSurf ), FRAME_ALLOC_DRAW_SURFACE );
+						memset( edgeSurf, 0, sizeof( *edgeSurf ) );
+						edgeSurf->softEdges = sedges;
+						edgeSurf->numSoftEdges = nedges;
+						edgeSurf->space = vEntity;
+						edgeSurf->scissorRect = vLight->scissorRect;
 
-						wedgeSurf->linkChain = &vLight->softShadowWedges;
-						wedgeSurf->nextOnLight = vEntity->drawSurfs;
-						vEntity->drawSurfs = wedgeSurf;
+						edgeSurf->linkChain = &vLight->softShadowWedges;
+						edgeSurf->nextOnLight = vEntity->drawSurfs;
+						vEntity->drawSurfs = edgeSurf;
 					}
 				}
 
@@ -1610,5 +1603,52 @@ void R_AddModels()
 		}
 
 		vEntity->drawSurfs = NULL;
+	}
+
+	// Analytic soft shadows: flatten each light's per-caster silhouette edges into one contiguous
+	// vertex-cache buffer. The interaction pixel shader loops these against the exact receiver world
+	// position, evaluating penumbra coverage without any screen-space depth reconstruction.
+	if( r_useSoftShadowVolumes.GetBool() )
+	{
+		// Hard per-frame budget so we can NEVER overflow the joint buffer (that overflow is a fatal
+		// idLib::Error). softShadowEdge_t = 32 bytes; keep well under the 64MB joint buffer, leaving room
+		// for skinning. Lights past the budget simply get no soft shadow this frame (approximation).
+		const int SOFT_EDGE_FRAME_BUDGET = 400000;	// ~12.8 MB of edges, well under the joint buffer
+		int edgesUsed = 0;
+
+		for( viewLight_t* vLight = tr.viewDef->viewLights; vLight != NULL; vLight = vLight->next )
+		{
+			vLight->softEdgeCache = 0;
+			vLight->softEdgeCount = 0;
+
+			int total = 0;
+			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
+			{
+				total += s->numSoftEdges;
+			}
+			if( total <= 0 || edgesUsed + total > SOFT_EDGE_FRAME_BUDGET )
+			{
+				continue;	// no edges, or over the frame budget -> skip soft for this light (no overflow)
+			}
+			edgesUsed += total;
+
+			softShadowEdge_t* flat = ( softShadowEdge_t* )R_FrameAlloc( total * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
+			int n = 0;
+			float casterId = 0.0f;	// tag each caster's edges so the shader can group + combine per caster
+			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
+			{
+				for( int i = 0; i < s->numSoftEdges; i++ )
+				{
+					flat[n] = s->softEdges[i];
+					flat[n].e1.w = casterId;	// per-caster group id (edges of one caster are contiguous)
+					n++;
+				}
+				casterId += 1.0f;
+			}
+			// AllocJoint (not AllocVertex): the joint buffer is the SRV-capable StructuredBuffer the
+			// interaction pixel shader can read; the vertex buffer is not bound as an SRV.
+			vLight->softEdgeCache = vertexCache.AllocJoint( flat, total, sizeof( softShadowEdge_t ) );
+			vLight->softEdgeCount = total;
+		}
 	}
 }

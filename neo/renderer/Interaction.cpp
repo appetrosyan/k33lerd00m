@@ -541,6 +541,126 @@ void R_CreatePenumbraWedges( const idRenderEntityLocal* ent, const srfTriangles_
 }
 
 /*
+=====================
+R_CollectPenumbraEdges
+
+Analytic soft shadows (per-fragment path): collect this caster's silhouette edges against the light,
+in WORLD space, for the interaction pixel shader to evaluate coverage against the EXACT receiver
+position (no screen-space depth reconstruction, so no grazing instability). Same silhouette and
+winding as the wedge/stencil path; the umbra is emergent from summing the edges, so we emit ALL of
+them, not just a boundary subset. Frame-allocated; outputs NULL/0 if the caster has no silhouette.
+=====================
+*/
+void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
+		const idRenderLightLocal* light, float penumbraSize, const float* modelToWorld,
+		softShadowEdge_t** outEdges, int* outNumEdges )
+{
+	*outEdges = NULL;
+	*outNumEdges = 0;
+
+	if( tri->silEdges == NULL || tri->numSilEdges == 0 || penumbraSize <= 0.0f )
+	{
+		return;
+	}
+
+	srfCullInfo_t cullInfo = {};
+	R_CalcInteractionFacing( ent, tri, light, cullInfo );
+	const byte* facing = cullInfo.facing;
+
+	idVec3 localLight;
+	R_GlobalPointToLocal( ent->modelMatrix, light->globalLightOrigin, localLight );
+
+	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
+
+	int numSil = 0;
+	for( int i = 0; i < tri->numSilEdges; i++ )
+	{
+		if( facing[tri->silEdges[i].p1] ^ facing[tri->silEdges[i].p2] )
+		{
+			numSil++;
+		}
+	}
+	if( numSil == 0 )
+	{
+		R_FreeInteractionCullInfo( cullInfo );
+		return;
+	}
+
+	softShadowEdge_t* edges = ( softShadowEdge_t* )R_FrameAlloc( numSil * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
+
+	extern idCVar r_softShadowWedgeFade;
+	const bool doFade = r_softShadowWedgeFade.GetBool();
+	const int numFaces = tri->numIndexes / 3;
+
+	int n = 0;
+	for( int i = 0; i < tri->numSilEdges; i++ )
+	{
+		const silEdge_t& sil = tri->silEdges[i];
+		if( !( facing[sil.p1] ^ facing[sil.p2] ) )
+		{
+			continue;
+		}
+
+		idVec3 E0 = verts[sil.v1].xyz;
+		idVec3 E1 = verts[sil.v2].xyz;
+
+		// Orient the edge so the umbra-plane normal cross(E1-E0, L-E0) points toward the SHADOW (away from
+		// the caster body). The shader's per-edge coverage is then 1 on the shadow side, and the MIN over a
+		// caster's silhouette loop is the convex umbra - the intersection of the edges' shadow half-spaces.
+		// The body/lit side is marked by the off-edge vertex of the light-FACING triangle; if N points at
+		// it, flip the edge. This is derived from the same light-relative facing that defines the
+		// silhouette, so it stays correct and self-consistent as a dynamic light moves. Open edges (no
+		// valid second face) fall back to stencil-order winding.
+		// Consistent silhouette winding (match the stencil order) so the per-edge signed disk-coverage
+		// areas accumulate coherently around the loop. The interaction shader combines them as an area
+		// (light disk INTERSECT projected silhouette) and takes |sum|, so ONLY winding consistency matters
+		// here - not which way N points. This is why the combine works for non-convex casters where a
+		// per-edge intersection (MIN) cannot.
+		if( !facing[sil.p1] )
+		{
+			idVec3 tmp = E0;
+			E0 = E1;
+			E1 = tmp;
+		}
+
+		idVec3 d0 = E0 - localLight;
+		idVec3 d1 = E1 - localLight;
+		const float dist0 = d0.Normalize();
+		const float dist1 = d1.Normalize();
+
+		// NOTE: previously skipped edges within a light radius of the light. That opened the silhouette
+		// LOOP (the disk-coverage combine needs closed loops), and an open loop's phantom closing chord
+		// spuriously enclosed the light disk -> uniform over-occlusion for casters near a light. Keep the
+		// edge; the shader's degenerate/NaN guards cover the singular at-light case.
+
+		idVec3 worldE0, worldE1;
+		R_LocalPointToGlobal( modelToWorld, E0, worldE0 );
+		R_LocalPointToGlobal( modelToWorld, E1, worldE1 );
+
+		// Continuous silhouette weight: ramp an edge in over the last ~9 degrees of grazing so it fades
+		// in instead of popping as it crosses the silhouette threshold.
+		float silWeight = 1.0f;
+		if( doFade && sil.p1 < numFaces && sil.p2 < numFaces )
+		{
+			const idPlane pa( verts[tri->indexes[sil.p1 * 3 + 0]].xyz, verts[tri->indexes[sil.p1 * 3 + 1]].xyz, verts[tri->indexes[sil.p1 * 3 + 2]].xyz );
+			const idPlane pb( verts[tri->indexes[sil.p2 * 3 + 0]].xyz, verts[tri->indexes[sil.p2 * 3 + 1]].xyz, verts[tri->indexes[sil.p2 * 3 + 2]].xyz );
+			const float distL = 0.5f * ( dist0 + dist1 );
+			const float graze = Min( idMath::Fabs( pa.Distance( localLight ) ), idMath::Fabs( pb.Distance( localLight ) ) ) / Max( distL, 1.0f );
+			silWeight = idMath::ClampFloat( 0.0f, 1.0f, graze / 0.15f );
+		}
+
+		edges[n].e0 = idVec4( worldE0.x, worldE0.y, worldE0.z, silWeight );
+		edges[n].e1 = idVec4( worldE1.x, worldE1.y, worldE1.z, 0.0f );
+		n++;
+	}
+
+	R_FreeInteractionCullInfo( cullInfo );
+
+	*outEdges = edges;
+	*outNumEdges = n;
+}
+
+/*
 ====================
 R_CreateInteractionLightTris
 
