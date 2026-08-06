@@ -208,6 +208,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	float swOcc = 0.0;				// max occlusion across casters
 	float swArea = 0.0;				// signed disk-intersection area for the current caster
 	float curCaster = -1.0;
+	bool  swSkip = false;			// current caster culled: its bounding sphere can't reach the light disk
 	for( int se = 0; se < swN; se++ )
 	{
 		float4 e0 = t_SoftEdges[swFirstElem + se * 2 + 0];
@@ -215,10 +216,30 @@ void main( PS_IN fragment, out PS_OUT result )
 		float  id = e1.w;
 		if( id != curCaster )
 		{
-			if( curCaster >= 0.0 ) { swOcc = max( swOcc, saturate( abs( swArea ) / swDiskArea ) ); }
+			if( curCaster >= 0.0 )
+			{
+				swOcc = max( swOcc, saturate( abs( swArea ) / swDiskArea ) );
+				if( swOcc >= 0.999 ) { break; }		// fully occluded: no remaining caster can raise the max past 1
+			}
 			curCaster = id;
 			swArea = 0.0;
+			swSkip = false;
 		}
+		// Per-caster bounding-sphere cull. The header record (e0.w < 0, one per caster from the frontend
+		// flatten) carries the caster's world bounding sphere: centre e0.xyz, radius e1.x. If the sphere's
+		// angular extent from the receiver cannot reach the light disk's angular extent, the caster
+		// contributes ~0 coverage (unit-test verified conservative) -> skip all its edges cheaply.
+		if( e0.w < 0.0 )
+		{
+			float3 dCv   = e0.xyz - swP;
+			float  dClen = max( length( dCv ), 1e-4 );
+			float  alpha = asin( saturate( swR / swDistPL ) );		// light-disk angular radius from P
+			float  beta  = asin( saturate( e1.x / dClen ) );		// caster-sphere angular radius from P
+			float  ang   = acos( clamp( dot( dCv / dClen, swNrm ), -1.0, 1.0 ) );
+			swSkip = ( ang > alpha + beta + 1e-3 );
+			continue;
+		}
+		if( swSkip ) { continue; }
 		// Near-plane clip. A silhouette vertex behind the receiver (dn<=0, receiver in front of it) can't be
 		// projected onto the light disk. Do NOT skip the edge - that opens the loop and the shoelace closes
 		// the gap with a chord that spuriously encloses the disk (over-occlusion). Instead CLIP the edge to

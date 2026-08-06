@@ -1315,10 +1315,12 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				//
 				if( r_useSoftShadowVolumes.GetBool() && tri->silEdges != NULL )
 				{
+					const int swCollectStart = Sys_Microseconds();
 					softShadowEdge_t* sedges = NULL;
 					int nedges = 0;
 					R_CollectPenumbraEdges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
 											vEntity->modelMatrix, &sedges, &nedges );
+					tr.pc.softShadowMicroSec += Sys_Microseconds() - swCollectStart;
 					if( nedges > 0 )
 					{
 						drawSurf_t* edgeSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *edgeSurf ), FRAME_ALLOC_DRAW_SURFACE );
@@ -1615,28 +1617,59 @@ void R_AddModels()
 		// for skinning. Lights past the budget simply get no soft shadow this frame (approximation).
 		const int SOFT_EDGE_FRAME_BUDGET = 400000;	// ~12.8 MB of edges, well under the joint buffer
 		int edgesUsed = 0;
+		const int swFlattenStart = Sys_Microseconds();
 
 		for( viewLight_t* vLight = tr.viewDef->viewLights; vLight != NULL; vLight = vLight->next )
 		{
 			vLight->softEdgeCache = 0;
 			vLight->softEdgeCount = 0;
 
-			int total = 0;
+			// Perf: prepend each caster's edge block with a HEADER record carrying the caster's
+			// world-space bounding sphere, so the pixel shader can cheaply reject a whole caster that
+			// cannot occlude a given fragment's light disk (a distant world surface then skips its
+			// entire edge loop instead of an atan2 per edge). One header per caster; the shader marks
+			// a header by e0.w < 0 (edges carry e0.w = silWeight >= 0). Records = edges + one header/caster.
+			int total = 0, numCasters = 0;
 			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 			{
 				total += s->numSoftEdges;
+				numCasters++;
 			}
-			if( total <= 0 || edgesUsed + total > SOFT_EDGE_FRAME_BUDGET )
+			const int records = total + numCasters;
+			if( total <= 0 )
 			{
-				continue;	// no edges, or over the frame budget -> skip soft for this light (no overflow)
+				continue;	// no edges for this light
 			}
-			edgesUsed += total;
+			if( edgesUsed + records > SOFT_EDGE_FRAME_BUDGET )
+			{
+				tr.pc.c_softShadowDroppedEdges += total;	// over budget -> this light gets no soft shadow
+				continue;
+			}
+			edgesUsed += records;
 
-			softShadowEdge_t* flat = ( softShadowEdge_t* )R_FrameAlloc( total * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
+			softShadowEdge_t* flat = ( softShadowEdge_t* )R_FrameAlloc( records * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
 			int n = 0;
 			float casterId = 0.0f;	// tag each caster's edges so the shader can group + combine per caster
 			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 			{
+				// world-space bounding sphere of this caster's silhouette edges (for the shader-side cull)
+				idVec3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+				for( int i = 0; i < s->numSoftEdges; i++ )
+				{
+					const idVec4& e0 = s->softEdges[i].e0;
+					const idVec4& e1 = s->softEdges[i].e1;
+					mn.x = Min( mn.x, Min( e0.x, e1.x ) );	mx.x = Max( mx.x, Max( e0.x, e1.x ) );
+					mn.y = Min( mn.y, Min( e0.y, e1.y ) );	mx.y = Max( mx.y, Max( e0.y, e1.y ) );
+					mn.z = Min( mn.z, Min( e0.z, e1.z ) );	mx.z = Max( mx.z, Max( e0.z, e1.z ) );
+				}
+				const idVec3 c = ( mn + mx ) * 0.5f;
+				const float  rad = ( mx - mn ).Length() * 0.5f;
+
+				// header record: e0 = ( centre, -1 marker ), e1 = ( radius, 0, 0, casterId )
+				flat[n].e0 = idVec4( c.x, c.y, c.z, -1.0f );
+				flat[n].e1 = idVec4( rad, 0.0f, 0.0f, casterId );
+				n++;
+
 				for( int i = 0; i < s->numSoftEdges; i++ )
 				{
 					flat[n] = s->softEdges[i];
@@ -1647,8 +1680,15 @@ void R_AddModels()
 			}
 			// AllocJoint (not AllocVertex): the joint buffer is the SRV-capable StructuredBuffer the
 			// interaction pixel shader can read; the vertex buffer is not bound as an SRV.
-			vLight->softEdgeCache = vertexCache.AllocJoint( flat, total, sizeof( softShadowEdge_t ) );
-			vLight->softEdgeCount = total;
+			vLight->softEdgeCache = vertexCache.AllocJoint( flat, records, sizeof( softShadowEdge_t ) );
+			vLight->softEdgeCount = records;
+
+			tr.pc.c_softShadowLights++;
+			tr.pc.c_softShadowCasters += numCasters;
+			tr.pc.c_softShadowEdges += total;
+			tr.pc.c_softShadowMaxEdgesPerLight = Max( tr.pc.c_softShadowMaxEdgesPerLight, total );
 		}
+
+		tr.pc.softShadowMicroSec += Sys_Microseconds() - swFlattenStart;
 	}
 }

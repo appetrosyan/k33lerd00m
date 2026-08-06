@@ -382,6 +382,11 @@ public:
 		return stats_backend.gpuRTShadowMaskMicroSec;
 	}
 
+	uint64		GetRendererGpuSoftShadowMicroseconds() const
+	{
+		return stats_backend.gpuSoftShadowMicroSec;
+	}
+
 	uint64		GetRendererGpuShaderPassMicroseconds() const
 	{
 		return stats_backend.gpuShaderPassMicroSec;

@@ -4683,10 +4683,17 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				renderLog.EndShadowGen();
 			}
 
+			// attribute this light's interaction draw to the soft-shadow GPU bucket when the analytic
+			// soft path is what these interactions run (so showFPS can split soft cost out of the
+			// otherwise-opaque Interactions total). Same predicate as the shader's isSoftWedge.
+			const bool lightIsSoft = r_useSoftShadowVolumes.GetBool() && vLight->softEdgeCount > 0;
+
 			if( vLight->localInteractions != NULL )
 			{
 				renderLog.OpenBlock( "Local Light Interactions", colorPurple );
+				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
 				RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, performStencilTest, useLightDepthBounds );
+				if( lightIsSoft ) { renderLog.EndShadowGen(); }
 				renderLog.CloseBlock();
 			}
 
@@ -4700,7 +4707,9 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			if( vLight->globalInteractions != NULL )
 			{
 				renderLog.OpenBlock( "Global Light Interactions", colorPurple );
+				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
 				RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, performStencilTest, useLightDepthBounds );
+				if( lightIsSoft ) { renderLog.EndShadowGen(); }
 				renderLog.CloseBlock();
 			}
 		}

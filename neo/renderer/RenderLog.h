@@ -74,6 +74,7 @@ enum renderLogShadowGen_t
 	RLS_STENCIL,		// stencil shadow-volume clear + extrusion
 	RLS_SHADOWMAP,		// per-light shadow map (only when the shadow atlas is off)
 	RLS_RTMASK,			// ray-traced shadow visibility mask
+	RLS_SOFT,			// analytic soft-shadow interaction draw (per-fragment silhouette coverage)
 	RLS_TOTAL,
 };
 

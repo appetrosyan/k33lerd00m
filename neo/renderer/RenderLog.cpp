@@ -384,6 +384,7 @@ void idRenderLog::FetchGPUTimers( backEndCounters_t& pc )
 	pc.gpuStencilShadowMicroSec	= shadowGen[RLS_STENCIL];
 	pc.gpuShadowMapMicroSec		= shadowGen[RLS_SHADOWMAP];
 	pc.gpuRTShadowMaskMicroSec	= shadowGen[RLS_RTMASK];
+	pc.gpuSoftShadowMicroSec	= shadowGen[RLS_SOFT];
 
 	// free the pool slots for this parity to be rewritten this frame
 	shadowGenCount[frameParity] = 0;

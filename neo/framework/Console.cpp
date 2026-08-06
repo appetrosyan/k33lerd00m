@@ -304,12 +304,15 @@ float idConsoleLocal::DrawFPS( float y )
 	const uint64 rendererGPU_SSAOTime = commonLocal.GetRendererGpuSSAOMicroseconds();
 	const uint64 rendererGPU_SSRTime = commonLocal.GetRendererGpuSSRMicroseconds();
 	const uint64 rendererGPUAmbientPassTime = commonLocal.GetRendererGpuAmbientPassMicroseconds();
-	const uint64 rendererGPUShadowAtlasTime = commonLocal.GetRendererGpuShadowAtlasPassMicroseconds();
 	// Interactions timer folds in the shadow-generation work interleaved with lighting; split
 	// it out so the Interactions number is pure lighting and each active shadow path is its own line.
 	const uint64 rendererGPUStencilShadowTime = commonLocal.GetRendererGpuStencilShadowMicroseconds();
 	const uint64 rendererGPUShadowMapTime = commonLocal.GetRendererGpuShadowMapMicroseconds();
 	const uint64 rendererGPURTShadowMaskTime = commonLocal.GetRendererGpuRTShadowMaskMicroseconds();
+	// analytic soft shadows: this is a SUBSET of Interactions (the soft-lit lights' interaction draw),
+	// NOT shadow-generation, so it is NOT subtracted from Interactions below - it annotates how much of
+	// the Interactions total is soft-shadowed lights.
+	const uint64 rendererGPUSoftShadowTime = commonLocal.GetRendererGpuSoftShadowMicroseconds();
 	const uint64 rendererGPUShadowGenTime = rendererGPUStencilShadowTime + rendererGPUShadowMapTime + rendererGPURTShadowMaskTime;
 	const uint64 rendererGPUInteractionsTotal = commonLocal.GetRendererGpuInteractionsMicroseconds();
 	// guard against underflow if the shadow segments slightly outweigh the (overlapping) total
@@ -474,12 +477,17 @@ float idConsoleLocal::DrawFPS( float y )
 
 		if( com_showFPS.GetInteger() > 2 )
 		{
-			int atlasPercentage = idMath::Ftoi( 100.0f * ( commonLocal.stats_backend.c_shadowAtlasUsage / ( float )Square( r_shadowMapAtlasSize.GetInteger() ) ) );
-			ImGui::TextColored( colorLtGrey, "SHADOWS: atlas usage:%2i%% views:%i draws:%i tris:%i",
-								atlasPercentage,
-								commonLocal.stats_backend.c_shadowViews,
-								commonLocal.stats_backend.c_shadowElements,
-								commonLocal.stats_backend.c_shadowIndexes / 3 );
+			// only when shadow geometry actually rendered this frame (hidden in soft/stencil-less views)
+			if( commonLocal.stats_backend.c_shadowElements > 0 )
+			{
+				const int atlasSize = r_shadowMapAtlasSize.GetInteger();
+				const int atlasPercentage = atlasSize > 0 ? idMath::Ftoi( 100.0f * ( commonLocal.stats_backend.c_shadowAtlasUsage / ( float )Square( atlasSize ) ) ) : 0;
+				ImGui::TextColored( colorLtGrey, "SHADOWS: atlas usage:%2i%% views:%i draws:%i tris:%i",
+									atlasPercentage,
+									commonLocal.stats_backend.c_shadowViews,
+									commonLocal.stats_backend.c_shadowElements,
+									commonLocal.stats_backend.c_shadowIndexes / 3 );
+			}
 
 			ImGui::TextColored( colorLtGrey, "DYNAMIC: callback:%-2i md5:%i dfrmVerts:%i dfrmTris:%i tangTris:%i guis:%i",
 								commonLocal.stats_frontend.c_entityDefCallbacks,
@@ -504,6 +512,27 @@ float idConsoleLocal::DrawFPS( float y )
 								commonLocal.stats_frontend.c_entityDefCallbacks,
 								commonLocal.stats_frontend.c_createInteractions,
 								commonLocal.stats_frontend.c_createShadowVolumes );
+
+			// analytic soft shadows: full attribution so the optimisation target is unambiguous.
+			//  - CPU collect vs GPU draw = the frontend/backend fork (cache silhouettes vs cut GPU work).
+			//  - edges + max/light = the per-fragment loop length driving GPU cost (cull / collection).
+			//  - dropped = load lost to the frame budget (raising it trades memory for coverage).
+			//  - edges/caster = silhouette granularity; casters = how many groups the shader unions.
+			if( commonLocal.stats_frontend.c_softShadowEdges > 0 || commonLocal.stats_frontend.softShadowMicroSec > 0 )
+			{
+				const int swCasters = commonLocal.stats_frontend.c_softShadowCasters;
+				const int swEdgesPerCaster = swCasters > 0 ? commonLocal.stats_frontend.c_softShadowEdges / swCasters : 0;
+				ImGui::TextColored( colorOrange, "SOFT SHADOWS  CPU collect:%llu us   GPU draw:%llu us",
+									commonLocal.stats_frontend.softShadowMicroSec,
+									rendererGPUSoftShadowTime );
+				ImGui::TextColored( colorOrange, "   lights:%i casters:%i edges:%i  max/light:%i (loop len)  edges/caster:%i  dropped:%i",
+									commonLocal.stats_frontend.c_softShadowLights,
+									swCasters,
+									commonLocal.stats_frontend.c_softShadowEdges,
+									commonLocal.stats_frontend.c_softShadowMaxEdgesPerLight,
+									swEdgesPerCaster,
+									commonLocal.stats_frontend.c_softShadowDroppedEdges );
+			}
 
 			ImGui::TextColored( colorLtGrey, "viewEntities:%-3i  shadowEntities:%-3i  viewLights:%i\n",	commonLocal.stats_frontend.c_visibleViewEntities,
 								commonLocal.stats_frontend.c_shadowViewEntities,
@@ -533,39 +562,42 @@ float idConsoleLocal::DrawFPS( float y )
 
 		ImGui::Spacing();
 
-		ImGui::TextColored( colorMdGrey,													"CPU                 GPU" );
-		ImGui::TextColored( gameThreadTotalTime > maxTime ? colorRed : colorWhite,			"Game+RF: %5llu us   EarlyZ:       %5llu us", gameThreadTotalTime, rendererGPUEarlyZTime );
-		ImGui::TextColored( gameThreadGameTime > maxTime ? colorRed : colorWhite,			"Game:    %5llu us   SSAO:         %5llu us", gameThreadGameTime, rendererGPU_SSAOTime );
-		ImGui::TextColored( gameThreadRenderTime > maxTime ? colorRed : colorWhite,			"RF:      %5llu us   SSR:          %5llu us", gameThreadRenderTime, rendererGPU_SSRTime );
-		ImGui::TextColored( rendererBackEndTime > maxTime ? colorRed : colorWhite,			"RB:      %5llu us   Ambient Pass: %5llu us", rendererBackEndTime, rendererGPUAmbientPassTime );
-		ImGui::TextColored( rendererMaskedOcclusionCullingTime > maxTime ? colorRed : colorWhite,	"MOC:     %5llu us   Shadow Atlas: %5llu us", rendererMaskedOcclusionCullingTime, rendererGPUShadowAtlasTime );
+		// CPU thread timings - core stages always shown; optional stages only when they ran this frame.
+		ImGui::TextColored( colorMdGrey, "CPU" );
+		ImGui::TextColored( gameThreadTotalTime > maxTime ? colorRed : colorWhite,	"  Game+RF: %5llu us", gameThreadTotalTime );
+		ImGui::TextColored( gameThreadGameTime > maxTime ? colorRed : colorWhite,	"  Game:    %5llu us", gameThreadGameTime );
+		ImGui::TextColored( gameThreadRenderTime > maxTime ? colorRed : colorWhite,	"  RF:      %5llu us", gameThreadRenderTime );
+		ImGui::TextColored( rendererBackEndTime > maxTime ? colorRed : colorWhite,	"  RB:      %5llu us", rendererBackEndTime );
 #if defined(__APPLE__) && defined( USE_MoltenVK )
-		// SRS - For more recent versions of MoltenVK with enhanced performance statistics (v1.2.6 and later), display the Vulkan to Metal encoding thread time on macOS
-		ImGui::TextColored( rendererMvkEncodeTime > maxTime || rendererGPUInteractionsTime > maxTime ? colorRed : colorWhite,	"Encode:  %5lld us   Interactions: %5llu us", rendererMvkEncodeTime, rendererGPUInteractionsTime );
-		ImGui::TextColored( rendererGPUShaderPassesTime > maxTime ? colorRed : colorWhite,	"Sync:    %5lld us   Shader Pass:  %5llu us", frameSyncTime, rendererGPUShaderPassesTime );
-#else
-		ImGui::TextColored( rendererGPUInteractionsTime > maxTime ? colorRed : colorWhite,	"Sync:    %5lld us   Interactions: %5llu us", frameSyncTime, rendererGPUInteractionsTime );
-		ImGui::TextColored( rendererGPUShaderPassesTime > maxTime ? colorRed : colorWhite,	"                    Shader Pass:  %5llu us", rendererGPUShaderPassesTime );
+		// Vulkan -> Metal encoding thread time (macOS / MoltenVK only)
+		ImGui::TextColored( rendererMvkEncodeTime > maxTime ? colorRed : colorWhite,	"  Encode:  %5lld us", rendererMvkEncodeTime );
 #endif
-		// shadow-generation split out of Interactions; only the active path(s) report non-zero
-		if( rendererGPUStencilShadowTime > 0 )
+		if( rendererMaskedOcclusionCullingTime > 0 )
 		{
-			ImGui::TextColored( rendererGPUStencilShadowTime > maxTime ? colorRed : colorWhite, "                    Stencil Shdw: %5llu us", rendererGPUStencilShadowTime );
+			ImGui::TextColored( rendererMaskedOcclusionCullingTime > maxTime ? colorRed : colorWhite, "  MOC:     %5llu us", rendererMaskedOcclusionCullingTime );
 		}
-		if( rendererGPUShadowMapTime > 0 )
-		{
-			ImGui::TextColored( rendererGPUShadowMapTime > maxTime ? colorRed : colorWhite,	"                    Shadow Maps:  %5llu us", rendererGPUShadowMapTime );
-		}
-		if( rendererGPURTShadowMaskTime > 0 )
-		{
-			ImGui::TextColored( rendererGPURTShadowMaskTime > maxTime ? colorRed : colorWhite, "                    RT Shdw Mask: %5llu us", rendererGPURTShadowMaskTime );
-		}
-		ImGui::TextColored( rendererGPU_TAATime > maxTime ? colorRed : colorWhite,			"                    TAA:          %5llu us", rendererGPU_TAATime );
-		ImGui::TextColored( rendererGPUPostProcessingTime > maxTime ? colorRed : colorWhite, "                    PostFX:       %5llu us", rendererGPUPostProcessingTime );
-		ImGui::TextColored( frameBusyTime > maxTime || rendererGPUTime > maxTime ? colorRed : colorWhite, "Total:   %5lld us   Total:        %5lld us", frameBusyTime, rendererGPUTime );
-		ImGui::TextColored( colorWhite,														"Idle:    %5lld us   Idle:         %5lld us", frameIdleTime, rendererGPUIdleTime );
-		// SRS - Show CPU and GPU overall usage statistics
-		ImGui::TextColored( colorWhite,														"Frame:     %3.0f %%    Frame:          %3.0f %%", cpuUsage, gpuUsage );
+		ImGui::TextColored( frameSyncTime > maxTime ? colorRed : colorWhite,			"  Sync:    %5lld us", frameSyncTime );
+
+		// GPU pass timings - a pass that is disabled reads 0 and is omitted, so only active work shows.
+		// (Interactions is the whole lighting pass; "of which Soft" is the soft-shadowed-lights subset of it.)
+		ImGui::TextColored( colorMdGrey, "GPU" );
+		if( rendererGPUEarlyZTime > 0 )			{ ImGui::TextColored( rendererGPUEarlyZTime > maxTime ? colorRed : colorWhite,		"  EarlyZ:        %5llu us", rendererGPUEarlyZTime ); }
+		if( rendererGPU_SSAOTime > 0 )			{ ImGui::TextColored( rendererGPU_SSAOTime > maxTime ? colorRed : colorWhite,		"  SSAO:          %5llu us", rendererGPU_SSAOTime ); }
+		if( rendererGPU_SSRTime > 0 )			{ ImGui::TextColored( rendererGPU_SSRTime > maxTime ? colorRed : colorWhite,			"  SSR:           %5llu us", rendererGPU_SSRTime ); }
+		if( rendererGPUAmbientPassTime > 0 )	{ ImGui::TextColored( rendererGPUAmbientPassTime > maxTime ? colorRed : colorWhite,	"  Ambient Pass:  %5llu us", rendererGPUAmbientPassTime ); }
+		if( rendererGPUInteractionsTime > 0 )	{ ImGui::TextColored( rendererGPUInteractionsTime > maxTime ? colorRed : colorWhite,	"  Interactions:  %5llu us", rendererGPUInteractionsTime ); }
+		if( rendererGPUSoftShadowTime > 0 )		{ ImGui::TextColored( rendererGPUSoftShadowTime > maxTime ? colorRed : colorOrange,	"    of wh. Soft: %5llu us", rendererGPUSoftShadowTime ); }
+		if( rendererGPUStencilShadowTime > 0 )	{ ImGui::TextColored( rendererGPUStencilShadowTime > maxTime ? colorRed : colorWhite,	"  Stencil Shdw:  %5llu us", rendererGPUStencilShadowTime ); }
+		if( rendererGPUShadowMapTime > 0 )		{ ImGui::TextColored( rendererGPUShadowMapTime > maxTime ? colorRed : colorWhite,	"  Shadow Maps:   %5llu us", rendererGPUShadowMapTime ); }
+		if( rendererGPURTShadowMaskTime > 0 )	{ ImGui::TextColored( rendererGPURTShadowMaskTime > maxTime ? colorRed : colorWhite,	"  RT Shdw Mask:  %5llu us", rendererGPURTShadowMaskTime ); }
+		if( rendererGPUShaderPassesTime > 0 )	{ ImGui::TextColored( rendererGPUShaderPassesTime > maxTime ? colorRed : colorWhite,	"  Shader Pass:   %5llu us", rendererGPUShaderPassesTime ); }
+		if( rendererGPU_TAATime > 0 )			{ ImGui::TextColored( rendererGPU_TAATime > maxTime ? colorRed : colorWhite,			"  TAA:           %5llu us", rendererGPU_TAATime ); }
+		if( rendererGPUPostProcessingTime > 0 )	{ ImGui::TextColored( rendererGPUPostProcessingTime > maxTime ? colorRed : colorWhite,	"  PostFX:        %5llu us", rendererGPUPostProcessingTime ); }
+
+		// overall busy / idle / utilisation
+		ImGui::TextColored( frameBusyTime > maxTime || rendererGPUTime > maxTime ? colorRed : colorWhite, "Total:  CPU %5lld us   GPU %5llu us", frameBusyTime, rendererGPUTime );
+		ImGui::TextColored( colorWhite,	"Idle:   CPU %5lld us   GPU %5lld us", frameIdleTime, rendererGPUIdleTime );
+		ImGui::TextColored( colorWhite,	"Frame:  CPU %3.0f %%    GPU %3.0f %%", cpuUsage, gpuUsage );
 
 		ImGui::End();
 	}

@@ -137,7 +137,14 @@ struct performanceCounters_t
 	int		c_mocCulledSurfaces;
 	int		c_mocCulledLights;
 
+	int		c_softShadowLights;			// lights that received analytic soft-shadow edges this frame
+	int		c_softShadowCasters;		// per-caster silhouette groups collected for soft shadows
+	int		c_softShadowEdges;			// silhouette edges uploaded for soft shadows
+	int		c_softShadowMaxEdgesPerLight;	// worst single light's edge count == the per-fragment loop length
+	int		c_softShadowDroppedEdges;	// soft-shadow edges dropped when a light blew the frame budget
+
 	uint64	mocMicroSec;
+	uint64	softShadowMicroSec;			// CPU: collecting + flattening soft-shadow silhouette edges (frontend)
 	uint64	frontEndMicroSec;	// sum of time in all RE_RenderScene's in a frame
 };
 
@@ -176,6 +183,7 @@ struct backEndCounters_t
 	uint64	gpuStencilShadowMicroSec;
 	uint64	gpuShadowMapMicroSec;		// per-light shadow maps rendered when the atlas is off
 	uint64	gpuRTShadowMaskMicroSec;
+	uint64	gpuSoftShadowMicroSec;		// analytic soft-shadow interaction draws (subset of gpuInteractionsMicroSec)
 	uint64	gpuShaderPassMicroSec;
 	uint64	gpuFogAllLightsMicroSec;
 	uint64	gpuBloomMicroSec;
