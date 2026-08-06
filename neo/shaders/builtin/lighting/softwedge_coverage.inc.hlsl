@@ -63,22 +63,21 @@ float2 SoftDisk_ProjClipped( float3 A, float3 P, float dn, float distPL, float3 
 // over a closed loop's directed edges this yields the signed area of disk INTERSECT polygon. Handles the
 // four clip cases: both endpoints in; one in one out; segment crossing; segment entirely outside (a pure
 // circular sector). A sector's signed area is 0.5*r^2*angle, the triangle's is 0.5*cross(A,B).
-float SoftDisk_CircleTriArea( float2 A, float2 B, float r )
+float SoftDisk_CircleTriArea( float2 A, float2 B, float r2 )		// r2 = disk radius squared (fragment-invariant, hoisted)
 {
-	float r2 = r * r;
 	float a2 = dot( A, A );
 	float b2 = dot( B, B );
+
+	if( a2 <= r2 && b2 <= r2 )
+	{
+		return 0.5 * ( A.x * B.y - A.y * B.x );					// both inside: plain triangle (checked first: no D/qa needed)
+	}
 
 	float2 D  = B - A;
 	float  qa = dot( D, D );
 	if( qa < 1e-9 )
 	{
 		return 0.0;												// degenerate edge (endpoints coincide): no area, avoids /0
-	}
-
-	if( a2 <= r2 && b2 <= r2 )
-	{
-		return 0.5 * ( A.x * B.y - A.y * B.x );					// both inside: plain triangle
 	}
 
 	float  qb = 2.0 * dot( A, D );

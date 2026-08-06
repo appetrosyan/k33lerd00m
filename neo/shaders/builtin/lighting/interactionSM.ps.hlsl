@@ -203,7 +203,8 @@ void main( PS_IN fragment, out PS_OUT result )
 	float3 swUp  = ( abs( swNrm.z ) > 0.9 ) ? float3( 0.0, 1.0, 0.0 ) : float3( 0.0, 0.0, 1.0 );
 	float3 swU   = normalize( cross( swUp, swNrm ) );
 	float3 swV   = cross( swNrm, swU );
-	float  swDiskArea = PI * swR * swR;
+	float  swR2       = swR * swR;								// disk radius squared, hoisted for CircleTriArea
+	float  swDiskArea = PI * swR2;
 	float  swInvDiskArea = 1.0 / swDiskArea;					// hoisted: per-caster finalize multiplies instead of divides
 	float  swSinA     = saturate( swR / swDistPL );				// sin of the light-disk half-angle from P (caster-invariant)
 	float  swCosA     = sqrt( 1.0 - swSinA * swSinA );			// cos of it; used by the cheap per-caster angular cull
@@ -286,7 +287,7 @@ void main( PS_IN fragment, out PS_OUT result )
 		if( dnB > swDistPL )  { b = b + ( ( swDistPL - dnB ) / ( dnA - dnB ) ) * ( a - b ); dnB = swDistPL; }
 		float2 qa = ( swDistPL / dnA ) * float2( dot( a, swU ), dot( a, swV ) );
 		float2 qb = ( swDistPL / dnB ) * float2( dot( b, swU ), dot( b, swV ) );
-		swArea += SoftDisk_CircleTriArea( qa, qb, swR );
+		swArea += SoftDisk_CircleTriArea( qa, qb, swR2 );
 	}
 	if( haveCaster ) { swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) ); }	// last caster
 	float shadow = 1.0 - saturate( swOcc );
