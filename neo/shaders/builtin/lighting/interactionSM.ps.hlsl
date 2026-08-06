@@ -226,15 +226,24 @@ void main( PS_IN fragment, out PS_OUT result )
 			swSkip = false;
 		}
 		// Per-caster bounding-sphere cull. The header record (e0.w < 0, one per caster from the frontend
-		// flatten) carries the caster's world bounding sphere: centre e0.xyz, radius e1.x. If the sphere's
-		// angular extent from the receiver cannot reach the light disk's angular extent, the caster
-		// contributes ~0 coverage (unit-test verified conservative) -> skip all its edges cheaply.
+		// flatten) carries the caster's world bounding sphere: centre e0.xyz, radius e1.x. Skip the whole
+		// caster (unit-test verified conservative) when it cannot occlude this fragment's light disk, by
+		// two cheap rejects: (1) DEPTH - the sphere lies entirely behind the receiver or entirely beyond
+		// the light plane (matches the per-edge slab clip below at caster granularity, so lossless); and
+		// (2) ANGLE - the sphere's angular extent from the receiver can't reach the disk's angular extent.
 		if( e0.w < 0.0 )
 		{
 			float3 dCv   = e0.xyz - swP;
+			float  cRad  = e1.x;
+			float  dCn   = dot( dCv, swNrm );						// sphere-centre depth along receiver->light
+			if( dCn + cRad < 1e-3 || dCn - cRad > swDistPL )		// wholly behind receiver, or wholly beyond light
+			{
+				swSkip = true;
+				continue;
+			}
 			float  dClen = max( length( dCv ), 1e-4 );
 			float  alpha = asin( saturate( swR / swDistPL ) );		// light-disk angular radius from P
-			float  beta  = asin( saturate( e1.x / dClen ) );		// caster-sphere angular radius from P
+			float  beta  = asin( saturate( cRad / dClen ) );		// caster-sphere angular radius from P
 			float  ang   = acos( clamp( dot( dCv / dClen, swNrm ), -1.0, 1.0 ) );
 			swSkip = ( ang > alpha + beta + 1e-3 );
 			continue;
