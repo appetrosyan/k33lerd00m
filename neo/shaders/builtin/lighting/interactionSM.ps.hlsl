@@ -114,62 +114,11 @@ float2 VogelDiskSample( float sampleIndex, float samplesCount, float phi )
 
 void main( PS_IN fragment, out PS_OUT result )
 {
-	float2 baseUV = fragment.texcoord4.xy;
-	float2 bumpUV = fragment.texcoord1.xy;
-	float2 specUV = fragment.texcoord5.xy;
-
-	// PSX affine texture mapping
-	if( pc.rpPSXDistortions.z > 0.0 )
-	{
-		baseUV /= fragment.texcoord1.z;
-		bumpUV /= fragment.texcoord1.z;
-		specUV /= fragment.texcoord1.z;
-	}
-
-	float4 bumpMap =		t_Normal.Sample( s_Material, bumpUV );
-	float4 lightFalloff =	idtex2Dproj( s_Lighting, t_LightFalloff, fragment.texcoord2 );
-	float4 lightProj =		idtex2Dproj( s_Lighting, t_LightProjection, fragment.texcoord3 );
-	float4 YCoCG =			t_BaseColor.Sample( s_Material, baseUV );
-	float4 specMapSRGB =	t_Specular.Sample( s_Material, specUV );
-	float4 specMap =		sRGBAToLinearRGBA( specMapSRGB );
-
-	float3 lightVector = normalize( fragment.texcoord0.xyz );
-	float3 viewVector = normalize( fragment.texcoord6.xyz );
-	float3 diffuseMap = sRGBToLinearRGB( ConvertYCoCgToRGB( YCoCG ) );
-
-	float3 localNormal;
-	// RB begin
-#if USE_NORMAL_FMT_RGB8
-	localNormal.xy = bumpMap.rg - 0.5;
-#else
-	localNormal.xy = bumpMap.wy - 0.5;
-#endif
-	// RB end
-	localNormal.z = sqrt( abs( dot( localNormal.xy, localNormal.xy ) - 0.25 ) );
-	localNormal = normalize( localNormal );
-
-	// Geometric specular antialiasing: sub-pixel normal variance -> extra GGX
-	// roughness, so shiny detailed surfaces (wet blood) don't alias into specular
-	// point noise. Source-level fix, no temporal accumulation. See interaction.ps.hlsl.
-	float3 dNdx = ddx( localNormal );
-	float3 dNdy = ddy( localNormal );
-	float specAAvariance = 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) );
-	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.25 );
-
-	// traditional very dark Lambert light model used in Doom 3
-	float ldotN = saturate( dot3( localNormal, lightVector ) );
-
-#if defined(USE_HALF_LAMBERT)
-	// RB: http://developer.valvesoftware.com/wiki/Half_Lambert
-	float halfLdotN = dot3( localNormal, lightVector ) * 0.5 + 0.5;
-	halfLdotN *= halfLdotN;
-
-	// tweak to not loose so many details
-	float lambert = lerp( ldotN, halfLdotN, 0.5 );
-#else
-	float lambert = ldotN;
-#endif
-
+	// Material sampling, the local normal and the Lambert term are computed AFTER the shadow block below
+	// (moved down from here). The shadow computation uses none of them (verified), so this reorder is
+	// lossless - but keeping their registers out of the soft-shadow coverage loop matters: the loop's live
+	// state plus these material values pushed the pixel shader to 60 VGPRs = 24 waves/SIMD on gfx1100, where
+	// <= 48 VGPRs would give 32 waves. Freeing the material registers across the loop targets that jump.
 
 	//
 	// shadow mapping
@@ -622,6 +571,64 @@ void main( PS_IN fragment, out PS_OUT result )
 	// to 1.0 and clobbers every soft fragment to fully-lit (no shadow anywhere while the coverage
 	// loop still runs). The soft path's shadow = 1 - saturate(swOcc) flows straight to the combine.
 	shadow = saturate( max( shadow, pc.rpJitterTexScale.z ) );
+#endif
+
+	// Material sampling + normal + Lambert, moved here from the top of main() so their registers are not live
+	// across the soft-shadow coverage loop (occupancy: see the note above the shadow block).
+	float2 baseUV = fragment.texcoord4.xy;
+	float2 bumpUV = fragment.texcoord1.xy;
+	float2 specUV = fragment.texcoord5.xy;
+
+	// PSX affine texture mapping
+	if( pc.rpPSXDistortions.z > 0.0 )
+	{
+		baseUV /= fragment.texcoord1.z;
+		bumpUV /= fragment.texcoord1.z;
+		specUV /= fragment.texcoord1.z;
+	}
+
+	float4 bumpMap =		t_Normal.Sample( s_Material, bumpUV );
+	float4 lightFalloff =	idtex2Dproj( s_Lighting, t_LightFalloff, fragment.texcoord2 );
+	float4 lightProj =		idtex2Dproj( s_Lighting, t_LightProjection, fragment.texcoord3 );
+	float4 YCoCG =			t_BaseColor.Sample( s_Material, baseUV );
+	float4 specMapSRGB =	t_Specular.Sample( s_Material, specUV );
+	float4 specMap =		sRGBAToLinearRGBA( specMapSRGB );
+
+	float3 lightVector = normalize( fragment.texcoord0.xyz );
+	float3 viewVector = normalize( fragment.texcoord6.xyz );
+	float3 diffuseMap = sRGBToLinearRGB( ConvertYCoCgToRGB( YCoCG ) );
+
+	float3 localNormal;
+	// RB begin
+#if USE_NORMAL_FMT_RGB8
+	localNormal.xy = bumpMap.rg - 0.5;
+#else
+	localNormal.xy = bumpMap.wy - 0.5;
+#endif
+	// RB end
+	localNormal.z = sqrt( abs( dot( localNormal.xy, localNormal.xy ) - 0.25 ) );
+	localNormal = normalize( localNormal );
+
+	// Geometric specular antialiasing: sub-pixel normal variance -> extra GGX
+	// roughness, so shiny detailed surfaces (wet blood) don't alias into specular
+	// point noise. Source-level fix, no temporal accumulation. See interaction.ps.hlsl.
+	float3 dNdx = ddx( localNormal );
+	float3 dNdy = ddy( localNormal );
+	float specAAvariance = 0.25 * ( dot( dNdx, dNdx ) + dot( dNdy, dNdy ) );
+	float specAAkernelRoughness2 = min( 2.0 * specAAvariance, 0.25 );
+
+	// traditional very dark Lambert light model used in Doom 3
+	float ldotN = saturate( dot3( localNormal, lightVector ) );
+
+#if defined(USE_HALF_LAMBERT)
+	// RB: http://developer.valvesoftware.com/wiki/Half_Lambert
+	float halfLdotN = dot3( localNormal, lightVector ) * 0.5 + 0.5;
+	halfLdotN *= halfLdotN;
+
+	// tweak to not loose so many details
+	float lambert = lerp( ldotN, halfLdotN, 0.5 );
+#else
+	float lambert = ldotN;
 #endif
 
 	float3 halfAngleVector = normalize( lightVector + viewVector );
