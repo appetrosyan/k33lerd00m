@@ -1,1 +1,13 @@
 * TODO crash on video linkup
+
+* TODO RoE is too bright
+
+* TODO Embers don't depend on force as much as they should
+
+Ideally want to seed the initial velocity by the monster's death velocity
+
+* TODO Death dissolve animation is extended, but the monster disappears long before it's finished
+
+* TODO Volumetric shadows don't shadow every object
+
+* TODO Raytraced shadows, produce weird effect on grabber
