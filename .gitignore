@@ -78,3 +78,8 @@ neo/bin/
 /neo/tools/compilers/cmake_install.cmake
 /neo/tools/compilers/CMakeFiles/
 /neo/shaders/cmake_install.cmake
+
+# clangd tooling / generated compile database (per-developer, not for the repo)
+/.clangd
+/compile_commands.json
+/neo/compile_commands.json
