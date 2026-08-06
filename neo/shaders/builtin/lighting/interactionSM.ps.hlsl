@@ -206,7 +206,9 @@ void main( PS_IN fragment, out PS_OUT result )
 				// -> dCn < cosA*sqrt(dClen^2 - cRad^2) - sinA*cRad. sinA/cosA (the disk half-angle) are
 				// caster-invariant and hoisted (swSinA/swCosA). One sqrt, no asin/acos, so a MISS is ~free -
 				// the test no longer taxes the casters it fails to cull. Gate above keeps it conservative.
-				float front = max( dot( dCv, dCv ) - cRad * cRad, 0.0 );
+				// front > 0 always here: the gate dCn - cRad > swEps gives dCn > cRad, and dClen >= dCn
+				// (Cauchy-Schwarz, swNrm unit), so dot(dCv,dCv) = dClen^2 > cRad^2. The max(,0) was redundant.
+				float front = dot( dCv, dCv ) - cRad * cRad;
 				swSkip = ( dCn < swCosA * sqrt( front ) - swSinA * cRad );
 			}
 			continue;
