@@ -31,7 +31,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 // bump on any layout change; the reader rejects mismatches.
 #define SOFTCAP_MAGIC   0x50434653u			// 'SFCP' little-endian
-#define SOFTCAP_VERSION 1u
+#define SOFTCAP_VERSION 2u					// v2: added receiver surface meshes (RECVVERTS/RECVIDX)
 
 #pragma pack( push, 1 )
 
@@ -67,6 +67,18 @@ struct softcapCaster_t
 	uint32_t numIndex;
 };
 
+// Per RECEIVER interaction surface (world space): the surfaces the coverage shader shades. The coverage uses
+// the receiver's surface position, so evaluating coverage-vs-truth at these surface points reproduces the
+// artifact WITHOUT depth reconstruction. Verts/indices live in the RECVVERTS / RECVIDX blocks.
+struct softcapReceiver_t
+{
+	uint32_t lightIndex;		// which light this receiver surface interacts with
+	uint32_t firstVert;			// index into RECVVERTS (float3 elements)
+	uint32_t numVerts;
+	uint32_t firstIndex;		// index into RECVIDX (uint32 elements)
+	uint32_t numIndex;
+};
+
 // File header. Fixed-size; followed by the variable blocks in this order:
 //   lights[numLights]  edges[numEdges]  casters[numCasters]  meshVerts[numMeshVerts*3]
 //   meshIdx[numMeshIdx]  depth[screenW*screenH] (float32, row-major top-left origin)
@@ -91,10 +103,13 @@ struct softcapHeader_t
 	uint32_t numLights;
 	uint32_t numEdges;						// total softcapEdge_t across all lights
 	uint32_t numCasters;
-	uint32_t numMeshVerts;					// float3 count
-	uint32_t numMeshIdx;					// uint32 count
+	uint32_t numMeshVerts;					// float3 count (caster meshes)
+	uint32_t numMeshIdx;					// uint32 count (caster meshes)
 	uint32_t hasDepth;						// 1 if a depth block follows, else 0
-	uint32_t reserved[8];
+	uint32_t numReceivers;					// softcapReceiver_t count
+	uint32_t numRecvVerts;					// float3 count (receiver meshes)
+	uint32_t numRecvIdx;					// uint32 count (receiver meshes)
+	uint32_t reserved[5];
 };
 
 #pragma pack( pop )

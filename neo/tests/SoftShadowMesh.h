@@ -42,9 +42,12 @@ struct SoftCap
 	std::vector<softcapLight_t>  lights;
 	std::vector<softcapEdge_t>   edges;
 	std::vector<softcapCaster_t> casters;
-	std::vector<float>           meshVerts;	// float3 packed
+	std::vector<float>           meshVerts;	// float3 packed (caster meshes)
 	std::vector<uint32_t>        meshIdx;
 	std::vector<float>           depth;
+	std::vector<softcapReceiver_t> receivers;	// receiver interaction surfaces
+	std::vector<float>           recvVerts;	// float3 packed (receiver meshes)
+	std::vector<uint32_t>        recvIdx;
 };
 
 // ----------------------------------------------------------------------------------- binary IO (round-trip)
@@ -59,6 +62,9 @@ inline bool WriteSoftCap( const char* path, const SoftCap& c )
 	if( !c.meshVerts.empty() ) { std::fwrite( c.meshVerts.data(), sizeof( float ),           c.meshVerts.size(), f ); }
 	if( !c.meshIdx.empty() )   { std::fwrite( c.meshIdx.data(),   sizeof( uint32_t ),        c.meshIdx.size(), f ); }
 	if( !c.depth.empty() )     { std::fwrite( c.depth.data(),     sizeof( float ),           c.depth.size(), f ); }
+	if( !c.receivers.empty() ) { std::fwrite( c.receivers.data(), sizeof( softcapReceiver_t ), c.receivers.size(), f ); }
+	if( !c.recvVerts.empty() ) { std::fwrite( c.recvVerts.data(), sizeof( float ),           c.recvVerts.size(), f ); }
+	if( !c.recvIdx.empty() )   { std::fwrite( c.recvIdx.data(),   sizeof( uint32_t ),        c.recvIdx.size(), f ); }
 	std::fclose( f );
 	return true;
 }
@@ -75,6 +81,9 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 	c.meshVerts.resize( ( size_t )c.hdr.numMeshVerts * 3 );
 	c.meshIdx.resize( c.hdr.numMeshIdx );
 	c.depth.resize( c.hdr.hasDepth ? ( size_t )c.hdr.screenW * c.hdr.screenH : 0 );
+	c.receivers.resize( c.hdr.numReceivers );
+	c.recvVerts.resize( ( size_t )c.hdr.numRecvVerts * 3 );
+	c.recvIdx.resize( c.hdr.numRecvIdx );
 	bool ok = true;
 	if( c.hdr.numLights )    { ok = ok && std::fread( c.lights.data(),    sizeof( softcapLight_t ),  c.lights.size(), f ) == c.lights.size(); }
 	if( c.hdr.numEdges )     { ok = ok && std::fread( c.edges.data(),     sizeof( softcapEdge_t ),   c.edges.size(), f ) == c.edges.size(); }
@@ -82,6 +91,9 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 	if( c.meshVerts.size() ) { ok = ok && std::fread( c.meshVerts.data(), sizeof( float ),           c.meshVerts.size(), f ) == c.meshVerts.size(); }
 	if( c.meshIdx.size() )   { ok = ok && std::fread( c.meshIdx.data(),   sizeof( uint32_t ),        c.meshIdx.size(), f ) == c.meshIdx.size(); }
 	if( c.depth.size() )     { ok = ok && std::fread( c.depth.data(),     sizeof( float ),           c.depth.size(), f ) == c.depth.size(); }
+	if( c.receivers.size() ) { ok = ok && std::fread( c.receivers.data(), sizeof( softcapReceiver_t ), c.receivers.size(), f ) == c.receivers.size(); }
+	if( c.recvVerts.size() ) { ok = ok && std::fread( c.recvVerts.data(), sizeof( float ),           c.recvVerts.size(), f ) == c.recvVerts.size(); }
+	if( c.recvIdx.size() )   { ok = ok && std::fread( c.recvIdx.data(),   sizeof( uint32_t ),        c.recvIdx.size(), f ) == c.recvIdx.size(); }
 	std::fclose( f );
 	return ok;
 }
