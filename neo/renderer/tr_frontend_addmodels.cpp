@@ -1629,11 +1629,20 @@ void R_AddModels()
 			// cannot occlude a given fragment's light disk (a distant world surface then skips its
 			// entire edge loop instead of an atan2 per edge). One header per caster; the shader marks
 			// a header by e0.w < 0 (edges carry e0.w = silWeight >= 0). Records = edges + one header/caster.
+			// One caster PER ENTITY, not per surface. A caster built from several surfaces (a tripod's legs, a
+			// rock's faces) would otherwise become several casters, which the coverage shader unions by
+			// max( occlusion ). At a joint no single surface occludes the whole light disk, so max() reports a
+			// half-covered disk - a hairline lit crack running through solid umbra. Grouping every surface of
+			// one entity under a single header makes the shader SUM their coverage integrals (each surface is a
+			// separate closed chain; disjoint areas add, shared seams cancel), reconstructing the union. An
+			// entity's edge surfaces are linked contiguously (all off one vEntity->drawSurfs), so a caster is a
+			// run of consecutive surfaces with the same space.
 			int total = 0, numCasters = 0;
+			const void* prevSpace = NULL;
 			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 			{
 				total += s->numSoftEdges;
-				numCasters++;
+				if( s->space != prevSpace ) { numCasters++; prevSpace = s->space; }
 			}
 			const int records = total + numCasters;
 			if( total <= 0 )
@@ -1650,32 +1659,49 @@ void R_AddModels()
 			softShadowEdge_t* flat = ( softShadowEdge_t* )R_FrameAlloc( records * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
 			int n = 0;
 			float casterId = 0.0f;	// tag each caster's edges so the shader can group + combine per caster
+			const void* curSpace = NULL;
+			int   headerIdx = -1;			// record index of the current entity's header (reserved, backfilled on close)
+			idVec3 gmn( 1e30f, 1e30f, 1e30f ), gmx( -1e30f, -1e30f, -1e30f );	// entity bounding box (for the sphere)
 			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 			{
-				// world-space bounding sphere of this caster's silhouette edges (for the shader-side cull)
-				idVec3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+				if( s->space != curSpace )
+				{
+					if( headerIdx >= 0 )	// close the previous entity: its sphere is now known
+					{
+						const idVec3 c = ( gmn + gmx ) * 0.5f;
+						const float  rad = ( gmx - gmn ).Length() * 0.5f;
+						flat[headerIdx].e0 = idVec4( c.x, c.y, c.z, -1.0f );		// e0 = ( centre, -1 marker )
+						flat[headerIdx].e1 = idVec4( rad, 0.0f, 0.0f, casterId );	// e1 = ( radius, 0, 0, casterId )
+						casterId += 1.0f;
+					}
+					headerIdx = n++;		// reserve this entity's header slot
+					gmn.Set( 1e30f, 1e30f, 1e30f );
+					gmx.Set( -1e30f, -1e30f, -1e30f );
+					curSpace = s->space;
+				}
+
 				for( int i = 0; i < s->numSoftEdges; i++ )
 				{
 					const idVec4& e0 = s->softEdges[i].e0;
 					const idVec4& e1 = s->softEdges[i].e1;
-					mn.x = Min( mn.x, Min( e0.x, e1.x ) );	mx.x = Max( mx.x, Max( e0.x, e1.x ) );
-					mn.y = Min( mn.y, Min( e0.y, e1.y ) );	mx.y = Max( mx.y, Max( e0.y, e1.y ) );
-					mn.z = Min( mn.z, Min( e0.z, e1.z ) );	mx.z = Max( mx.z, Max( e0.z, e1.z ) );
-				}
-				const idVec3 c = ( mn + mx ) * 0.5f;
-				const float  rad = ( mx - mn ).Length() * 0.5f;
+					gmn.x = Min( gmn.x, Min( e0.x, e1.x ) );	gmx.x = Max( gmx.x, Max( e0.x, e1.x ) );
+					gmn.y = Min( gmn.y, Min( e0.y, e1.y ) );	gmx.y = Max( gmx.y, Max( e0.y, e1.y ) );
+					gmn.z = Min( gmn.z, Min( e0.z, e1.z ) );	gmx.z = Max( gmx.z, Max( e0.z, e1.z ) );
 
-				// header record: e0 = ( centre, -1 marker ), e1 = ( radius, 0, 0, casterId )
-				flat[n].e0 = idVec4( c.x, c.y, c.z, -1.0f );
-				flat[n].e1 = idVec4( rad, 0.0f, 0.0f, casterId );
-				n++;
-
-				for( int i = 0; i < s->numSoftEdges; i++ )
-				{
 					flat[n] = s->softEdges[i];
-					flat[n].e1.w = casterId;	// per-caster group id (edges of one caster are contiguous)
+					// e1.w carries this caster's HEADER record index so the band prepass VS (softband.vs.hlsl)
+					// can fetch the caster's bounding-sphere centre for the near/far volume caps. The coverage
+					// pixel shader detects caster boundaries by the e0.w<0 header, not by e1.w, so this is free.
+					flat[n].e1.w = ( float )headerIdx;
 					n++;
 				}
+			}
+			if( headerIdx >= 0 )	// close the final entity
+			{
+				const idVec3 c = ( gmn + gmx ) * 0.5f;
+				const float  rad = ( gmx - gmn ).Length() * 0.5f;
+				flat[headerIdx].e0 = idVec4( c.x, c.y, c.z, -1.0f );
+				flat[headerIdx].e1 = idVec4( rad, 0.0f, 0.0f, casterId );
 				casterId += 1.0f;
 			}
 			// AllocJoint (not AllocVertex): the joint buffer is the SRV-capable StructuredBuffer the
