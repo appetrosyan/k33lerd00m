@@ -511,6 +511,9 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	int sampled = 0, bad = 0, tooLight = 0, tooDark = 0; double worst = 0, sumAbs = 0, covSum = 0, truSum = 0;
 	// hunt the EXTRANEOUS-SHADOW cases the user sees: coverage says shadow where truth says lit (cov << truth).
 	int extraneous = 0, extraneousDir = 0; float worstOver = 0; float3 owP( 0, 0, 0 ), owL( 0, 0, 0 ); float owCov = 0, owTru = 0, owDir = 0;
+	// candidate FIX: gate coverage on the receiver actually being in the caster's shadow (hard-shadow center
+	// ray blocked). gatedExtraneous should collapse; penumbraClipped is what a strict hard gate would cost.
+	int gatedExtraneous = 0, penumbraClipped = 0;
 	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 	{
 		const softcapLight_t& L = c.lights[li];
@@ -552,6 +555,11 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 				float dcov = DirShadow( recVec, P, Lo, L.penumbraSize );		// direction-space reference
 				float truth = MeshTruthShadowSoup( c.meshVerts.data(), castIdx.data(), ( uint32_t )castIdx.size(), P, Lo, L.penumbraSize, 12 );
 				if( dcov < 0.5f && truth > 0.85f ) { extraneousDir++; }			// same extraneous test for direction-space
+				// gate: coverage only counts if the receiver is in the caster's actual shadow (center ray blocked)
+				bool hardBlocked = RayHitsMesh( P, Lo - P, c.meshVerts.data(), castIdx.data(), ( uint32_t )castIdx.size() );
+				float gatedCov = hardBlocked ? cov : 1.0f;
+				if( gatedCov < 0.5f && truth > 0.85f ) { gatedExtraneous++; }	// extraneous shadow after gating (want ~0)
+				if( !hardBlocked && truth < 0.9f ) { penumbraClipped++; }		// outer penumbra a hard gate would drop
 				float d = std::fabs( cov - truth );
 				sampled++; sumAbs += d; worst = std::fmax( worst, ( double )d ); covSum += cov; truSum += truth;
 				if( d > 0.1f ) { bad++; }
@@ -569,7 +577,8 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	// to the side (a shadow no light would cast there)?
 	float3 dPL = owL - owP; float distPL = std::sqrt( dot( dPL, dPL ) );
 	float3 dirPL = distPL > 1e-4f ? dPL * ( 1.0f / distPL ) : float3( 0, 0, 1 );
-	std::printf( "    [cap_cov] EXTRANEOUS shadow (cov<0.5 & truth>0.85): planar=%d  direction-space=%d\n", extraneous, extraneousDir );
+	std::printf( "    [cap_cov] EXTRANEOUS shadow (cov<0.5 & truth>0.85): planar=%d  direction-space=%d  hard-gated=%d  (penumbra a hard gate would clip=%d)\n",
+			extraneous, extraneousDir, gatedExtraneous, penumbraClipped );
 	std::printf( "    [cap_cov] worst over-shadow: planar=%.3f dir=%.3f truth=%.3f at P(%.0f,%.0f,%.0f) light(%.0f,%.0f,%.0f) dir(%.2f,%.2f,%.2f)\n",
 			owCov, owDir, owTru, owP.x, owP.y, owP.z, owL.x, owL.y, owL.z, dirPL.x, dirPL.y, dirPL.z );
 	std::printf( "    [cap_cov] %d samples: %d disagree>0.1 (%.1f%%)  worst=%.3f  mean|cov-truth|=%.4f\n",
