@@ -287,3 +287,43 @@ TEST( SoftShadowCoverage, coverage_is_spatially_smooth_wide_slab )
 	std::printf( "    [smooth slab] max adjacent jump = %.3f at (%.2f,%.2f)\n", jump, ax, ay );
 	CHECK( jump < 0.20f );
 }
+
+// ============================================== MULTI-PART CASTER: joints must not leak (tripod / rock)
+// A tripod or a rock is several caster SURFACES that abut at joints. In the shipping frontend each surface
+// gets its own casterId, and the coverage loop UNIONS casters by max( occ ). Where two surfaces meet, no
+// SINGLE surface occludes the whole light disk - one covers one half, the other the other half - so max()
+// reports ~0.5 at the seam: a hairline lit crack running through what should be solid umbra (USER: joints
+// and where multiple faces meet produce no coverage; rocks show hairline lit lines inside the full umbra).
+// The union is fully occluded; the bug is purely the max combine. Grouping the surfaces as ONE caster makes
+// their coverage integrals SUM (disjoint areas on the disk add), reconstructing the union - the per-entity
+// grouping fix. This test reproduces the leak and proves the fix on the exact geometry that triggers it.
+//
+// Two thin half-slabs meeting at the seam x=0, both between the light and the receiver directly under the
+// seam. Each half alone covers about half the disk; together they fully occlude it.
+TEST( SoftShadowCoverage, multipart_joint_does_not_leak_when_summed )
+{
+	float3 P0( 0, 0, 0 );
+	// two rectangles splitting a 3.2 x 3.2 slab at the seam x=0; each half is 1.6 x 3.2, wound CCW. The union
+	// projects (scale 12/6 = 2) to 6.4 x 6.4, comfortably covering the r=3 disk => the union is FULL umbra.
+	std::vector<float3> left  = { float3( -1.6f, -1.6f, 6 ), float3( 0, -1.6f, 6 ), float3( 0, 1.6f, 6 ), float3( -1.6f, 1.6f, 6 ) };
+	std::vector<float3> right = { float3( 0, -1.6f, 6 ), float3( 1.6f, -1.6f, 6 ), float3( 1.6f, 1.6f, 6 ), float3( 0, 1.6f, 6 ) };
+
+	// ground truth: the union is one solid slab spanning both halves.
+	Box unionSlab = MakeBox( float3( 0, 0, 6 ), float3( 1.6f, 1.6f, 0.02f ) );
+	float truth = TruthShadow( P0, L_OVER, RAD, unionSlab, 400 );
+
+	// SHIPPING BUG: two separate casters (two headers) -> the loop max-combines them.
+	std::vector<float4> sep = BuildCaster( { left } );
+	std::vector<float4> rr  = BuildCaster( { right } );
+	sep.insert( sep.end(), rr.begin(), rr.end() );				// concatenate = two casterIds in one light
+	float maxCombine = LiveShadow( sep, P0, L_OVER, RAD );
+
+	// FIX: one caster carrying both surfaces -> the loop sums their coverage.
+	float sumCombine = LiveShadow( BuildCaster( { left, right } ), P0, L_OVER, RAD );
+
+	std::printf( "    [joint] truth=%.3f  max-combine(shipping)=%.3f  sum-combine(fixed)=%.3f\n",
+			truth, maxCombine, sumCombine );
+	CHECK( truth < 0.05f );							// the union genuinely occludes the disk (solid umbra)
+	CHECK( maxCombine > truth + 0.2f );				// max-combine LEAKS: a bright crack at the joint (the bug)
+	CHECK_NEAR( sumCombine, truth, 0.03f );			// per-entity SUM is solid: the joint closes (the fix)
+}
