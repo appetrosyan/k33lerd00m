@@ -483,6 +483,32 @@ TEST( SoftShadowCoverage, multipart_joint_does_not_leak_when_summed )
 // own caster solids. Where they disagree by a lot is the real Erebus artifact - measured, not eyeballed - on
 // the exact geometry the shader ran. This is what a fix (direction-space or other) must drive down, and the
 // seed for the Phase 5 minimal test. Needs a v3 capture (global mesh indices + receiver surfaces).
+// One caster's silhouette (world edges + centre) for the offline band-membership test.
+struct BandCaster { float3 center; std::vector<std::pair<float3, float3>> edges; };
+
+// Is P inside the ACTUAL softband inflated shadow volume of this caster? Mirrors softband.vs.hlsl: inflate
+// each silhouette vertex radially about the caster centre by rp, extrude the point-light shadow from the
+// light centre L. Membership = the inflated silhouette's directions (from L) wind around the direction to P.
+// This is the REAL gate the game runs, not an idealized ray-cast - so it reproduces the band's own behaviour.
+static bool BandCasterContains( float3 P, float3 L, float rp, const BandCaster& bc )
+{
+	float3 dP = P - L; float dl = std::sqrt( dot( dP, dP ) ); if( dl < 1e-4f ) { return false; } dP = dP * ( 1.0f / dl );
+	float3 up = ( std::fabs( dP.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+	float3 u = normalize( cross( up, dP ) ); float3 v = cross( dP, u );
+	double sum = 0.0;
+	for( const std::pair<float3, float3>& e : bc.edges )
+	{
+		float3 dA = e.first - bc.center;  float la = std::sqrt( dot( dA, dA ) );
+		float3 dB = e.second - bc.center; float lb = std::sqrt( dot( dB, dB ) );
+		float3 A = la > 1e-4f ? e.first  + dA * ( rp / la ) : e.first;
+		float3 B = lb > 1e-4f ? e.second + dB * ( rp / lb ) : e.second;
+		float3 aDir = normalize( A - L ), bDir = normalize( B - L );
+		float ax = dot( aDir, u ), ay = dot( aDir, v ), bx = dot( bDir, u ), by = dot( bDir, v );
+		sum += std::atan2( ax * by - ay * bx, ax * bx + ay * by );
+	}
+	return std::fabs( sum ) > 3.14159;		// ~2*pi: the inflated silhouette encloses the direction to P
+}
+
 TEST( SoftShadowCapture, coverage_vs_truth )
 {
 	const char* path = std::getenv( "SOFTCAP" );
@@ -519,6 +545,9 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	// the candidate COMPREHENSIVE fix: direction-space coverage (fixes missing shadow) GATED by the shadow
 	// volume (fixes direction-space's own over-occlusion). Both failure counts should collapse together.
 	int dirMissing = 0, dirGatedExtraneous = 0; double dcovSum = 0;
+	// the REAL band gate (softband.vs.hlsl geometry, built from the captured edges). If this still shows
+	// extraneous shadow, the shipped band is not fixing it - which is what the band-on captures indicate.
+	int realBandExtraneous = 0, realBandIn = 0;
 	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 	{
 		const softcapLight_t& L = c.lights[li];
@@ -536,12 +565,22 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 
 		// this light's edge records as a float4 array, for the direction-space reference (SoftShadowDir.h)
 		std::vector<float4> recVec;
+		std::vector<BandCaster> bandCasters;		// per-caster silhouettes for the REAL band-gate test
 		for( uint32_t r = L.firstEdge; r < L.firstEdge + L.edgeCount && r < c.edges.size(); r++ )
 		{
 			const softcapEdge_t& e = c.edges[r];
 			recVec.push_back( float4( e.e0[0], e.e0[1], e.e0[2], e.e0[3] ) );
 			recVec.push_back( float4( e.e1[0], e.e1[1], e.e1[2], e.e1[3] ) );
+			if( e.e0[3] < 0.0f )					// header: caster boundary, centre in e0.xyz
+			{
+				BandCaster bc; bc.center = float3( e.e0[0], e.e0[1], e.e0[2] ); bandCasters.push_back( bc );
+			}
+			else if( !bandCasters.empty() )
+			{
+				bandCasters.back().edges.push_back( std::make_pair( float3( e.e0[0], e.e0[1], e.e0[2] ), float3( e.e1[0], e.e1[1], e.e1[2] ) ) );
+			}
 		}
+		const float bandRp = L.penumbraSize * 1.1f;	// softband margin (RenderBackend swParm .z = 1.1)
 
 		// sample this light's receiver surfaces (subsampled to keep the ray-cast tractable)
 		for( const softcapReceiver_t& R : c.receivers )
@@ -580,6 +619,12 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 				if( dcov > truth + 0.35f ) { dirMissing++; }			// direction-space under-occlusion (want << planar)
 				float dGated = hardBlocked ? dcov : 1.0f;				// direction-space, gated by the shadow volume
 				if( dGated < 0.5f && truth > 0.85f ) { dirGatedExtraneous++; }	// its over-occlusion after gating (want ~0)
+				// the REAL band gate: is P inside any caster's softband volume?
+				bool bandIn = false;
+				for( const BandCaster& bc : bandCasters ) { if( BandCasterContains( P, Lo, bandRp, bc ) ) { bandIn = true; break; } }
+				float realBandCov = bandIn ? cov : 1.0f;
+				if( bandIn ) { realBandIn++; }
+				if( realBandCov < 0.5f && truth > 0.85f ) { realBandExtraneous++; }	// extraneous shadow the REAL band leaves
 				if( cov - truth > worstUnder )					// track the single worst under-occlusion + geometry
 				{
 					worstUnder = cov - truth; uwP = P; uwL = Lo; uwCov = cov; uwTru = truth; uwDir = dcov;
@@ -591,8 +636,8 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	// to the side (a shadow no light would cast there)?
 	float3 dPL = owL - owP; float distPL = std::sqrt( dot( dPL, dPL ) );
 	float3 dirPL = distPL > 1e-4f ? dPL * ( 1.0f / distPL ) : float3( 0, 0, 1 );
-	std::printf( "    [cap_cov] EXTRANEOUS shadow (cov<0.5 & truth>0.85): planar=%d  direction-space=%d  hard-gated=%d  (penumbra a hard gate would clip=%d)\n",
-			extraneous, extraneousDir, gatedExtraneous, penumbraClipped );
+	std::printf( "    [cap_cov] EXTRANEOUS shadow (cov<0.5 & truth>0.85): planar=%d  direction-space=%d  idealized-hard-gate=%d  REAL-softband-gate=%d  (band marks %d/%d samples in-band)\n",
+			extraneous, extraneousDir, gatedExtraneous, realBandExtraneous, realBandIn, sampled );
 	std::printf( "    [cap_cov] worst over-shadow: planar=%.3f dir=%.3f truth=%.3f at P(%.0f,%.0f,%.0f) light(%.0f,%.0f,%.0f) dir(%.2f,%.2f,%.2f)\n",
 			owCov, owDir, owTru, owP.x, owP.y, owP.z, owL.x, owL.y, owL.z, dirPL.x, dirPL.y, dirPL.z );
 	float3 uPL = uwL - uwP; float uDist = std::sqrt( dot( uPL, uPL ) ); float3 uDir = uDist > 1e-4f ? uPL * ( 1.0f / uDist ) : float3( 0, 0, 1 );
