@@ -76,6 +76,9 @@ option(FLATPAK
 option(REPRODUCIBLE_BUILD
 		"Replace __DATE__ and __TIME__ by hardcoded values for reproducible builds" OFF)
 
+option(BUILD_TESTS
+		"Build the standalone unit-test runner (neo/tests) as a separate executable" OFF)
+
 #set(NVRHI_INSTALL OFF)
 
 set(CPU_TYPE "" CACHE STRING "When set, passes this string as CPU-ID which will be embedded into the binary.")
@@ -1501,4 +1504,16 @@ add_subdirectory(shaders)
 add_dependencies(Shaders ShaderMake)
 add_dependencies(ShadersRT ShaderMake)
 add_dependencies(${APP_NAME} Shaders ShadersRT ${MASKED_OCCLUSION_LIBRARY} ${ISPC_TEXCOMP_LIBRARY})
+
+# Standalone unit-test runner. Pure-logic tests (no engine link) so they compile and run before the
+# full game build: `cmake -DBUILD_TESTS=ON` then run the `rbdoom3bfg_tests` binary. Tests self-register
+# via TEST() in neo/tests/*.cpp; the framework core (idUnitTest) is dependency-free so engine-coupled
+# tests can later be added here and linked against idlib.
+if(BUILD_TESTS)
+	file(GLOB TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
+	add_executable(rbdoom3bfg_tests ${TEST_SOURCES})
+	target_compile_definitions(rbdoom3bfg_tests PRIVATE ID_UNIT_TEST_STANDALONE)
+	target_include_directories(rbdoom3bfg_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+	set_target_properties(rbdoom3bfg_tests PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+endif()
 
