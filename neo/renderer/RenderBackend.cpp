@@ -1835,6 +1835,47 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		const bool pbr = ( specUsage == TD_SPECULAR_PBR_RMAO || specUsage == TD_SPECULAR_PBR_RMAOD );
 		const bool skinned = ( din->surf->jointCache != 0 );
 
+		// DIAGNOSTIC (r_softShadowBandMask == 2): paint the band map flat - red where the coverage variant
+		// runs (band, stencil>0) and green where the cheap lit variant runs (stencil==0). Reveals exactly
+		// what the prepass marked: a red fringe OUTSIDE the umbra means the wedges added penumbra; red only
+		// covering the umbra shape means the wedges contributed nothing.
+		extern idCVar r_softShadowBandMask;
+		if( softBandStencilRef >= 0 && r_softShadowBandMask.GetInteger() >= 2 )
+		{
+			renderProgManager.BindShader_Color();
+			const idVec4 dbg = ( softBandStencilRef == 1 ) ? idVec4( 1.0f, 0.0f, 0.0f, 1.0f ) : idVec4( 0.0f, 0.25f, 0.0f, 1.0f );
+			SetVertexParm( RENDERPARM_COLOR, dbg.ToFloatPtr() );
+			SetFragmentParm( RENDERPARM_COLOR, dbg.ToFloatPtr() );
+			DrawElementsWithCounters( din->surf );
+			return;
+		}
+
+		// Analytic soft shadows, penumbra-band LIT pass (softBandStencilRef == 0): this draw only touches
+		// fragments the band prepass left at stencil == 0, which are provably fully lit (outside every
+		// silhouette's penumbra wedge => coverage exactly 0). Bind the plain unshadowed interaction variant
+		// - no coverage loop, no shadow map, texunit 5 ignored - which is bit-identical to shadow = 1.
+		if( softBandStencilRef == 0 )
+		{
+			if( pbr )
+			{
+				skinned ? renderProgManager.BindShader_PBR_InteractionSkinned() : renderProgManager.BindShader_PBR_Interaction();
+			}
+			else
+			{
+				skinned ? renderProgManager.BindShader_InteractionSkinned() : renderProgManager.BindShader_Interaction();
+			}
+
+			GL_SelectTexture( INTERACTION_TEXUNIT_BUMP );
+			din->bumpImage->Bind();
+			GL_SelectTexture( INTERACTION_TEXUNIT_SPECULARMIX );
+			din->specularImage->Bind();
+			GL_SelectTexture( INTERACTION_TEXUNIT_BASECOLOR );
+			din->diffuseImage->Bind();
+
+			DrawElementsWithCounters( din->surf );
+			return;
+		}
+
 		// Analytic soft shadows: this light carries silhouette edges, so evaluate penumbra coverage per
 		// fragment against the EXACT receiver position (no screen-space mask). Bind the edge buffer (the
 		// SRV-capable joint buffer) + (R, minWidth, numEdges), and pick the soft-wedge interaction variant
@@ -2001,6 +2042,22 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 			GLS_STENCIL_MAKE_REF( STENCIL_SHADOW_TEST_VALUE ) |
 			GLS_STENCIL_MAKE_MASK( STENCIL_SHADOW_MASK_VALUE ) );
 
+	}
+	else if( softBandStencilRef >= 0 )
+	{
+		// Analytic soft shadows, penumbra-band pass: the prepass marked stencil > 0 inside the penumbra
+		// band. The stencil test is (ref OP buffer), so "in band" (buffer > 0) is ref 0 LESS; "lit"
+		// (buffer == 0) is ref 0 EQUAL. Coverage variant runs on the band, cheap unshadowed on the lit
+		// remainder. Stencil is read-only here (ops KEEP).
+		GL_State(
+			GLS_SRCBLEND_ONE |
+			GLS_DSTBLEND_ONE |
+			GLS_DEPTHMASK |
+			depthFunc |
+			( ( softBandStencilRef == 0 ) ? GLS_STENCIL_FUNC_EQUAL : GLS_STENCIL_FUNC_LESS ) |
+			GLS_STENCIL_MAKE_REF( 0 ) |
+			GLS_STENCIL_MAKE_MASK( 0xFF ) |
+			GLS_STENCIL_OP_FAIL_KEEP | GLS_STENCIL_OP_ZFAIL_KEEP | GLS_STENCIL_OP_PASS_KEEP );
 	}
 	else
 	{
@@ -4688,11 +4745,142 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			// otherwise-opaque Interactions total). Same predicate as the shader's isSoftWedge.
 			const bool lightIsSoft = r_useSoftShadowVolumes.GetBool() && vLight->softEdgeCount > 0;
 
+			// Analytic soft shadows: penumbra-band stencil prepass. Rasterise every silhouette edge's
+			// penumbra WEDGE volume into stencil (two-sided z-fail), marking stencil > 0 at every receiver
+			// fragment inside any wedge - a conservative SUPERSET of the true penumbra (band ⊇ penumbra by
+			// construction, since the wedges use the same edges + radius the coverage shader integrates).
+			// The interactions below then run the expensive coverage variant only on the band (stencil > 0)
+			// and the cheap unshadowed variant on the provably-lit remainder (stencil == 0). Bit-identical.
+			extern idCVar r_softShadowBandMask;
+			const bool bandMask = lightIsSoft && r_softShadowBandMask.GetBool() && vLight->softEdgeCache != 0;
+			if( bandMask )
+			{
+				extern idCVar r_shadowPenumbraSize;
+				extern idCVar r_shadowPenumbraMinWidth;
+
+				// clear this light's S-cull-tile-aligned rect to 0 (= LIT); the prepass writes > 0 in-band.
+				idScreenRect rect;
+				rect.x1 = ( vLight->scissorRect.x1 +  0 ) & ~15;
+				rect.y1 = ( vLight->scissorRect.y1 +  0 ) & ~15;
+				rect.x2 = ( vLight->scissorRect.x2 + 15 ) & ~15;
+				rect.y2 = ( vLight->scissorRect.y2 + 15 ) & ~15;
+				if( !currentScissor.Equals( rect ) && r_useScissor.GetBool() )
+				{
+					GL_Scissor( viewDef->viewport.x1 + rect.x1,
+								viewDef->viewport.y2 - rect.y2,
+								rect.x2 + 1 - rect.x1,
+								rect.y2 + 1 - rect.y1 );
+					currentScissor = rect;
+				}
+				GL_State( GLS_DEFAULT );
+				GL_Clear( false, false, true, 0, 0.0f, 0.0f, 0.0f, 0.0f, false );
+
+				renderLog.OpenBlock( "SoftShadow Band Prepass", colorBlue );
+				renderLog.BeginShadowGen( RLS_SOFT );
+
+				// The band = union of two confines, marked +1 into a cleared (0) stencil, coverage gated on != 0:
+				//
+				//   CORE  = the engine's REAL capped point-light shadow volumes (vLight->global/localShadows,
+				//           built for soft lights too - tr_frontend_addmodels.cpp:1185). These have proper caps
+				//           and per-surf z-fail when the view is inside them, so they are concave-safe and never
+				//           drop out - the robust backstop. They mark the umbra + inner penumbra (the hard shadow
+				//           is a SUBSET of the soft shadow, which is why the core ALONE loses the dominant
+				//           penumbra - hence the shell below).
+				//   SHELL = the soft silhouette inflated by r' about the caster centre, extruded from L, walls
+				//           only (softband.vs.hlsl) marked CAPLESS z-PASS. This is the conservative SUPERSET that
+				//           covers the OUTER penumbra the core misses. Walls-only + z-pass = no shards, no far-prism
+				//           bleed, and (having no caps) none of the concave-caster killed/displaced-shadow failures
+				//           a procedural cap causes. Its one soft spot - the thin outer fringe dropping when the eye
+				//           is inside it (capless z-pass) - is backed by the z-fail CORE, so the shadow never vanishes.
+				//
+				// Both mark +1 inside (DrawStencilShadowPass and the z-pass shell agree), so the union is stencil>0.
+
+				// --- CORE: engine shadow volumes -------------------------------------------------------------
+				GL_State(
+					GLS_DEPTHMASK | GLS_COLORMASK | GLS_ALPHAMASK | GLS_DEPTHFUNC_LESS |
+					GLS_CULL_TWOSIDED | GLS_STENCIL_FUNC_ALWAYS |
+					GLS_STENCIL_MAKE_REF( 0 ) | GLS_STENCIL_MAKE_MASK( 0xFF ) );
+				renderProgManager.BindShader_Shadow();
+				currentSpace = NULL;
+				extern idCVar r_forceZPassStencilShadows;
+				for( int shPass = 0; shPass < 2; shPass++ )
+				{
+					const drawSurf_t* shadowList = ( shPass == 0 ) ? vLight->globalShadows : vLight->localShadows;
+					for( const drawSurf_t* s = shadowList; s != NULL; s = s->nextOnLight )
+					{
+						if( s->numIndexes == 0 )
+						{
+							continue;
+						}
+						if( s->space != currentSpace )
+						{
+							RB_SetMVP( s->space->mvp );
+							// shadow VS reads the light origin from rpLocalViewOrigin (w=0 -> extrude to infinity).
+							idVec4 localLight( 0.0f );
+							R_GlobalPointToLocal( s->space->modelMatrix, vLight->globalLightOrigin, localLight.ToVec3() );
+							SetVertexParm( RENDERPARM_LOCALVIEWORIGIN, localLight.ToFloatPtr() );
+							currentSpace = s->space;
+						}
+						// use the per-surf pass the volume was BUILT for (z-pass no-caps unless it needs z-fail).
+						const bool renderZPass = ( s->renderZFail == 0 ) || r_forceZPassStencilShadows.GetBool();
+						DrawStencilShadowPass( s, renderZPass );
+					}
+				}
+
+				// --- SHELL: inflated soft silhouette, capless z-pass -----------------------------------------
+				RB_SetMVP( viewDef->worldSpace.mvp );
+				const idVec4 lightOrigin( vLight->globalLightOrigin.x, vLight->globalLightOrigin.y, vLight->globalLightOrigin.z, 1.0f );
+				SetVertexParm( RENDERPARM_GLOBALLIGHTORIGIN, lightOrigin.ToFloatPtr() );
+
+				const vertCacheHandle_t eh = vLight->softEdgeCache;
+				currentSoftEdgeOffset = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				currentSoftEdgeBuffer = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+				currentSoftEdgeCount = vLight->softEdgeCount;
+
+				float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), 0.0f, 0.0f, 0.0f };
+				SetVertexParm( RENDERPARM_JITTERTEXOFFSET, swOff );
+				renderProgManager.BindShader_SoftShadowBand();
+
+				// swParm = ( r, apexSign -1 = inflate (outer), marginScale 1.1, - ). Capless z-PASS with the
+				// EXACT engine convention (front-face pass INCR / back-face pass DECR, SATURATING - not WRAP), so
+				// the shell and the core count the same sign: where they overlap the stencil adds to +2, it never
+				// wraps 255->0 and cancels the umbra (that cancellation was the "brightens + inaccurate" bug). If
+				// the shell winding were opposite the engine's it would saturate to 0 (shell contributes nothing)
+				// rather than corrupt the core - a safe failure. z-pass (not z-fail) never bleeds the far prism.
+				const float swParm[4] = { r_shadowPenumbraSize.GetFloat(), -1.0f, 1.1f, 0.0f };
+				SetVertexParm( RENDERPARM_JITTERTEXSCALE, swParm );
+				GL_State(
+					GLS_DEPTHMASK | GLS_COLORMASK | GLS_ALPHAMASK | GLS_DEPTHFUNC_LESS |
+					GLS_CULL_TWOSIDED | GLS_STENCIL_FUNC_ALWAYS |
+					GLS_STENCIL_OP_FAIL_KEEP | GLS_STENCIL_OP_ZFAIL_KEEP | GLS_STENCIL_OP_PASS_INCR |
+					GLS_BACK_STENCIL_OP_FAIL_KEEP | GLS_BACK_STENCIL_OP_ZFAIL_KEEP | GLS_BACK_STENCIL_OP_PASS_DECR |
+					GLS_STENCIL_MAKE_REF( 0 ) | GLS_STENCIL_MAKE_MASK( 0xFF ) );
+				DrawSoftShadowBand( vLight->softEdgeCount );
+
+				// the prepass may have left the bound MVP at world->clip with currentSpace still pointing at
+				// the last shadow-volume space; force the interaction pass to re-set per-surf MVP.
+				currentSpace = NULL;
+
+				renderLog.EndShadowGen();
+				renderLog.CloseBlock();
+			}
+
 			if( vLight->localInteractions != NULL )
 			{
 				renderLog.OpenBlock( "Local Light Interactions", colorPurple );
 				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
-				RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, performStencilTest, useLightDepthBounds );
+				if( bandMask )
+				{
+					softBandStencilRef = 1;		// coverage variant on the band (stencil > 0)
+					RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					softBandStencilRef = 0;		// cheap unshadowed variant on the lit remainder (stencil == 0)
+					RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					softBandStencilRef = -1;
+				}
+				else
+				{
+					RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, performStencilTest, useLightDepthBounds );
+				}
 				if( lightIsSoft ) { renderLog.EndShadowGen(); }
 				renderLog.CloseBlock();
 			}
@@ -4708,7 +4896,18 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			{
 				renderLog.OpenBlock( "Global Light Interactions", colorPurple );
 				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
-				RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, performStencilTest, useLightDepthBounds );
+				if( bandMask )
+				{
+					softBandStencilRef = 1;
+					RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					softBandStencilRef = 0;
+					RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					softBandStencilRef = -1;
+				}
+				else
+				{
+					RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, performStencilTest, useLightDepthBounds );
+				}
 				if( lightIsSoft ) { renderLog.EndShadowGen(); }
 				renderLog.CloseBlock();
 			}

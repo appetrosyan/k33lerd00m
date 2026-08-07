@@ -90,7 +90,8 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 	// Analytic soft shadows: the SM_SOFT layouts carry this light's silhouette-edge StructuredBuffer at
 	// t12 (the interaction pixel shader loops it against the exact receiver position). Isolated from the
 	// shared SM layout so shadow-mapped lights are untouched.
-	const bool soft = ( layoutType == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT ) || ( layoutType == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED );
+	const bool soft = ( layoutType == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT ) || ( layoutType == BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED )
+					  || ( layoutType == BINDING_LAYOUT_SOFT_BAND );	// band prepass VS reads the same edge buffer at t12
 
 	// SRS - Create and return uniforms layout based on above choices and skinning enablement
 	if( skinning )
@@ -593,6 +594,13 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 	{
 		uniformsLayout( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED, true ), defaultMaterialLayout, interactionSmBindingLayout, samplerFourBindingLayout
 	};
+	// Analytic soft shadows: penumbra-band stencil prepass. A single set - renderparms (b0) + the
+	// silhouette-edge StructuredBuffer at t12 - both All-visible via uniformsLayout, so the band VS
+	// can read the edges and expand each into a wedge volume. No materials/samplers (stencil only).
+	bindingLayouts[BINDING_LAYOUT_SOFT_BAND] =
+	{
+		uniformsLayout( BINDING_LAYOUT_SOFT_BAND, false )
+	};
 
 	auto fogBindingLayoutDesc = nvrhi::BindingLayoutDesc()
 								.setVisibility( nvrhi::ShaderType::Pixel )
@@ -1022,6 +1030,10 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		{ BUILTIN_INTERACTION_SOFT_WEDGE_POINT_SKINNED, "builtin/lighting/interactionSM", "_softwedge_point_skinned", { { "USE_GPU_SKINNING", "1" }, { "LIGHT_POINT", "1" }, { "LIGHT_PARALLEL", "0" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED },
 		{ BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL, "builtin/lighting/interactionSM", "_softwedge_parallel", { { "USE_GPU_SKINNING", "0" }, { "LIGHT_POINT", "0" }, { "LIGHT_PARALLEL", "1" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT },
 		{ BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL_SKINNED, "builtin/lighting/interactionSM", "_softwedge_parallel_skinned", { { "USE_GPU_SKINNING", "1" }, { "LIGHT_POINT", "0" }, { "LIGHT_PARALLEL", "1" }, { "USE_PBR", "0" }, { "USE_NORMAL_FMT_RGB8", "0" }, { "USE_SHADOW_ATLAS", "0" }, { "USE_SOFT_WEDGE", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED },
+
+		// Analytic soft shadows: penumbra-band stencil prepass. Procedural (no vertex buffer -> LAYOUT_UNKNOWN,
+		// null input layout); the VS expands each t12 edge record into a wedge volume from SV_VertexID.
+		{ BUILTIN_SOFT_BAND, "builtin/lighting/softband", "", { { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_SOFT_BAND ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_UNKNOWN, BINDING_LAYOUT_SOFT_BAND },
 	};
 	int numBuiltins = sizeof( builtins ) / sizeof( builtins[0] );
 

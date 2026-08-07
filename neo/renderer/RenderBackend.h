@@ -149,6 +149,11 @@ public:
 
 	void				DrawElementsWithCounters( const drawSurf_t* surf, bool shadowCounter = false );
 
+	// Analytic soft shadows: procedural (no vertex buffer) draw of the penumbra-band stencil prepass.
+	// Expands recordCount silhouette-edge records from t12 into wedge volumes (36 verts each) via
+	// SV_VertexID; the bound GL_State two-sided z-fail marks the band into stencil. See DrawInteractions.
+	void				DrawSoftShadowBand( int recordCount );
+
 private:
 	void				DrawFlickerBox();
 
@@ -392,6 +397,7 @@ private:
 	nvrhi::IBuffer*					currentSoftEdgeBuffer;	// analytic soft shadows: this light's silhouette-edge buffer (t12)
 	uint							currentSoftEdgeOffset;
 	int								currentSoftEdgeCount;
+	int								softBandStencilRef;		// analytic soft shadows: penumbra-band interaction pass. -1 = no band test (soft on whole surface); 0 = draw stencil==0 fragments with the cheap unshadowed variant; 1 = draw stencil>0 (band) fragments with the coverage variant.
 	nvrhi::GraphicsPipelineHandle	currentPipeline;
 
 	idStaticList<nvrhi::BindingSetHandle, nvrhi::c_MaxBindingLayouts> currentBindingSets;

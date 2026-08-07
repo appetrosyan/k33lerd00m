@@ -914,6 +914,7 @@ enum bindingLayoutType_t
 	// analytic soft shadows: appended at the END so no existing binding-layout value shifts
 	BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT,			// SM layout + silhouette-edge StructuredBuffer at t12
 	BINDING_LAYOUT_DRAW_INTERACTION_SM_SOFT_SKINNED,
+	BINDING_LAYOUT_SOFT_BAND,							// penumbra-band stencil prepass: renderparms + edge buffer at t12 (VS-read)
 
 	NUM_BINDING_LAYOUTS
 };

@@ -567,9 +567,6 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 	R_CalcInteractionFacing( ent, tri, light, cullInfo );
 	const byte* facing = cullInfo.facing;
 
-	idVec3 localLight;
-	R_GlobalPointToLocal( ent->modelMatrix, light->globalLightOrigin, localLight );
-
 	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
 
 	int numSil = 0;
@@ -588,11 +585,20 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 
 	softShadowEdge_t* edges = ( softShadowEdge_t* )R_FrameAlloc( numSil * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
 
-	extern idCVar r_softShadowWedgeFade;
-	const bool doFade = r_softShadowWedgeFade.GetBool();
-	const int numFaces = tri->numIndexes / 3;
+	// Gather the light-facing silhouette edges oriented E0->E1 by facing so the loop winds consistently
+	// (holes opposite the outer loop; the disk-coverage combine takes |sum| and needs that). Store vertex
+	// indices + world positions, then walk them into ordered chains (follow each edge's E1 to the next edge
+	// whose E0 matches) and MERGE runs of colinear edges into one. Perspective projection maps a world
+	// straight line to a straight line on the light disk, and CircleTriArea telescopes across colinear
+	// points, so dropping a mid-vertex on a straight silhouette segment is EXACTLY lossless - it just emits
+	// fewer edges for the shader to loop. Flat faces (common in this content) collapse toward a single edge.
+	const int numVerts = tri->numVerts;
+	int*    ev0 = ( int* )R_FrameAlloc( numSil * sizeof( int ), FRAME_ALLOC_UNKNOWN );
+	int*    ev1 = ( int* )R_FrameAlloc( numSil * sizeof( int ), FRAME_ALLOC_UNKNOWN );
+	idVec3* ew0 = ( idVec3* )R_FrameAlloc( numSil * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
+	idVec3* ew1 = ( idVec3* )R_FrameAlloc( numSil * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
 
-	int n = 0;
+	int ne = 0;
 	for( int i = 0; i < tri->numSilEdges; i++ )
 	{
 		const silEdge_t& sil = tri->silEdges[i];
@@ -600,57 +606,91 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 		{
 			continue;
 		}
-
-		idVec3 E0 = verts[sil.v1].xyz;
-		idVec3 E1 = verts[sil.v2].xyz;
-
-		// Orient the edge so the umbra-plane normal cross(E1-E0, L-E0) points toward the SHADOW (away from
-		// the caster body). The shader's per-edge coverage is then 1 on the shadow side, and the MIN over a
-		// caster's silhouette loop is the convex umbra - the intersection of the edges' shadow half-spaces.
-		// The body/lit side is marked by the off-edge vertex of the light-FACING triangle; if N points at
-		// it, flip the edge. This is derived from the same light-relative facing that defines the
-		// silhouette, so it stays correct and self-consistent as a dynamic light moves. Open edges (no
-		// valid second face) fall back to stencil-order winding.
-		// Consistent silhouette winding (match the stencil order) so the per-edge signed disk-coverage
-		// areas accumulate coherently around the loop. The interaction shader combines them as an area
-		// (light disk INTERSECT projected silhouette) and takes |sum|, so ONLY winding consistency matters
-		// here - not which way N points. This is why the combine works for non-convex casters where a
-		// per-edge intersection (MIN) cannot.
-		if( !facing[sil.p1] )
+		int a = sil.v1, b = sil.v2;
+		if( !facing[sil.p1] )		// orient E0->E1 by facing so the loop winds consistently (holes opposite outer)
 		{
-			idVec3 tmp = E0;
-			E0 = E1;
-			E1 = tmp;
+			a = sil.v2;
+			b = sil.v1;
 		}
+		ev0[ne] = a;
+		ev1[ne] = b;
+		R_LocalPointToGlobal( modelToWorld, verts[a].xyz, ew0[ne] );
+		R_LocalPointToGlobal( modelToWorld, verts[b].xyz, ew1[ne] );
+		ne++;
+	}
 
-		idVec3 d0 = E0 - localLight;
-		idVec3 d1 = E1 - localLight;
-		const float dist0 = d0.Normalize();
-		const float dist1 = d1.Normalize();
+	// directed incidence keyed by E0 vertex, so from a vertex we can find the outgoing edge to follow
+	int* vHead = ( int* )R_FrameAlloc( numVerts * sizeof( int ), FRAME_ALLOC_UNKNOWN );
+	for( int i = 0; i < numVerts; i++ )
+	{
+		vHead[i] = -1;
+	}
+	int* vNext = ( int* )R_FrameAlloc( ne * sizeof( int ), FRAME_ALLOC_UNKNOWN );
+	for( int i = 0; i < ne; i++ )
+	{
+		vNext[i] = vHead[ev0[i]];
+		vHead[ev0[i]] = i;
+	}
+	bool* used = ( bool* )R_FrameAlloc( ne * sizeof( bool ), FRAME_ALLOC_UNKNOWN );
+	for( int i = 0; i < ne; i++ )
+	{
+		used[i] = false;
+	}
 
-		// NOTE: previously skipped edges within a light radius of the light. That opened the silhouette
-		// LOOP (the disk-coverage combine needs closed loops), and an open loop's phantom closing chord
-		// spuriously enclosed the light disk -> uniform over-occlusion for casters near a light. Keep the
-		// edge; the shader's degenerate/NaN guards cover the singular at-light case.
+	// Colinearity tolerance: merge when the mid-vertex's perpendicular deviation from the chord is at most
+	// colTol * chord length, so the dropped triangle's projected area is far below the coverage's float
+	// precision. Default 0 -> merge ONLY exactly-colinear runs (bit-exact; flat axis-aligned faces qualify).
+	extern idCVar r_softShadowColinearTol;
+	const float colTol = Max( r_softShadowColinearTol.GetFloat(), 0.0f );
 
-		idVec3 worldE0, worldE1;
-		R_LocalPointToGlobal( modelToWorld, E0, worldE0 );
-		R_LocalPointToGlobal( modelToWorld, E1, worldE1 );
-
-		// Continuous silhouette weight: ramp an edge in over the last ~9 degrees of grazing so it fades
-		// in instead of popping as it crosses the silhouette threshold.
-		float silWeight = 1.0f;
-		if( doFade && sil.p1 < numFaces && sil.p2 < numFaces )
+	int n = 0;
+	for( int s = 0; s < ne; s++ )
+	{
+		if( used[s] )
 		{
-			const idPlane pa( verts[tri->indexes[sil.p1 * 3 + 0]].xyz, verts[tri->indexes[sil.p1 * 3 + 1]].xyz, verts[tri->indexes[sil.p1 * 3 + 2]].xyz );
-			const idPlane pb( verts[tri->indexes[sil.p2 * 3 + 0]].xyz, verts[tri->indexes[sil.p2 * 3 + 1]].xyz, verts[tri->indexes[sil.p2 * 3 + 2]].xyz );
-			const float distL = 0.5f * ( dist0 + dist1 );
-			const float graze = Min( idMath::Fabs( pa.Distance( localLight ) ), idMath::Fabs( pb.Distance( localLight ) ) ) / Max( distL, 1.0f );
-			silWeight = idMath::ClampFloat( 0.0f, 1.0f, graze / 0.15f );
+			continue;
 		}
-
-		edges[n].e0 = idVec4( worldE0.x, worldE0.y, worldE0.z, silWeight );
-		edges[n].e1 = idVec4( worldE1.x, worldE1.y, worldE1.z, 0.0f );
+		used[s] = true;
+		int    e = s;
+		idVec3 segA = ew0[s], segB = ew1[s];			// current (possibly extended) edge of the chain
+		while( true )
+		{
+			const int curV = ev1[e];					// follow E1 -> next unused edge whose E0 == curV
+			int nx = -1;
+			for( int p = vHead[curV]; p >= 0; p = vNext[p] )
+			{
+				if( !used[p] )
+				{
+					nx = p;
+					break;
+				}
+			}
+			if( nx < 0 )
+			{
+				break;
+			}
+			used[nx] = true;
+			const idVec3 nextC = ew1[nx];
+			const idVec3 u = segB - segA;				// deviation of segB from the line segA->nextC
+			const idVec3 w = nextC - segA;
+			const float  cr2 = u.Cross( w ).LengthSqr();
+			const float  chord2 = w.LengthSqr();
+			if( cr2 <= colTol * colTol * chord2 * chord2 )
+			{
+				segB = nextC;							// colinear: extend, drop segB as an interior vertex
+			}
+			else
+			{
+				edges[n].e0 = idVec4( segA.x, segA.y, segA.z, 0.0f );
+				edges[n].e1 = idVec4( segB.x, segB.y, segB.z, 0.0f );
+				n++;
+				segA = segB;
+				segB = nextC;
+			}
+			e = nx;
+		}
+		edges[n].e0 = idVec4( segA.x, segA.y, segA.z, 0.0f );
+		edges[n].e1 = idVec4( segB.x, segB.y, segB.z, 0.0f );
 		n++;
 	}
 

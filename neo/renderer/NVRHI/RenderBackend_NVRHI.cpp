@@ -263,6 +263,7 @@ void idRenderBackend::Init()
 	currentSoftEdgeBuffer = nullptr;
 	currentSoftEdgeOffset = 0;
 	currentSoftEdgeCount = 0;
+	softBandStencilRef = -1;
 	currentVertexOffset = 0;
 	currentIndexOffset = 0;
 	currentJointOffset = 0;
@@ -595,6 +596,85 @@ void idRenderBackend::DrawElementsWithCounters( const drawSurf_t* surf, bool sha
 		pc.c_drawElements++;
 		pc.c_drawIndexes += surf->numIndexes;
 	}
+}
+
+/*
+=====================
+idRenderBackend::DrawSoftShadowBand
+
+Analytic soft shadows: procedural draw of the penumbra-band stencil prepass. There is NO vertex or
+index buffer - the band vertex shader (softband.vs.hlsl, registered LAYOUT_UNKNOWN so the pipeline has
+a null input layout) expands each silhouette-edge record into a hexahedral penumbra-wedge VOLUME (36
+verts = 12 triangles) purely from SV_VertexID, reading the edge StructuredBuffer at t12 (set by the
+caller via currentSoftEdge*). The GL_State bound by the caller (two-sided z-fail, colour+depth writes
+off) marks the wedge interiors into stencil. Mirrors DrawElementsWithCounters' state setup minus the
+geometry fetch; called once per soft light so it always rebuilds state (no caching needed).
+=====================
+*/
+void idRenderBackend::DrawSoftShadowBand( int recordCount )
+{
+	if( recordCount <= 0 || currentSoftEdgeBuffer == nullptr )
+	{
+		return;
+	}
+
+	// procedural: no vertex/index/joint buffers
+	currentVertexBuffer = nullptr;
+	currentIndexBuffer = nullptr;
+	currentVertexOffset = 0;
+	currentIndexOffset = 0;
+	currentJointBuffer = nullptr;
+	currentJointOffset = 0;
+
+	const int bindingLayoutType = renderProgManager.BindingLayoutType();
+	idStaticList<nvrhi::BindingLayoutHandle, nvrhi::c_MaxBindingLayouts>* layouts
+		= renderProgManager.GetBindingLayout( bindingLayoutType );
+
+	GetCurrentBindingLayout( bindingLayoutType );
+	for( int i = 0; i < layouts->Num(); i++ )
+	{
+		currentBindingSets[i] = bindingCache.GetOrCreateBindingSet( pendingBindingSetDescs[bindingLayoutType][i], ( *layouts )[i] );
+	}
+
+	const int program = renderProgManager.CurrentProgram();
+	const PipelineKey key{ glStateBits, program, static_cast<int>( depthBias ), slopeScaleBias, currentFrameBuffer };
+	const auto pipeline = pipelineCache.GetOrCreatePipeline( key );
+	currentPipeline = pipeline;
+
+	renderProgManager.CommitConstantBuffer( commandList, true );
+
+	nvrhi::GraphicsState state;
+	for( int i = 0; i < layouts->Num(); i++ )
+	{
+		state.bindings.push_back( currentBindingSets[i] );
+	}
+	state.pipeline = pipeline;
+	state.framebuffer = currentFrameBuffer->GetApiObject();
+
+	nvrhi::Viewport viewport{ ( float )currentViewport.x1, ( float )currentViewport.x2,
+							  ( float )currentViewport.y1, ( float )currentViewport.y2, 0.0f, 1.0f };
+	state.viewport.addViewport( viewport );
+	if( !context.scissor.IsEmpty() )
+	{
+		state.viewport.addScissorRect( nvrhi::Rect( context.scissor.x1, context.scissor.x2, context.scissor.y1, context.scissor.y2 ) );
+	}
+	else
+	{
+		state.viewport.addScissorRect( nvrhi::Rect( viewport ) );
+	}
+
+	commandList->setGraphicsState( state );
+	renderProgManager.CommitPushConstants( commandList, bindingLayoutType );
+
+	// force the next DrawElementsWithCounters to rebuild (currentVertexBuffer/pipeline just changed)
+	prevContext = context;
+	prevBindingLayoutType = bindingLayoutType;
+
+	nvrhi::DrawArguments args;
+	args.vertexCount = ( uint32_t )( recordCount * 6 );	// 6 verts (2 tris = side quad) per edge record - see softband.vs.hlsl
+	commandList->draw( args );
+
+	pc.c_drawElements++;
 }
 
 /*
@@ -1651,6 +1731,18 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 			nvrhi::BindingSetItem::Sampler( 1, commonPasses.m_LinearBorderSampler ),
 			nvrhi::BindingSetItem::Sampler( 2, commonPasses.m_LinearClampCompareSampler ),
 			nvrhi::BindingSetItem::Sampler( 3, commonPasses.m_PointWrapSampler )  // blue noise
+		};
+	}
+	else if( type == BINDING_LAYOUT_SOFT_BAND )
+	{
+		// Analytic soft shadows: penumbra-band stencil prepass. One set: renderparms (b0) + this light's
+		// silhouette-edge StructuredBuffer at t12 (the band VS reads it to build wedge volumes). No
+		// materials/samplers - stencil-only. Range mirrors the SM_SOFT case (index from element 0).
+		const nvrhi::BufferRange sw_range( 0, ( size_t )currentSoftEdgeOffset + ( size_t )sizeof( idVec4 ) * 2 * currentSoftEdgeCount );
+		desc[0].bindings =
+		{
+			uniformsBindingSetItem,
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range )
 		};
 	}
 	else if( type == BINDING_LAYOUT_FOG )
