@@ -26,10 +26,12 @@ the Free Software Foundation, either version 3 of the License, or
 #include "hlsl_compat.h"
 #include "softwedge_coverage.inc.hlsl"		// the live shader coverage function (compiled as C++)
 #include "SoftShadowBox.h"
+#include "SoftShadowDir.h"					// direction-space coverage (singularity-free, under development)
 #include "idUnitTest.h"
 
 #include <cstdio>
 #include <cmath>
+#include <chrono>
 
 using namespace swtest;
 
@@ -101,6 +103,150 @@ TEST( SoftShadowCoverage, planar_fuzz_is_exact )
 	std::printf( "    [planar_fuzz] %d/%d disagree>0.03, worst=%.3f\n", bad, tot, worst );
 	CHECK( bad * 100 < tot );				// < 1% gross disagreements: the math is exact here
 	CHECK( worst < 0.2f );					// lone outlier = ray-cast disk quantisation on a grazing sliver
+}
+
+// ------------------------------------------------ ISOLATED near-plane straddle: the deep-umbra artifact
+// The clean signal for the near-plane cross-section bug, undiluted by the fat-caster parallax that muddies
+// box_fuzz_ground_standing. A pillar stands on the floor; the receiver sweeps directly UNDER its footprint,
+// where the silhouette dips behind the receiver near-plane on opposite sides and the true occlusion is FULL
+// (solid umbra, shadow 0). The straight near-plane connector cuts the disk to a chord, so coverage reports
+// ~0.5 instead: the unphysical half-disk / semicircular umbra the USER sees on pillars. This prints the
+// worst reported shadow under the footprint (target 0.0) as the metric the cross-section fix must drive down;
+// asserts only the CURRENT characterization so the suite stays honest until the fix lands.
+TEST( SoftShadowCoverage, deep_umbra_under_pillar_characterization )
+{
+	Box pillar = MakeBox( float3( 0, 0, 3 ), float3( 0.8f, 0.8f, 3.0f ) );	// base on the floor, top at z=6
+	auto rec = BuildCaster( { Silhouette( pillar, L_OVER ) } );
+	float minShadow = 1.0f, worstTruth = 0.0f;								// under the footprint shadow should be 0
+	for( int iy = -3; iy <= 3; iy++ )
+		for( int ix = -3; ix <= 3; ix++ )
+		{
+			float3 P( ix * 0.12f, iy * 0.12f, 0.0f );						// receivers within the ~0.8 footprint
+			float truth = TruthShadow( P, L_OVER, RAD, pillar, 120 );
+			if( truth > 0.05f ) { continue; }							// only sample cells that ARE full umbra
+			minShadow = std::fmin( minShadow, LiveShadow( rec, P, L_OVER, RAD ) );
+			worstTruth = std::fmax( worstTruth, truth );
+		}
+	std::printf( "    [deep_umbra] full-umbra cells: min reported shadow=%.3f (truth 0.0; target 0.0)\n", minShadow );
+	CHECK( worstTruth < 0.05f );				// the sampled cells really are umbra (sanity on the setup)
+	CHECK( minShadow <= 1.01f );				// characterization only: records the artifact, not yet a target
+}
+
+// ============================================================ DIRECTION-SPACE coverage (the real fix)
+// The singularity-free reformulation (SoftShadowDir.h). These drive its development against ground truth:
+// it must (a) turn the deep-umbra pillar SOLID where the planar method leaves a bright hole, and (b) still
+// match truth on planar casters where the planar method is already exact.
+TEST( SoftShadowDir, ground_standing_beats_planar )
+{
+	// The head-to-head: same ground-standing distribution the planar method fails on (box_fuzz), both
+	// methods vs ray-cast truth. Direction-space removes the near-plane singularity, so it should cut the
+	// disagreements sharply. What survives is the fat-caster light-vs-receiver parallax, which no projection
+	// space can fix - so this asserts a large reduction, not zero.
+	Rng rng( 99 );										// same seed/sequence as box_fuzz_ground_standing
+	float3 P0( 0, 0, 0 );
+	int planarBad = 0, dirBad = 0, tot = 0; float planarWorst = 0, dirWorst = 0;
+	for( int k = 0; k < 1500; k++ )
+	{
+		float3 h( rng.f( 0.4f, 2.0f ), rng.f( 0.4f, 2.0f ), rng.f( 0.5f, 3.0f ) );
+		float3 C( rng.f( -3, 3 ), rng.f( -3, 3 ), h.z - 0.05f );
+		Box b = MakeBox( C, h, rng.f( 0, 3.14f ), rng.f( -0.15f, 0.15f ) );
+		auto loop = Silhouette( b, L_OVER );
+		if( loop.size() < 3 ) { continue; }
+		tot++;
+		auto rec = BuildCaster( { loop } );
+		float truth = TruthShadow( P0, L_OVER, RAD, b, 160 );
+		float dp = std::fabs( LiveShadow( rec, P0, L_OVER, RAD ) - truth );
+		float dd = std::fabs( DirShadow( rec, P0, L_OVER, RAD ) - truth );
+		if( dp > 0.03f ) { planarBad++; } planarWorst = std::fmax( planarWorst, dp );
+		if( dd > 0.03f ) { dirBad++; }    dirWorst = std::fmax( dirWorst, dd );
+	}
+	std::printf( "    [dir vs planar] planar bad=%d (worst %.3f)   dir bad=%d (worst %.3f)  of %d\n",
+			planarBad, planarWorst, dirBad, dirWorst, tot );
+	CHECK( dirBad < planarBad );				// direction-space is strictly better on the failing distribution
+}
+
+TEST( SoftShadowDir, near_plane_straddle_canopy )
+{
+	// A valid near-plane straddle: a wide thin canopy overhead, extending FAR behind P relative to an ANGLED
+	// light, so the far silhouette edge sits behind P's near-plane (dn < 0). P underneath is in full umbra
+	// (ray truth confirms). This is the geometry that actually triggers the chord bug; the overhead-light box
+	// fuzz cannot. Planar should leave the bright hole / half-disk; direction-space should read solid.
+	const float3 Lang( 5, 0, 8 );							// up and to the side
+	Box canopy = MakeBox( float3( -1, 0, 3 ), float3( 7.0f, 4.0f, 0.05f ) );	// x[-8,6] y[-4,4], thin
+	auto rec = BuildCaster( { Silhouette( canopy, Lang ) } );
+	float3 P0( 0, 0, 0 );
+
+	// confirm the setup: P is genuinely in full umbra, and the silhouette really straddles the near-plane.
+	float truth = TruthShadow( P0, Lang, RAD, canopy, 200 );
+	float3 nrm = normalize( Lang - P0 );
+	bool straddles = false;
+	for( float3 V : Silhouette( canopy, Lang ) ) { if( dot( V - P0, nrm ) < 0.0f ) { straddles = true; break; } }
+
+	float planar = LiveShadow( rec, P0, Lang, RAD );
+	float dir    = DirShadow( rec, P0, Lang, RAD );
+	std::printf( "    [canopy] truth=%.3f straddles=%d  planar=%.3f  direction-space=%.3f\n",
+			truth, ( int )straddles, planar, dir );
+	CHECK( truth < 0.05f );						// setup sanity: P is in solid umbra
+	CHECK( straddles );							// setup sanity: the silhouette dips behind the near-plane
+	CHECK( dir < 0.05f );						// direction-space reads SOLID (the fix)
+}
+
+TEST( SoftShadowDir, planar_matches_truth )
+{
+	Rng rng( 7 );
+	int bad = 0, tot = 0; float worst = 0;
+	float3 P0( 0, 0, 0 );
+	for( int k = 0; k < 1500; k++ )
+	{
+		float3 h( rng.f( 0.3f, 1.6f ), rng.f( 0.3f, 1.6f ), 0.02f );
+		float3 C( rng.f( -3, 3 ), rng.f( -3, 3 ), rng.f( 4.5f, 8.0f ) );
+		Box b = MakeBox( C, h, rng.f( 0, 3.14f ), rng.f( -0.2f, 0.2f ) );
+		auto loop = Silhouette( b, L_OVER );
+		if( loop.size() < 3 ) { continue; }
+		tot++;
+		float d = std::fabs( DirShadow( BuildCaster( { loop } ), P0, L_OVER, RAD ) - TruthShadow( P0, L_OVER, RAD, b, 200 ) );
+		worst = std::fmax( worst, d );
+		if( d > 0.03f ) { bad++; }
+	}
+	std::printf( "    [dir planar] %d/%d disagree>0.03, worst=%.3f\n", bad, tot, worst );
+	CHECK( bad * 20 < tot );					// within 5% gross (looser than planar's exact; spherical clip WIP)
+}
+
+// ------------------------------------------------------------------------------- BENCHMARK (the cost)
+// Correctness-first: this quantifies how much the direction-space method costs vs the planar one, so the
+// trade is a measured number. Same caster set through both, timed; prints ns/call and the ratio. Not a
+// pass/fail gate on absolute time (machine-dependent) - it asserts only that both actually ran.
+TEST( SoftShadowBench, planar_vs_direction_space )
+{
+	Rng rng( 321 );
+	std::vector<std::vector<float4>> casters;
+	for( int k = 0; k < 200; k++ )				// a mix: pillars, slabs, floating boxes
+	{
+		float3 h( rng.f( 0.4f, 2.0f ), rng.f( 0.4f, 2.0f ), rng.f( 0.3f, 3.0f ) );
+		float3 C( rng.f( -3, 3 ), rng.f( -3, 3 ), rng.f( 1.5f, 8.0f ) );
+		Box b = MakeBox( C, h, rng.f( 0, 3.14f ), rng.f( -0.2f, 0.2f ) );
+		auto loop = Silhouette( b, L_OVER );
+		if( loop.size() >= 3 ) { casters.push_back( BuildCaster( { loop } ) ); }
+	}
+	float3 P0( 0, 0, 0 );
+	const int reps = 2000;
+	volatile float sink = 0.0f;
+
+	auto t0 = std::chrono::steady_clock::now();
+	for( int r = 0; r < reps; r++ )
+		for( const auto& c : casters ) { sink += 1.0f - saturate( SoftShadow_WedgeOcclusion( P0, L_OVER, RAD, 0, ( int )( c.size() / 2 ), SoftEdgeBuffer{ c.data(), ( int )c.size() } ) ); }
+	auto t1 = std::chrono::steady_clock::now();
+	for( int r = 0; r < reps; r++ )
+		for( const auto& c : casters ) { sink += DirShadow( c, P0, L_OVER, RAD ); }
+	auto t2 = std::chrono::steady_clock::now();
+
+	double calls = double( reps ) * casters.size();
+	double planarNs = std::chrono::duration<double, std::nano>( t1 - t0 ).count() / calls;
+	double dirNs    = std::chrono::duration<double, std::nano>( t2 - t1 ).count() / calls;
+	std::printf( "    [bench] planar %.1f ns/call   direction-space %.1f ns/call   (%.2fx)\n",
+			planarNs, dirNs, dirNs / planarNs );
+	CHECK( calls > 0 );
+	CHECK( sink != -12345.0f );				// keep the optimiser from eliding the work
 }
 
 // -------------------------------------------- accuracy vs ray-cast truth, GROUND-STANDING (known limit)
