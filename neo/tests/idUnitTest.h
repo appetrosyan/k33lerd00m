@@ -41,7 +41,7 @@ struct idTestResult
 	void Fail( const char* file, int line, const std::string& expr )
 	{
 		failures++;
-		char buf[64];
+		char buf[1024];   // absolute __FILE__ paths are long; size for the worst case
 		std::snprintf( buf, sizeof( buf ), "%s:%d: ", file, line );
 		std::string msg = std::string( buf ) + expr;
 		if( firstFailure.empty() )
