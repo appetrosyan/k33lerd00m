@@ -509,6 +509,8 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 
 	SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
 	int sampled = 0, bad = 0, tooLight = 0, tooDark = 0; double worst = 0, sumAbs = 0, covSum = 0, truSum = 0;
+	// hunt the EXTRANEOUS-SHADOW cases the user sees: coverage says shadow where truth says lit (cov << truth).
+	int extraneous = 0, extraneousDir = 0; float worstOver = 0; float3 owP( 0, 0, 0 ), owL( 0, 0, 0 ); float owCov = 0, owTru = 0, owDir = 0;
 	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 	{
 		const softcapLight_t& L = c.lights[li];
@@ -524,6 +526,15 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 			}
 		if( castIdx.empty() ) { continue; }
 
+		// this light's edge records as a float4 array, for the direction-space reference (SoftShadowDir.h)
+		std::vector<float4> recVec;
+		for( uint32_t r = L.firstEdge; r < L.firstEdge + L.edgeCount && r < c.edges.size(); r++ )
+		{
+			const softcapEdge_t& e = c.edges[r];
+			recVec.push_back( float4( e.e0[0], e.e0[1], e.e0[2], e.e0[3] ) );
+			recVec.push_back( float4( e.e1[0], e.e1[1], e.e1[2], e.e1[3] ) );
+		}
+
 		// sample this light's receiver surfaces (subsampled to keep the ray-cast tractable)
 		for( const softcapReceiver_t& R : c.receivers )
 		{
@@ -538,15 +549,29 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 				float3 toL = Lo - P; float dl = std::sqrt( dot( toL, toL ) );
 				if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }
 				float cov = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, Lo, L.penumbraSize, ( int )( L.firstEdge * 2 ), ( int )L.edgeCount, buf ) );
+				float dcov = DirShadow( recVec, P, Lo, L.penumbraSize );		// direction-space reference
 				float truth = MeshTruthShadowSoup( c.meshVerts.data(), castIdx.data(), ( uint32_t )castIdx.size(), P, Lo, L.penumbraSize, 12 );
+				if( dcov < 0.5f && truth > 0.85f ) { extraneousDir++; }			// same extraneous test for direction-space
 				float d = std::fabs( cov - truth );
 				sampled++; sumAbs += d; worst = std::fmax( worst, ( double )d ); covSum += cov; truSum += truth;
 				if( d > 0.1f ) { bad++; }
 				if( cov > truth + 0.1f ) { tooLight++; }		// coverage MISSES shadow (deep-umbra hole / under-occlusion)
 				if( cov < truth - 0.1f ) { tooDark++; }			// coverage OVER-shadows (halo / over-occlusion)
+				if( cov < 0.5f && truth > 0.85f ) { extraneous++; }	// heavy shadow where truth is essentially lit
+				if( truth - cov > worstOver )					// track the single worst over-occlusion + its geometry
+				{
+					worstOver = truth - cov; owP = P; owL = Lo; owCov = cov; owTru = truth; owDir = dcov;
+				}
 			}
 		}
 	}
+	// the extraneous shadow, with geometry: is the receiver directly under the caster while the light is off
+	// to the side (a shadow no light would cast there)?
+	float3 dPL = owL - owP; float distPL = std::sqrt( dot( dPL, dPL ) );
+	float3 dirPL = distPL > 1e-4f ? dPL * ( 1.0f / distPL ) : float3( 0, 0, 1 );
+	std::printf( "    [cap_cov] EXTRANEOUS shadow (cov<0.5 & truth>0.85): planar=%d  direction-space=%d\n", extraneous, extraneousDir );
+	std::printf( "    [cap_cov] worst over-shadow: planar=%.3f dir=%.3f truth=%.3f at P(%.0f,%.0f,%.0f) light(%.0f,%.0f,%.0f) dir(%.2f,%.2f,%.2f)\n",
+			owCov, owDir, owTru, owP.x, owP.y, owP.z, owL.x, owL.y, owL.z, dirPL.x, dirPL.y, dirPL.z );
 	std::printf( "    [cap_cov] %d samples: %d disagree>0.1 (%.1f%%)  worst=%.3f  mean|cov-truth|=%.4f\n",
 			sampled, bad, sampled ? 100.0 * bad / sampled : 0.0, worst, sampled ? sumAbs / sampled : 0.0 );
 	std::printf( "    [cap_cov] mean coverage=%.3f mean truth=%.3f   too-light(miss shadow)=%d  too-dark(over-shadow)=%d\n",
