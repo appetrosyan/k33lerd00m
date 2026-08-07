@@ -84,6 +84,7 @@ neo/bin/
 /compile_commands.json
 /neo/compile_commands.json
 
-# local soft-shadow scene captures (large; not committed)
+# local soft-shadow scene captures (large / binary; not committed)
 neo/tests/data/*.softcap
 neo/tests/data/*.png
+base/softcap/
