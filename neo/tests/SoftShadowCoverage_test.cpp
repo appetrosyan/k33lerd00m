@@ -493,6 +493,10 @@ struct BandCaster { float3 center; std::vector<std::pair<float3, float3>> edges;
 static bool BandCasterContains( float3 P, float3 L, float rp, const BandCaster& bc )
 {
 	float3 dP = P - L; float dl = std::sqrt( dot( dP, dP ) ); if( dl < 1e-4f ) { return false; } dP = dP * ( 1.0f / dl );
+	// z-pass volume only shadows points BEYOND the caster: the caster centre must lie between the light and P
+	// along the view ray. Without this, points in front of the caster get marked (a big over-inclusion).
+	float dCn = dot( bc.center - L, dP );
+	if( dCn <= 0.0f || dCn >= dl ) { return false; }
 	float3 up = ( std::fabs( dP.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
 	float3 u = normalize( cross( up, dP ) ); float3 v = cross( dP, u );
 	double sum = 0.0;
@@ -536,7 +540,7 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
 	int sampled = 0, bad = 0, tooLight = 0, tooDark = 0; double worst = 0, sumAbs = 0, covSum = 0, truSum = 0;
 	// hunt the EXTRANEOUS-SHADOW cases the user sees: coverage says shadow where truth says lit (cov << truth).
-	int extraneous = 0, extraneousDir = 0; float worstOver = 0; float3 owP( 0, 0, 0 ), owL( 0, 0, 0 ); float owCov = 0, owTru = 0, owDir = 0;
+	int extraneous = 0, extraneousDir = 0; float worstOver = 0; float3 owP( 0, 0, 0 ), owL( 0, 0, 0 ); float owCov = 0, owTru = 0, owDir = 0, owNear = 0;
 	// candidate FIX: gate coverage on the receiver actually being in the caster's shadow (hard-shadow center
 	// ray blocked). gatedExtraneous should collapse; penumbraClipped is what a strict hard gate would cost.
 	int gatedExtraneous = 0, penumbraClipped = 0;
@@ -548,6 +552,7 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	// the REAL band gate (softband.vs.hlsl geometry, built from the captured edges). If this still shows
 	// extraneous shadow, the shipped band is not fixing it - which is what the band-on captures indicate.
 	int realBandExtraneous = 0, realBandIn = 0;
+	int extraneousNear = 0, extraneousFar = 0;		// extraneous split: self/near-shadow (<20u) vs distant parallax
 	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 	{
 		const softcapLight_t& L = c.lights[li];
@@ -609,10 +614,18 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 				if( d > 0.1f ) { bad++; }
 				if( cov > truth + 0.1f ) { tooLight++; }		// coverage MISSES shadow (deep-umbra hole / under-occlusion)
 				if( cov < truth - 0.1f ) { tooDark++; }			// coverage OVER-shadows (halo / over-occlusion)
-				if( cov < 0.5f && truth > 0.85f ) { extraneous++; }	// heavy shadow where truth is essentially lit
+				if( cov < 0.5f && truth > 0.85f )					// heavy shadow where truth is essentially lit
+				{
+					extraneous++;
+					float nd = 1e30f;
+					for( const BandCaster& bc : bandCasters ) { float3 d = bc.center - P; nd = std::fmin( nd, std::sqrt( dot( d, d ) ) ); }
+					if( nd < 20.0f ) { extraneousNear++; } else { extraneousFar++; }	// self/near-shadow vs distant parallax
+				}
 				if( truth - cov > worstOver )					// track the single worst over-occlusion + its geometry
 				{
 					worstOver = truth - cov; owP = P; owL = Lo; owCov = cov; owTru = truth; owDir = dcov;
+					owNear = 1e30f;								// nearest caster centre - tiny => self/near-shadow
+					for( const BandCaster& bc : bandCasters ) { float3 d = bc.center - P; owNear = std::fmin( owNear, std::sqrt( dot( d, d ) ) ); }
 				}
 				if( cov > truth + 0.35f ) { missingShadow++; }	// coverage misses a real shadow (under-occlusion)
 				dcovSum += dcov;
@@ -638,8 +651,10 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	float3 dirPL = distPL > 1e-4f ? dPL * ( 1.0f / distPL ) : float3( 0, 0, 1 );
 	std::printf( "    [cap_cov] EXTRANEOUS shadow (cov<0.5 & truth>0.85): planar=%d  direction-space=%d  idealized-hard-gate=%d  REAL-softband-gate=%d  (band marks %d/%d samples in-band)\n",
 			extraneous, extraneousDir, gatedExtraneous, realBandExtraneous, realBandIn, sampled );
-	std::printf( "    [cap_cov] worst over-shadow: planar=%.3f dir=%.3f truth=%.3f at P(%.0f,%.0f,%.0f) light(%.0f,%.0f,%.0f) dir(%.2f,%.2f,%.2f)\n",
-			owCov, owDir, owTru, owP.x, owP.y, owP.z, owL.x, owL.y, owL.z, dirPL.x, dirPL.y, dirPL.z );
+	std::printf( "    [cap_cov] worst over-shadow: planar=%.3f dir=%.3f truth=%.3f at P(%.0f,%.0f,%.0f) light-dir(%.2f,%.2f,%.2f)  nearest caster centre=%.1f units\n",
+			owCov, owDir, owTru, owP.x, owP.y, owP.z, dirPL.x, dirPL.y, dirPL.z, owNear );
+	std::printf( "    [cap_cov] extraneous ORIGIN: self/near-shadow(<20u)=%d  distant-parallax=%d  (of %d extraneous)\n",
+			extraneousNear, extraneousFar, extraneous );
 	float3 uPL = uwL - uwP; float uDist = std::sqrt( dot( uPL, uPL ) ); float3 uDir = uDist > 1e-4f ? uPL * ( 1.0f / uDist ) : float3( 0, 0, 1 );
 	std::printf( "    [cap_cov] MISSING shadow (cov>truth+0.35): planar=%d  direction-space=%d   worst under: planar=%.3f dir=%.3f truth=%.3f light-dir(%.2f,%.2f,%.2f) dist=%.0f\n",
 			missingShadow, dirMissing, uwCov, uwDir, uwTru, uDir.x, uDir.y, uDir.z, uDist );
