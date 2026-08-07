@@ -27,11 +27,14 @@ the Free Software Foundation, either version 3 of the License, or
 #include "softwedge_coverage.inc.hlsl"		// the live shader coverage function (compiled as C++)
 #include "SoftShadowBox.h"
 #include "SoftShadowDir.h"					// direction-space coverage (singularity-free, under development)
+#include "SoftShadowMesh.h"					// .softcap reader + ray-cast ground truth
 #include "idUnitTest.h"
 
 #include <cstdio>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
+#include <vector>
 
 using namespace swtest;
 
@@ -472,4 +475,59 @@ TEST( SoftShadowCoverage, multipart_joint_does_not_leak_when_summed )
 	CHECK( truth < 0.05f );							// the union genuinely occludes the disk (solid umbra)
 	CHECK( maxCombine > truth + 0.2f );				// max-combine LEAKS: a bright crack at the joint (the bug)
 	CHECK_NEAR( sumCombine, truth, 0.03f );			// per-entity SUM is solid: the joint closes (the fix)
+}
+
+// ============================================= THE PAYOFF: measure the artifact on real captured geometry
+// Loads a .softcap (SOFTCAP env var; skips cleanly if unset so the committed suite stays green) and, at the
+// captured RECEIVER surface points, compares the shipped analytic coverage against a ray-cast of the light's
+// own caster solids. Where they disagree by a lot is the real Erebus artifact - measured, not eyeballed - on
+// the exact geometry the shader ran. This is what a fix (direction-space or other) must drive down, and the
+// seed for the Phase 5 minimal test. Needs a v3 capture (global mesh indices + receiver surfaces).
+TEST( SoftShadowCapture, coverage_vs_truth )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL ) { std::printf( "    [cap_cov] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
+	SoftCap c;
+	if( !LoadSoftCap( path, c ) ) { std::printf( "    [cap_cov] load failed (v3 capture required)\n" ); CHECK( false ); return; }
+	if( c.receivers.empty() || c.recvVerts.empty() )
+	{
+		std::printf( "    [cap_cov] no receiver surfaces (need a v3 capture)\n" ); CHECK( true ); return;
+	}
+
+	SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
+	int sampled = 0, bad = 0; double worst = 0, sumAbs = 0;
+	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
+	{
+		const softcapLight_t& L = c.lights[li];
+		if( L.penumbraSize <= 0.0f ) { continue; }
+		float3 Lo( L.origin[0], L.origin[1], L.origin[2] );
+
+		// this light's caster triangle soup (global indices)
+		std::vector<uint32_t> castIdx;
+		for( const softcapCaster_t& cs : c.casters )
+			if( cs.lightIndex == li )
+			{
+				castIdx.insert( castIdx.end(), c.meshIdx.begin() + cs.firstIndex, c.meshIdx.begin() + cs.firstIndex + cs.numIndex );
+			}
+		if( castIdx.empty() ) { continue; }
+
+		// sample this light's receiver surfaces (subsampled to keep the ray-cast tractable)
+		for( const softcapReceiver_t& R : c.receivers )
+		{
+			if( R.lightIndex != li ) { continue; }
+			uint32_t step = R.numVerts > 16 ? R.numVerts / 16 : 1;
+			for( uint32_t vi = R.firstVert; vi < R.firstVert + R.numVerts; vi += step )
+			{
+				float3 P( c.recvVerts[vi * 3 + 0], c.recvVerts[vi * 3 + 1], c.recvVerts[vi * 3 + 2] );
+				float cov = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, Lo, L.penumbraSize, ( int )( L.firstEdge * 2 ), ( int )L.edgeCount, buf ) );
+				float truth = MeshTruthShadowSoup( c.meshVerts.data(), castIdx.data(), ( uint32_t )castIdx.size(), P, Lo, L.penumbraSize, 12 );
+				float d = std::fabs( cov - truth );
+				sampled++; sumAbs += d; worst = std::fmax( worst, ( double )d );
+				if( d > 0.1f ) { bad++; }
+			}
+		}
+	}
+	std::printf( "    [cap_cov] %d receiver samples: %d disagree>0.1 (%.1f%%)  worst=%.3f  mean|cov-truth|=%.4f\n",
+			sampled, bad, sampled ? 100.0 * bad / sampled : 0.0, worst, sampled ? sumAbs / sampled : 0.0 );
+	CHECK( sampled > 0 );		// characterization: the disagreement IS the artifact, to be driven down by a fix
 }

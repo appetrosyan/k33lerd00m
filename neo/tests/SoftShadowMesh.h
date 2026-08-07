@@ -126,6 +126,30 @@ inline bool RayHitsMesh( float3 P, float3 dir, const float* verts, const uint32_
 	return false;
 }
 
+// TRUE shadow over an explicit triangle soup (a specific light's caster subset), verts float3-packed, idx
+// GLOBAL into verts. 1 = lit, 0 = fully occluded.
+inline float MeshTruthShadowSoup( const float* verts, const uint32_t* idx, uint32_t numIdx, float3 P, float3 L, float r, int N )
+{
+	float3 toL = L - P;
+	float dist = std::sqrt( dot( toL, toL ) );
+	if( dist < 1e-6f ) { return 1.0f; }
+	float3 nrm = toL * ( 1.0f / dist );
+	float3 up = ( std::fabs( nrm.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+	float3 u = normalize( cross( up, nrm ) );
+	float3 v = cross( nrm, u );
+	int inside = 0, total = 0;
+	for( int iy = 0; iy < N; iy++ )
+		for( int ix = 0; ix < N; ix++ )
+		{
+			float du = ( ix + 0.5f ) / N * 2 - 1, dv = ( iy + 0.5f ) / N * 2 - 1;
+			if( du * du + dv * dv > 1.0f ) { continue; }
+			total++;
+			float3 Dp = L + u * ( du * r ) + v * ( dv * r );
+			if( RayHitsMesh( P, Dp - P, verts, idx, numIdx ) ) { inside++; }
+		}
+	return total ? 1.0f - ( float )inside / total : 1.0f;
+}
+
 // TRUE shadow (1=lit, 0=occluded): fraction of the light disk (centre L, radius r, facing P) whose ray from
 // P is NOT blocked by any captured caster mesh. Mirrors TruthShadow (SoftShadowBox.h) but over the soup.
 inline float MeshTruthShadow( const SoftCap& c, float3 P, float3 L, float r, int N = 64 )

@@ -31,7 +31,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 // bump on any layout change; the reader rejects mismatches.
 #define SOFTCAP_MAGIC   0x50434653u			// 'SFCP' little-endian
-#define SOFTCAP_VERSION 2u					// v2: added receiver surface meshes (RECVVERTS/RECVIDX)
+#define SOFTCAP_VERSION 3u					// v2: receiver meshes; v3: mesh indices stored GLOBAL (offset by firstVert)
 
 #pragma pack( push, 1 )
 
