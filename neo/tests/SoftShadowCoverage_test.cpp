@@ -483,8 +483,9 @@ TEST( SoftShadowCoverage, multipart_joint_does_not_leak_when_summed )
 // own caster solids. Where they disagree by a lot is the real Erebus artifact - measured, not eyeballed - on
 // the exact geometry the shader ran. This is what a fix (direction-space or other) must drive down, and the
 // seed for the Phase 5 minimal test. Needs a v3 capture (global mesh indices + receiver surfaces).
-// One caster's silhouette (world edges + centre) for the offline band-membership test.
-struct BandCaster { float3 center; std::vector<std::pair<float3, float3>> edges; };
+// One caster's silhouette (world edges + centre + bounding radius + its record range) for the offline
+// band-membership test and per-caster coverage.
+struct BandCaster { float3 center; float cRad; uint32_t firstRec, numRec; std::vector<std::pair<float3, float3>> edges; };
 
 // Is P inside the ACTUAL softband inflated shadow volume of this caster? Mirrors softband.vs.hlsl: inflate
 // each silhouette vertex radially about the caster centre by rp, extrude the point-light shadow from the
@@ -553,6 +554,9 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	// extraneous shadow, the shipped band is not fixing it - which is what the band-on captures indicate.
 	int realBandExtraneous = 0, realBandIn = 0;
 	int extraneousNear = 0, extraneousFar = 0;		// extraneous split: self/near-shadow (<20u) vs distant parallax
+	// the FIX: exclude the caster the receiver sits inside (self-shadow). Measure the extraneous drop AND that
+	// real shadows are not lost (a caster genuinely between P and the light must still count).
+	int selfExclExtraneous = 0, realShadowLost = 0;
 	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 	{
 		const softcapLight_t& L = c.lights[li];
@@ -576,15 +580,20 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 			const softcapEdge_t& e = c.edges[r];
 			recVec.push_back( float4( e.e0[0], e.e0[1], e.e0[2], e.e0[3] ) );
 			recVec.push_back( float4( e.e1[0], e.e1[1], e.e1[2], e.e1[3] ) );
-			if( e.e0[3] < 0.0f )					// header: caster boundary, centre in e0.xyz
+			if( e.e0[3] < 0.0f )					// header: caster boundary, centre in e0.xyz, radius in e1.x
 			{
-				BandCaster bc; bc.center = float3( e.e0[0], e.e0[1], e.e0[2] ); bandCasters.push_back( bc );
+				if( !bandCasters.empty() ) { bandCasters.back().numRec = ( uint32_t )( recVec.size() / 2 ) - 1 - bandCasters.back().firstRec; }
+				BandCaster bc; bc.center = float3( e.e0[0], e.e0[1], e.e0[2] ); bc.cRad = e.e1[0];
+				bc.firstRec = ( uint32_t )( recVec.size() / 2 ) - 1; bc.numRec = 0;
+				bandCasters.push_back( bc );
 			}
 			else if( !bandCasters.empty() )
 			{
 				bandCasters.back().edges.push_back( std::make_pair( float3( e.e0[0], e.e0[1], e.e0[2] ), float3( e.e1[0], e.e1[1], e.e1[2] ) ) );
 			}
 		}
+		if( !bandCasters.empty() ) { bandCasters.back().numRec = ( uint32_t )( recVec.size() / 2 ) - bandCasters.back().firstRec; }
+		SoftEdgeBuffer bufLight{ reinterpret_cast<const float4*>( recVec.data() ), ( int )recVec.size() };
 		const float bandRp = L.penumbraSize * 1.1f;	// softband margin (RenderBackend swParm .z = 1.1)
 
 		// sample this light's receiver surfaces (subsampled to keep the ray-cast tractable)
@@ -638,6 +647,23 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 				float realBandCov = bandIn ? cov : 1.0f;
 				if( bandIn ) { realBandIn++; }
 				if( realBandCov < 0.5f && truth > 0.85f ) { realBandExtraneous++; }	// extraneous shadow the REAL band leaves
+				// SELF-SHADOW FIX: coverage combining only casters the receiver is NOT inside (|center-P| > cRad).
+				float selfOcc = 0.0f;
+				for( const BandCaster& bc : bandCasters )
+				{
+					float minEdgeD = 1e30f;										// nearest silhouette-edge vertex to P
+					for( const std::pair<float3, float3>& e : bc.edges )
+					{
+						float3 da = e.first - P, db = e.second - P;
+						minEdgeD = std::fmin( minEdgeD, std::fmin( std::sqrt( dot( da, da ) ), std::sqrt( dot( db, db ) ) ) );
+					}
+					if( minEdgeD < 5.0f ) { continue; }							// silhouette grazes P -> self-shadow, skip
+					float o = SoftShadow_WedgeOcclusion( P, Lo, L.penumbraSize, ( int )( bc.firstRec * 2 ), ( int )bc.numRec, bufLight );
+					selfOcc = std::fmax( selfOcc, o );
+				}
+				float selfCov = 1.0f - saturate( selfOcc );
+				if( selfCov < 0.5f && truth > 0.85f ) { selfExclExtraneous++; }		// extraneous remaining after the fix
+				if( truth < 0.3f && selfCov > 0.7f ) { realShadowLost++; }			// a real shadow the fix wrongly dropped
 				if( cov - truth > worstUnder )					// track the single worst under-occlusion + geometry
 				{
 					worstUnder = cov - truth; uwP = P; uwL = Lo; uwCov = cov; uwTru = truth; uwDir = dcov;
@@ -655,6 +681,8 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 			owCov, owDir, owTru, owP.x, owP.y, owP.z, dirPL.x, dirPL.y, dirPL.z, owNear );
 	std::printf( "    [cap_cov] extraneous ORIGIN: self/near-shadow(<20u)=%d  distant-parallax=%d  (of %d extraneous)\n",
 			extraneousNear, extraneousFar, extraneous );
+	std::printf( "    [cap_cov] SELF-SHADOW FIX (drop caster containing receiver): extraneous %d -> %d   real shadows lost=%d\n",
+			extraneous, selfExclExtraneous, realShadowLost );
 	float3 uPL = uwL - uwP; float uDist = std::sqrt( dot( uPL, uPL ) ); float3 uDir = uDist > 1e-4f ? uPL * ( 1.0f / uDist ) : float3( 0, 0, 1 );
 	std::printf( "    [cap_cov] MISSING shadow (cov>truth+0.35): planar=%d  direction-space=%d   worst under: planar=%.3f dir=%.3f truth=%.3f light-dir(%.2f,%.2f,%.2f) dist=%.0f\n",
 			missingShadow, dirMissing, uwCov, uwDir, uwTru, uDir.x, uDir.y, uDir.z, uDist );
