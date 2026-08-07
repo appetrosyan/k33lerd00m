@@ -1629,20 +1629,28 @@ void R_AddModels()
 			// cannot occlude a given fragment's light disk (a distant world surface then skips its
 			// entire edge loop instead of an atan2 per edge). One header per caster; the shader marks
 			// a header by e0.w < 0 (edges carry e0.w = silWeight >= 0). Records = edges + one header/caster.
-			// One caster PER ENTITY, not per surface. A caster built from several surfaces (a tripod's legs, a
-			// rock's faces) would otherwise become several casters, which the coverage shader unions by
+			// One caster PER MODEL ENTITY, not per surface. A caster built from several surfaces (a tripod's
+			// legs, a rock's faces) would otherwise become several casters, which the coverage shader unions by
 			// max( occlusion ). At a joint no single surface occludes the whole light disk, so max() reports a
 			// half-covered disk - a hairline lit crack running through solid umbra. Grouping every surface of
 			// one entity under a single header makes the shader SUM their coverage integrals (each surface is a
 			// separate closed chain; disjoint areas add, shared seams cancel), reconstructing the union. An
 			// entity's edge surfaces are linked contiguously (all off one vEntity->drawSurfs), so a caster is a
 			// run of consecutive surfaces with the same space.
+			//
+			// EXCEPTION: the static world model is a SINGLE space holding the whole level's surfaces, spread
+			// far apart and not one coherent occluder. Grouping it would (a) give one caster a level-sized
+			// bounding sphere so the shader-side cull never rejects it - every fragment loops every world edge
+			// (huge perf hit) - and (b) SUM spatially-unrelated world surfaces, over-darkening large lit areas.
+			// So each world surface stays its own caster (tight sphere, max-combine), exactly as before.
 			int total = 0, numCasters = 0;
 			const void* prevSpace = NULL;
 			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 			{
 				total += s->numSoftEdges;
-				if( s->space != prevSpace ) { numCasters++; prevSpace = s->space; }
+				const bool isWorld = s->space->entityDef != NULL && s->space->entityDef->parms.hModel != NULL
+									 && s->space->entityDef->parms.hModel->IsStaticWorldModel();
+				if( isWorld || s->space != prevSpace ) { numCasters++; prevSpace = s->space; }
 			}
 			const int records = total + numCasters;
 			if( total <= 0 )
@@ -1664,7 +1672,9 @@ void R_AddModels()
 			idVec3 gmn( 1e30f, 1e30f, 1e30f ), gmx( -1e30f, -1e30f, -1e30f );	// entity bounding box (for the sphere)
 			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 			{
-				if( s->space != curSpace )
+				const bool isWorld = s->space->entityDef != NULL && s->space->entityDef->parms.hModel != NULL
+									 && s->space->entityDef->parms.hModel->IsStaticWorldModel();
+				if( isWorld || s->space != curSpace )	// world surfaces never group (each is its own caster)
 				{
 					if( headerIdx >= 0 )	// close the previous entity: its sphere is now known
 					{
