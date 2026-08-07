@@ -56,11 +56,13 @@ SamplerState 			s_Jitter   : register( s3 VK_DESCRIPTOR_SET( 3 ) ); // for sampl
 // Analytic soft shadows (per-fragment path): this light's silhouette edges, evaluated against the
 // EXACT receiver world position. StructuredBuffer at t12 in the uniforms set (mirrors the joint
 // buffer at t11). rpJitterTexScale carries (R, minWidth, numEdges) for the soft path.
-#include "softwedge_coverage.inc.hlsl"
 // The buffer is the vertex-cache joint buffer, whose struct stride is sizeof(float4)=16. So read it as
 // float4 elements: each edge is TWO consecutive float4 (e0 = xyz world endpoint 0 + w silWeight; e1 =
 // xyz endpoint 1). Edge se lives at elements [se*2], [se*2+1].
 StructuredBuffer<float4> t_SoftEdges : register( t12 VK_DESCRIPTOR_SET( 0 ) );
+// Included AFTER t_SoftEdges: SoftShadow_WedgeOcclusion reads that global directly (HLSL), so the
+// declaration must be in scope at include time.
+#include "softwedge_coverage.inc.hlsl"
 #endif
 
 struct PS_IN
@@ -141,172 +143,10 @@ void main( PS_IN fragment, out PS_OUT result )
 	// explicit first element (this light's edges start here), passed in rpJitterTexOffset.x.
 	int swFirstElem = int( pc.rpJitterTexOffset.x );
 
-	// Light-disk coverage combine. Build the area light's disk (centre swL, radius swR) facing the receiver
-	// and a 2D basis (swU,swV). For each caster (edges tagged with a group id in e1.w) accumulate the signed
-	// area of disk INTERSECT its projected silhouette; the occluded fraction is |area| / (pi r^2). This is
-	// winding-correct -> exact for NON-CONVEX casters (unlike a per-edge MIN). Casters union by max. A caster
-	// with any vertex not toward the light (receiver in front of it) can't cleanly shadow P -> contributes 0.
-	float3 swToL    = swL - swP;
-	float  swDistPL = max( length( swToL ), 1e-4 );		// receiver->light distance; casters beyond it can't occlude
-	float3 swNrm = swToL / swDistPL;
-	float3 swUp  = ( abs( swNrm.z ) > 0.9 ) ? float3( 0.0, 1.0, 0.0 ) : float3( 0.0, 0.0, 1.0 );
-	float3 swU   = normalize( cross( swUp, swNrm ) );
-	float3 swV   = cross( swNrm, swU );
-	float  swR2       = swR * swR;								// disk radius squared, hoisted for CircleTriArea
-	float  swDiskArea = PI * swR2;
-	float  swInvDiskArea = 1.0 / swDiskArea;					// hoisted: per-caster finalize multiplies instead of divides
-	float  swSinA     = saturate( swR / swDistPL );				// sin of the light-disk half-angle from P (caster-invariant)
-	float  swCosA     = sqrt( 1.0 - swSinA * swSinA );			// cos of it; used by the cheap per-caster angular cull
-
-	float swOcc = 0.0;				// max occlusion across casters
-	float swArea = 0.0;				// signed disk-intersection area for the current caster
-	bool  haveCaster = false;		// opened a caster (seen its header record) yet?
-	bool  swSkip = false;			// current caster culled: its bounding sphere can't reach the light disk
-	// Streaming Sutherland-Hodgman: each caster silhouette is clipped to the depth slab [swEps, swDistPL]
-	// and its clipped contour summed as a shoelace of SoftDisk_CircleTriArea triangles. swFirst/swPrev hold
-	// the first/last clipped vertex of the CURRENT chain so the near/far-plane connector (a straight edge of
-	// the clipped polygon) forms automatically when an edge is dropped or a chain closes - keeping the loop
-	// CLOSED. A loop left open winds a spurious chord across the disk = over-occlusion on genuinely lit
-	// fragments (the whole-scene darkening + shadow halo). Verified lossless in neo/tests/SoftShadowCoverage_test.cpp.
-	bool   swFirstValid = false;	// have we emitted the first clipped vertex of the current chain?
-	float2 swFirst = float2( 0.0, 0.0 );
-	float2 swPrev  = float2( 0.0, 0.0 );
-	bool   havePrevE1 = false;		// have a previous edge's E1 world vertex to test chain continuity against?
-	float3 prevE1w = float3( 0.0, 0.0, 0.0 );
-	const float swEps = 1e-3;
-	for( int se = 0; se < swN; se++ )
-	{
-		float4 e0 = t_SoftEdges[swFirstElem + se * 2 + 0];
-		float4 e1 = t_SoftEdges[swFirstElem + se * 2 + 1];
-		// Per-caster bounding-sphere cull. The header record (e0.w < 0, one per caster from the frontend
-		// flatten) carries the caster's world bounding sphere: centre e0.xyz, radius e1.x. Only the DEPTH
-		// reject is applied: skip the caster when its sphere lies entirely behind the receiver or entirely
-		// beyond the light plane. Provably lossless vs the full loop - a sphere wholly behind the receiver
-		// has every vertex dn < swEps, one wholly beyond the light has every vertex dn > swDistPL, so the
-		// per-edge slab clip below drops every one of that caster's edges anyway (identical zero contribution).
-		// The ANGULAR "sphere cone misses the disk" reject is GATED (AO-4): it is only conservative when the
-		// sphere is fully in FRONT of the receiver near-plane (dCn - cRad > swEps). There every silhouette
-		// vertex has dn > swEps, so its disk-plane projection radius is bounded (no 1/dn blowup) and the
-		// sphere's angular cone genuinely bounds the silhouette's projection - a cone entirely off the disk
-		// gives a loop that winds zero disk area (0 coverage). When the sphere STRADDLES the near-plane a
-		// vertex at dn->0 projects to radius proportional to 1/dn, so an angularly-off caster can still sweep
-		// a winding sector across the disk; angular-culling it there drops real penumbra (the corruption AO-4
-		// fixed). So we apply the angular reject only in the safe (fully-in-front) regime.
-		if( e0.w < 0.0 )		// header record = caster boundary: finalize the previous caster here (no per-edge id compare)
-		{
-			if( haveCaster && swFirstValid )
-			{
-				swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the previous caster's open chain
-			}
-			if( haveCaster )
-			{
-				swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
-				if( swOcc >= 0.999 ) { break; }		// fully occluded: no remaining caster can raise the max past 1
-			}
-			haveCaster = true;
-			swArea = 0.0;
-			swSkip = false;
-			swFirstValid = false;
-			havePrevE1 = false;
-			float3 dCv  = e0.xyz - swP;
-			float  cRad = e1.x;
-			float  dCn  = dot( dCv, swNrm );						// sphere-centre depth along receiver->light
-			if( dCn + cRad < swEps || dCn - cRad > swDistPL )		// wholly behind receiver, or wholly beyond light
-			{
-				swSkip = true;
-				continue;
-			}
-			if( dCn - cRad > 1e-3 )									// sphere fully in front of the near-plane: angular reject is safe
-			{
-				// Cull when the caster-sphere cone and the light-disk cone are angularly disjoint (ang >
-				// alpha+beta), computed WITHOUT transcendentals: cos(ang) < cos(alpha+beta), both sides x dClen
-				// -> dCn < cosA*sqrt(dClen^2 - cRad^2) - sinA*cRad. sinA/cosA (the disk half-angle) are
-				// caster-invariant and hoisted (swSinA/swCosA). One sqrt, no asin/acos, so a MISS is ~free -
-				// the test no longer taxes the casters it fails to cull. Gate above keeps it conservative.
-				// front > 0 always here: the gate dCn - cRad > swEps gives dCn > cRad, and dClen >= dCn
-				// (Cauchy-Schwarz, swNrm unit), so dot(dCv,dCv) = dClen^2 > cRad^2. The max(,0) was redundant.
-				float front = dot( dCv, dCv ) - cRad * cRad;
-				swSkip = ( dCn < swCosA * sqrt( front ) - swSinA * cRad );
-			}
-			continue;
-		}
-		if( swSkip ) { continue; }
-		// Chain boundary. A caster concatenates several CLOSED, walk-ordered silhouette chains (a hole is a
-		// loop wound the other way; a multi-surface entity contributes one chain per part). Consecutive edges
-		// inside one chain share a world vertex bit-exactly (E1 of one == E0 of the next, from the frontend
-		// walk), so a mismatch marks the start of a new chain: close the finished chain's clipped contour so
-		// it never connects across to the next one (which would fabricate a spanning chord = over-occlusion).
-		float3 A = e0.xyz;
-		float3 B = e1.xyz;
-		if( havePrevE1 && any( A != prevE1w ) && swFirstValid )
-		{
-			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );
-			swFirstValid = false;
-		}
-		havePrevE1 = true;
-		prevE1w = B;
-
-		// Clip the edge's parameter interval [t0,t1] to the depth slab [swEps, swDistPL] (Sutherland-Hodgman
-		// against the two planes parallel to the light disk). An empty interval = the whole edge is outside the
-		// slab (behind the receiver or beyond the light); it contributes no vertex, and its span is bridged by
-		// the connector formed against swPrev on the next kept edge - so the clipped loop stays CLOSED without a
-		// spurious chord. A silhouette vertex behind the receiver can't project onto the disk (dn->0 blows up),
-		// which is exactly why the loop must be clipped, not the projection point clamped.
-		// Receiver-relative coords a=A-swP, b=B-swP feed both the slab depth (dot swNrm) and the disk projection
-		// (dot swU/swV): projection is (swDistPL/dn)*(dot(a,swU),dot(a,swV)) since dot(L-P,swNrm)==swDistPL and
-		// the disk basis is perpendicular to swNrm.
-		float3 a = A - swP;
-		float3 b = B - swP;
-		float  dnA = dot( a, swNrm );
-		float  dnB = dot( b, swNrm );
-		float  d   = dnB - dnA;
-		float  t0 = 0.0;
-		float  t1 = 1.0;
-		bool   empty = false;
-		if( abs( d ) < 1e-12 )
-		{
-			if( dnA < swEps ) { empty = true; }				// edge parallel to the planes and behind the near plane
-		}
-		else
-		{
-			float tc = ( swEps - dnA ) / d;					// param where the edge meets the near plane
-			if( d > 0.0 ) { t0 = max( t0, tc ); }
-			else          { t1 = min( t1, tc ); }
-		}
-		if( !empty )
-		{
-			if( abs( d ) < 1e-12 )
-			{
-				if( dnA > swDistPL ) { empty = true; }		// parallel and beyond the light plane
-			}
-			else
-			{
-				float tc = ( swDistPL - dnA ) / d;			// param where the edge meets the light plane
-				if( d > 0.0 ) { t1 = min( t1, tc ); }
-				else          { t0 = max( t0, tc ); }
-			}
-		}
-		if( empty || t0 > t1 ) { continue; }
-
-		float3 pa  = a + t0 * ( b - a );					// clipped endpoints in receiver-relative coords
-		float3 pb  = a + t1 * ( b - a );
-		float  dna = dnA + t0 * d;							// their slab depths (in [swEps, swDistPL])
-		float  dnb = dnA + t1 * d;
-		float2 q0 = ( swDistPL / dna ) * float2( dot( pa, swU ), dot( pa, swV ) );
-		float2 q1 = ( swDistPL / dnb ) * float2( dot( pb, swU ), dot( pb, swV ) );
-
-		// stream into the shoelace: connector from the previous vertex (0 when they coincide = the common
-		// unclipped case, so bit-identical to the old per-edge sum there), then this edge's own triangle.
-		if( swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 ); }
-		else               { swFirst = q0; swFirstValid = true; }
-		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
-		swPrev = q1;
-	}
-	if( haveCaster && swFirstValid )
-	{
-		swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the last caster's open chain
-	}
-	if( haveCaster ) { swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) ); }	// last caster
+	// Light-disk coverage: sum each caster's silhouette against the area-light disk (see
+	// softwedge_coverage.inc.hlsl). This is the SAME function the unit tests compile as C++
+	// (neo/tests/SoftShadowCoverage_test.cpp via hlsl_compat.h), so the tested math IS the shipped math.
+	float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN );
 	float shadow = 1.0 - saturate( swOcc );
 	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
 #elif USE_RT_SHADOW

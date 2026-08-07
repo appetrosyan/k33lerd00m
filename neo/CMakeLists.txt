@@ -1513,7 +1513,9 @@ if(BUILD_TESTS)
 	file(GLOB TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
 	add_executable(rbdoom3bfg_tests ${TEST_SOURCES})
 	target_compile_definitions(rbdoom3bfg_tests PRIVATE ID_UNIT_TEST_STANDALONE)
-	target_include_directories(rbdoom3bfg_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+	target_include_directories(rbdoom3bfg_tests PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/tests
+		${CMAKE_CURRENT_SOURCE_DIR}/shaders/builtin/lighting)	# so tests can #include the live coverage .inc.hlsl
 	set_target_properties(rbdoom3bfg_tests PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 endif()
 

@@ -27,38 +27,6 @@ the Free Software Foundation, either version 3 of the License, or
 #ifndef __SOFTWEDGE_COVERAGE_INC__
 #define __SOFTWEDGE_COVERAGE_INC__
 
-// Project a world-space silhouette vertex A onto the light-disk plane (centre L, unit normal n facing the
-// receiver P), returning its 2D coordinate in the disk frame (u,v). Returns false when A is not toward the
-// light from P (the receiver is in front of that vertex) - such a caster cannot cleanly shadow P.
-bool SoftDisk_Project( float3 A, float3 P, float3 L, float3 n, float3 u, float3 v, out float2 outUV )
-{
-	float3 dir = A - P;
-	float  dn  = dot( dir, n );
-	if( dn <= 1e-4 )
-	{
-		outUV = float2( 0.0, 0.0 );
-		return false;
-	}
-	float  s   = dot( L - P, n ) / dn;
-	float3 Q   = P + s * dir;
-	float3 rel = Q - L;
-	outUV = float2( dot( rel, u ), dot( rel, v ) );
-	return true;
-}
-
-// Fast path for a vertex that the caller has ALREADY slab-clipped: its depth dn = dot(A-P,n) is known and
-// guaranteed in [swEps, distPL], so the projection can never fail (no bool) and never produce NaN/Inf. Two
-// identities collapse the general Project: (1) dot(L-P,n) is exactly distPL because n = (L-P)/|L-P|, so
-// s = distPL/dn - no re-derivation; (2) the disk basis (u,v) is perpendicular to n, so dot(L-P,u)=dot(L-P,v)=0
-// and the disk-plane offset is simply s*(dot(dir,u), dot(dir,v)) - no Q/rel reconstruction. Algebraically
-// identical to SoftDisk_Project, just far fewer ops on the hot per-edge path.
-float2 SoftDisk_ProjClipped( float3 A, float3 P, float dn, float distPL, float3 u, float3 v )
-{
-	float3 dir = A - P;
-	float  s   = distPL / dn;
-	return s * float2( dot( dir, u ), dot( dir, v ) );
-}
-
 // Signed area of the disk (centre origin, radius r) intersected with the triangle (origin, A, B). Summed
 // over a closed loop's directed edges this yields the signed area of disk INTERSECT polygon. Handles the
 // four clip cases: both endpoints in; one in one out; segment crossing; segment entirely outside (a pure
@@ -119,6 +87,170 @@ float SoftDisk_CircleTriArea( float2 A, float2 B, float r2 )		// r2 = disk radiu
 			   + 0.5 * r2 * atan2( P2.x * B.y - P2.y * B.x, dot( P2, B ) );
 	}
 	return 0.5 * r2 * atan2( A.x * B.y - A.y * B.x, dot( A, B ) );		// both outside, no crossing: sector
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Full per-fragment light-disk occlusion. Shared by the pixel shader (interactionSM.ps.hlsl) and the
+// unit tests (neo/tests/SoftShadowCoverage_test.cpp), which compile this exact source as C++ via
+// hlsl_compat.h - so the tests exercise the LIVE shader math, not a copy. Written with only single-
+// component (.x/.y/.z/.w) access, no multi-swizzles, to stay valid in both languages. The edge buffer
+// is the global t_SoftEdges in HLSL and a trailing parameter in C++ (SW_EDGEBUF_PARAM).
+//
+// swP = receiver world pos, swL = light origin, swR = light-disk radius (penumbra size), swFirstElem =
+// this light's first edge record, swN = record count (edges + one header per caster). Returns the
+// occluded fraction 0(lit)..1(umbra); the caller forms shadow = 1 - saturate( occ ).
+//
+// NEAR-PLANE CLOSURE (Sutherland-Hodgman). The blocked region on the disk is the projection of the part
+// of the caster IN FRONT of the receiver; the part behind P blocks nothing. So the silhouette is clipped
+// to the depth slab [swEps, swDistPL] and only the clipped (front) contour is summed. A vertex behind the
+// receiver is CLIPPED OFF, not projected (its projection blows up as dn->0). The near-plane clip inserts a
+// straight connector edge (the central projection of the caster's planar near-plane cross-section - lines
+// map to lines, so it is exactly straight), whose endpoints sit at radius ~swDistPL/swEps. swEps is kept
+// small so those crossings project FAR outside the disk and the connector never cuts it (a connector that
+// cut the disk was the semicircular-umbra bug: at a coarse eps two opposite crossings form a diameter).
+
+#ifndef PI
+	#define PI 3.14159265358979323846
+#endif
+
+#ifndef SW_NEAR_EPS
+	#define SW_NEAR_EPS 1e-3		// near-plane clip depth; small so near-plane crossings project far off the disk
+#endif
+
+#ifdef __cplusplus
+	#define SW_EDGEBUF_PARAM , SoftEdgeBuffer t_SoftEdges
+#else
+	#define SW_EDGEBUF_PARAM
+#endif
+
+float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int swFirstElem, int swN SW_EDGEBUF_PARAM )
+{
+	swR = max( swR, 1e-2 );
+	float3 swToL = swL - swP;
+	float  swDistPL = max( length( swToL ), 1e-4 );					// receiver->light distance
+	float3 swNrm = swToL * ( 1.0 / swDistPL );
+	float3 swUp  = ( abs( swNrm.z ) > 0.9 ) ? float3( 0.0, 1.0, 0.0 ) : float3( 0.0, 0.0, 1.0 );
+	float3 swU   = normalize( cross( swUp, swNrm ) );
+	float3 swV   = cross( swNrm, swU );
+	float  swR2  = swR * swR;
+	float  swInvDiskArea = 1.0 / ( PI * swR2 );
+	float  swSinA = saturate( swR / swDistPL );						// disk half-angle (caster-invariant cull)
+	float  swCosA = sqrt( 1.0 - swSinA * swSinA );
+	const float swEps = SW_NEAR_EPS;
+
+	float swOcc = 0.0;
+	float swArea = 0.0;
+	bool  haveCaster = false;
+	bool  swSkip = false;
+	// per-chain shoelace state: swFirst/swPrev are the first/last clipped vertex of the current silhouette
+	// chain. A caster concatenates several CLOSED walk-ordered chains (a hole wound the other way, one chain
+	// per surface of a multi-part entity); a chain boundary is detected bit-exactly by e0 != previous e1.
+	bool   swFirstValid = false;
+	float2 swFirst = float2( 0.0, 0.0 );
+	float2 swPrev  = float2( 0.0, 0.0 );
+	bool   havePrevE1 = false;
+	float3 prevE1w = float3( 0.0, 0.0, 0.0 );
+	for( int se = 0; se < swN; se++ )
+	{
+		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
+		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
+		if( e0.w < 0.0 )		// header record = caster boundary: close+finalize the previous caster, cull the next
+		{
+			if( haveCaster && swFirstValid )
+			{
+				swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the previous caster's open chain
+			}
+			if( haveCaster )
+			{
+				swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
+				if( swOcc >= 0.999 ) { break; }
+			}
+			haveCaster = true;
+			swArea = 0.0;
+			swSkip = false;
+			swFirstValid = false;
+			havePrevE1 = false;
+			float3 dCv  = float3( e0.x, e0.y, e0.z ) - swP;			// caster bounding sphere: centre, radius e1.x
+			float  cRad = e1.x;
+			float  dCn  = dot( dCv, swNrm );
+			if( dCn + cRad < swEps || dCn - cRad > swDistPL )		// wholly behind receiver, or wholly beyond light
+			{
+				swSkip = true;
+				continue;
+			}
+			if( dCn - cRad > 1e-3 )									// sphere fully in front: angular reject is safe (AO-4)
+			{
+				float front = dot( dCv, dCv ) - cRad * cRad;
+				swSkip = ( dCn < swCosA * sqrt( front ) - swSinA * cRad );
+			}
+			continue;
+		}
+		if( swSkip ) { continue; }
+
+		float3 A = float3( e0.x, e0.y, e0.z );
+		float3 B = float3( e1.x, e1.y, e1.z );
+		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close a finished chain before the next
+			swFirstValid = false;
+		}
+		havePrevE1 = true;
+		prevE1w = B;
+
+		// clip the edge's parameter interval to the depth slab [swEps, swDistPL]; an empty interval = the
+		// whole edge is behind the receiver or beyond the light, contributes no vertex, and its span is
+		// bridged by the connector against swPrev on the next kept edge - keeping the clipped loop closed.
+		float3 a = A - swP;
+		float3 b = B - swP;
+		float  dnA = dot( a, swNrm );
+		float  dnB = dot( b, swNrm );
+		float  d   = dnB - dnA;
+		float  t0 = 0.0;
+		float  t1 = 1.0;
+		bool   empty = false;
+		if( abs( d ) < 1e-12 )
+		{
+			if( dnA < swEps ) { empty = true; }
+		}
+		else
+		{
+			float tc = ( swEps - dnA ) / d;
+			if( d > 0.0 ) { t0 = max( t0, tc ); }
+			else          { t1 = min( t1, tc ); }
+		}
+		if( !empty )
+		{
+			if( abs( d ) < 1e-12 )
+			{
+				if( dnA > swDistPL ) { empty = true; }
+			}
+			else
+			{
+				float tc = ( swDistPL - dnA ) / d;
+				if( d > 0.0 ) { t1 = min( t1, tc ); }
+				else          { t0 = max( t0, tc ); }
+			}
+		}
+		if( empty || t0 > t1 ) { continue; }
+
+		float3 pa  = a + t0 * ( b - a );
+		float3 pb  = a + t1 * ( b - a );
+		float  dna = dnA + t0 * d;
+		float  dnb = dnA + t1 * d;
+		float2 q0 = float2( ( swDistPL / dna ) * dot( pa, swU ), ( swDistPL / dna ) * dot( pa, swV ) );
+		float2 q1 = float2( ( swDistPL / dnb ) * dot( pb, swU ), ( swDistPL / dnb ) * dot( pb, swV ) );
+
+		if( swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 ); }
+		else               { swFirst = q0; swFirstValid = true; }
+		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
+		swPrev = q1;
+	}
+	if( haveCaster && swFirstValid )
+	{
+		swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );		// close the last caster's open chain
+	}
+	if( haveCaster ) { swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) ); }
+	return swOcc;
 }
 
 #endif // __SOFTWEDGE_COVERAGE_INC__
