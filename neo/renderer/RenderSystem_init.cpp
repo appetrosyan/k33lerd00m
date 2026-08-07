@@ -43,6 +43,7 @@ If you have questions concerning this license or the applicable additional terms
 #endif
 
 #include "RenderCommon.h"
+#include "RenderCapture.h"
 
 #include "sys/DeviceManager.h"
 
@@ -1110,6 +1111,77 @@ bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nv
 
 /*
 ==================
+R_ReadPixelsR32F
+
+Reads one channel of `texture` back to CPU at full 32-bit float precision. The source is blitted into an
+RGBA32_FLOAT render target (the blit SAMPLES the source, so a DEPTH texture lands its depth in R), staged,
+and the R channel returned as a picWidth*picHeight float array (R_StaticAlloc; caller frees). Used by the
+soft-shadow scene capture to store the depth buffer without the half-float precision loss of R_ReadPixelsRGB16F.
+==================
+*/
+bool R_ReadPixelsR32F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, float** pic, int picWidth, int picHeight )
+{
+	nvrhi::TextureDesc desc = texture->getDesc();
+
+	nvrhi::CommandListHandle commandList = device->createCommandList();
+	commandList->open();
+
+	if( textureState != nvrhi::ResourceStates::Unknown )
+	{
+		commandList->beginTrackingTextureState( texture, nvrhi::TextureSubresourceSet( 0, 1, 0, 1 ), textureState );
+	}
+
+	// always blit into an RGBA32F RT: the source is a depth (or otherwise non-RGBA32F) texture, and the blit
+	// samples it, so full-precision depth ends up in R.
+	desc.format = nvrhi::Format::RGBA32_FLOAT;
+	desc.isRenderTarget = true;
+	desc.isTypeless = false;
+	desc.initialState = nvrhi::ResourceStates::RenderTarget;
+	desc.keepInitialState = true;
+
+	nvrhi::TextureHandle tempTexture = device->createTexture( desc );
+	nvrhi::FramebufferHandle tempFramebuffer = device->createFramebuffer( nvrhi::FramebufferDesc().addColorAttachment( tempTexture ) );
+	pPasses->BlitTexture( commandList, tempFramebuffer, texture );
+
+	nvrhi::StagingTextureHandle stagingTexture = device->createStagingTexture( desc, nvrhi::CpuAccessMode::Read );
+	commandList->copyTexture( stagingTexture, nvrhi::TextureSlice(), tempTexture, nvrhi::TextureSlice() );
+
+	if( textureState != nvrhi::ResourceStates::Unknown )
+	{
+		commandList->setTextureState( texture, nvrhi::TextureSubresourceSet( 0, 1, 0, 1 ), textureState );
+		commandList->commitBarriers();
+	}
+
+	commandList->close();
+	device->executeCommandList( commandList );
+
+	size_t rowPitch = 0;
+	void* pData = device->mapStagingTexture( stagingTexture, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, &rowPitch );
+	if( !pData )
+	{
+		return false;
+	}
+
+	float* out = ( float* )R_StaticAlloc( ( size_t )picWidth * picHeight * sizeof( float ) );
+	*pic = out;
+	const char* base = static_cast<const char*>( pData );
+	const int rows = Min( ( int )desc.height, picHeight );
+	const int cols = Min( ( int )desc.width, picWidth );
+	for( int y = 0; y < rows; y++ )
+	{
+		const float* row = reinterpret_cast<const float*>( base + ( size_t )y * rowPitch );
+		for( int x = 0; x < cols; x++ )
+		{
+			out[y * picWidth + x] = row[x * 4 + 0];		// R channel
+		}
+	}
+
+	device->unmapStagingTexture( stagingTexture );
+	return true;
+}
+
+/*
+==================
 R_CaptureHDRScreenshot
 
 Writes the current FP16 scene buffer (pre-tonemap linear HDR) to screenshots/<baseName>.exr.
@@ -1787,6 +1859,7 @@ void R_InitCommands()
 	cmdSystem->AddCommand( "listGuis", R_ListGuis_f, CMD_FL_RENDERER, "lists guis" );
 	cmdSystem->AddCommand( "touchGui", R_TouchGui_f, CMD_FL_RENDERER, "touches a gui" );
 	cmdSystem->AddCommand( "screenshot", R_ScreenShot_f, CMD_FL_RENDERER, "takes a screenshot" );
+	cmdSystem->AddCommand( "captureSoftShadow", R_CaptureSoftShadow_f, CMD_FL_RENDERER, "arms a one-shot soft-shadow scene capture (.softcap + .png)" );
 	cmdSystem->AddCommand( "envshot", R_EnvShot_f, CMD_FL_RENDERER, "takes an environment shot" );
 	cmdSystem->AddCommand( "envToSky", R_TransformEnvToSkybox_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "transforms environment textures to sky box textures" );
 	cmdSystem->AddCommand( "skyToEnv", R_TransformSkyboxToEnv_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "transforms sky box textures to environment textures" );

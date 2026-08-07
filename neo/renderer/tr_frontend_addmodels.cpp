@@ -39,6 +39,7 @@ If you have questions concerning this license or the applicable additional terms
 #endif
 
 #include "RenderCommon.h"
+#include "RenderCapture.h"
 #include "Model_local.h"
 
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
@@ -1327,6 +1328,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 						memset( edgeSurf, 0, sizeof( *edgeSurf ) );
 						edgeSurf->softEdges = sedges;
 						edgeSurf->numSoftEdges = nedges;
+						edgeSurf->frontEndGeo = tri;		// caster solid, for the scene-capture ground-truth mesh
 						edgeSurf->space = vEntity;
 						edgeSurf->scissorRect = vLight->scissorRect;
 
@@ -1718,6 +1720,11 @@ void R_AddModels()
 			// interaction pixel shader can read; the vertex buffer is not bound as an SRV.
 			vLight->softEdgeCache = vertexCache.AllocJoint( flat, records, sizeof( softShadowEdge_t ) );
 			vLight->softEdgeCount = records;
+
+			if( R_SoftShadowCaptureArmed() )
+			{
+				R_CaptureLightEdges( vLight, flat, records );	// retain a CPU copy before flat[] is dropped
+			}
 
 			tr.pc.c_softShadowLights++;
 			tr.pc.c_softShadowCasters += numCasters;

@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "RenderCommon.h"
+#include "RenderCapture.h"
 
 /*
 ==========================================================================================
@@ -1275,6 +1276,13 @@ void R_RenderView( viewDef_t* parms )
 
 	// RB: find closest environment probes so we can interpolate between them in the ambient shaders
 	R_FindClosestEnvironmentProbes();
+
+	// soft-shadow scene capture: snapshot the main view's lights/edges/caster-meshes (frontend half) before
+	// the view is handed to the backend, which finishes the capture with the screenshot.
+	if( R_SoftShadowCaptureArmed() && !parms->isSubview )
+	{
+		R_CaptureFrontendView( tr.viewDef );
+	}
 
 	// add the rendering commands for this viewDef
 	R_AddDrawViewCmd( parms, false );
