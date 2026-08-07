@@ -83,3 +83,7 @@ neo/bin/
 /.clangd
 /compile_commands.json
 /neo/compile_commands.json
+
+# local soft-shadow scene captures (large; not committed)
+neo/tests/data/*.softcap
+neo/tests/data/*.png

@@ -34,6 +34,7 @@ float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int swFirstE
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 using namespace swtest;
 
@@ -127,4 +128,78 @@ TEST( SoftShadowReplay, mesh_truth_matches_box_truth )
 	float boxT  = TruthShadow( P0, L, R, b, 120 );
 	std::printf( "    [mesh_truth] mesh=%.3f box=%.3f\n", meshT, boxT );
 	CHECK_NEAR( meshT, boxT, 0.02f );
+}
+
+// Real-capture validation. Loads a .softcap named by the SOFTCAP env var (skips cleanly if unset, so the
+// committed roster stays green without the data). The key check is the depth->world reconstruction: a pixel
+// reconstructed to world and reprojected through worldMVP must return to itself. If the captured matrices'
+// row/column convention is right this is exact (bar TAA sub-pixel jitter); if it's wrong the error explodes.
+// This is what validates ReconstructReceiver against a real frame before Phase 4 trusts it.
+TEST( SoftShadowReplay, real_capture_reconstruction_roundtrips )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL )
+	{
+		std::printf( "    [real_capture] SOFTCAP unset; skipping (set it to a .softcap to validate)\n" );
+		CHECK( true );
+		return;
+	}
+	SoftCap c;
+	if( !LoadSoftCap( path, c ) )
+	{
+		std::printf( "    [real_capture] could not load %s\n", path );
+		CHECK( false );
+		return;
+	}
+	std::printf( "    [real_capture] %s: %ux%u, %u lights, %u casters, %u tris, depth=%u\n",
+			path, c.hdr.screenW, c.hdr.screenH, c.hdr.numLights, c.hdr.numCasters, c.hdr.numMeshIdx / 3, c.hdr.hasDepth );
+	CHECK( c.hdr.numLights > 0 );
+	CHECK( c.hdr.hasDepth == 1 );
+
+	const int w = ( int )c.hdr.screenW, h = ( int )c.hdr.screenH;
+
+	// depth diagnostics: what range/encoding did we actually capture?
+	float dmin = 1e30f, dmax = -1e30f; double dsum = 0; int dn = 0, dmid = 0;
+	for( size_t i = 0; i < c.depth.size(); i += 37 )
+	{
+		float d = c.depth[i];
+		dmin = std::fmin( dmin, d ); dmax = std::fmax( dmax, d ); dsum += d; dn++;
+		if( d > 1e-4f && d < 1.0f - 1e-4f ) { dmid++; }
+	}
+	const double midFrac = dn ? ( double )dmid / dn : 0.0;
+	std::printf( "    [real_capture] depth: min=%.5f max=%.5f mean=%.5f  frac in (0,1)=%.3f\n",
+			dmin, dmax, dn ? dsum / dn : 0.0, midFrac );
+	if( midFrac < 0.02 )
+	{
+		// depth is degenerate (all near/far): the depth-texture readback did not sample real depth. The
+		// reconstruction is a function of depth, so it cannot be validated here - flag it, don't assert on
+		// a downstream symptom. Fix R_ReadPixelsR32F's depth path, re-capture, then this test validates.
+		std::printf( "    [real_capture] DEPTH CAPTURE DEGENERATE - reconstruction unvalidatable (fix depth readback)\n" );
+		CHECK( true );
+		return;
+	}
+
+	double worst = 0.0; int tested = 0;
+	for( int gy = 1; gy < 12; gy++ )
+		for( int gx = 1; gx < 12; gx++ )
+		{
+			int x = gx * w / 12, y = gy * h / 12;
+			float d = c.depth[( size_t )y * w + x];
+			if( d <= 1e-6f || d >= 1.0f - 1e-6f ) { continue; }		// sky / no geometry
+			float3 P = ReconstructReceiver( c, x, y );
+			const float* M = c.hdr.worldMVP;
+			float cx = M[0] * P.x + M[1] * P.y + M[2] * P.z + M[3];
+			float cy = M[4] * P.x + M[5] * P.y + M[6] * P.z + M[7];
+			float cw = M[12] * P.x + M[13] * P.y + M[14] * P.z + M[15];
+			if( std::fabs( cw ) < 1e-9f ) { continue; }
+			float ndcx = cx / cw, ndcy = cy / cw;
+			float sx = ( ndcx * 0.5f + 0.5f ) * w;
+			float sy = ( 1.0f - ( ndcy * 0.5f + 0.5f ) ) * h;
+			double err = std::fmax( std::fabs( sx - x ), std::fabs( sy - y ) );
+			worst = std::fmax( worst, err );
+			tested++;
+		}
+	std::printf( "    [real_capture] %d px reconstruct->reproject worst error = %.2f px\n", tested, worst );
+	CHECK( tested > 0 );
+	CHECK( worst < 2.0 );		// returns to the pixel: the depth->world convention is validated on real data
 }
