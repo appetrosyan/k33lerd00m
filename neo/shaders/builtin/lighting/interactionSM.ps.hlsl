@@ -162,6 +162,17 @@ void main( PS_IN fragment, out PS_OUT result )
 	float swArea = 0.0;				// signed disk-intersection area for the current caster
 	bool  haveCaster = false;		// opened a caster (seen its header record) yet?
 	bool  swSkip = false;			// current caster culled: its bounding sphere can't reach the light disk
+	// Streaming Sutherland-Hodgman: each caster silhouette is clipped to the depth slab [swEps, swDistPL]
+	// and its clipped contour summed as a shoelace of SoftDisk_CircleTriArea triangles. swFirst/swPrev hold
+	// the first/last clipped vertex of the CURRENT chain so the near/far-plane connector (a straight edge of
+	// the clipped polygon) forms automatically when an edge is dropped or a chain closes - keeping the loop
+	// CLOSED. A loop left open winds a spurious chord across the disk = over-occlusion on genuinely lit
+	// fragments (the whole-scene darkening + shadow halo). Verified lossless in neo/tests/SoftShadowCoverage_test.cpp.
+	bool   swFirstValid = false;	// have we emitted the first clipped vertex of the current chain?
+	float2 swFirst = float2( 0.0, 0.0 );
+	float2 swPrev  = float2( 0.0, 0.0 );
+	bool   havePrevE1 = false;		// have a previous edge's E1 world vertex to test chain continuity against?
+	float3 prevE1w = float3( 0.0, 0.0, 0.0 );
 	const float swEps = 1e-3;
 	for( int se = 0; se < swN; se++ )
 	{
@@ -183,6 +194,10 @@ void main( PS_IN fragment, out PS_OUT result )
 		// fixed). So we apply the angular reject only in the safe (fully-in-front) regime.
 		if( e0.w < 0.0 )		// header record = caster boundary: finalize the previous caster here (no per-edge id compare)
 		{
+			if( haveCaster && swFirstValid )
+			{
+				swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the previous caster's open chain
+			}
 			if( haveCaster )
 			{
 				swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
@@ -191,6 +206,8 @@ void main( PS_IN fragment, out PS_OUT result )
 			haveCaster = true;
 			swArea = 0.0;
 			swSkip = false;
+			swFirstValid = false;
+			havePrevE1 = false;
 			float3 dCv  = e0.xyz - swP;
 			float  cRad = e1.x;
 			float  dCn  = dot( dCv, swNrm );						// sphere-centre depth along receiver->light
@@ -214,31 +231,80 @@ void main( PS_IN fragment, out PS_OUT result )
 			continue;
 		}
 		if( swSkip ) { continue; }
-		// Near-plane clip. A silhouette vertex behind the receiver (dn<=0, receiver in front of it) can't be
-		// projected onto the light disk. Do NOT skip the edge - that opens the loop and the shoelace closes
-		// the gap with a chord that spuriously encloses the disk (over-occlusion). Instead CLIP the edge to
-		// the near plane: the clipped endpoint lands on the disk horizon, which CircleTriArea treats as a
-		// boundary sector, keeping the loop closed. An edge entirely behind is dropped (that arc is beyond P).
-		// Clip the edge to the slab BETWEEN the receiver and the light plane (swEps < dn < swDistPL). An
-		// edge fully behind the receiver, or fully BEYOND the light, can't occlude - and a beyond-light
-		// caster's silhouette spuriously encloses the disk (uniform over-occlusion). Clipping keeps the
-		// loop closed at both planes.
-		// Receiver-relative coords a=A-swP, b=B-swP: computed ONCE and reused for both the slab depth (dot with
-		// swNrm) and the disk projection (dot with swU/swV), instead of re-subtracting swP inside the projection.
-		// Clipping is affine so it is identical in this space; projection is (swDistPL/dn)*(dot(a,swU),dot(a,swV))
-		// because dot(L-P,swNrm) == swDistPL and the disk basis (swU,swV) is perpendicular to swNrm.
-		float3 a = e0.xyz - swP;
-		float3 b = e1.xyz - swP;
+		// Chain boundary. A caster concatenates several CLOSED, walk-ordered silhouette chains (a hole is a
+		// loop wound the other way; a multi-surface entity contributes one chain per part). Consecutive edges
+		// inside one chain share a world vertex bit-exactly (E1 of one == E0 of the next, from the frontend
+		// walk), so a mismatch marks the start of a new chain: close the finished chain's clipped contour so
+		// it never connects across to the next one (which would fabricate a spanning chord = over-occlusion).
+		float3 A = e0.xyz;
+		float3 B = e1.xyz;
+		if( havePrevE1 && any( A != prevE1w ) && swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );
+			swFirstValid = false;
+		}
+		havePrevE1 = true;
+		prevE1w = B;
+
+		// Clip the edge's parameter interval [t0,t1] to the depth slab [swEps, swDistPL] (Sutherland-Hodgman
+		// against the two planes parallel to the light disk). An empty interval = the whole edge is outside the
+		// slab (behind the receiver or beyond the light); it contributes no vertex, and its span is bridged by
+		// the connector formed against swPrev on the next kept edge - so the clipped loop stays CLOSED without a
+		// spurious chord. A silhouette vertex behind the receiver can't project onto the disk (dn->0 blows up),
+		// which is exactly why the loop must be clipped, not the projection point clamped.
+		// Receiver-relative coords a=A-swP, b=B-swP feed both the slab depth (dot swNrm) and the disk projection
+		// (dot swU/swV): projection is (swDistPL/dn)*(dot(a,swU),dot(a,swV)) since dot(L-P,swNrm)==swDistPL and
+		// the disk basis is perpendicular to swNrm.
+		float3 a = A - swP;
+		float3 b = B - swP;
 		float  dnA = dot( a, swNrm );
 		float  dnB = dot( b, swNrm );
-		if( ( dnA < swEps && dnB < swEps ) || ( dnA > swDistPL && dnB > swDistPL ) ) { continue; }
-		if( dnA < swEps )     { a = a + ( ( swEps - dnA ) / ( dnB - dnA ) ) * ( b - a ); dnA = swEps; }
-		if( dnB < swEps )     { b = b + ( ( swEps - dnB ) / ( dnA - dnB ) ) * ( a - b ); dnB = swEps; }
-		if( dnA > swDistPL )  { a = a + ( ( swDistPL - dnA ) / ( dnB - dnA ) ) * ( b - a ); dnA = swDistPL; }
-		if( dnB > swDistPL )  { b = b + ( ( swDistPL - dnB ) / ( dnA - dnB ) ) * ( a - b ); dnB = swDistPL; }
-		float2 qa = ( swDistPL / dnA ) * float2( dot( a, swU ), dot( a, swV ) );
-		float2 qb = ( swDistPL / dnB ) * float2( dot( b, swU ), dot( b, swV ) );
-		swArea += SoftDisk_CircleTriArea( qa, qb, swR2 );
+		float  d   = dnB - dnA;
+		float  t0 = 0.0;
+		float  t1 = 1.0;
+		bool   empty = false;
+		if( abs( d ) < 1e-12 )
+		{
+			if( dnA < swEps ) { empty = true; }				// edge parallel to the planes and behind the near plane
+		}
+		else
+		{
+			float tc = ( swEps - dnA ) / d;					// param where the edge meets the near plane
+			if( d > 0.0 ) { t0 = max( t0, tc ); }
+			else          { t1 = min( t1, tc ); }
+		}
+		if( !empty )
+		{
+			if( abs( d ) < 1e-12 )
+			{
+				if( dnA > swDistPL ) { empty = true; }		// parallel and beyond the light plane
+			}
+			else
+			{
+				float tc = ( swDistPL - dnA ) / d;			// param where the edge meets the light plane
+				if( d > 0.0 ) { t1 = min( t1, tc ); }
+				else          { t0 = max( t0, tc ); }
+			}
+		}
+		if( empty || t0 > t1 ) { continue; }
+
+		float3 pa  = a + t0 * ( b - a );					// clipped endpoints in receiver-relative coords
+		float3 pb  = a + t1 * ( b - a );
+		float  dna = dnA + t0 * d;							// their slab depths (in [swEps, swDistPL])
+		float  dnb = dnA + t1 * d;
+		float2 q0 = ( swDistPL / dna ) * float2( dot( pa, swU ), dot( pa, swV ) );
+		float2 q1 = ( swDistPL / dnb ) * float2( dot( pb, swU ), dot( pb, swV ) );
+
+		// stream into the shoelace: connector from the previous vertex (0 when they coincide = the common
+		// unclipped case, so bit-identical to the old per-edge sum there), then this edge's own triangle.
+		if( swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 ); }
+		else               { swFirst = q0; swFirstValid = true; }
+		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
+		swPrev = q1;
+	}
+	if( haveCaster && swFirstValid )
+	{
+		swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the last caster's open chain
 	}
 	if( haveCaster ) { swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) ); }	// last caster
 	float shadow = 1.0 - saturate( swOcc );
