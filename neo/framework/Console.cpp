@@ -642,21 +642,55 @@ float idConsoleLocal::DrawFPS( float y )
 		}
 		ImGui::TextColored( paShown[PA_SYNC] > maxTime ? colorRed : colorWhite,		"  Sync:    %06.0f+-%05.0f", paShown[PA_SYNC], paStd[PA_SYNC] );
 
-		// GPU pass timings - a disabled pass averages 0 and is omitted, so only active work shows.
-		// (Interactions is the whole lighting pass; "of wh. Soft" is the soft-shadowed-lights subset.)
-		ImGui::TextColored( colorMdGrey, "GPU  (mean+-std us)" );
-		if( paShown[PA_EARLYZ] > 0.0 )		{ ImGui::TextColored( paShown[PA_EARLYZ] > maxTime ? colorRed : colorWhite,		"  EarlyZ:        %06.0f+-%05.0f", paShown[PA_EARLYZ], paStd[PA_EARLYZ] ); }
-		if( paShown[PA_SSAO] > 0.0 )		{ ImGui::TextColored( paShown[PA_SSAO] > maxTime ? colorRed : colorWhite,		"  SSAO:          %06.0f+-%05.0f", paShown[PA_SSAO], paStd[PA_SSAO] ); }
-		if( paShown[PA_SSR] > 0.0 )			{ ImGui::TextColored( paShown[PA_SSR] > maxTime ? colorRed : colorWhite,			"  SSR:           %06.0f+-%05.0f", paShown[PA_SSR], paStd[PA_SSR] ); }
-		if( paShown[PA_AMBIENT] > 0.0 )		{ ImGui::TextColored( paShown[PA_AMBIENT] > maxTime ? colorRed : colorWhite,		"  Ambient Pass:  %06.0f+-%05.0f", paShown[PA_AMBIENT], paStd[PA_AMBIENT] ); }
-		if( paShown[PA_INTER] > 0.0 )		{ ImGui::TextColored( paShown[PA_INTER] > maxTime ? colorRed : colorWhite,		"  Interactions:  %06.0f+-%05.0f", paShown[PA_INTER], paStd[PA_INTER] ); }
-		if( paShown[PA_SOFTGPU] > 0.0 )		{ ImGui::TextColored( paShown[PA_SOFTGPU] > maxTime ? colorRed : colorOrange,	"    of wh. Soft: %06.0f+-%05.0f", paShown[PA_SOFTGPU], paStd[PA_SOFTGPU] ); }
-		if( paShown[PA_STENCIL] > 0.0 )		{ ImGui::TextColored( paShown[PA_STENCIL] > maxTime ? colorRed : colorWhite,		"  Stencil Shdw:  %06.0f+-%05.0f", paShown[PA_STENCIL], paStd[PA_STENCIL] ); }
-		if( paShown[PA_SHADOWMAP] > 0.0 )	{ ImGui::TextColored( paShown[PA_SHADOWMAP] > maxTime ? colorRed : colorWhite,	"  Shadow Maps:   %06.0f+-%05.0f", paShown[PA_SHADOWMAP], paStd[PA_SHADOWMAP] ); }
-		if( paShown[PA_RTMASK] > 0.0 )		{ ImGui::TextColored( paShown[PA_RTMASK] > maxTime ? colorRed : colorWhite,		"  RT Shdw Mask:  %06.0f+-%05.0f", paShown[PA_RTMASK], paStd[PA_RTMASK] ); }
-		if( paShown[PA_SHADERPASS] > 0.0 )	{ ImGui::TextColored( paShown[PA_SHADERPASS] > maxTime ? colorRed : colorWhite,	"  Shader Pass:   %06.0f+-%05.0f", paShown[PA_SHADERPASS], paStd[PA_SHADERPASS] ); }
-		if( paShown[PA_TAA] > 0.0 )			{ ImGui::TextColored( paShown[PA_TAA] > maxTime ? colorRed : colorWhite,			"  TAA:           %06.0f+-%05.0f", paShown[PA_TAA], paStd[PA_TAA] ); }
-		if( paShown[PA_POSTFX] > 0.0 )		{ ImGui::TextColored( paShown[PA_POSTFX] > maxTime ? colorRed : colorWhite,		"  PostFX:        %06.0f+-%05.0f", paShown[PA_POSTFX], paStd[PA_POSTFX] ); }
+		// GPU pass timings, sorted biggest-first and shown as absolute us then % of total GPU, so the
+		// bottleneck is unmistakable: the largest pass is marked '>>' in red. A disabled pass averages 0 and
+		// is omitted. Interactions is the whole lighting pass; "of wh. Soft" is the soft-shadowed subset.
+		const double swTotGpu = Max( paShown[PA_TOTGPU], 1.0 );
+		ImGui::TextColored( colorMdGrey, "GPU  (mean us  %% of GPU)    total %06.0f+-%05.0f us", paShown[PA_TOTGPU], paStd[PA_TOTGPU] );
+		{
+			struct gpuRow_t { const char* name; int pa; };
+			static const gpuRow_t gpuRows[] =
+			{
+				{ "EarlyZ+GBuf",  PA_EARLYZ },  { "SSAO",         PA_SSAO },       { "SSR",          PA_SSR },
+				{ "Ambient/GI",   PA_AMBIENT }, { "Interactions", PA_INTER },      { "Stencil Shdw", PA_STENCIL },
+				{ "Shadow Maps",  PA_SHADOWMAP }, { "RT Shdw Mask", PA_RTMASK },   { "Shader Pass",  PA_SHADERPASS },
+				{ "TAA",          PA_TAA },     { "PostFX",       PA_POSTFX },
+			};
+			const int gpuRowCount = sizeof( gpuRows ) / sizeof( gpuRows[0] );
+			int gpuOrder[gpuRowCount];
+			for( int i = 0; i < gpuRowCount; i++ )
+			{
+				gpuOrder[i] = i;
+			}
+			for( int i = 0; i < gpuRowCount - 1; i++ )				// selection sort by value, descending
+			{
+				for( int j = i + 1; j < gpuRowCount; j++ )
+				{
+					if( paShown[gpuRows[gpuOrder[j]].pa] > paShown[gpuRows[gpuOrder[i]].pa] )
+					{
+						const int t = gpuOrder[i];
+						gpuOrder[i] = gpuOrder[j];
+						gpuOrder[j] = t;
+					}
+				}
+			}
+			for( int k = 0; k < gpuRowCount; k++ )
+			{
+				const gpuRow_t& row = gpuRows[gpuOrder[k]];
+				const double v = paShown[row.pa];
+				if( v <= 0.0 )
+				{
+					continue;
+				}
+				const double pct = 100.0 * v / swTotGpu;
+				const ImVec4 col = ( k == 0 ) ? colorRed : ( pct >= 20.0 ? colorOrange : ( pct < 3.0 ? colorLtGrey : colorWhite ) );
+				ImGui::TextColored( col, "%s %-13s %07.0f us  %4.1f%%", ( k == 0 ) ? ">>" : "  ", row.name, v, pct );
+				if( row.pa == PA_INTER && paShown[PA_SOFTGPU] > 0.0 )
+				{
+					ImGui::TextColored( colorOrange, "     of wh. Soft %07.0f us  %4.1f%%", paShown[PA_SOFTGPU], 100.0 * paShown[PA_SOFTGPU] / swTotGpu );
+				}
+			}
+		}
 
 		// overall busy / idle / utilisation
 		ImGui::TextColored( ( paShown[PA_TOTCPU] > maxTime || paShown[PA_TOTGPU] > maxTime ) ? colorRed : colorWhite, "Total:  CPU %06.0f+-%05.0f   GPU %06.0f+-%05.0f us", paShown[PA_TOTCPU], paStd[PA_TOTCPU], paShown[PA_TOTGPU], paStd[PA_TOTGPU] );
