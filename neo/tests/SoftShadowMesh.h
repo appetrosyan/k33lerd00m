@@ -74,7 +74,7 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 	FILE* f = std::fopen( path, "rb" );
 	if( !f ) { return false; }
 	if( std::fread( &c.hdr, sizeof( c.hdr ), 1, f ) != 1 ) { std::fclose( f ); return false; }
-	if( c.hdr.magic != SOFTCAP_MAGIC || c.hdr.version != SOFTCAP_VERSION ) { std::fclose( f ); return false; }
+	if( c.hdr.magic != SOFTCAP_MAGIC || c.hdr.version < 2u || c.hdr.version > SOFTCAP_VERSION ) { std::fclose( f ); return false; }
 	c.lights.resize( c.hdr.numLights );
 	c.edges.resize( c.hdr.numEdges );
 	c.casters.resize( c.hdr.numCasters );
@@ -95,6 +95,16 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 	if( c.recvVerts.size() ) { ok = ok && std::fread( c.recvVerts.data(), sizeof( float ),           c.recvVerts.size(), f ) == c.recvVerts.size(); }
 	if( c.recvIdx.size() )   { ok = ok && std::fread( c.recvIdx.data(),   sizeof( uint32_t ),        c.recvIdx.size(), f ) == c.recvIdx.size(); }
 	std::fclose( f );
+
+	// v2 stored per-surface LOCAL triangle indices; v3 stores them GLOBAL (offset by firstVert). Normalize
+	// a v2 dump to global so all downstream code sees one convention.
+	if( ok && c.hdr.version < 3u )
+	{
+		for( const softcapCaster_t& cs : c.casters )
+			for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < c.meshIdx.size(); k++ ) { c.meshIdx[k] += cs.firstVert; }
+		for( const softcapReceiver_t& R : c.receivers )
+			for( uint32_t k = R.firstIndex; k < R.firstIndex + R.numIndex && k < c.recvIdx.size(); k++ ) { c.recvIdx[k] += R.firstVert; }
+	}
 	return ok;
 }
 

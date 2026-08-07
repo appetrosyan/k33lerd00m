@@ -494,8 +494,21 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 		std::printf( "    [cap_cov] no receiver surfaces (need a v3 capture)\n" ); CHECK( true ); return;
 	}
 
+	// SANITY: receiver points and caster verts should occupy the same world region (both are this scene's
+	// geometry). If they don't, the capture or the transforms are wrong and any coverage number is noise.
+	{
+		float rlo[3] = { 1e30f, 1e30f, 1e30f }, rhi[3] = { -1e30f, -1e30f, -1e30f };
+		float clo[3] = { 1e30f, 1e30f, 1e30f }, chi[3] = { -1e30f, -1e30f, -1e30f };
+		for( size_t i = 0; i + 2 < c.recvVerts.size(); i += 3 )
+			for( int k = 0; k < 3; k++ ) { rlo[k] = std::fmin( rlo[k], c.recvVerts[i + k] ); rhi[k] = std::fmax( rhi[k], c.recvVerts[i + k] ); }
+		for( size_t i = 0; i + 2 < c.meshVerts.size(); i += 3 )
+			for( int k = 0; k < 3; k++ ) { clo[k] = std::fmin( clo[k], c.meshVerts[i + k] ); chi[k] = std::fmax( chi[k], c.meshVerts[i + k] ); }
+		std::printf( "    [cap_cov] recv bbox [%.0f,%.0f,%.0f]..[%.0f,%.0f,%.0f]  caster bbox [%.0f,%.0f,%.0f]..[%.0f,%.0f,%.0f]\n",
+				rlo[0], rlo[1], rlo[2], rhi[0], rhi[1], rhi[2], clo[0], clo[1], clo[2], chi[0], chi[1], chi[2] );
+	}
+
 	SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
-	int sampled = 0, bad = 0; double worst = 0, sumAbs = 0;
+	int sampled = 0, bad = 0, tooLight = 0, tooDark = 0; double worst = 0, sumAbs = 0, covSum = 0, truSum = 0;
 	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 	{
 		const softcapLight_t& L = c.lights[li];
@@ -519,15 +532,24 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 			for( uint32_t vi = R.firstVert; vi < R.firstVert + R.numVerts; vi += step )
 			{
 				float3 P( c.recvVerts[vi * 3 + 0], c.recvVerts[vi * 3 + 1], c.recvVerts[vi * 3 + 2] );
+				// shadow-bias: lift the sample toward the light so the truth ray-cast does not self-hit the
+				// receiver's own surface (many surfaces are both receiver and caster here). Both coverage and
+				// truth use the lifted point, so the comparison stays fair.
+				float3 toL = Lo - P; float dl = std::sqrt( dot( toL, toL ) );
+				if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }
 				float cov = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, Lo, L.penumbraSize, ( int )( L.firstEdge * 2 ), ( int )L.edgeCount, buf ) );
 				float truth = MeshTruthShadowSoup( c.meshVerts.data(), castIdx.data(), ( uint32_t )castIdx.size(), P, Lo, L.penumbraSize, 12 );
 				float d = std::fabs( cov - truth );
-				sampled++; sumAbs += d; worst = std::fmax( worst, ( double )d );
+				sampled++; sumAbs += d; worst = std::fmax( worst, ( double )d ); covSum += cov; truSum += truth;
 				if( d > 0.1f ) { bad++; }
+				if( cov > truth + 0.1f ) { tooLight++; }		// coverage MISSES shadow (deep-umbra hole / under-occlusion)
+				if( cov < truth - 0.1f ) { tooDark++; }			// coverage OVER-shadows (halo / over-occlusion)
 			}
 		}
 	}
-	std::printf( "    [cap_cov] %d receiver samples: %d disagree>0.1 (%.1f%%)  worst=%.3f  mean|cov-truth|=%.4f\n",
+	std::printf( "    [cap_cov] %d samples: %d disagree>0.1 (%.1f%%)  worst=%.3f  mean|cov-truth|=%.4f\n",
 			sampled, bad, sampled ? 100.0 * bad / sampled : 0.0, worst, sampled ? sumAbs / sampled : 0.0 );
+	std::printf( "    [cap_cov] mean coverage=%.3f mean truth=%.3f   too-light(miss shadow)=%d  too-dark(over-shadow)=%d\n",
+			sampled ? covSum / sampled : 0.0, sampled ? truSum / sampled : 0.0, tooLight, tooDark );
 	CHECK( sampled > 0 );		// characterization: the disagreement IS the artifact, to be driven down by a fix
 }
