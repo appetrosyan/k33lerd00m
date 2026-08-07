@@ -514,6 +514,11 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 	// candidate FIX: gate coverage on the receiver actually being in the caster's shadow (hard-shadow center
 	// ray blocked). gatedExtraneous should collapse; penumbraClipped is what a strict hard gate would cost.
 	int gatedExtraneous = 0, penumbraClipped = 0;
+	// the OTHER failure: under-occlusion (coverage misses shadow the geometry casts). track its worst + geometry.
+	int missingShadow = 0; float worstUnder = 0; float3 uwP( 0, 0, 0 ), uwL( 0, 0, 0 ); float uwCov = 0, uwTru = 0, uwDir = 0;
+	// the candidate COMPREHENSIVE fix: direction-space coverage (fixes missing shadow) GATED by the shadow
+	// volume (fixes direction-space's own over-occlusion). Both failure counts should collapse together.
+	int dirMissing = 0, dirGatedExtraneous = 0; double dcovSum = 0;
 	for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 	{
 		const softcapLight_t& L = c.lights[li];
@@ -570,6 +575,15 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 				{
 					worstOver = truth - cov; owP = P; owL = Lo; owCov = cov; owTru = truth; owDir = dcov;
 				}
+				if( cov > truth + 0.35f ) { missingShadow++; }	// coverage misses a real shadow (under-occlusion)
+				dcovSum += dcov;
+				if( dcov > truth + 0.35f ) { dirMissing++; }			// direction-space under-occlusion (want << planar)
+				float dGated = hardBlocked ? dcov : 1.0f;				// direction-space, gated by the shadow volume
+				if( dGated < 0.5f && truth > 0.85f ) { dirGatedExtraneous++; }	// its over-occlusion after gating (want ~0)
+				if( cov - truth > worstUnder )					// track the single worst under-occlusion + geometry
+				{
+					worstUnder = cov - truth; uwP = P; uwL = Lo; uwCov = cov; uwTru = truth; uwDir = dcov;
+				}
 			}
 		}
 	}
@@ -581,6 +595,11 @@ TEST( SoftShadowCapture, coverage_vs_truth )
 			extraneous, extraneousDir, gatedExtraneous, penumbraClipped );
 	std::printf( "    [cap_cov] worst over-shadow: planar=%.3f dir=%.3f truth=%.3f at P(%.0f,%.0f,%.0f) light(%.0f,%.0f,%.0f) dir(%.2f,%.2f,%.2f)\n",
 			owCov, owDir, owTru, owP.x, owP.y, owP.z, owL.x, owL.y, owL.z, dirPL.x, dirPL.y, dirPL.z );
+	float3 uPL = uwL - uwP; float uDist = std::sqrt( dot( uPL, uPL ) ); float3 uDir = uDist > 1e-4f ? uPL * ( 1.0f / uDist ) : float3( 0, 0, 1 );
+	std::printf( "    [cap_cov] MISSING shadow (cov>truth+0.35): planar=%d  direction-space=%d   worst under: planar=%.3f dir=%.3f truth=%.3f light-dir(%.2f,%.2f,%.2f) dist=%.0f\n",
+			missingShadow, dirMissing, uwCov, uwDir, uwTru, uDir.x, uDir.y, uDir.z, uDist );
+	std::printf( "    [cap_cov] COMPREHENSIVE (direction-space + gate): extraneous=%d  missing=%d   [planar ungated: extraneous=%d missing=%d]  dir mean=%.3f\n",
+			dirGatedExtraneous, dirMissing, extraneous, missingShadow, sampled ? dcovSum / sampled : 0.0 );
 	std::printf( "    [cap_cov] %d samples: %d disagree>0.1 (%.1f%%)  worst=%.3f  mean|cov-truth|=%.4f\n",
 			sampled, bad, sampled ? 100.0 * bad / sampled : 0.0, worst, sampled ? sumAbs / sampled : 0.0 );
 	std::printf( "    [cap_cov] mean coverage=%.3f mean truth=%.3f   too-light(miss shadow)=%d  too-dark(over-shadow)=%d\n",
