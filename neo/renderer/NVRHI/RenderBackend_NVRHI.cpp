@@ -671,7 +671,7 @@ void idRenderBackend::DrawSoftShadowBand( int recordCount )
 	prevBindingLayoutType = bindingLayoutType;
 
 	nvrhi::DrawArguments args;
-	args.vertexCount = ( uint32_t )( recordCount * 6 );	// 6 verts (2 tris = side quad) per edge record - see softband.vs.hlsl
+	args.vertexCount = ( uint32_t )( recordCount * 12 );	// 12 verts (side quad + near/far cap fans) per edge record - see softband.vs.hlsl
 	commandList->draw( args );
 
 	pc.c_drawElements++;

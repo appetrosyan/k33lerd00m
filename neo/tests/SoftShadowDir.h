@@ -68,70 +68,74 @@ inline float SwWrapPi( float x )
 	return x;
 }
 
-// signed solid angle of cap(pole n, half-angle alpha) INTERSECT spherical triangle (n, dA, dB).
-// u,v complete an orthonormal frame with n; cosA = cos(alpha).
-inline float CapTri( float3 dA, float3 dB, float3 n, float3 u, float3 v, float cosA )
+// ---------------------------------------------------------- decomposed intermediates (unit-testable)
+
+// great-circle arc basis: along the arc x(t) = cos(t)*dA + sin(t)*e2, t in [0, omega].
+struct CapArcBasisT
 {
-	float cA = dot( dA, n );			// cos(angle from pole) for each endpoint
-	float cB = dot( dB, n );
-	bool  inA = ( cA >= cosA );
-	bool  inB = ( cB >= cosA );
-
-	float phiA = SwAzimuth( dA, u, v );
-	float phiB = SwAzimuth( dB, u, v );
-	float dphi = SwWrapPi( phiB - phiA );	// signed azimuth sweep dA->dB about the pole (the sector measure)
-	float sector = ( 1.0f - cosA ) * dphi;	// solid angle of the cap boundary swept through dphi
-
-	if( inA && inB )
+	float  omega;		// arc length dA..dB (radians)
+	float3 e2;			// unit vector completing the arc-plane basis with dA
+	bool   degenerate;	// endpoints coincide (or are antipodal: e2 undefined)
+};
+inline CapArcBasisT CapArcBasis( float3 dA, float3 dB )
+{
+	CapArcBasisT b;
+	b.omega = std::acos( std::fmax( -1.0f, std::fmin( 1.0f, dot( dA, dB ) ) ) );
+	b.e2 = float3( 0, 0, 0 );
+	b.degenerate = true;
+	if( b.omega < 1e-6f )
 	{
-		// the whole edge is inside the cap: the triangle (n,dA,dB) lies within the cap -> exact solid angle
-		return SphTriSolidAngle( n, dA, dB );
+		return b;						// degenerate edge (endpoints coincide)
 	}
-
-	// Does the great-circle arc dA->dB dip inside the cap? Closest approach of the great circle to n.
-	float omega = std::acos( std::fmax( -1.0f, std::fmin( 1.0f, dot( dA, dB ) ) ) );	// arc length dA..dB
-	if( omega < 1e-6f )
-	{
-		return 0.0f;						// degenerate edge
-	}
-	// orthonormal basis of the great-circle plane: e1 = dA, e2 = component of dB perpendicular to dA.
 	float3 e2 = dB - dA * dot( dA, dB );
 	float  e2len = length( e2 );
 	if( e2len < 1e-6f )
 	{
-		return 0.0f;
+		return b;						// antipodal: the arc plane is undefined
 	}
-	e2 = e2 * ( 1.0f / e2len );
-	// along the arc x(t) = cos t * e1 + sin t * e2, t in [0, omega]. dot(x,n) = cosA at the cap boundary:
-	//   (e1.n) cos t + (e2.n) sin t = cosA  ->  R cos(t - psi) = cosA
+	b.e2 = e2 * ( 1.0f / e2len );
+	b.degenerate = false;
+	return b;
+}
+
+// parameters t strictly inside (0, omega) where the arc crosses the cap boundary dot(x,n) = cosA:
+//   (dA.n) cos t + (e2.n) sin t = cosA  ->  R cos(t - psi) = cosA
+struct CapCrossT
+{
+	int   nt;			// 0, 1 or 2 crossings inside the open arc
+	float ts[2];		// sorted ascending
+};
+inline CapCrossT CapArcCrossings( float3 dA, float3 e2, float omega, float3 n, float cosA )
+{
+	CapCrossT c;
+	c.nt = 0;
+	c.ts[0] = 0.0f;
+	c.ts[1] = 0.0f;
 	float en1 = dot( dA, n );
 	float en2 = dot( e2, n );
 	float R = std::sqrt( en1 * en1 + en2 * en2 );
 	if( R < 1e-6f || cosA / R > 1.0f )
 	{
-		// great circle never reaches the cap (its closest approach angle > alpha): pure sector
-		return sector;
+		return c;						// great circle never reaches the cap boundary
 	}
 	float psi = std::atan2( en2, en1 );
 	float da  = std::acos( std::fmax( -1.0f, std::fmin( 1.0f, cosA / R ) ) );
 	float t1 = psi - da;
 	float t2 = psi + da;
-	// collect the crossings that fall strictly inside the arc (0, omega)
-	float ts[2]; int nt = 0;
-	if( t1 > 1e-6f && t1 < omega - 1e-6f ) { ts[nt++] = t1; }
-	if( t2 > 1e-6f && t2 < omega - 1e-6f ) { ts[nt++] = t2; }
-	if( nt == 0 )
-	{
-		// arc stays entirely outside the cap (endpoints outside, no interior crossing) -> sector
-		return sector;
-	}
-	if( nt == 2 && ts[0] > ts[1] ) { float tmp = ts[0]; ts[0] = ts[1]; ts[1] = tmp; }
+	if( t1 > 1e-6f && t1 < omega - 1e-6f ) { c.ts[c.nt++] = t1; }
+	if( t2 > 1e-6f && t2 < omega - 1e-6f ) { c.ts[c.nt++] = t2; }
+	if( c.nt == 2 && c.ts[0] > c.ts[1] ) { float tmp = c.ts[0]; c.ts[0] = c.ts[1]; c.ts[1] = tmp; }
+	return c;
+}
 
-	// walk the arc [0..omega], accumulating: inside-cap sub-arcs as triangle solid angle, outside-cap
-	// sub-arcs as sector (their azimuth sweep * (1-cosA)). Boundaries are 0, crossings..., omega.
+// walk the arc [0..omega] split at the crossings, accumulating: inside-cap sub-arcs as triangle solid
+// angle (apex at the pole), outside-cap sub-arcs as cap-boundary sector (azimuth sweep * (1-cosA)).
+inline float CapSubArcWalk( float3 dA, float3 e2, float omega, const CapCrossT& cross,
+							float3 n, float3 u, float3 v, float cosA )
+{
 	float bounds[4]; int nb = 0;
 	bounds[nb++] = 0.0f;
-	for( int i = 0; i < nt; i++ ) { bounds[nb++] = ts[i]; }
+	for( int i = 0; i < cross.nt; i++ ) { bounds[nb++] = cross.ts[i]; }
 	bounds[nb++] = omega;
 
 	float total = 0.0f;
@@ -155,6 +159,64 @@ inline float CapTri( float3 dA, float3 dB, float3 n, float3 u, float3 v, float c
 	return total;
 }
 
+// signed solid angle of cap(pole n, half-angle alpha) INTERSECT spherical triangle (n, dA, dB).
+// u,v complete an orthonormal frame with n; cosA = cos(alpha).
+inline float CapTri( float3 dA, float3 dB, float3 n, float3 u, float3 v, float cosA )
+{
+	float cA = dot( dA, n );			// cos(angle from pole) for each endpoint
+	float cB = dot( dB, n );
+	bool  inA = ( cA >= cosA );
+	bool  inB = ( cB >= cosA );
+
+	float phiA = SwAzimuth( dA, u, v );
+	float phiB = SwAzimuth( dB, u, v );
+	float dphi = SwWrapPi( phiB - phiA );	// signed azimuth sweep dA->dB about the pole (the sector measure)
+	float sector = ( 1.0f - cosA ) * dphi;	// solid angle of the cap boundary swept through dphi
+
+	if( inA && inB )
+	{
+		// the whole edge is inside the cap: the triangle (n,dA,dB) lies within the cap -> exact solid angle
+		return SphTriSolidAngle( n, dA, dB );
+	}
+
+	CapArcBasisT arc = CapArcBasis( dA, dB );
+	if( arc.degenerate )
+	{
+		return 0.0f;
+	}
+	CapCrossT cross = CapArcCrossings( dA, arc.e2, arc.omega, n, cosA );
+	if( cross.nt == 0 )
+	{
+		// arc never dips inside the cap (endpoints outside, no interior crossing) -> pure sector
+		return sector;
+	}
+	return CapSubArcWalk( dA, arc.e2, arc.omega, cross, n, u, v, cosA );
+}
+
+// CapTri on a WORLD edge wA->wB seen from swP. When the endpoint directions are near-antipodal (edge
+// passing close to the receiver) the great-circle plane degenerates and CapTri dropped the whole
+// contribution (finding F11: half the cap lost at a grazing edge). The world midpoint resolves the
+// plane exactly - subdividing the edge is an identity on the direction path - so split and recurse
+// once per level until the halves are well-conditioned. An edge passing exactly THROUGH swP has no
+// defined silhouette contribution; that residual degenerate returns 0.
+inline float CapTriWorld( float3 wA, float3 wB, float3 swP, float3 n, float3 u, float3 v, float cosA, int depth = 8 )
+{
+	float3 dA = normalize( wA - swP );
+	float3 dB = normalize( wB - swP );
+	if( dot( dA, dB ) > -0.99f || depth <= 0 )
+	{
+		return CapTri( dA, dB, n, u, v, cosA );
+	}
+	float3 wM( ( wA.x + wB.x ) * 0.5f, ( wA.y + wB.y ) * 0.5f, ( wA.z + wB.z ) * 0.5f );
+	float3 rel = wM - swP;
+	if( dot( rel, rel ) < 1e-12f )
+	{
+		return 0.0f;						// edge passes through the receiver point itself
+	}
+	return CapTriWorld( wA, wM, swP, n, u, v, cosA, depth - 1 )
+		 + CapTriWorld( wM, wB, swP, n, u, v, cosA, depth - 1 );
+}
+
 // full per-fragment occlusion in [0,1] (1 = umbra), same record layout as SoftShadow_WedgeOcclusion.
 inline float DirOcclusion( const std::vector<float4>& rec, float3 swP, float3 swL, float swR )
 {
@@ -170,7 +232,7 @@ inline float DirOcclusion( const std::vector<float4>& rec, float3 swP, float3 sw
 
 	float occ = 0.0f, sum = 0.0f;
 	bool  have = false, skip = false;
-	bool  firstValid = false; float3 dFirst( 0, 0, 0 ), dPrev( 0, 0, 0 );
+	bool  firstValid = false; float3 wFirst( 0, 0, 0 ), wPrev( 0, 0, 0 );	// WORLD chain endpoints (CapTriWorld)
 	bool  havePrev = false; float3 prevBw( 0, 0, 0 );
 	int   nrec = ( int )( rec.size() / 2 );
 	for( int se = 0; se < nrec; se++ )
@@ -178,27 +240,32 @@ inline float DirOcclusion( const std::vector<float4>& rec, float3 swP, float3 sw
 		float4 e0 = rec[se * 2 + 0], e1 = rec[se * 2 + 1];
 		if( e0.w < 0.0f )
 		{
-			if( have && firstValid ) { sum += CapTri( dPrev, dFirst, n, u, v, cosA ); }
+			if( have && firstValid ) { sum += CapTriWorld( wPrev, wFirst, swP, n, u, v, cosA ); }
 			if( have ) { occ = std::fmax( occ, std::fmin( std::fabs( sum ) / capSolid, 1.0f ) ); }
 			have = true; sum = 0.0f; skip = false; firstValid = false; havePrev = false;
+			// caster bounding-sphere cull (centre e0.xyz, radius e1.x). Without it, a caster wholly BEHIND
+			// the receiver winds the azimuth around the axis' antipodal piercing and reads as FULL
+			// occlusion (findings F1/F2): the sector measure cannot tell +n winding from -n winding, so
+			// geometry that can contribute nothing must never enter the sum.
+			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
+			float  dCn = dot( dCv, n );
+			if( dCn + e1.x < 0.0f || dCn - e1.x > distPL ) { skip = true; }
 			continue;
 		}
 		if( skip ) { continue; }
 		float3 A( e0.x, e0.y, e0.z ), B( e1.x, e1.y, e1.z );
 		if( havePrev && ( A.x != prevBw.x || A.y != prevBw.y || A.z != prevBw.z ) && firstValid )
 		{
-			sum += CapTri( dPrev, dFirst, n, u, v, cosA );
+			sum += CapTriWorld( wPrev, wFirst, swP, n, u, v, cosA );
 			firstValid = false;
 		}
 		havePrev = true; prevBw = B;
-		float3 dA = normalize( A - swP );
-		float3 dB = normalize( B - swP );
-		if( firstValid ) { sum += CapTri( dPrev, dA, n, u, v, cosA ); }
-		else             { dFirst = dA; firstValid = true; }
-		sum += CapTri( dA, dB, n, u, v, cosA );
-		dPrev = dB;
+		if( firstValid ) { sum += CapTriWorld( wPrev, A, swP, n, u, v, cosA ); }
+		else             { wFirst = A; firstValid = true; }
+		sum += CapTriWorld( A, B, swP, n, u, v, cosA );
+		wPrev = B;
 	}
-	if( have && firstValid ) { sum += CapTri( dPrev, dFirst, n, u, v, cosA ); }
+	if( have && firstValid ) { sum += CapTriWorld( wPrev, wFirst, swP, n, u, v, cosA ); }
 	if( have ) { occ = std::fmax( occ, std::fmin( std::fabs( sum ) / capSolid, 1.0f ) ); }
 	return occ;
 }

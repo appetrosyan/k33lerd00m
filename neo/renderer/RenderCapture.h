@@ -31,7 +31,14 @@ the Free Software Foundation, either version 3 of the License, or
 
 // bump on any layout change; the reader rejects mismatches.
 #define SOFTCAP_MAGIC   0x50434653u			// 'SFCP' little-endian
-#define SOFTCAP_VERSION 3u					// v2: receiver meshes; v3: mesh indices stored GLOBAL (offset by firstVert)
+#define SOFTCAP_VERSION 4u					// v2: receiver meshes; v3: global mesh indices; v4: mapName + gameTime (self-identifying for reconstruction). reserved[0]=gameTimeMs, reserved[1]=mapName byte length (a trailing MAPNAME block follows recvIdx).
+
+// v5 TEXTURE TAIL: appended AFTER every v4 block, self-describing (magic + counts), so the header
+// layout never changes and old readers simply stop before it. Carries what the offline verification
+// renders REAL textures from: per-receiver-vertex UVs, a per-receiver material index, and each unique
+// material's diffuse image baked down to <=SOFTCAP_TEX_MAX on the long side (RGB8).
+#define SOFTCAP_TAIL_MAGIC 0x35544653u		// 'SFT5' little-endian
+#define SOFTCAP_TEX_MAX    128
 
 #pragma pack( push, 1 )
 
@@ -65,6 +72,30 @@ struct softcapCaster_t
 	uint32_t numVerts;
 	uint32_t firstIndex;		// index into MESHIDX (uint32 elements); triangles = numIndex/3
 	uint32_t numIndex;
+};
+
+// Per CAPPED shadow-volume surface (world space), read back from the GPU shadowCache/shadowIndexCache - the
+// exact geometry the stencil pass rasterises. w==0 verts already extruded to (far) infinity from the light.
+// A separate tagged array (NOT fields on softcapLight_t) so the existing structs keep their size/ABI. v4+.
+// Header: reserved[2]=numShadowVols, reserved[3]=numShadowVerts(float3), reserved[4]=numShadowIdx(uint32).
+struct softcapShadowVol_t
+{
+	uint32_t lightIndex;
+	uint32_t firstVert;			// index into SHADOWVERTS (float3)
+	uint32_t numVert;
+	uint32_t firstIdx;			// index into SHADOWIDX (uint32); triangles = numIdx/3
+	uint32_t numIdx;
+};
+
+// v5 TEXTURE TAIL: one entry per unique receiver material; texels are RGB8, row-major, firstTexel is a
+// BYTE offset into the tail's texel blob. Tail layout after the magic:
+//   uint32 numMaterials, numTexelBytes, numStFloats (= 2 * numRecvVerts), numRecvMats (= numReceivers)
+//   softcapMaterial_t[numMaterials] ; uint8 texels[numTexelBytes] ; float st[numStFloats] ; uint32 recvMat[numRecvMats]
+struct softcapMaterial_t
+{
+	char     name[64];			// material name, for diagnostics
+	uint32_t texW, texH;		// baked diffuse dimensions (<= SOFTCAP_TEX_MAX per side)
+	uint32_t firstTexel;		// byte offset of this material's RGB8 texels in the tail blob
 };
 
 // Per RECEIVER interaction surface (world space): the surfaces the coverage shader shades. The coverage uses
@@ -125,6 +156,7 @@ class  idCmdArgs;
 
 // console command: `captureSoftShadow` arms a one-shot capture.
 void  R_CaptureSoftShadow_f( const idCmdArgs& args );
+void  R_CaptureShadowRefs_f( const idCmdArgs& args );
 
 // True when a one-shot capture has been armed by the `captureSoftShadow` console command.
 bool  R_SoftShadowCaptureArmed();

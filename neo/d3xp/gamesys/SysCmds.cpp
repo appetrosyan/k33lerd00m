@@ -860,16 +860,20 @@ void Cmd_SetViewpos_f( const idCmdArgs& args )
 		return;
 	}
 
-	if( ( args.Argc() != 4 ) && ( args.Argc() != 5 ) )
+	if( ( args.Argc() < 4 ) || ( args.Argc() > 6 ) )
 	{
-		gameLocal.Printf( "usage: setviewpos <x> <y> <z> <yaw>\n" );
+		gameLocal.Printf( "usage: setviewpos <x> <y> <z> [yaw] [pitch]\n" );
 		return;
 	}
 
 	angles.Zero();
-	if( args.Argc() == 5 )
+	if( args.Argc() >= 5 )
 	{
 		angles.yaw = atof( args.Argv( 4 ) );
+	}
+	if( args.Argc() == 6 )
+	{
+		angles.pitch = atof( args.Argv( 5 ) );		// scripted captures need the full view pose
 	}
 
 	for( i = 0 ; i < 3 ; i++ )

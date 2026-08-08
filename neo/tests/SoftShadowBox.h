@@ -126,7 +126,9 @@ inline std::vector<float3> Silhouette( const Box& b, float3 W )
 	return loop;
 }
 
-// ray P + t*dir hits the (convex) box solid strictly between P and the endpoint (0<t<1)?
+// Does the open segment P -> P+dir (t in (0,1)) intersect the (convex) box SOLID? A segment that STARTS
+// (or ends) inside the solid is blocked - the old `tmin > 1e-5` return reported a P inside the box as
+// unblocked, which lit-biased every contact-shadow truth value (finding F8).
 inline bool RayHitsBox( float3 P, float3 dir, const Box& b )
 {
 	float tmin = 0, tmax = 1;
@@ -140,7 +142,7 @@ inline bool RayHitsBox( float3 P, float3 dir, const Box& b )
 		if( den < 0 ) { if( t > tmin ) { tmin = t; } } else { if( t < tmax ) { tmax = t; } }
 		if( tmin > tmax ) { return false; }
 	}
-	return tmin > 1e-5f && tmin < 1.0f - 1e-5f;
+	return tmax > 1e-5f && tmin < 1.0f - 1e-5f;		// non-empty overlap of [tmin,tmax] with the open (0,1)
 }
 
 // ground-truth SHADOW (1=lit, 0=occluded): fraction of the light disk (centre L, radius r, facing P)
@@ -167,18 +169,25 @@ inline float TruthShadow( float3 P, float3 L, float r, const Box& b, int N = 96 
 }
 
 // flatten a set of closed world loops into the t_SoftEdges record layout (one caster: header + edges).
+// The header sphere is the TIGHT half-diagonal bound (the old full-diagonal radius was 2x oversized,
+// which made every cull-sensitivity failure untestable by construction - finding F13). Loops may be
+// empty (a silhouette can come back empty, e.g. viewpoint inside the caster); if NO vertices exist at
+// all the function returns an empty record list rather than a garbage +-1e30 header (finding F9).
 inline std::vector<float4> BuildCaster( const std::vector<std::vector<float3>>& loops )
 {
 	float3 lo = v3( 1e30f, 1e30f, 1e30f ), hi = v3( -1e30f, -1e30f, -1e30f );
+	int nVerts = 0;
 	for( auto& l : loops )
 		for( float3 p : l )
 		{
+			nVerts++;
 			lo = v3( std::fmin( lo.x, p.x ), std::fmin( lo.y, p.y ), std::fmin( lo.z, p.z ) );
 			hi = v3( std::fmax( hi.x, p.x ), std::fmax( hi.y, p.y ), std::fmax( hi.z, p.z ) );
 		}
-	float3 c = ( lo + hi ) * 0.5f;
-	float rad = len3( hi - lo );
 	std::vector<float4> rec;
+	if( nVerts == 0 ) { return rec; }
+	float3 c = ( lo + hi ) * 0.5f;
+	float rad = 0.5f * len3( hi - lo );
 	rec.push_back( float4( c.x, c.y, c.z, -1.0f ) );
 	rec.push_back( float4( rad, 0, 0, 0 ) );
 	for( auto& l : loops )
@@ -198,7 +207,7 @@ inline std::vector<float4> BuildCaster( const std::vector<std::vector<float3>>& 
 inline float LiveShadow( const std::vector<float4>& rec, float3 P, float3 L, float r )
 {
 	SoftEdgeBuffer buf{ rec.data(), ( int )rec.size() };
-	return 1.0f - saturate( SoftShadow_WedgeOcclusion( P, L, r, 0, ( int )( rec.size() / 2 ), buf ) );
+	return 1.0f - saturate( SoftShadow_WedgeOcclusion( P, L, r, 0, ( int )( rec.size() / 2 ), 0.0f, buf ) );
 }
 
 // deterministic LCG so fuzz is reproducible across platforms (no <random> variance)

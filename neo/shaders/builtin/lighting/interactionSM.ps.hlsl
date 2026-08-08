@@ -146,7 +146,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	// Light-disk coverage: sum each caster's silhouette against the area-light disk (see
 	// softwedge_coverage.inc.hlsl). This is the SAME function the unit tests compile as C++
 	// (neo/tests/SoftShadowCoverage_test.cpp via hlsl_compat.h), so the tested math IS the shipped math.
-	float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN );
+	float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
 	float shadow = 1.0 - saturate( swOcc );
 	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
 #elif USE_RT_SHADOW
@@ -642,5 +642,6 @@ void main( PS_IN fragment, out PS_OUT result )
 	else if( swDbg == 2 ) { result.color = float4( frac( swP / 64.0 ), 1.0 ); }			// receiver world pos (smooth gradient => swP valid)
 	else if( swDbg == 6 ) { result.color = float4( saturate( swOcc ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
 	else if( swDbg == 9 ) { result.color = float4( frac( float( swFirstElem ) / 256.0 ), frac( float( swN ) / 64.0 ), 0.0, 1.0 ); }	// R = first-element param, G = edge count param
+		else if( swDbg == 8 ) { result.color = float4( shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
 #endif
 }

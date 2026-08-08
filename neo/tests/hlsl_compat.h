@@ -46,10 +46,14 @@ inline float3 cross( float3 a, float3 b ) { return float3( a.y * b.z - a.z * b.y
 inline float  length( float3 a ) { return std::sqrt( dot( a, a ) ); }
 inline float3 normalize( float3 a ) { float l = length( a ); return l > 0 ? a * ( 1.0f / l ) : a; }
 
-// scalar intrinsics (HLSL names, global scope so the .inc's unqualified calls resolve)
-inline float saturate( float x ) { return x < 0.0f ? 0.0f : ( x > 1.0f ? 1.0f : x ); }
-inline float max( float a, float b ) { return a > b ? a : b; }
-inline float min( float a, float b ) { return a < b ? a : b; }
+// scalar intrinsics (HLSL names, global scope so the .inc's unqualified calls resolve).
+// NaN semantics MATCH THE GPU, not C++ habit: D3D saturate(NaN) = 0, and min/max return the non-NaN
+// operand when one input is NaN. The old shim propagated NaN through saturate and max(a,NaN) - so a
+// NaN produced inside the shader math was LOUD in the C++ tests but a silent 0-contribution on the
+// GPU; the tests were validating a different failure mode than the one that ships (finding F15/F7).
+inline float saturate( float x ) { return x > 1.0f ? 1.0f : ( x >= 0.0f ? x : 0.0f ); }		// NaN -> 0 (both compares false)
+inline float max( float a, float b ) { if( a != a ) { return b; } if( b != b ) { return a; } return a > b ? a : b; }
+inline float min( float a, float b ) { if( a != a ) { return b; } if( b != b ) { return a; } return a < b ? a : b; }
 inline int   max( int a, int b ) { return a > b ? a : b; }
 inline int   min( int a, int b ) { return a < b ? a : b; }
 inline float abs( float x ) { return x < 0.0f ? -x : x; }

@@ -381,7 +381,12 @@ void PipelineCache::GetRenderState( uint64 stateBits, PipelineKey key, nvrhi::Re
 
 		depthStencilState.setStencilRefValue( ref );
 		depthStencilState.setStencilReadMask( mask );
-		depthStencilState.setStencilWriteMask( 0xFF );
+		// The GLS mask is BOTH the read and the write mask. Every engine site passes 0xFF (identical
+		// behaviour to the old hardcoded 0xFF write mask) except: the material stencilStage, whose field
+		// is literally named writeMask and always meant this; and the soft-shadow band shell, whose
+		// parity INVERT is confined to SOFTBAND_SHELL_BIT and must not clobber the core's counting bits
+		// (a full-byte INVERT would bitwise-NOT the whole stencil value).
+		depthStencilState.setStencilWriteMask( mask );
 	}
 
 	nvrhi::DepthStencilState::StencilOpDesc stencilFuncOp;

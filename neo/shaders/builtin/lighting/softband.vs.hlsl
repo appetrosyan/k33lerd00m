@@ -55,23 +55,33 @@ struct VS_OUT
 	float4 position : SV_Position;
 };
 
-// 6 verts = 2 triangles = the side quad (prism wall) for one silhouette edge. Corner ids:
-//   0 = A' (w1)   1 = B' (w1)   2 = A'_inf (w0)   3 = B'_inf (w0)
-// Walls only, no caps: this is the OUTER-penumbra SHELL, marked with capless z-PASS (correct while the eye
-// is outside; z-pass never bleeds the far prism through world geometry). The engine's real capped shadow
-// volumes provide the concave-safe, eye-inside-robust CORE underneath - see RenderBackend.cpp band prepass.
-static const uint volIdx[6] =
+// 12 verts = 4 triangles per silhouette edge: the side quad (prism wall) + a near-cap fan triangle at
+// the caster + a far-cap fan triangle at infinity. Corner ids:
+//   0 = A' (w1)   1 = B' (w1)   2 = A'_inf (w0)   3 = B'_inf (w0)   4 = centre (w1)   5 = centre_inf (w0)
+// The caps close each caster's prism into a WATERTIGHT oriented volume (fan apex = the caster centre from
+// the header record, which inflates onto itself; the far fan apex is its extrusion). Watertightness is what
+// lets the backend mark the shell with z-FAIL (Carmack's reverse): the count then depends only on the
+// FRAGMENT's containment, not on the camera. The previous capless z-PASS marking counted crossings of the
+// camera->fragment segment, which is wrong whenever the camera sits inside a penumbra prism - fat, infinite
+// volumes the camera is inside all the time - producing camera-dependent penumbra classification (the
+// tripod shadow that changed as the camera moved; reproduced by SoftShadowPipeline tests).
+// Orientation: each cap triangle traverses its shared boundary edge OPPOSITE to the side quad (near cap
+// B'->A', far cap A'_inf->B'_inf), so the closed surface is consistently oriented; holes (loops wound the
+// other way) count negative and carve out of the shell, as they should.
+static const uint volIdx[12] =
 {
 	0, 1, 3,	// side quad tri 1  (A', B', B'_inf)
-	0, 3, 2		// side quad tri 2  (A', B'_inf, A'_inf)
+	0, 3, 2,	// side quad tri 2  (A', B'_inf, A'_inf)
+	4, 1, 0,	// near-cap fan     (centre, B', A')
+	5, 2, 3		// far-cap fan      (centre_inf, A'_inf, B'_inf)
 };
 
 VS_OUT main( uint vertexId : SV_VertexID )
 {
 	VS_OUT result;
 
-	const uint rec = vertexId / 6u;
-	const uint c   = volIdx[ vertexId % 6u ];
+	const uint rec = vertexId / 12u;
+	const uint c   = volIdx[ vertexId % 12u ];
 
 	const uint first = uint( pc.rpJitterTexOffset.x );
 	const float4 e0 = t_SoftEdges[ first + rec * 2u + 0u ];
@@ -109,7 +119,8 @@ VS_OUT main( uint vertexId : SV_VertexID )
 	B += ( -apexSign * rp ) * ( length( dB ) > 1e-4 ? normalize( dB ) : float3( 0.0, 0.0, 0.0 ) );
 
 	// corner positions. *_inf are extruded to infinity from the light centre L (w=0 direction) - a point-light
-	// shadow of the inflated silhouette. Shared apex L keeps the summed prism watertight.
+	// shadow of the inflated silhouette. Shared apex L keeps the summed prism watertight; the cap fans use the
+	// caster centre (inflation maps it onto itself) and its extrusion.
 	float3 posW;
 	float  w;
 	switch( c )
@@ -117,7 +128,9 @@ VS_OUT main( uint vertexId : SV_VertexID )
 		case 0u:  posW = A;         w = 1.0; break;	// A'
 		case 1u:  posW = B;         w = 1.0; break;	// B'
 		case 2u:  posW = A - L;     w = 0.0; break;	// A'_inf
-		default:  posW = B - L;     w = 0.0; break;	// B'_inf
+		case 3u:  posW = B - L;     w = 0.0; break;	// B'_inf
+		case 4u:  posW = ctr;       w = 1.0; break;	// near-cap fan apex
+		default:  posW = ctr - L;   w = 0.0; break;	// far-cap fan apex
 	}
 
 	// world -> clip (rpMVPmatrix set to world->clip for this pass).

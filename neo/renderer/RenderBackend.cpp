@@ -36,6 +36,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "framework/Common_local.h"
 #include "RenderCommon.h"
 #include "Framebuffer.h"
+#include "SoftShadowBand.h"
 
 #include "imgui/ImGui_Hooks.h"
 
@@ -1896,7 +1897,15 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 
 			// first edge element in the joint buffer (structStride 16 bytes) - the shader indexes from here
 			// because nvrhi doesn't apply the structured-buffer range byteOffset to the shader index.
-			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), 0.0f, 0.0f, 0.0f };
+			// .y = CENTRE-LIT flag: in an AAM penumbra-RING pass (stencil 1..3) the fragment is provably
+			// outside every hard shadow, so the light-disk CENTRE is visible - the coverage function then
+			// subtracts any spurious winding of the projected silhouette around the disk centre (the
+			// illusory-umbra saturation a huge concave caster produces at far receivers; see the
+			// SoftShadowDefects "guilty caster" isolation). Off (0) outside AAM ring passes: without the
+			// hard-base guarantee the same subtraction would delete REAL umbra.
+			extern idCVar r_softShadowAAM;
+			const float swCentreLit = ( r_softShadowAAM.GetBool() && softBandStencilRef > 0 ) ? 1.0f : 0.0f;
+			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, 0.0f, 0.0f };
 			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
 		}
 
@@ -2045,17 +2054,28 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 	}
 	else if( softBandStencilRef >= 0 )
 	{
-		// Analytic soft shadows, penumbra-band pass: the prepass marked stencil > 0 inside the penumbra
-		// band. The stencil test is (ref OP buffer), so "in band" (buffer > 0) is ref 0 LESS; "lit"
-		// (buffer == 0) is ref 0 EQUAL. Coverage variant runs on the band, cheap unshadowed on the lit
-		// remainder. Stencil is read-only here (ops KEEP).
+		// Analytic soft shadows, penumbra-band pass. Stencil is read-only here (ops KEEP).
+		// Prepass encoding (AAM): core z-fail volumes at weight 4 -> umbra = stencil >= 4; shell rings
+		// count 1 each -> ring = 1..3 (up to three overlapping penumbras stay penumbra); lit = 0.
+		// The interaction runs the coverage variant once per ring ref (softBandStencilRef = 1, 2, 3,
+		// EQUAL - each pixel matches at most one) and the cheap unshadowed variant at ref 0; stencil
+		// >= 4 is drawn by NO pass and stays solid umbra by construction.
+		// Non-AAM band keeps the old scheme: coverage where stencil > 0 (ref 0 LESS), lit at ==0.
+		// Sign-agnostic encoding (SoftShadowBand.h): lit = exactly LIT_REF (low bits untouched, parity
+		// clear), ring = exactly RING_REF (parity set, low bits untouched), umbra = anything else (low
+		// bits deviated in EITHER direction) - drawn by no pass. EQUAL tests only; sign never matters.
+		extern idCVar r_softShadowAAM;
+		const bool swAAM = r_softShadowAAM.GetBool();
+		( void )swAAM;
+		const uint64 swStencilFunc = GLS_STENCIL_FUNC_EQUAL;
+		const int swStencilRef = ( softBandStencilRef > 0 ) ? SOFTBAND_RING_REF : SOFTBAND_LIT_REF;
 		GL_State(
 			GLS_SRCBLEND_ONE |
 			GLS_DSTBLEND_ONE |
 			GLS_DEPTHMASK |
 			depthFunc |
-			( ( softBandStencilRef == 0 ) ? GLS_STENCIL_FUNC_EQUAL : GLS_STENCIL_FUNC_LESS ) |
-			GLS_STENCIL_MAKE_REF( 0 ) |
+			swStencilFunc |
+			GLS_STENCIL_MAKE_REF( swStencilRef ) |
 			GLS_STENCIL_MAKE_MASK( 0xFF ) |
 			GLS_STENCIL_OP_FAIL_KEEP | GLS_STENCIL_OP_ZFAIL_KEEP | GLS_STENCIL_OP_PASS_KEEP );
 	}
@@ -4752,7 +4772,8 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			// The interactions below then run the expensive coverage variant only on the band (stencil > 0)
 			// and the cheap unshadowed variant on the provably-lit remainder (stencil == 0). Bit-identical.
 			extern idCVar r_softShadowBandMask;
-			const bool bandMask = lightIsSoft && r_softShadowBandMask.GetBool() && vLight->softEdgeCache != 0;
+			extern idCVar r_softShadowAAM;
+				const bool bandMask = lightIsSoft && ( r_softShadowBandMask.GetBool() || r_softShadowAAM.GetBool() ) && vLight->softEdgeCache != 0;
 			if( bandMask )
 			{
 				extern idCVar r_shadowPenumbraSize;
@@ -4772,8 +4793,12 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 								rect.y2 + 1 - rect.y1 );
 					currentScissor = rect;
 				}
+				// Clear to the low-bits counting base (SoftShadowBand.h): counting away from 0 keeps the
+				// CLAMP-mapped INCR/DECR transients exact (0-based counting let DECR-before-INCR clamp and
+				// fabricate umbra on lit floors), and the sign-agnostic encoding makes the unknowable GPU
+				// face convention irrelevant (umbra = low bits DEVIATED, either direction).
 				GL_State( GLS_DEFAULT );
-				GL_Clear( false, false, true, 0, 0.0f, 0.0f, 0.0f, 0.0f, false );
+				GL_Clear( false, false, true, SOFTBAND_CORE_BASE, 0.0f, 0.0f, 0.0f, 0.0f, false );
 
 				renderLog.OpenBlock( "SoftShadow Band Prepass", colorBlue );
 				renderLog.BeginShadowGen( RLS_SOFT );
@@ -4803,9 +4828,19 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				renderProgManager.BindShader_Shadow();
 				currentSpace = NULL;
 				extern idCVar r_forceZPassStencilShadows;
-				for( int shPass = 0; shPass < 2; shPass++ )
+				// The z-fail core is the ROBUST umbra marker (Carmack's reverse counts from infinity, so it
+				// survives the eye being inside the volume). It counts +-1 per volume in the LOW stencil bits
+				// around SOFTBAND_CORE_BASE; umbra = low bits DEVIATED in either direction, so the GPU's face
+				// convention (which decides the sign) cannot break the classification. Must be drawn BEFORE
+				// the shell parity pass: a DECR borrowing across the bit boundary would corrupt an already-set
+				// parity bit, but the shell's write-masked INVERT can never touch the low bits.
+				extern idCVar r_softShadowAAM;
+				const int swCoreReps = SOFTBAND_CORE_REPS;
+				( void )r_softShadowAAM;
+					bool swEyeInside = false;	// any surf z-fail => eye may be inside that volume (shell would miscount)
+				for( int shPass = 0; shPass < swCoreReps; shPass++ )
 				{
-					const drawSurf_t* shadowList = ( shPass == 0 ) ? vLight->globalShadows : vLight->localShadows;
+					const drawSurf_t* shadowList = ( shPass % 2 == 0 ) ? vLight->globalShadows : vLight->localShadows;
 					for( const drawSurf_t* s = shadowList; s != NULL; s = s->nextOnLight )
 					{
 						if( s->numIndexes == 0 )
@@ -4823,10 +4858,28 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 						}
 						// use the per-surf pass the volume was BUILT for (z-pass no-caps unless it needs z-fail).
 						const bool renderZPass = ( s->renderZFail == 0 ) || r_forceZPassStencilShadows.GetBool();
-						DrawStencilShadowPass( s, renderZPass );
+						if( s->renderZFail != 0 ) { swEyeInside = true; }	// eye may be inside this volume -> shell unreliable
+							DrawStencilShadowPass( s, renderZPass );
 					}
 				}
 
+				// --- SHELL (OFF by default via r_softShadowBandWedges): the inflated-silhouette capless-z-pass
+				// shell is an over-inclusive SUPERSET - it marks lit ground in-band (~90% of samples), so the
+				// coverage runs there and produces the extraneous over-occlusion the band was supposed to prevent.
+				// Gating on the CORE alone - the engine's exact z-fail (Carmack's reverse) volumes, which already
+				// exclude self-shadow via the local/global split - removes the over-occlusion; the only cost is the
+				// outer-penumbra fringe the hard shadow clips. Enable the shell to A/B the old (broken) union.
+				extern idCVar r_softShadowBandWedges;
+				extern idCVar r_softShadowAAM;
+				// The shell is now a WATERTIGHT capped volume (softband.vs.hlsl emits near/far cap fans) marked
+				// with z-FAIL, so its count depends only on the fragment's containment - camera-independent, eye-
+				// inside-safe. The old capless z-pass shell counted camera->fragment crossings, which is wrong
+				// whenever the camera sits inside a penumbra prism (fat, infinite - the camera is inside them all
+				// the time): penumbra classification changed with the camera (the unstable tripod shadow), and the
+				// eye-inside skip below dropped the whole ring some frames, flickering it on/off. Both gone.
+				( void )swEyeInside;
+				if( r_softShadowBandWedges.GetBool() || r_softShadowAAM.GetBool() )	// AAM: shell encodes the penumbra ring (stencil 1) distinct from the umbra (>=2)
+				{
 				// --- SHELL: inflated soft silhouette, capless z-pass -----------------------------------------
 				RB_SetMVP( viewDef->worldSpace.mvp );
 				const idVec4 lightOrigin( vLight->globalLightOrigin.x, vLight->globalLightOrigin.y, vLight->globalLightOrigin.z, 1.0f );
@@ -4841,21 +4894,23 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				SetVertexParm( RENDERPARM_JITTERTEXOFFSET, swOff );
 				renderProgManager.BindShader_SoftShadowBand();
 
-				// swParm = ( r, apexSign -1 = inflate (outer), marginScale 1.1, - ). Capless z-PASS with the
-				// EXACT engine convention (front-face pass INCR / back-face pass DECR, SATURATING - not WRAP), so
-				// the shell and the core count the same sign: where they overlap the stencil adds to +2, it never
-				// wraps 255->0 and cancels the umbra (that cancellation was the "brightens + inaccurate" bug). If
-				// the shell winding were opposite the engine's it would saturate to 0 (shell contributes nothing)
-				// rather than corrupt the core - a safe failure. z-pass (not z-fail) never bleeds the far prism.
+				// swParm = ( r, apexSign -1 = inflate (outer), marginScale 1.1, - ). The shell volumes are
+				// CAPPED (watertight), marked by z-fail INVERT of SOFTBAND_SHELL_BIT on BOTH faces, write-
+				// masked to that bit: the crossing PARITY behind the fragment equals containment for a
+				// watertight surface, and parity is immune to the GPU face convention that flips signed
+				// counts (the property SoftContract.shell_capped_volume_* proved unknowable). The write
+				// mask means this pass can never disturb the core's low-bit counts; the reverse is why the
+				// core must draw FIRST (its DECR could borrow across the bit boundary).
 				const float swParm[4] = { r_shadowPenumbraSize.GetFloat(), -1.0f, 1.1f, 0.0f };
 				SetVertexParm( RENDERPARM_JITTERTEXSCALE, swParm );
 				GL_State(
 					GLS_DEPTHMASK | GLS_COLORMASK | GLS_ALPHAMASK | GLS_DEPTHFUNC_LESS |
 					GLS_CULL_TWOSIDED | GLS_STENCIL_FUNC_ALWAYS |
-					GLS_STENCIL_OP_FAIL_KEEP | GLS_STENCIL_OP_ZFAIL_KEEP | GLS_STENCIL_OP_PASS_INCR |
-					GLS_BACK_STENCIL_OP_FAIL_KEEP | GLS_BACK_STENCIL_OP_ZFAIL_KEEP | GLS_BACK_STENCIL_OP_PASS_DECR |
-					GLS_STENCIL_MAKE_REF( 0 ) | GLS_STENCIL_MAKE_MASK( 0xFF ) );
+					GLS_STENCIL_OP_FAIL_KEEP | GLS_STENCIL_OP_ZFAIL_INVERT | GLS_STENCIL_OP_PASS_KEEP |
+					GLS_BACK_STENCIL_OP_FAIL_KEEP | GLS_BACK_STENCIL_OP_ZFAIL_INVERT | GLS_BACK_STENCIL_OP_PASS_KEEP |
+					GLS_STENCIL_MAKE_REF( 0 ) | GLS_STENCIL_MAKE_MASK( SOFTBAND_SHELL_BIT ) );
 				DrawSoftShadowBand( vLight->softEdgeCount );
+				}	// r_softShadowBandWedges (shell)
 
 				// the prepass may have left the bound MVP at world->clip with currentSpace still pointing at
 				// the last shadow-volume space; force the interaction pass to re-set per-surf MVP.
@@ -4871,9 +4926,9 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
 				if( bandMask )
 				{
-					softBandStencilRef = 1;		// coverage variant on the band (stencil > 0)
+					softBandStencilRef = 1;		// coverage variant on the penumbra ring (== RING_REF)
 					RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
-					softBandStencilRef = 0;		// cheap unshadowed variant on the lit remainder (stencil == 0)
+					softBandStencilRef = 0;		// cheap unshadowed variant on the lit remainder (== LIT_REF)
 					RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
 					softBandStencilRef = -1;
 				}
@@ -4898,9 +4953,9 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
 				if( bandMask )
 				{
-					softBandStencilRef = 1;
+					softBandStencilRef = 1;		// coverage variant on the penumbra ring (== RING_REF)
 					RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
-					softBandStencilRef = 0;
+					softBandStencilRef = 0;		// cheap unshadowed variant on the lit remainder (== LIT_REF)
 					RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
 					softBandStencilRef = -1;
 				}
