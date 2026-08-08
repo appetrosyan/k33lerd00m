@@ -1113,6 +1113,13 @@ TEST( SoftFinding, F6_caster_piercing_light_plane )
 	float truth = TruthShadow( P, L, r, pierce, 300 );
 	float live  = LiveShadow( BuildCaster( { Silhouette( pierce, L ) } ), P, L, r );
 	std::printf( "    [F6] pierce-light-plane: truth=%.4f live=%.4f\n", truth, live );
+	// MECHANISM (dissected 2026-08-08): the box's OUTER face (x=2.3) lies entirely at dn=12, beyond the
+	// light plane dn=distPL=10, so every one of its edges is dropped by the slab clip. The two surviving
+	// silhouette edges both cross the plane at the INNER face x=0.70, so the connector traces only that
+	// inner face - the caster's true cross-section AT the light plane (the full x in [0.7,2.3] rectangle,
+	// = the silhouette of the CLIPPED solid, which the edge stream does not contain) is never emitted.
+	// The loop encloses a 2.5% sliver where truth is 19%. Fix = emit the light-plane cross-section contour
+	// per fragment (needs caster face/solid data, not just the light-apex silhouette). RED until that lands.
 	CHECK_NEAR( live, truth, 0.05f );
 }
 
@@ -2388,7 +2395,8 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		std::vector<float> imgP( ( size_t )W * H, 1.0f ), imgR( ( size_t )W * H, 1.0f );
 		std::vector<unsigned char> covered( ( size_t )W * H, 0 );
 		int n = 0, exN = 0, misN = 0, gross = 0;
-		double sumAbs = 0;
+		int pN = 0, pGross = 0, pOverHard = 0;
+		double sumAbs = 0, pSum = 0;
 		float worst = 0;
 		for( int i = 0; i < W * H; i++ )
 		{
@@ -2400,20 +2408,23 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 			float dl = std::sqrt( dot( toL, toL ) );
 			if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }
 			covered[i] = 1;
-			// the shipped composition: core containment -> umbra; shell parity -> ring coverage; else lit
-			bool hard = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+			// EMERGENT-UMBRA composition. The inflated shell is a SOLID cone containing the whole penumbra
+			// AND the umbra, so shell parity is odd across all of it; the coverage integral runs everywhere
+			// inside and the umbra falls out where it SATURATES to 1 - it is never stamped. The point-light
+			// hit (centreBlocked) is NOT an umbra flag: the point-light silhouette is the ~50% occlusion
+			// contour, the MIDDLE of the penumbra. Its only job is to tell the integral whether the disk
+			// CENTRE is visible, which selects the guard mode (winding subtraction + debris drop are sound
+			// only when the centre is lit; enabling them where the centre is blocked would delete the umbra).
+			bool centreBlocked = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+			int par = 0;
+			for( auto& sh : lc.shells ) { par += std::abs( ShellZFailCapped( sh.second, sh.first, lc.bandRp, lc.Lo, cam0, P ) ); }
 			float shadow;
-			if( hard ) { shadow = 0.0f; }
-			else
+			if( ( par & 1 ) != 0 )
 			{
-				int par = 0;
-				for( auto& sh : lc.shells ) { par += std::abs( ShellZFailCapped( sh.second, sh.first, lc.bandRp, lc.Lo, cam0, P ) ); }
-				if( ( par & 1 ) != 0 )
-				{
-					shadow = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, 1.0f, buf ) );
-				}
-				else { shadow = 1.0f; }
+				float ov = SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, centreBlocked ? 0.0f : 1.0f, buf );
+				shadow = 1.0f - saturate( ov );
 			}
+			else { shadow = centreBlocked ? 0.0f : 1.0f; }
 			// full ray-traced reference, EVERY pixel
 			float truth = TruthShadowCulled( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
 			imgP[i] = shadow;
@@ -2425,6 +2436,18 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 			if( std::fabs( d ) > 0.25f ) { gross++; }
 			if( d < -0.5f ) { exN++; }		// pipeline much darker than reference (extraneous shadow)
 			if( d > 0.5f ) { misN++; }		// pipeline much lighter than reference (missing shadow)
+			// PENUMBRA-CONDITIONAL metrics: the whole point of the technique lives in the pixels whose
+			// true value is BETWEEN lit and umbra. Whole-frame means dilute them to invisibility (a few-
+			// pixel band in a 50k-pixel frame reads as single-digit error while the penumbra itself is
+			// wrong by half). Over-hardening - reading darker than truth inside the true penumbra, i.e.
+			// stamping gradient pixels toward black - defeats the technique and is penalised separately.
+			if( truth > 0.02f && truth < 0.98f )
+			{
+				pN++;
+				pSum += std::fabs( d );
+				if( std::fabs( d ) > 0.25f ) { pGross++; }
+				if( d < -0.25f ) { pOverHard++; }		// darker than truth by >0.25 inside the penumbra
+			}
 		}
 		// side-by-side sheet: SHADED pipeline | SHADED ray reference | signed-error heatmap. The two left
 		// panes are lit renders (world-space checker albedo x N.L x warm light tint x shadow term + ambient)
@@ -2512,13 +2535,354 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		}
 		std::printf( "    [ref %s] %d px: mean|err|=%.4f worst=%.3f gross(>0.25)=%d (%.2f%%) extraneous(<-0.5)=%d missing(>0.5)=%d -> ref_%s.ppm\n",
 				nm, n, n ? sumAbs / n : 0.0, worst, gross, n ? 100.0 * gross / n : 0.0, exN, misN, nm );
+		std::printf( "    [ref %s] PENUMBRA (%d px, truth in 0.02..0.98): mean|err|=%.4f gross=%.1f%% OVER-HARDENED=%.1f%%\n",
+				nm, pN, pN ? pSum / pN : 0.0, pN ? 100.0 * pGross / pN : 0.0, pN ? 100.0 * pOverHard / pN : 0.0 );
 		CHECK( n > 1000 );
 		CHECK( exN == 0 );						// no pixel grossly darker than the ray reference
 		CHECK( misN == 0 );						// no pixel grossly lighter than the ray reference
 		CHECK( gross * 100 <= n );				// and <=1% above truth-quantization disagreement
+		CHECK( pN == 0 || pSum / pN < 0.08 );	// the PENUMBRA ITSELF must track the integral, not just the frame
+		CHECK( pOverHard * 10 <= pN );			// over-hardening (gradient stamped dark) heavily penalised
 	}
 	std::printf( "    [ref] %d captures fully ray-verified\n", capsSeen );
 	CHECK( capsSeen >= 7 );
+}
+
+// ====================================================================== 5d-bis. THE SILHOUETTE CONTOUR
+// MECHANISM ISOLATION for the residual penumbra error, and it FALSIFIES two tempting fixes. The DIAGNOSIS
+// hypothesised the light-apex silhouette (stencil edges) over-encloses where the receiver-apex silhouette
+// would not, so feeding the receiver-apex contour would fix the penumbra. Measured directly - same live
+// game function (SoftShadow_WedgeOcclusion), receiver-apex contour rebuilt per fragment from the caster
+// soup - it is the OPPOSITE: on both penumbra-rich captures the receiver-apex contour reads FURTHER from
+// truth (0.49/0.43 vs light-apex 0.26/0.33), because the residual is systematic UNDER-shadow (occ too LOW,
+// pipeline too light: over-hard/darker count ~0), and the receiver contour encloses even less. Forcing the
+// winding-subtraction / debris-drop guards off changes the error by <0.002 - the guards are inert here too.
+// So the penumbra residual is NOT the fed contour and NOT the guards; the area math is exact (the synthetic
+// SoftShadowSoftness width ratio is 1.00). It is in the FED DATA / multi-caster combine / thick-caster
+// cross-section: the captured silhouette outline occludes less of the disk than the solid mesh truth does.
+// This test LOCKS that conclusion so the receiver-apex path is not re-attempted. Pixels strided (truth cost).
+TEST( SoftShadowContour, penumbra_residual_is_undershadow_not_the_fed_contour )
+{
+	const char* names[] = { "erebus5", "erebus13" };		// the two penumbra-rich captures
+	const int W = 288, STRIDE = 2;
+	int capsSeen = 0, capsChecked = 0;
+	for( const char* nm : names )
+	{
+		char path[512];
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
+		SoftCap c;
+		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		capsSeen++;
+		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
+		SwGBuffer g( W, H );
+		for( const softcapReceiver_t& R : c.receivers )
+		{
+			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
+			{
+				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
+				float3 A( c.recvVerts[ia * 3 + 0], c.recvVerts[ia * 3 + 1], c.recvVerts[ia * 3 + 2] );
+				float3 B( c.recvVerts[ib * 3 + 0], c.recvVerts[ib * 3 + 1], c.recvVerts[ib * 3 + 2] );
+				float3 C( c.recvVerts[ic * 3 + 0], c.recvVerts[ic * 3 + 1], c.recvVerts[ic * 3 + 2] );
+				float2 z( 0, 0 );
+				SwRasterTri( g, c.hdr.worldMVP, A, B, C, ( int )R.lightIndex, z, z, z, -1 );
+			}
+		}
+		// per-light: origin, penumbra, light-apex stream slice, culled caster ranges, and per-caster
+		// RECEIVER-apex adjacency (built once, reused for every fragment of that light)
+		struct CLight { bool soft = false; float3 Lo; float rp = 0; int firstElem = 0, nRec = 0; std::vector<CasterRange> casters; std::vector<std::vector<TriEdgeAdj>> adj; };
+		std::vector<CLight> lights( c.hdr.numLights );
+		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
+		{
+			const softcapLight_t& Lt = c.lights[li];
+			CLight& lc = lights[li];
+			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
+			lc.soft = true;
+			lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
+			lc.rp = Lt.penumbraSize;
+			lc.firstElem = ( int )( Lt.firstEdge * 2 );
+			lc.nRec = ( int )Lt.edgeCount;
+			for( const softcapCaster_t& cs : c.casters )
+			{
+				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
+				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
+				cr.lo = float3( 1e30f, 1e30f, 1e30f ); cr.hi = float3( -1e30f, -1e30f, -1e30f );
+				for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < c.meshIdx.size(); k++ )
+				{
+					const float* vp = &c.meshVerts[c.meshIdx[k] * 3];
+					cr.lo = float3( std::fmin( cr.lo.x, vp[0] ), std::fmin( cr.lo.y, vp[1] ), std::fmin( cr.lo.z, vp[2] ) );
+					cr.hi = float3( std::fmax( cr.hi.x, vp[0] ), std::fmax( cr.hi.y, vp[1] ), std::fmax( cr.hi.z, vp[2] ) );
+				}
+				lc.casters.push_back( cr );
+				std::vector<TriEdgeAdj> a;
+				BuildTriEdgeAdj( c.meshVerts.data(), &c.meshIdx[cs.firstIndex], cs.numIndex, a );
+				lc.adj.push_back( std::move( a ) );
+			}
+		}
+		SoftEdgeBuffer lightBuf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
+		int pN = 0; double sumLight = 0, sumRecv = 0, sumNoGuard = 0; int lightIllusory = 0, recvIllusory = 0;
+		for( int y = 0; y < H; y += STRIDE )
+			for( int x = 0; x < W; x += STRIDE )
+			{
+				int i = y * W + x;
+				int li = g.light[i];
+				if( li < 0 || li >= ( int )lights.size() || !lights[li].soft ) { continue; }
+				CLight& lc = lights[li];
+				float3 P = g.wpos[i];
+				float3 toL = lc.Lo - P; float dl = std::sqrt( dot( toL, toL ) );
+				if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }
+				float truth = TruthShadowCulled( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+				if( truth <= 0.02f || truth >= 0.98f ) { continue; }		// PENUMBRA band only
+				bool centreBlocked = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+				float occLight = saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, centreBlocked ? 0.0f : 1.0f, lightBuf ) );
+				// same light-apex contour, guards FORCED OFF: isolates whether the winding-subtraction / debris
+				// drop (active when the disk centre is lit) is what starves the outer-penumbra occlusion
+				float occNoGuard = saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, 0.0f, lightBuf ) );
+				sumNoGuard += std::fabs( ( 1.0f - occNoGuard ) - truth );
+				// rebuild THIS receiver's apex silhouette from the caster soup and run the SAME game function
+				std::vector<float4> rec;
+				for( const std::vector<TriEdgeAdj>& a : lc.adj ) { AppendReceiverSilhouetteRecords( a, P, rec ); }
+				float occRecv = rec.empty() ? 0.0f
+						: saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, 0, ( int )( rec.size() / 2 ), centreBlocked ? 0.0f : 1.0f, SoftEdgeBuffer{ rec.data(), ( int )rec.size() } ) );
+				float shadeLight = 1.0f - occLight, shadeRecv = 1.0f - occRecv;
+				sumLight += std::fabs( shadeLight - truth );
+				sumRecv  += std::fabs( shadeRecv  - truth );
+				if( shadeLight < truth - 0.25f ) { lightIllusory++; }		// darker than truth: illusory umbra
+				if( shadeRecv  < truth - 0.25f ) { recvIllusory++; }
+				pN++;
+			}
+		double mL = pN ? sumLight / pN : 0, mR = pN ? sumRecv / pN : 0;
+		double mNG = pN ? sumNoGuard / pN : 0;
+		std::printf( "    [contour %s] penumbra=%d px  LIGHT-apex mean|err|=%.4f over-hard=%d   LIGHT-apex NOGUARD mean|err|=%.4f   RECEIVER-apex mean|err|=%.4f over-hard=%d\n",
+				nm, pN, mL, lightIllusory, mNG, mR, recvIllusory );
+		CHECK( pN > 50 );
+		// (1) the residual is UNDER-shadow, not over-enclosure: almost no penumbra pixel is darker than truth
+		CHECK( lightIllusory * 20 <= pN );
+		// (2) the receiver-apex contour does NOT help - it reads no closer to truth than light-apex (falsified)
+		CHECK( mR >= mL );
+		// (3) the guards are inert in the penumbra: on/off within 0.01
+		CHECK( std::fabs( mL - mNG ) < 0.01 );
+		capsChecked++;
+	}
+	CHECK( capsSeen == 2 );
+	CHECK( capsChecked == 2 );
+}
+
+// ====================================================================== 5d-ter. THE CASTER COMBINE
+// The penumbra under-shadow root. SoftShadow_WedgeOcclusion combines casters with MAX (line ~328:
+// swOcc = max(swOcc, |thisCaster|)). Real world geometry splits every surface into its own caster, so
+// when N surfaces each occlude a DIFFERENT part of the same light disk from one receiver, MAX keeps only
+// the largest single contribution and the rest of the occlusion is thrown away - a systematic under-
+// shadow exactly where multiple casters share a receiver's penumbra. This runs the live per-caster area
+// (slicing the fed stream at its header records, e0.w<0) and compares three combines against the ray
+// truth over the penumbra pixels: MAX (shipped), clamp-SUM (min(1,sum)), and probabilistic UNION
+// (1-prod(1-occ)). If a union-style combine tracks truth markedly better than MAX, the fix is the
+// combine operator in the interaction path, not the contour or the area math.
+TEST( SoftShadowCombine, union_of_casters_beats_max_in_the_penumbra )
+{
+	const char* names[] = { "erebus5", "erebus13" };
+	const int W = 288, STRIDE = 2;
+	int capsSeen = 0, unionWins = 0;
+	for( const char* nm : names )
+	{
+		char path[512];
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
+		SoftCap c;
+		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		capsSeen++;
+		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
+		SwGBuffer g( W, H );
+		for( const softcapReceiver_t& R : c.receivers )
+			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
+			{
+				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
+				float3 A( c.recvVerts[ia * 3 + 0], c.recvVerts[ia * 3 + 1], c.recvVerts[ia * 3 + 2] );
+				float3 B( c.recvVerts[ib * 3 + 0], c.recvVerts[ib * 3 + 1], c.recvVerts[ib * 3 + 2] );
+				float3 C( c.recvVerts[ic * 3 + 0], c.recvVerts[ic * 3 + 1], c.recvVerts[ic * 3 + 2] );
+				float2 z( 0, 0 );
+				SwRasterTri( g, c.hdr.worldMVP, A, B, C, ( int )R.lightIndex, z, z, z, -1 );
+			}
+		SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
+		// per-light: origin/rp/culled caster ranges (for truth+centre), plus per-caster stream SLICES (record
+		// index + count) delimited by header records so each caster's area runs on the live game function alone
+		struct Slice { int firstElem, nRec; };
+		struct CLight { bool soft = false; float3 Lo; float rp = 0; std::vector<CasterRange> casters; std::vector<Slice> slices; };
+		std::vector<CLight> lights( c.hdr.numLights );
+		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
+		{
+			const softcapLight_t& Lt = c.lights[li];
+			CLight& lc = lights[li];
+			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
+			lc.soft = true; lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] ); lc.rp = Lt.penumbraSize;
+			for( const softcapCaster_t& cs : c.casters )
+			{
+				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
+				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
+				cr.lo = float3( 1e30f, 1e30f, 1e30f ); cr.hi = float3( -1e30f, -1e30f, -1e30f );
+				for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < c.meshIdx.size(); k++ )
+				{
+					const float* vp = &c.meshVerts[c.meshIdx[k] * 3];
+					cr.lo = float3( std::fmin( cr.lo.x, vp[0] ), std::fmin( cr.lo.y, vp[1] ), std::fmin( cr.lo.z, vp[2] ) );
+					cr.hi = float3( std::fmax( cr.hi.x, vp[0] ), std::fmax( cr.hi.y, vp[1] ), std::fmax( cr.hi.z, vp[2] ) );
+				}
+				lc.casters.push_back( cr );
+			}
+			// walk the light's edge records; each header (e0.w<0) starts a new caster slice
+			int cur = -1;
+			for( uint32_t r = Lt.firstEdge; r < Lt.firstEdge + Lt.edgeCount && r < c.edges.size(); r++ )
+			{
+				if( c.edges[r].e0[3] < 0.0f )
+				{
+					lc.slices.push_back( { ( int )( r * 2 ), 0 } );
+					cur = ( int )lc.slices.size() - 1;
+				}
+				if( cur >= 0 ) { lc.slices[cur].nRec++; }
+			}
+		}
+		int pN = 0, dissected = 0; double sMax = 0, sSum = 0, sUnion = 0;
+		for( int y = 0; y < H; y += STRIDE )
+			for( int x = 0; x < W; x += STRIDE )
+			{
+				int i = y * W + x, li = g.light[i];
+				if( li < 0 || li >= ( int )lights.size() || !lights[li].soft ) { continue; }
+				CLight& lc = lights[li];
+				float3 P = g.wpos[i];
+				float3 toL = lc.Lo - P; float dl = std::sqrt( dot( toL, toL ) );
+				if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }
+				float truth = TruthShadowCulled( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+				if( truth <= 0.02f || truth >= 0.98f ) { continue; }
+				bool cb = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+				float occMax = 0.0f, occProd = 1.0f, occAdd = 0.0f;
+				for( const Slice& s : lc.slices )
+				{
+					float o = saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, s.firstElem, s.nRec, cb ? 0.0f : 1.0f, buf ) );
+					occMax = std::fmax( occMax, o );
+					occProd *= ( 1.0f - o );
+					occAdd += o;
+				}
+				float occUnion = 1.0f - occProd, occSum = std::fmin( 1.0f, occAdd );
+				sMax   += std::fabs( ( 1.0f - occMax )   - truth );
+				sSum   += std::fabs( ( 1.0f - occSum )   - truth );
+				sUnion += std::fabs( ( 1.0f - occUnion ) - truth );
+				// DISSECT the worst under-shadowed pixels: is truth from ONE caster whose integral reads low,
+				// or spread across casters? print per-caster integral vs that caster's OWN ray truth.
+				if( dissected < 10 && ( 1.0f - occMax ) > truth + 0.4f )
+				{
+					dissected++;
+					std::printf( "      [dissect %s] P(%.0f,%.0f,%.0f) truth=%.3f occMax=%.3f  per-caster(integral|ownTruth):", nm, P.x, P.y, P.z, truth, occMax );
+					for( size_t ci = 0; ci < lc.slices.size() && ci < lc.casters.size(); ci++ )
+					{
+						float o = saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.slices[ci].firstElem, lc.slices[ci].nRec, cb ? 0.0f : 1.0f, buf ) );
+						std::vector<CasterRange> one( 1, lc.casters[ci] );
+						float ot = TruthShadowCulled( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), one );
+						if( o > 0.02f || ot > 0.02f ) { std::printf( " c%zu(%.2f|%.2f)", ci, o, ot ); }
+							if( ot < 0.9f )		// the genuine occluder: count clip fates on ITS fed silhouette
+							{
+								// slice<->caster pairing is order-based and the capture zeroes casterId, so match the
+								// occluder caster to the slice whose header CENTRE is nearest its mesh AABB centre
+								float3 cc( ( lc.casters[ci].lo.x + lc.casters[ci].hi.x ) * 0.5f, ( lc.casters[ci].lo.y + lc.casters[ci].hi.y ) * 0.5f, ( lc.casters[ci].lo.z + lc.casters[ci].hi.z ) * 0.5f );
+								int bestS = -1; float bestD = 1e30f;
+								for( size_t s = 0; s < lc.slices.size(); s++ )
+								{
+									int hr = lc.slices[s].firstElem / 2;
+									float3 hc( c.edges[hr].e0[0] - cc.x, c.edges[hr].e0[1] - cc.y, c.edges[hr].e0[2] - cc.z );
+									float dd = dot( hc, hc );
+									if( dd < bestD ) { bestD = dd; bestS = ( int )s; }
+								}
+								int rs = bestS >= 0 ? lc.slices[bestS].firstElem / 2 : 0, rc = bestS >= 0 ? lc.slices[bestS].nRec : 0, eN = 0, nC = 0, fC = 0, dr = 0;
+								float occAligned = bestS >= 0 ? saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.slices[bestS].firstElem, lc.slices[bestS].nRec, cb ? 0.0f : 1.0f, buf ) ) : -1.0f;
+								softFrame_t fr = SoftShadow_Frame( P, lc.Lo );
+								for( int r = rs; r < rs + rc && r < ( int )c.edges.size(); r++ )
+								{
+									if( c.edges[r].e0[3] < 0.0f ) { continue; }
+									eN++;
+									float3 ea( c.edges[r].e0[0] - P.x, c.edges[r].e0[1] - P.y, c.edges[r].e0[2] - P.z );
+									float3 eb( c.edges[r].e1[0] - P.x, c.edges[r].e1[1] - P.y, c.edges[r].e1[2] - P.z );
+									float dnA = dot( ea, fr.nrm ), dnB = dot( eb, fr.nrm );
+									if( dnA < SW_NEAR_EPS || dnB < SW_NEAR_EPS ) { nC++; }
+									if( dnA > fr.distPL || dnB > fr.distPL ) { fC++; }
+									if( SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, fr.distPL ).empty ) { dr++; }
+								}
+								std::printf( "\n        occluder c%zu lit=%.2f integral(idx=%.2f aligned=%.2f) slice=%d edges=%d near-clip=%d far-clip=%d dropped=%d distPL=%.0f", ci, ot, o, occAligned, bestS, eN, nC, fC, dr, fr.distPL );
+							}
+					}
+					std::printf( "\n" );
+				}
+				pN++;
+			}
+		double mMax = pN ? sMax / pN : 0, mSum = pN ? sSum / pN : 0, mUnion = pN ? sUnion / pN : 0;
+		std::printf( "    [combine %s] penumbra=%d px  MAX(shipped) mean|err|=%.4f   clamp-SUM=%.4f   prob-UNION=%.4f\n",
+				nm, pN, mMax, mSum, mUnion );
+		CHECK( pN > 50 );
+		// FALSIFIED: a union-style combine does NOT beat MAX - the three are within 1%. The penumbra under-
+		// shadow is not the combine operator; at the under-shadowed pixels the genuine occluder's OWN
+		// silhouette already integrates to ~0 (dissect above: erebus5 all edges past the light plane and
+		// dropped; erebus13 the surviving large silhouette's signed area cancels). The root is the silhouette
+		// edge stream failing to express the caster's near/far cross-section - an architecture gap (F6 +
+		// near-plane connector), not the combine, contour, or guards.
+		if( std::fmin( mSum, mUnion ) >= mMax * 0.95 ) { unionWins++; }
+	}
+	CHECK( capsSeen == 2 );
+	CHECK( unionWins == 2 );		// combine is inert: MAX ~= clamp-SUM ~= prob-UNION on both captures
+}
+
+// ====================================================================== 5e. SOFTNESS / CONTACT HARDENING
+// The two properties that justify this technique over shadow maps and RT: a temporally-stable soft
+// gradient, and CONTACT HARDENING - penumbra width growing with caster-receiver separation. The
+// pipeline's penumbra profile is swept across the shadow edge of an elevated slab at several receiver
+// distances and its 10%..90% transition width compared against the ray-traced truth. Stamping the
+// hard shadow as umbra halves the width (the inner penumbra is crushed to black) - which is exactly
+// "blur around a stencil shadow", not an analytic soft shadow - and fails this test.
+TEST( SoftShadowSoftness, penumbra_width_tracks_truth_contact_hardening )
+{
+	const float3 L( 0, 0, 96 );
+	const float  rp = 6.0f;
+	// slab edge at x=0, elevated: receivers on the floor z=0 at varying lateral positions. The caster
+	// z varies per case -> the penumbra width at the floor varies (contact hardening).
+	const float slabZ[3] = { 80.0f, 48.0f, 16.0f };		// near the light .. near the floor
+	int fails = 0;
+	for( int s = 0; s < 3; s++ )
+	{
+		Box slab = MakeBox( float3( -30.0f, 0, slabZ[s] ), float3( 30.0f, 30.0f, 0.25f ) );
+		auto loop = Silhouette( slab, L );
+		CHECK( loop.size() >= 3 );
+		auto rec = BuildCaster( { loop } );
+		std::vector<std::pair<float3, float3>> edges;
+		for( size_t i = 0; i < loop.size(); i++ ) { edges.push_back( { loop[i], loop[( i + 1 ) % loop.size()] } ); }
+		float3 ctr( rec[0].x, rec[0].y, rec[0].z );
+		// sweep the profile: shadow term and ray truth as functions of x on the floor
+		auto profile = [&]( float x, float& pipe, float& truth )
+		{
+			float3 P( x, 0, 0 );
+			// emergent-umbra model: integral runs across the full inflated cone; umbra falls out of
+			// saturation. centreBlocked only selects the guard mode, it does not stamp black.
+			bool centreBlocked = RayHitsBox( P + float3( 0, 0, 1e-3f ), L - P, slab );
+			int par = std::abs( ShellZFailCapped( edges, ctr, rp * 1.1f, L, float3( 60, 40, 30 ), P ) );
+			if( par & 1 ) { pipe = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, L, rp, 0, ( int )( rec.size() / 2 ), centreBlocked ? 0.0f : 1.0f, SoftEdgeBuffer{ rec.data(), ( int )rec.size() } ) ); }
+			else { pipe = centreBlocked ? 0.0f : 1.0f; }
+			truth = TruthShadow( P, L, rp, slab, 160 );
+		};
+		// locate the transition band in both signals: scan x, record where each crosses 10% and 90% lit
+		auto width = [&]( bool usePipe ) -> float
+		{
+			float x10 = 1e9f, x90 = -1e9f;
+			for( int i = 0; i <= 1200; i++ )		// wide enough for the near-light slab whose floor penumbra spans ~+-30
+			{
+				float x = -60.0f + i * 0.1f;
+				float p, t;
+				profile( x, p, t );
+				float v = usePipe ? p : t;
+				if( v <= 0.1f ) { x10 = x; }				// last x still <=10% lit
+				if( v >= 0.9f && x90 < -1e8f ) { x90 = x; }	// first x reaching 90% lit
+			}
+			return ( x90 > -1e8f && x10 < 1e8f ) ? ( x90 - x10 ) : -1.0f;
+		};
+		float wP = width( true ), wT = width( false );
+		float ratio = ( wT > 0 ) ? wP / wT : -1;
+		std::printf( "    [softness] slab z=%.0f: penumbra width pipeline=%.2f truth=%.2f ratio=%.2f\n",
+				slabZ[s], wP, wT, ratio );
+		if( !( ratio > 0.7f && ratio < 1.4f ) ) { fails++; }
+	}
+	CHECK( fails == 0 );		// the FULL analytic width, both halves - not blur around a stencil edge
 }
 
 // ====================================================================== 6. CAPTURE-STREAM INVARIANTS

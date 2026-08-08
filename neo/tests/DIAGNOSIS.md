@@ -1,5 +1,34 @@
 # Soft-shadow analytic coverage — per-step failure map
 
+## SOFTNESS FRONT (2026-08-08, supersedes the FINAL STATE below on the penumbra)
+
+The shipped state was artifact-free but NOT soft (over-hardened): it stamped the point-light hard shadow
+as umbra. The point-light silhouette is the ~50% occlusion contour = the MIDDLE of the penumbra, so the
+inner half of every penumbra was crushed to black (contact-hardening width ratio measured exactly 0.50).
+
+FIX (tests only, proven; NOT yet in the shipped shader): drop the hard-umbra stamp. The inflated shell is
+a SOLID cone containing the whole penumbra AND umbra, so run the coverage integral across all of it - the
+umbra EMERGES where it saturates to 1. The point-light hit is repurposed as the swCentreLit selector only
+(centre visible -> guards on; centre blocked -> guards off so it can saturate). SoftShadowSoftness now
+GREEN: contact-hardening width ratio 1.00/1.01/1.03 across three caster heights (was 0.50).
+
+REAL-CAPTURE PENUMBRA RESIDUAL - ROOT PROVEN, three mechanism tests LOCKED GREEN:
+- The penumbra is systematically UNDER-shadowed (~0.26-0.33 mean|err|; missing dominates extraneous 30-100x).
+- SoftShadowContour: receiver-apex contour is WORSE (0.49/0.43), FALSIFYING the DIAGNOSIS "receiver-apex
+  needed" claim for the penumbra (that was about extraneous at LIT points, <=111px); guards inert (<0.002).
+- SoftShadowCombine: MAX ~= clamp-SUM ~= prob-UNION within 1% - the caster combine is NOT the lever; one
+  caster dominates each penumbra pixel.
+- Aligned per-caster dissect: at each under-shadowed pixel the ONE genuine occluder's OWN silhouette
+  integrates to ~0 despite ray truth 46-92% occluded. Two forms of ONE gap - the edge stream cannot express
+  the caster's cross-section: (a) erebus5 - all the occluder's edges lie beyond the light plane, dropped;
+  (b) erebus13 - the large silhouette survives clipping but its signed shoelace CANCELS.
+- F6 (clean synthetic) nails it: a box straddling the light plane - its outer face at dn>distPL is dropped,
+  the true cross-section at the plane (silhouette of the CLIPPED solid) is never emitted; occ 0.025 vs 0.189.
+
+USER DECISION (2026-08-08): fix by emitting the real light-plane cross-section. This is per-fragment (the
+light plane dn=distPL depends on P) and needs the caster's face/solid geometry, not just the light-apex
+silhouette - a data-flow change to R_CollectPenumbraEdges + the coverage integral. NEXT.
+
 ## FINAL STATE (supersedes historical sections below where they conflict)
 
 Shipped pipeline (r_softShadowAAM 1, default): z-fail stencil CORE = solid umbra; capped watertight

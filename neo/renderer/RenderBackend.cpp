@@ -1904,7 +1904,10 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			// SoftShadowDefects "guilty caster" isolation). Off (0) outside AAM ring passes: without the
 			// hard-base guarantee the same subtraction would delete REAL umbra.
 			extern idCVar r_softShadowAAM;
-			const float swCentreLit = ( r_softShadowAAM.GetBool() && softBandStencilRef > 0 ) ? 1.0f : 0.0f;
+			// Ring pass (ref 1) guarantees the disk centre is VISIBLE -> guard on (1). The emergent-umbra CORE
+			// pass (ref 2) is exactly where the centre is BLOCKED -> guard off (0) so the integral can saturate
+			// to a real umbra instead of having its winding subtracted away. Only ref 1 gets the centre-lit guard.
+			const float swCentreLit = ( r_softShadowAAM.GetBool() && softBandStencilRef == 1 ) ? 1.0f : 0.0f;
 			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, 0.0f, 0.0f };
 			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
 		}
@@ -2067,8 +2070,21 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 		extern idCVar r_softShadowAAM;
 		const bool swAAM = r_softShadowAAM.GetBool();
 		( void )swAAM;
-		const uint64 swStencilFunc = GLS_STENCIL_FUNC_EQUAL;
-		const int swStencilRef = ( softBandStencilRef > 0 ) ? SOFTBAND_RING_REF : SOFTBAND_LIT_REF;
+		// softBandStencilRef: 0 = LIT (EQUAL LIT_REF), 1 = penumbra RING (EQUAL RING_REF). The emergent-umbra
+		// path adds 2 = CORE/UMBRA: the region whose LOW bits deviated from CORE_BASE (the point-light hard
+		// shadow the core volumes counted), tested sign-agnostically by NOTEQUAL CORE_BASE while MASKING OFF
+		// the shell parity bit - so it catches umbra whether the low bits went up or down and whether or not
+		// the shell also covered it, and is mutually exclusive with LIT (0x20) and RING (0x60), both of which
+		// mask to CORE_BASE. Running coverage here (guard off) is what lets the umbra emerge from saturation.
+		uint64 swStencilFunc = GLS_STENCIL_FUNC_EQUAL;
+		int    swStencilRef  = ( softBandStencilRef > 0 ) ? SOFTBAND_RING_REF : SOFTBAND_LIT_REF;
+		int    swStencilMask = 0xFF;
+		if( softBandStencilRef == 2 )
+		{
+			swStencilFunc = GLS_STENCIL_FUNC_NOTEQUAL;
+			swStencilRef  = SOFTBAND_CORE_BASE;
+			swStencilMask = 0xFF & ~SOFTBAND_SHELL_BIT;
+		}
 		GL_State(
 			GLS_SRCBLEND_ONE |
 			GLS_DSTBLEND_ONE |
@@ -2076,7 +2092,7 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 			depthFunc |
 			swStencilFunc |
 			GLS_STENCIL_MAKE_REF( swStencilRef ) |
-			GLS_STENCIL_MAKE_MASK( 0xFF ) |
+			GLS_STENCIL_MAKE_MASK( swStencilMask ) |
 			GLS_STENCIL_OP_FAIL_KEEP | GLS_STENCIL_OP_ZFAIL_KEEP | GLS_STENCIL_OP_PASS_KEEP );
 	}
 	else
@@ -4926,8 +4942,14 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
 				if( bandMask )
 				{
-					softBandStencilRef = 1;		// coverage variant on the penumbra ring (== RING_REF)
+					extern idCVar r_softShadowEmergentUmbra;
+					softBandStencilRef = 1;		// coverage variant on the penumbra ring (== RING_REF, centre-lit guard on)
 					RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					if( r_softShadowEmergentUmbra.GetBool() )
+					{
+						softBandStencilRef = 2;	// EMERGENT umbra: coverage on the core (guard off) - umbra from saturation
+						RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					}
 					softBandStencilRef = 0;		// cheap unshadowed variant on the lit remainder (== LIT_REF)
 					RenderInteractions( vLight->localInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
 					softBandStencilRef = -1;
@@ -4953,8 +4975,14 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				if( lightIsSoft ) { renderLog.BeginShadowGen( RLS_SOFT ); }
 				if( bandMask )
 				{
-					softBandStencilRef = 1;		// coverage variant on the penumbra ring (== RING_REF)
+					extern idCVar r_softShadowEmergentUmbra;
+					softBandStencilRef = 1;		// coverage variant on the penumbra ring (== RING_REF, centre-lit guard on)
 					RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					if( r_softShadowEmergentUmbra.GetBool() )
+					{
+						softBandStencilRef = 2;	// EMERGENT umbra: coverage on the core (guard off) - umbra from saturation
+						RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
+					}
 					softBandStencilRef = 0;		// cheap unshadowed variant on the lit remainder (== LIT_REF)
 					RenderInteractions( vLight->globalInteractions, vLight, GLS_DEPTHFUNC_EQUAL, false, useLightDepthBounds );
 					softBandStencilRef = -1;
