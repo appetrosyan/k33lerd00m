@@ -396,4 +396,120 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 	return swOcc;
 }
 
+// ===================================================================================================
+// RECEIVER-APEX coverage for ONE caster (the cross-section fix). Fed the caster's CANDIDATE edges (all
+// potential silhouette edges, NOT pre-filtered by light facing), each as 4 float4:
+//   q0 = ( A.xyz, vidA )   q1 = ( B.xyz, vidB )   q2 = ( nA.xyz, boundaryFlag )   q3 = ( nB.xyz, 0 )
+// where nA,nB are the two adjacent face normals and vidA,vidB are welded (position-canonical) vertex ids.
+// Per fragment it selects the edges that are a silhouette FROM THE RECEIVER (boundary, or the two faces
+// straddle P), chains them into loops by shared vertex id (a GLOBAL greedy walk with a used[] bitmask -
+// the accurate result needs true chaining; every cheaper order-free form was measured to degrade), and
+// sums the clipped circle-triangle areas with the near/far connector in loop order. raBlocksCentre = does
+// THIS caster occlude the disk-centre ray (point-light-shadow membership); when false the illusory winding
+// of a far caster wrapping the axis is subtracted. O(nEdges^2) by design: correct first, optimise later.
+#ifndef SW_RA_MAX
+	#define SW_RA_MAX 1024			// max candidate edges per caster (used-bitmask capacity); real casters reach ~940
+#endif
+SW_FUNC float SoftShadow_ProcCaster( float3 swP, float3 swL, float swR, bool raBlocksCentre, int raFirst, int raN SW_EDGEBUF_PARAM )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float swR2 = swR * swR;
+	float swInv = 1.0f / ( PI * swR2 );
+	if( raN > SW_RA_MAX ) { raN = SW_RA_MAX; }		// clamp (accuracy loss on huge casters; optimise later)
+	uint raUsed[SW_RA_MAX / 32];
+	for( int w = 0; w < SW_RA_MAX / 32; w++ ) { raUsed[w] = 0u; }
+	float raArea = 0.0f;
+	float raAng  = 0.0f;
+	for( int s = 0; s < raN; s++ )
+	{
+		if( ( raUsed[s >> 5] & ( 1u << ( s & 31 ) ) ) != 0u ) { continue; }
+		// select + orient edge s from P; skip if not a receiver silhouette
+		float4 s0 = t_SoftEdges[ raFirst + s * 4 + 0 ];
+		float4 s1 = t_SoftEdges[ raFirst + s * 4 + 1 ];
+		float4 s2 = t_SoftEdges[ raFirst + s * 4 + 2 ];
+		float4 s3 = t_SoftEdges[ raFirst + s * 4 + 3 ];
+		float3 sA = float3( s0.x, s0.y, s0.z ), sB = float3( s1.x, s1.y, s1.z );
+		float3 snA = float3( s2.x, s2.y, s2.z ), snB = float3( s3.x, s3.y, s3.z );
+		bool sFaP = dot( snA, swP - sA ) > 0.0f, sFbP = dot( snB, swP - sA ) > 0.0f;
+		bool sBnd = s2.w > 0.5f;
+		if( !( sBnd || ( sFaP != sFbP ) ) ) { continue; }
+		// directed start/end vertex ids (front face on the consistent side)
+		bool sFlip = sBnd ? ( !sFaP ) : ( sFbP );
+		float curEndVid = sFlip ? s0.w : s1.w;
+		float3 dA = sFlip ? sB : sA, dB = sFlip ? sA : sB;
+		raUsed[s >> 5] |= ( 1u << ( s & 31 ) );
+		// project the (clipped) start edge; open the chain
+		float2 chFirst = float2( 0.0f, 0.0f ), chPrev = float2( 0.0f, 0.0f );
+		bool chValid = false;
+		// inline: clip+project a directed edge (dA->dB); accumulate into raArea/raAng with connector-on-open
+		// (repeated below for the walk; kept inline for HLSL - no closures)
+		{
+			float3 a = dA - swP, b = dB - swP;
+			float dnA = dot( a, swF.nrm ), dnB = dot( b, swF.nrm ), d = dnB - dnA;
+			softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, swF.distPL );
+			if( !cl.empty )
+			{
+				float2 q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, swF );
+				float2 q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, swF );
+				chFirst = q0; chPrev = q1; chValid = true;
+				raArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
+				raAng  += SoftDisk_EdgeAngle( q0, q1 );
+			}
+		}
+		// walk the chain: follow curEndVid to the next unused receiver-silhouette edge whose START == curEndVid
+		for( int step = 0; step < raN; step++ )
+		{
+			int nx = -1;
+			for( int j = 0; j < raN; j++ )
+			{
+				if( ( raUsed[j >> 5] & ( 1u << ( j & 31 ) ) ) != 0u ) { continue; }
+				float4 j0 = t_SoftEdges[ raFirst + j * 4 + 0 ];
+				float4 j1 = t_SoftEdges[ raFirst + j * 4 + 1 ];
+				float4 j2 = t_SoftEdges[ raFirst + j * 4 + 2 ];
+				float4 j3 = t_SoftEdges[ raFirst + j * 4 + 3 ];
+				float3 jA = float3( j0.x, j0.y, j0.z );
+				bool jFaP = dot( float3( j2.x, j2.y, j2.z ), swP - jA ) > 0.0f;
+				bool jFbP = dot( float3( j3.x, j3.y, j3.z ), swP - jA ) > 0.0f;
+				bool jBnd = j2.w > 0.5f;
+				if( !( jBnd || ( jFaP != jFbP ) ) ) { continue; }
+				bool jFlip = jBnd ? ( !jFaP ) : ( jFbP );
+				float jStart = jFlip ? j1.w : j0.w;
+				if( jStart == curEndVid ) { nx = j; break; }
+			}
+			if( nx < 0 ) { break; }
+			raUsed[nx >> 5] |= ( 1u << ( nx & 31 ) );
+			float4 n0 = t_SoftEdges[ raFirst + nx * 4 + 0 ];
+			float4 n1 = t_SoftEdges[ raFirst + nx * 4 + 1 ];
+			float4 n2 = t_SoftEdges[ raFirst + nx * 4 + 2 ];
+			float4 n3 = t_SoftEdges[ raFirst + nx * 4 + 3 ];
+			float3 nAp = float3( n0.x, n0.y, n0.z ), nBp = float3( n1.x, n1.y, n1.z );
+			bool nFaP = dot( float3( n2.x, n2.y, n2.z ), swP - nAp ) > 0.0f;
+			bool nFbP = dot( float3( n3.x, n3.y, n3.z ), swP - nAp ) > 0.0f;
+			bool nBnd = n2.w > 0.5f;
+			bool nFlip = nBnd ? ( !nFaP ) : ( nFbP );
+			curEndVid = nFlip ? n0.w : n1.w;
+			float3 wA = nFlip ? nBp : nAp, wB = nFlip ? nAp : nBp;
+			float3 a = wA - swP, b = wB - swP;
+			float dnA = dot( a, swF.nrm ), dnB = dot( b, swF.nrm ), d = dnB - dnA;
+			softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, swF.distPL );
+			if( cl.empty ) { continue; }		// dropped edge: chain continues, next kept edge bridges from chPrev
+			float2 q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, swF );
+			float2 q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, swF );
+			if( chValid ) { raArea += SoftDisk_CircleTriArea( chPrev, q0, swR2 ); raAng += SoftDisk_EdgeAngle( chPrev, q0 ); }
+			else { chFirst = q0; chValid = true; }
+			raArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
+			raAng  += SoftDisk_EdgeAngle( q0, q1 );
+			chPrev = q1;
+		}
+		if( chValid ) { raArea += SoftDisk_CircleTriArea( chPrev, chFirst, swR2 ); raAng += SoftDisk_EdgeAngle( chPrev, chFirst ); }
+	}
+	if( !raBlocksCentre )		// centre visible: subtract illusory winding, drop near-plane chain-fragment debris
+	{
+		raArea -= floor( raAng * ( 0.5f / PI ) + 0.5f ) * ( PI * swR2 );
+		if( abs( raArea ) > 1.2f * ( PI * swR2 ) ) { raArea = 0.0f; }
+	}
+	return saturate( abs( raArea ) * swInv );
+}
+
 #endif // __SOFTWEDGE_COVERAGE_INC__

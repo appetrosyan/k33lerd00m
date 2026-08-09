@@ -409,8 +409,12 @@ inline void AppendReceiverSilhouetteRecords( const std::vector<TriEdgeAdj>& adj,
 	out.push_back( float4( ctr.x, ctr.y, ctr.z, -1.0f ) );			// header: caster boundary (e0.w<0)
 	out.push_back( float4( rad, 0.0f, 0.0f, 0.0f ) );				// header: bounding-sphere radius in e1.x
 
-	std::unordered_multimap<uint32_t, int> byStart;
-	for( int i = 0; i < ( int )es.size(); i++ ) { byStart.insert( std::make_pair( es[i].a, i ) ); }
+	// next-edge tie-break MUST match SoftShadow_ProcCaster: at a non-manifold vertex (world corner, >2
+	// silhouette edges) the continuation is ambiguous, and the clipped-connector area + chain-closure winding
+	// depend on WHICH loop decomposition results. ProcCaster scans the candidate buffer in adjacency-index
+	// order; mirror that here (first unused es with a==cur.b, ascending index) so the chained reference and the
+	// shader walk decompose loops identically - an unordered_multimap's bucket order diverged and tipped the
+	// debris-drop cliff (|area|>1.2 pi r^2 -> 0) on the divergent caster.
 	std::vector<char> used( es.size(), 0 );
 	for( int s = 0; s < ( int )es.size(); s++ )
 	{
@@ -420,8 +424,8 @@ inline void AppendReceiverSilhouetteRecords( const std::vector<TriEdgeAdj>& adj,
 			used[cur] = 1;
 			out.push_back( float4( es[cur].pa.x, es[cur].pa.y, es[cur].pa.z, 1.0f ) );	// edge e0 = A (e0.w>=0)
 			out.push_back( float4( es[cur].pb.x, es[cur].pb.y, es[cur].pb.z, 0.0f ) );	// edge e1 = B
-			auto range = byStart.equal_range( es[cur].b ); int nxt = -1;
-			for( auto it = range.first; it != range.second; ++it ) { if( !used[it->second] ) { nxt = it->second; break; } }
+			uint32_t endv = es[cur].b; int nxt = -1;
+			for( int j = 0; j < ( int )es.size(); j++ ) { if( !used[j] && es[j].a == endv ) { nxt = j; break; } }
 			cur = nxt;
 		}
 	}
