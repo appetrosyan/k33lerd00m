@@ -2899,39 +2899,45 @@ static float RecvApexOcc_LocalConnector( float3 P, float3 L, float r, const std:
 	return saturate( ( float )( std::fabs( area ) / ( PI * r2 ) ) );
 }
 
-// ACCURATE multi-caster union coverage. A disk point is occluded by a caster iff the segment P->point passes
-// through it. For a caster wholly inside the depth slab this is EXACT from the receiver-apex silhouette alone:
-// the ray hits the caster iff its DIRECTION lies inside the silhouette cone (spherical winding != 0), with no
-// projection, no clip, no connector. A caster that straddles a clip plane is depth-ambiguous, so it takes an
-// exact ray-segment test (a small minority). The UNION over casters (occluded if ANY) is the true occluded
-// area - it accounts for WHERE casters overlap vs tile, which a scalar MAX/sum of per-caster areas cannot.
-static std::vector<std::pair<float3, float3>> CasterSilDirs( float3 P, const std::vector<TriEdgeAdj>& adj )
+// WALK-ORDERED clipped silhouette as direction-space loops (no projection singularity). The engine feed is
+// already walk-ordered, so clipping each edge to the depth slab and letting consecutive clipped points connect
+// (a great-circle chord closes each loop) gives the clipped occluder's boundary; the far part beyond the light
+// is dropped and its gap bridged. Winding of a disk direction about these loops, with the F2 uniform-winding
+// guard, is the analytic clipped occlusion. One centre-ray per caster (the point-light shadow the engine has)
+// resolves the guard - NOT a per-sample ray. This is the real-time, temporally-stable, ray-free straddler path.
+static std::vector<std::vector<float3>> CasterDirLoops( float3 P, float3 Lo, const std::vector<TriEdgeAdj>& adj )
 {
-	std::vector<std::pair<float3, float3>> es;
-	for( const TriEdgeAdj& e : adj )
+	std::vector<float4> rec; AppendReceiverSilhouetteRecords( adj, P, rec );
+	softFrame_t f = SoftShadow_Frame( P, Lo );
+	std::vector<std::vector<float3>> loops; std::vector<float3> cur; float3 prevEnd( 0, 0, 0 ); bool have = false;
+	for( size_t i = 0; i + 1 < rec.size(); )
 	{
-		float3 sA, sB; bool keep = false;
-		if( e.count < 2 ) { bool fa = dot( e.nA, P - e.A ) > 0.0f; if( fa ) { sA = e.A; sB = e.B; } else { sA = e.B; sB = e.A; } keep = true; }
-		else { bool fa = dot( e.nA, P - e.A ) > 0.0f, fb = dot( e.nB, P - e.A ) > 0.0f; if( fa != fb ) { if( !fb ) { sA = e.A; sB = e.B; } else { sA = e.B; sB = e.A; } keep = true; } }
-		if( !keep ) { continue; }
-		es.push_back( std::make_pair( normalize( sA - P ), normalize( sB - P ) ) );
+		if( rec[i].w < 0.0f ) { if( cur.size() >= 3 ) { loops.push_back( cur ); } cur.clear(); have = false; i += 2; continue; }
+		float3 A( rec[i].x, rec[i].y, rec[i].z ), B( rec[i + 1].x, rec[i + 1].y, rec[i + 1].z ); i += 2;
+		if( have && length( A - prevEnd ) > 1e-4f ) { if( cur.size() >= 3 ) { loops.push_back( cur ); } cur.clear(); }
+		float3 a = A - P, b = B - P; float dnA = dot( a, f.nrm ), dnB = dot( b, f.nrm );
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, f.distPL );
+		if( !cl.empty ) { cur.push_back( normalize( a + cl.t0 * ( b - a ) ) ); cur.push_back( normalize( a + cl.t1 * ( b - a ) ) ); }
+		prevEnd = B; have = true;
 	}
-	return es;
+	if( cur.size() >= 3 ) { loops.push_back( cur ); }
+	return loops;
 }
-// spherical winding of direction d about a caster's silhouette loop(s): tangent-plane project each silhouette
-// vertex direction at d and sum subtended angles. !=0 means d is inside the cone (the ray hits the caster).
-static bool SphOccludes( const std::vector<std::pair<float3, float3>>& es, float3 d )
+// spherical winding number of direction d about a caster's direction-space loops (great-circle edges).
+static int DirWinding( const std::vector<std::vector<float3>>& loops, float3 d )
 {
 	float3 up = ( std::fabs( d.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
 	float3 e1 = normalize( cross( up, d ) ), e2 = cross( d, e1 );
 	double ang = 0.0;
-	for( const std::pair<float3, float3>& e : es )
-	{
-		float3 pa = e.first - dot( e.first, d ) * d, pb = e.second - dot( e.second, d ) * d;
-		float ax = dot( pa, e1 ), ay = dot( pa, e2 ), bx = dot( pb, e1 ), by = dot( pb, e2 );
-		ang += std::atan2( ( double )( ax * by - ay * bx ), ( double )( ax * bx + ay * by ) );
-	}
-	return std::fabs( ang ) > PI;
+	for( const std::vector<float3>& L : loops )
+		for( size_t k = 0; k < L.size(); k++ )
+		{
+			float3 A = L[k], B = L[( k + 1 ) % L.size()];
+			float3 pa = A - dot( A, d ) * d, pb = B - dot( B, d ) * d;
+			float ax = dot( pa, e1 ), ay = dot( pa, e2 ), bx = dot( pb, e1 ), by = dot( pb, e2 );
+			ang += std::atan2( ( double )( ax * by - ay * bx ), ( double )( ax * bx + ay * by ) );
+		}
+	return ( int )std::lround( ang / ( 2.0 * PI ) );
 }
 
 TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
@@ -3070,12 +3076,12 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 								ci, o1, oProc, nSil, ( int )( r1.size() / 2 ), ( int )rayBlocks );
 					}
 				}
-				// ACCURATE UNION. Classify each caster by its bounding-box depth range along nrm: wholly behind the
-				// receiver or wholly beyond the light -> cull; wholly inside the slab -> exact silhouette-cone
-				// (spherical winding); straddling a clip plane -> exact ray-segment. Then a disk point is occluded
-				// iff ANY caster occludes it. Integrated over the disk with the SAME Hammersley set as the oracle.
+				// FULLY-ANALYTIC ACCURATE UNION (no ray). Each caster's clipped-occluder boundary is built once as
+				// DIRECTIONS from P (clipped silhouette + cross-section caps); a disk direction is occluded by that
+				// caster iff its spherical winding about it is non-zero; occluded iff ANY caster occludes. Wholly
+				// behind-receiver / beyond-light casters are culled. Integrated with the oracle's Hammersley set.
 				softFrame_t fu = SoftShadow_Frame( P, lc.Lo );
-				std::vector<std::vector<std::pair<float3, float3>>> allDirs; std::vector<char> mode( lc.adj.size(), 0 );	// 0 cull, 1 sil-cone, 2 ray
+				std::vector<std::vector<std::vector<float3>>> allLoops; std::vector<char> rbC; std::vector<int> wcC;
 				for( size_t ci = 0; ci < lc.adj.size() && ci < lc.casters.size(); ci++ )
 				{
 					const CasterRange& cr = lc.casters[ci];
@@ -3085,12 +3091,16 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 						float3 corner( ( cxi & 1 ) ? cr.hi.x : cr.lo.x, ( cxi & 2 ) ? cr.hi.y : cr.lo.y, ( cxi & 4 ) ? cr.hi.z : cr.lo.z );
 						float dncr = dot( corner - P, fu.nrm ); dnMin = std::fmin( dnMin, dncr ); dnMax = std::fmax( dnMax, dncr );
 					}
-					std::vector<std::pair<float3, float3>> es;
-					if( dnMax < SW_NEAR_EPS || dnMin > fu.distPL ) { mode[ci] = 0; }			// culled
-					else if( dnMin >= SW_NEAR_EPS && dnMax <= fu.distPL ) { mode[ci] = 1; es = CasterSilDirs( P, lc.adj[ci] ); }	// in-slab: exact cone
-					else { mode[ci] = 2; }														// straddles a plane: exact ray
-					if( mode[ci] == 1 ) { nSilMode++; } else if( mode[ci] == 2 ) { nRayMode++; }
-					allDirs.push_back( std::move( es ) );
+					std::vector<std::vector<float3>> lp; int wc = 0; char rb = 0;
+					if( dnMax >= SW_NEAR_EPS && dnMin <= fu.distPL )		// not wholly behind receiver / beyond light
+					{
+						lp = CasterDirLoops( P, lc.Lo, lc.adj[ci] );
+						std::vector<CasterRange> one( 1, cr );
+						rb = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), one ) ? 1 : 0;	// ONE centre ray = point-light shadow
+						wc = DirWinding( lp, fu.nrm );
+						if( dnMin >= SW_NEAR_EPS && dnMax <= fu.distPL ) { nSilMode++; } else { nRayMode++; }
+					}
+					allLoops.push_back( std::move( lp ) ); rbC.push_back( rb ); wcC.push_back( wc );
 				}
 				int inside = 0; const int MU = 256;
 				for( int s = 0; s < MU; s++ )
@@ -3100,10 +3110,10 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 					float3 q3 = lc.Lo + fu.u * ( rr * std::cos( th ) ) + fu.v * ( rr * std::sin( th ) );
 					float3 d = normalize( q3 - P );
 					bool occ = false;
-					for( size_t ci = 0; ci < allDirs.size() && !occ; ci++ )
+					for( size_t ci = 0; ci < allLoops.size() && !occ; ci++ )
 					{
-						if( mode[ci] == 1 ) { occ = SphOccludes( allDirs[ci], d ); }
-						else if( mode[ci] == 2 ) { occ = RayHitsMesh( P, q3 - P, c.meshVerts.data(), &c.meshIdx[lc.casters[ci].first], lc.casters[ci].num ); }
+						if( allLoops[ci].empty() || ( !rbC[ci] && wcC[ci] != 0 ) ) { continue; }		// skip F2-illusory caster (chord-loop winds centre, centre not blocked)
+						occ = ( DirWinding( allLoops[ci], d ) != 0 );
 					}
 					if( occ ) { inside++; }
 				}
@@ -3146,9 +3156,9 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 				nm, pN ? sumRecvOI / pN : 0.0, innerN ? biasInner / innerN : 0.0,
 				pN ? sumUnion / pN : 0.0, innerN ? biasUnionInner / innerN : 0.0,
 				pN ? sumClamp / pN : 0.0, innerN ? biasClampInner / innerN : 0.0 );
-		std::printf( "    [UNION-accurate %s] hybrid union vs converged oracle: overall=%.4f  INNER mean=%.4f bias=%+.4f  (MAX overall %.4f inner bias %+.4f)  [analytic-cone %ld / ray-straddler %ld]\n",
+		std::printf( "    [UNION-analytic %s] direction-space clip+chord+guard (NO ray, NO chaining) vs converged oracle: overall=%.4f  INNER mean=%.4f bias=%+.4f  (MAX inner bias %+.4f)  [in-slab %ld / straddler %ld]\n",
 				nm, pN ? sumUn / pN : 0.0, innerN ? sumUnInner / innerN : 0.0, innerN ? biasUnInner / innerN : 0.0,
-				pN ? sumRecvOI / pN : 0.0, innerN ? biasInner / innerN : 0.0, nSilMode, nRayMode );
+				innerN ? biasInner / innerN : 0.0, nSilMode, nRayMode );
 		CHECK( pN > 50 );
 		// (1) the light-apex residual is UNDER-shadow, not over-enclosure: almost no light-apex pixel is dark
 		CHECK( lightIllusory * 20 <= pN );
