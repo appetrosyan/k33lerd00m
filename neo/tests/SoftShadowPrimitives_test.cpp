@@ -1961,6 +1961,38 @@ bool RayHitsCasters( float3 P, float3 D, const float* verts, const uint32_t* idx
 }
 
 // disk truth with AABB-culled rays (N=4 -> 13 rays; enough to certify "essentially lit" vs "shadowed")
+// CONVERGED ray-traced occlusion oracle. A regular N x N grid has structured boundary bias and needs
+// ~3200 samples (N=64) to converge; a deterministic Hammersley (radical-inverse base 2) sequence with
+// equal-area disk mapping converges to the same value at ~256 samples, unbiased, and stays reproducible
+// (no RNG). This is THE oracle the capture accuracy tests measure against - not a tuned grid N.
+inline float SoftRadicalInverse2( uint32_t i )
+{
+	i = ( i << 16 ) | ( i >> 16 );
+	i = ( ( i & 0x55555555u ) << 1 ) | ( ( i & 0xAAAAAAAAu ) >> 1 );
+	i = ( ( i & 0x33333333u ) << 2 ) | ( ( i & 0xCCCCCCCCu ) >> 2 );
+	i = ( ( i & 0x0F0F0F0Fu ) << 4 ) | ( ( i & 0xF0F0F0F0u ) >> 4 );
+	i = ( ( i & 0x00FF00FFu ) << 8 ) | ( ( i & 0xFF00FF00u ) >> 8 );
+	return ( float )( ( double )i / 4294967296.0 );
+}
+float TruthShadowConverged( float3 P, float3 L, float r, const float* verts, const uint32_t* idx,
+							const std::vector<CasterRange>& casters, int M = 256 )
+{
+	float3 toL = L - P;
+	float dist = std::sqrt( dot( toL, toL ) );
+	if( dist < 1e-6f ) { return 1.0f; }
+	float3 nrm = toL * ( 1.0f / dist );
+	float3 up = ( std::fabs( nrm.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+	float3 u = normalize( cross( up, nrm ) ), v = cross( nrm, u );
+	int inside = 0;
+	for( int i = 0; i < M; i++ )
+	{
+		float u1 = ( i + 0.5f ) / M, u2 = SoftRadicalInverse2( ( uint32_t )i );
+		float rr = std::sqrt( u1 ) * r, th = 2.0f * ( float )M_PI * u2;		// equal-area disk map
+		float3 Dp = L + u * ( rr * std::cos( th ) ) + v * ( rr * std::sin( th ) );
+		if( RayHitsCasters( P, Dp - P, verts, idx, casters ) ) { inside++; }
+	}
+	return 1.0f - ( float )inside / M;
+}
 float TruthShadowCulled( float3 P, float3 L, float r, const float* verts, const uint32_t* idx,
 						 const std::vector<CasterRange>& casters, int N = 4 )
 {
@@ -2926,6 +2958,9 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 		}
 		SoftEdgeBuffer lightBuf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
 		int pN = 0, dissected = 0; double sumLight = 0, sumRecv = 0, sumNoGuard = 0, sumRecvPC = 0, sumRecvOI = 0; int lightIllusory = 0, recvIllusory = 0, recvPCillusory = 0, recvOIill = 0;
+		double biasOI = 0, sumInner = 0, biasInner = 0, sumOuter = 0, biasOuter = 0; int innerN = 0, outerN = 0;		// residual structure vs converged oracle
+		double sumUnion = 0, sumUnionInner = 0, biasUnionInner = 0;		// probabilistic-union combine (vs MAX) - does it fix the inner under-shadow?
+		double sumClamp = 0, sumClampInner = 0, biasClampInner = 0;		// clamp-sum combine min(1,sum) - the standard AAM combine
 		for( int y = 0; y < H; y += STRIDE )
 			for( int x = 0; x < W; x += STRIDE )
 			{
@@ -2936,7 +2971,7 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 				float3 P = g.wpos[i];
 				float3 toL = lc.Lo - P; float dl = std::sqrt( dot( toL, toL ) );
 				if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }
-				float truth = TruthShadowCulled( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+				float truth = TruthShadowConverged( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), lc.casters, 256 );	// converged Hammersley oracle - matches the N=64 grid (0.057/0.035) at 12x fewer samples
 				if( truth <= 0.02f || truth >= 0.98f ) { continue; }		// PENUMBRA band only
 				bool centreBlocked = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
 				float occLight = saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, centreBlocked ? 0.0f : 1.0f, lightBuf ) );
@@ -2962,7 +2997,7 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 				// partial/grazing casters on the OPEN clipped silhouette misclassifies). The ray test is exact; its
 				// cheap shader equivalent is point-in-silhouette of the ONE centre ray against the caster's
 				// light-apex loop (O(edges), same order as the coverage, not O(triangles)).
-				float occRecvPC = 0.0f, occRecvOI = 0.0f;
+				float occRecvPC = 0.0f, occRecvOI = 0.0f, prodU = 1.0f, sumOcc = 0.0f;	// prodU: prob-union; sumOcc: clamp-sum
 				for( size_t ci = 0; ci < lc.adj.size() && ci < lc.casters.size(); ci++ )
 				{
 					std::vector<CasterRange> one( 1, lc.casters[ci] );
@@ -2989,6 +3024,8 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 					}
 					float oProc = SoftShadow_ProcCaster( P, lc.Lo, lc.rp, rayBlocks, 0, ( int )lc.adj[ci].size(), SoftEdgeBuffer{ cand.data(), ( int )cand.size() } );
 					occRecvOI = std::fmax( occRecvOI, oProc );
+					prodU *= ( 1.0f - oProc );
+					sumOcc += oProc;
 					if( dissected < 12 && std::fabs( oProc - o1 ) > 0.15f )
 					{
 						dissected++;
@@ -3001,6 +3038,16 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 				if( shadeRecvPC < truth - 0.25f ) { recvPCillusory++; }
 				sumRecvOI += std::fabs( shadeRecvOI - truth );
 				if( shadeRecvOI < truth - 0.25f ) { recvOIill++; }
+				// residual STRUCTURE of the shipped ProcCaster path vs the converged oracle: signed bias +
+				// inner(truth<0.5)/outer split, to tell a fixable systematic over/under-shadow from scatter.
+				double eSigned = shadeRecvOI - truth;			// >0 too LIGHT (under-shadow); <0 too DARK (over-hard)
+				biasOI += eSigned;
+				float shadeUnion = prodU;						// 1-(1-prod(1-occ)) = prod(1-occ); prob-union shade
+				float shadeClamp = 1.0f - std::fmin( 1.0f, sumOcc );	// clamp-sum shade
+				double eUnion = shadeUnion - truth, eClamp = shadeClamp - truth;
+				sumUnion += std::fabs( eUnion ); sumClamp += std::fabs( eClamp );
+				if( truth < 0.5f ) { sumInner += std::fabs( eSigned ); biasInner += eSigned; innerN++; sumUnionInner += std::fabs( eUnion ); biasUnionInner += eUnion; sumClampInner += std::fabs( eClamp ); biasClampInner += eClamp; }
+				else               { sumOuter += std::fabs( eSigned ); biasOuter += eSigned; outerN++; }
 				sumLight += std::fabs( shadeLight - truth );
 				sumRecv  += std::fabs( shadeRecv  - truth );
 				if( shadeLight < truth - 0.25f ) { lightIllusory++; }		// darker than truth: illusory umbra
@@ -3014,6 +3061,13 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 		double mOI = pN ? sumRecvOI / pN : 0;
 		std::printf( "    [contour %s] penumbra=%d px  LIGHT-apex=%.4f(oh%d)  RECV-apex=%.4f(oh%d)  RECV+GUARD(chained ref)=%.4f(oh%d)  SHADER ProcCaster(O(n^2))=%.4f(oh%d)\n",
 				nm, pN, mL, lightIllusory, mR, recvIllusory, mRPC, recvPCillusory, mOI, recvOIill );
+		std::printf( "    [residual %s] vs CONVERGED oracle: bias=%+.4f  INNER(truth<.5) n=%d mean=%.4f bias=%+.4f  OUTER n=%d mean=%.4f bias=%+.4f\n",
+				nm, pN ? biasOI / pN : 0.0, innerN, innerN ? sumInner / innerN : 0.0, innerN ? biasInner / innerN : 0.0,
+				outerN, outerN ? sumOuter / outerN : 0.0, outerN ? biasOuter / outerN : 0.0 );
+		std::printf( "    [combine %s] MAX ov=%.4f inBias=%+.4f | UNION ov=%.4f inBias=%+.4f | CLAMPSUM ov=%.4f inBias=%+.4f\n",
+				nm, pN ? sumRecvOI / pN : 0.0, innerN ? biasInner / innerN : 0.0,
+				pN ? sumUnion / pN : 0.0, innerN ? biasUnionInner / innerN : 0.0,
+				pN ? sumClamp / pN : 0.0, innerN ? biasClampInner / innerN : 0.0 );
 		CHECK( pN > 50 );
 		// (1) the light-apex residual is UNDER-shadow, not over-enclosure: almost no light-apex pixel is dark
 		CHECK( lightIllusory * 20 <= pN );
