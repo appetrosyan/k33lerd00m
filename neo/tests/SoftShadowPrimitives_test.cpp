@@ -2899,48 +2899,39 @@ static float RecvApexOcc_LocalConnector( float3 P, float3 L, float r, const std:
 	return saturate( ( float )( std::fabs( area ) / ( PI * r2 ) ) );
 }
 
-// ACCURATE multi-caster union coverage. Each caster's receiver-apex silhouette is projected+clipped to the
-// disk plane (the slab clip bounds depth - a caster beyond the light does not occlude) as closed 2D loops;
-// a disk point is occluded by that caster iff its winding about the point is non-zero. The UNION over casters
-// (occluded if inside ANY caster) is the true occluded area - it accounts for WHERE casters overlap vs tile,
-// which a scalar MAX/sum of per-caster areas cannot. Correctness first; the shader form optimises THIS.
-static std::vector<std::vector<float2>> CasterProjLoops( float3 P, float3 Lo, const std::vector<TriEdgeAdj>& adj )
+// ACCURATE multi-caster union coverage. A disk point is occluded by a caster iff the segment P->point passes
+// through it. For a caster wholly inside the depth slab this is EXACT from the receiver-apex silhouette alone:
+// the ray hits the caster iff its DIRECTION lies inside the silhouette cone (spherical winding != 0), with no
+// projection, no clip, no connector. A caster that straddles a clip plane is depth-ambiguous, so it takes an
+// exact ray-segment test (a small minority). The UNION over casters (occluded if ANY) is the true occluded
+// area - it accounts for WHERE casters overlap vs tile, which a scalar MAX/sum of per-caster areas cannot.
+static std::vector<std::pair<float3, float3>> CasterSilDirs( float3 P, const std::vector<TriEdgeAdj>& adj )
 {
-	std::vector<float4> rec; AppendReceiverSilhouetteRecords( adj, P, rec );
-	softFrame_t f = SoftShadow_Frame( P, Lo );
-	std::vector<std::vector<float2>> loops;
-	std::vector<float2> cur; float3 prevEnd( 0, 0, 0 ); bool have = false;
-	for( size_t i = 0; i + 1 < rec.size(); )
+	std::vector<std::pair<float3, float3>> es;
+	for( const TriEdgeAdj& e : adj )
 	{
-		if( rec[i].w < 0.0f ) { if( cur.size() >= 3 ) { loops.push_back( cur ); } cur.clear(); have = false; i += 2; continue; }	// header
-		float3 A( rec[i].x, rec[i].y, rec[i].z ), B( rec[i + 1].x, rec[i + 1].y, rec[i + 1].z ); i += 2;
-		if( have && length( A - prevEnd ) > 1e-4f ) { if( cur.size() >= 3 ) { loops.push_back( cur ); } cur.clear(); }	// chain boundary
-		float3 a = A - P, b = B - P; float dnA = dot( a, f.nrm ), dnB = dot( b, f.nrm ), d = dnB - dnA;
-		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, f.distPL );
-		if( !cl.empty )
-		{
-			cur.push_back( SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, f ) );
-			cur.push_back( SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, f ) );
-		}
-		prevEnd = B; have = true;
+		float3 sA, sB; bool keep = false;
+		if( e.count < 2 ) { bool fa = dot( e.nA, P - e.A ) > 0.0f; if( fa ) { sA = e.A; sB = e.B; } else { sA = e.B; sB = e.A; } keep = true; }
+		else { bool fa = dot( e.nA, P - e.A ) > 0.0f, fb = dot( e.nB, P - e.A ) > 0.0f; if( fa != fb ) { if( !fb ) { sA = e.A; sB = e.B; } else { sA = e.B; sB = e.A; } keep = true; } }
+		if( !keep ) { continue; }
+		es.push_back( std::make_pair( normalize( sA - P ), normalize( sB - P ) ) );
 	}
-	if( cur.size() >= 3 ) { loops.push_back( cur ); }
-	return loops;
+	return es;
 }
-// winding of point q about a caster's closed 2D loops; !=0 (|sum|>pi) means inside.
-static bool PointInLoops( const std::vector<std::vector<float2>>& loops, float2 q )
+// spherical winding of direction d about a caster's silhouette loop(s): tangent-plane project each silhouette
+// vertex direction at d and sum subtended angles. !=0 means d is inside the cone (the ray hits the caster).
+static bool SphOccludes( const std::vector<std::pair<float3, float3>>& es, float3 d )
 {
-	for( const std::vector<float2>& L : loops )
+	float3 up = ( std::fabs( d.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+	float3 e1 = normalize( cross( up, d ) ), e2 = cross( d, e1 );
+	double ang = 0.0;
+	for( const std::pair<float3, float3>& e : es )
 	{
-		double ang = 0.0;
-		for( size_t k = 0; k < L.size(); k++ )
-		{
-			float2 a = L[k] - q, b = L[( k + 1 ) % L.size()] - q;
-			ang += std::atan2( ( double )( a.x * b.y - a.y * b.x ), ( double )( a.x * b.x + a.y * b.y ) );
-		}
-		if( std::fabs( ang ) > PI ) { return true; }
+		float3 pa = e.first - dot( e.first, d ) * d, pb = e.second - dot( e.second, d ) * d;
+		float ax = dot( pa, e1 ), ay = dot( pa, e2 ), bx = dot( pb, e1 ), by = dot( pb, e2 );
+		ang += std::atan2( ( double )( ax * by - ay * bx ), ( double )( ax * bx + ay * by ) );
 	}
-	return false;
+	return std::fabs( ang ) > PI;
 }
 
 TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
@@ -3003,6 +2994,7 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 		SoftEdgeBuffer lightBuf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
 		int pN = 0, dissected = 0; double sumLight = 0, sumRecv = 0, sumNoGuard = 0, sumRecvPC = 0, sumRecvOI = 0; int lightIllusory = 0, recvIllusory = 0, recvPCillusory = 0, recvOIill = 0;
 		double biasOI = 0, sumInner = 0, biasInner = 0, sumOuter = 0, biasOuter = 0; int innerN = 0, outerN = 0;		// residual structure vs converged oracle
+		long nSilMode = 0, nRayMode = 0;		// how many caster-evaluations used the analytic silhouette cone vs the exact ray fallback
 		double sumUnion = 0, sumUnionInner = 0, biasUnionInner = 0;		// probabilistic-union combine (vs MAX) - does it fix the inner under-shadow?
 		double sumClamp = 0, sumClampInner = 0, biasClampInner = 0;		// clamp-sum combine min(1,sum) - the standard AAM combine
 		double sumUn = 0, sumUnInner = 0, biasUnInner = 0;				// ACCURATE union of projected regions (the fix)
@@ -3078,27 +3070,42 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 								ci, o1, oProc, nSil, ( int )( r1.size() / 2 ), ( int )rayBlocks );
 					}
 				}
-				// ACCURATE UNION: build each caster's projected silhouette loops once, integrate union occupancy
-				// over the disk with the SAME Hammersley set as the oracle. GUARD: a caster whose loop winds the
-				// disk CENTRE but which does NOT block the centre ray is F2-illusory (its winding marks the whole
-				// disk falsely) - exclude it, as ProcCaster's winding subtraction does. Point occluded iff inside
-				// ANY non-illusory caster. This is the true occluded-area combine the scalar forms approximate.
-				std::vector<std::vector<std::vector<float2>>> allLoops; std::vector<char> illusory;
+				// ACCURATE UNION. Classify each caster by its bounding-box depth range along nrm: wholly behind the
+				// receiver or wholly beyond the light -> cull; wholly inside the slab -> exact silhouette-cone
+				// (spherical winding); straddling a clip plane -> exact ray-segment. Then a disk point is occluded
+				// iff ANY caster occludes it. Integrated over the disk with the SAME Hammersley set as the oracle.
+				softFrame_t fu = SoftShadow_Frame( P, lc.Lo );
+				std::vector<std::vector<std::pair<float3, float3>>> allDirs; std::vector<char> mode( lc.adj.size(), 0 );	// 0 cull, 1 sil-cone, 2 ray
 				for( size_t ci = 0; ci < lc.adj.size() && ci < lc.casters.size(); ci++ )
 				{
-					std::vector<std::vector<float2>> lp = CasterProjLoops( P, lc.Lo, lc.adj[ci] );
-					std::vector<CasterRange> one( 1, lc.casters[ci] );
-					bool rb = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), one );
-					illusory.push_back( ( PointInLoops( lp, float2( 0.0f, 0.0f ) ) && !rb ) ? 1 : 0 );
-					allLoops.push_back( std::move( lp ) );
+					const CasterRange& cr = lc.casters[ci];
+					float dnMin = 1e30f, dnMax = -1e30f;
+					for( int cxi = 0; cxi < 8; cxi++ )
+					{
+						float3 corner( ( cxi & 1 ) ? cr.hi.x : cr.lo.x, ( cxi & 2 ) ? cr.hi.y : cr.lo.y, ( cxi & 4 ) ? cr.hi.z : cr.lo.z );
+						float dncr = dot( corner - P, fu.nrm ); dnMin = std::fmin( dnMin, dncr ); dnMax = std::fmax( dnMax, dncr );
+					}
+					std::vector<std::pair<float3, float3>> es;
+					if( dnMax < SW_NEAR_EPS || dnMin > fu.distPL ) { mode[ci] = 0; }			// culled
+					else if( dnMin >= SW_NEAR_EPS && dnMax <= fu.distPL ) { mode[ci] = 1; es = CasterSilDirs( P, lc.adj[ci] ); }	// in-slab: exact cone
+					else { mode[ci] = 2; }														// straddles a plane: exact ray
+					if( mode[ci] == 1 ) { nSilMode++; } else if( mode[ci] == 2 ) { nRayMode++; }
+					allDirs.push_back( std::move( es ) );
 				}
 				int inside = 0; const int MU = 256;
 				for( int s = 0; s < MU; s++ )
 				{
 					float u1 = ( s + 0.5f ) / MU, u2 = SoftRadicalInverse2( ( uint32_t )s );
 					float rr = std::sqrt( u1 ) * lc.rp, th = 2.0f * ( float )PI * u2;
-					float2 q( rr * std::cos( th ), rr * std::sin( th ) );
-					for( size_t ci = 0; ci < allLoops.size(); ci++ ) { if( !illusory[ci] && PointInLoops( allLoops[ci], q ) ) { inside++; break; } }
+					float3 q3 = lc.Lo + fu.u * ( rr * std::cos( th ) ) + fu.v * ( rr * std::sin( th ) );
+					float3 d = normalize( q3 - P );
+					bool occ = false;
+					for( size_t ci = 0; ci < allDirs.size() && !occ; ci++ )
+					{
+						if( mode[ci] == 1 ) { occ = SphOccludes( allDirs[ci], d ); }
+						else if( mode[ci] == 2 ) { occ = RayHitsMesh( P, q3 - P, c.meshVerts.data(), &c.meshIdx[lc.casters[ci].first], lc.casters[ci].num ); }
+					}
+					if( occ ) { inside++; }
 				}
 				float occUnion = ( float )inside / MU;
 				double eUn = ( 1.0f - occUnion ) - truth;
@@ -3139,9 +3146,9 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 				nm, pN ? sumRecvOI / pN : 0.0, innerN ? biasInner / innerN : 0.0,
 				pN ? sumUnion / pN : 0.0, innerN ? biasUnionInner / innerN : 0.0,
 				pN ? sumClamp / pN : 0.0, innerN ? biasClampInner / innerN : 0.0 );
-		std::printf( "    [UNION-accurate %s] projected-region union vs converged oracle: overall=%.4f  INNER mean=%.4f bias=%+.4f  (MAX overall %.4f inner bias %+.4f)\n",
+		std::printf( "    [UNION-accurate %s] hybrid union vs converged oracle: overall=%.4f  INNER mean=%.4f bias=%+.4f  (MAX overall %.4f inner bias %+.4f)  [analytic-cone %ld / ray-straddler %ld]\n",
 				nm, pN ? sumUn / pN : 0.0, innerN ? sumUnInner / innerN : 0.0, innerN ? biasUnInner / innerN : 0.0,
-				pN ? sumRecvOI / pN : 0.0, innerN ? biasInner / innerN : 0.0 );
+				pN ? sumRecvOI / pN : 0.0, innerN ? biasInner / innerN : 0.0, nSilMode, nRayMode );
 		CHECK( pN > 50 );
 		// (1) the light-apex residual is UNDER-shadow, not over-enclosure: almost no light-apex pixel is dark
 		CHECK( lightIllusory * 20 <= pN );
