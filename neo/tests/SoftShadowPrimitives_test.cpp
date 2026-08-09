@@ -3004,6 +3004,7 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 		double sumUnion = 0, sumUnionInner = 0, biasUnionInner = 0;		// probabilistic-union combine (vs MAX) - does it fix the inner under-shadow?
 		double sumClamp = 0, sumClampInner = 0, biasClampInner = 0;		// clamp-sum combine min(1,sum) - the standard AAM combine
 		double sumUn = 0, sumUnInner = 0, biasUnInner = 0;				// ACCURATE union of projected regions (the fix)
+		double tMaxU = 0; int tHardU = 0, tPenumU = 0;					// temporal stability of the analytic union under 1-unit P/L jitter
 		for( int y = 0; y < H; y += STRIDE )
 			for( int x = 0; x < W; x += STRIDE )
 			{
@@ -3076,51 +3077,68 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 								ci, o1, oProc, nSil, ( int )( r1.size() / 2 ), ( int )rayBlocks );
 					}
 				}
-				// FULLY-ANALYTIC ACCURATE UNION (no ray). Each caster's clipped-occluder boundary is built once as
-				// DIRECTIONS from P (clipped silhouette + cross-section caps); a disk direction is occluded by that
-				// caster iff its spherical winding about it is non-zero; occluded iff ANY caster occludes. Wholly
-				// behind-receiver / beyond-light casters are culled. Integrated with the oracle's Hammersley set.
-				softFrame_t fu = SoftShadow_Frame( P, lc.Lo );
-				std::vector<std::vector<std::vector<float3>>> allLoops; std::vector<char> rbC; std::vector<int> wcC;
-				for( size_t ci = 0; ci < lc.adj.size() && ci < lc.casters.size(); ci++ )
+				// FULLY-ANALYTIC ACCURATE UNION (no ray). Each caster's clipped-occluder boundary is built as
+				// DIRECTIONS from P; a disk direction is occluded by that caster iff its spherical winding is
+				// non-zero; occluded iff ANY caster occludes. Wrapped in a lambda so it can be re-evaluated at a
+				// perturbed (P,L) to measure temporal stability - a discrete guard flip here = penumbra hardening.
+				const int MU = 256;
+				auto unionAt = [&]( float3 Pp, float3 Lop ) -> float
 				{
-					const CasterRange& cr = lc.casters[ci];
-					float dnMin = 1e30f, dnMax = -1e30f;
-					for( int cxi = 0; cxi < 8; cxi++ )
+					softFrame_t fu = SoftShadow_Frame( Pp, Lop );
+					std::vector<std::vector<std::vector<float3>>> allLoops; std::vector<char> rbC; std::vector<int> wcC;
+					for( size_t ci = 0; ci < lc.adj.size() && ci < lc.casters.size(); ci++ )
 					{
-						float3 corner( ( cxi & 1 ) ? cr.hi.x : cr.lo.x, ( cxi & 2 ) ? cr.hi.y : cr.lo.y, ( cxi & 4 ) ? cr.hi.z : cr.lo.z );
-						float dncr = dot( corner - P, fu.nrm ); dnMin = std::fmin( dnMin, dncr ); dnMax = std::fmax( dnMax, dncr );
+						const CasterRange& cr = lc.casters[ci];
+						float dnMin = 1e30f, dnMax = -1e30f;
+						for( int cxi = 0; cxi < 8; cxi++ )
+						{
+							float3 corner( ( cxi & 1 ) ? cr.hi.x : cr.lo.x, ( cxi & 2 ) ? cr.hi.y : cr.lo.y, ( cxi & 4 ) ? cr.hi.z : cr.lo.z );
+							float dncr = dot( corner - Pp, fu.nrm ); dnMin = std::fmin( dnMin, dncr ); dnMax = std::fmax( dnMax, dncr );
+						}
+						std::vector<std::vector<float3>> lp; int wc = 0; char rb = 0;
+						if( dnMax >= SW_NEAR_EPS && dnMin <= fu.distPL )
+						{
+							lp = CasterDirLoops( Pp, Lop, lc.adj[ci] );
+							std::vector<CasterRange> one( 1, cr );
+							rb = RayHitsCasters( Pp, Lop - Pp, c.meshVerts.data(), c.meshIdx.data(), one ) ? 1 : 0;
+							wc = DirWinding( lp, fu.nrm );
+						}
+						allLoops.push_back( std::move( lp ) ); rbC.push_back( rb ); wcC.push_back( wc );
 					}
-					std::vector<std::vector<float3>> lp; int wc = 0; char rb = 0;
-					if( dnMax >= SW_NEAR_EPS && dnMin <= fu.distPL )		// not wholly behind receiver / beyond light
+					int inside = 0;
+					for( int s = 0; s < MU; s++ )
 					{
-						lp = CasterDirLoops( P, lc.Lo, lc.adj[ci] );
-						std::vector<CasterRange> one( 1, cr );
-						rb = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), one ) ? 1 : 0;	// ONE centre ray = point-light shadow
-						wc = DirWinding( lp, fu.nrm );
-						if( dnMin >= SW_NEAR_EPS && dnMax <= fu.distPL ) { nSilMode++; } else { nRayMode++; }
+						float u1 = ( s + 0.5f ) / MU, u2 = SoftRadicalInverse2( ( uint32_t )s );
+						float rr = std::sqrt( u1 ) * lc.rp, th = 2.0f * ( float )PI * u2;
+						float3 q3 = Lop + fu.u * ( rr * std::cos( th ) ) + fu.v * ( rr * std::sin( th ) );
+						float3 d = normalize( q3 - Pp );
+						bool occ = false;
+						for( size_t ci = 0; ci < allLoops.size() && !occ; ci++ )
+						{
+							if( allLoops[ci].empty() || ( !rbC[ci] && wcC[ci] != 0 ) ) { continue; }		// skip F2-illusory caster (chord-loop winds centre, centre not blocked)
+							occ = ( DirWinding( allLoops[ci], d ) != 0 );
+						}
+						if( occ ) { inside++; }
 					}
-					allLoops.push_back( std::move( lp ) ); rbC.push_back( rb ); wcC.push_back( wc );
-				}
-				int inside = 0; const int MU = 256;
-				for( int s = 0; s < MU; s++ )
-				{
-					float u1 = ( s + 0.5f ) / MU, u2 = SoftRadicalInverse2( ( uint32_t )s );
-					float rr = std::sqrt( u1 ) * lc.rp, th = 2.0f * ( float )PI * u2;
-					float3 q3 = lc.Lo + fu.u * ( rr * std::cos( th ) ) + fu.v * ( rr * std::sin( th ) );
-					float3 d = normalize( q3 - P );
-					bool occ = false;
-					for( size_t ci = 0; ci < allLoops.size() && !occ; ci++ )
-					{
-						if( allLoops[ci].empty() || ( !rbC[ci] && wcC[ci] != 0 ) ) { continue; }		// skip F2-illusory caster (chord-loop winds centre, centre not blocked)
-						occ = ( DirWinding( allLoops[ci], d ) != 0 );
-					}
-					if( occ ) { inside++; }
-				}
-				float occUnion = ( float )inside / MU;
+					return ( float )inside / MU;
+				};
+				float occUnion = unionAt( P, lc.Lo );
 				double eUn = ( 1.0f - occUnion ) - truth;
 				sumUn += std::fabs( eUn );
 				if( truth < 0.5f ) { sumUnInner += std::fabs( eUn ); biasUnInner += eUn; }
+				// [temporal] perturbation stability of the analytic union - only in the soft penumbra.
+				if( truth > 0.02f && truth < 0.98f )
+				{
+					const float pE = 1.0f;
+					const float3 dP[5] = { {pE,0,0}, {-pE,0,0}, {0,pE,0}, {0,0,pE}, {0,0,0} };
+					float jmax = 0;
+					for( int k = 0; k < 5; k++ )
+					{
+						float sp = ( k < 4 ) ? unionAt( P + dP[k], lc.Lo ) : unionAt( P, lc.Lo + float3( pE, 0, 0 ) );
+						jmax = std::fmax( jmax, std::fabs( sp - occUnion ) );
+					}
+					tPenumU++; tMaxU = std::fmax( tMaxU, ( double )jmax ); if( jmax > 0.25f ) { tHardU++; }
+				}
 				float shadeLight = 1.0f - occLight, shadeRecv = 1.0f - occRecv, shadeRecvPC = 1.0f - occRecvPC, shadeRecvOI = 1.0f - occRecvOI;
 				sumRecvPC += std::fabs( shadeRecvPC - truth );
 				if( shadeRecvPC < truth - 0.25f ) { recvPCillusory++; }
@@ -3159,6 +3177,8 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 		std::printf( "    [UNION-analytic %s] direction-space clip+chord+guard (NO ray, NO chaining) vs converged oracle: overall=%.4f  INNER mean=%.4f bias=%+.4f  (MAX inner bias %+.4f)  [in-slab %ld / straddler %ld]\n",
 				nm, pN ? sumUn / pN : 0.0, innerN ? sumUnInner / innerN : 0.0, innerN ? biasUnInner / innerN : 0.0,
 				innerN ? biasInner / innerN : 0.0, nSilMode, nRayMode );
+		std::printf( "    [temporal-analytic %s] union under 1u P/L jitter: maxJump=%.3f  HARD(>0.25)=%d/%d (%.1f%%)\n",
+				nm, tMaxU, tHardU, tPenumU, tPenumU ? 100.0 * tHardU / tPenumU : 0.0 );
 		CHECK( pN > 50 );
 		// (1) the light-apex residual is UNDER-shadow, not over-enclosure: almost no light-apex pixel is dark
 		CHECK( lightIllusory * 20 <= pN );
