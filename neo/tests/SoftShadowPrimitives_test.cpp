@@ -1123,6 +1123,63 @@ TEST( SoftFinding, F6_caster_piercing_light_plane )
 	CHECK_NEAR( live, truth, 0.05f );
 }
 
+TEST( SoftFinding, F6b_receiver_apex_recovers_the_cross_section )
+{
+	// Does the RECEIVER-apex silhouette (of the box, from P) recover the light-plane cross-section the
+	// light-apex silhouette drops? The light-apex silhouette of this box is just its left face (crosses the
+	// light plane only at x=0.70, a thin sliver); the receiver-apex silhouette also carries the bottom edge
+	// spanning the full width, which projects to the whole footprint. Same live coverage function on both.
+	const float3 L( 0, 0, 10 );
+	const float3 P( 0, 0, 0 );
+	const float  r = 2.0f;
+	Box b = MakeBox( float3( 1.5f, 0, 10 ), float3( 0.8f, 0.8f, 2.0f ) );
+	float truth = TruthShadow( P, L, r, b, 300 );
+	float shadeLight = LiveShadow( BuildCaster( { Silhouette( b, L ) } ), P, L, r );
+	// box -> triangle soup (8 corners, 6 quad faces -> 12 tris) for receiver-apex adjacency
+	std::vector<float> verts( 24 );
+	for( int i = 0; i < 8; i++ ) { verts[i * 3 + 0] = b.c[i].x; verts[i * 3 + 1] = b.c[i].y; verts[i * 3 + 2] = b.c[i].z; }
+	std::vector<uint32_t> idx;
+	for( int fi = 0; fi < 6; fi++ )
+	{
+		idx.push_back( b.f[fi][0] ); idx.push_back( b.f[fi][1] ); idx.push_back( b.f[fi][2] );
+		idx.push_back( b.f[fi][0] ); idx.push_back( b.f[fi][2] ); idx.push_back( b.f[fi][3] );
+	}
+	std::vector<TriEdgeAdj> adj;
+	BuildTriEdgeAdj( verts.data(), idx.data(), ( uint32_t )idx.size(), adj );
+	std::vector<float4> rec;
+	AppendReceiverSilhouetteRecords( adj, P, rec );
+	float occR = rec.empty() ? 0.0f : saturate( SoftShadow_WedgeOcclusion( P, L, r, 0, ( int )( rec.size() / 2 ), 0.0f, SoftEdgeBuffer{ rec.data(), ( int )rec.size() } ) );
+	float shadeRecv = 1.0f - occR;
+	// ORDER-INDEPENDENT variant for the SHADER port: select receiver-apex edges per-fragment and sum their
+	// clipped circle-triangle areas with NO connector and NO chain closure. If this matches the chained value
+	// the shader needs no per-fragment chaining (Sum CircleTriArea over a consistently-oriented closed edge
+	// set is traversal-order-independent; only the far-clip connector wanted order).
+	softFrame_t fr = SoftShadow_Frame( P, L );
+	float rr = std::fmax( r, 1e-2f ), r2 = rr * rr;
+	double areaOI = 0;
+	for( const TriEdgeAdj& e : adj )
+	{
+		bool faP = dot( e.nA, P - e.A ) > 0.0f, fbP = dot( e.nB, P - e.A ) > 0.0f;
+		bool isSil = ( e.count < 2 ) || ( faP != fbP );
+		if( !isSil ) { continue; }
+		float3 A, B;
+		if( e.count < 2 ) { if( faP ) { A = e.A; B = e.B; } else { A = e.B; B = e.A; } }
+		else { if( !fbP ) { A = e.A; B = e.B; } else { A = e.B; B = e.A; } }
+		float3 a = A - P, b = B - P;
+		float dnA = dot( a, fr.nrm ), dnB = dot( b, fr.nrm ), d = dnB - dnA;
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, fr.distPL );
+		if( cl.empty ) { continue; }
+		float2 q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, fr );
+		float2 q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, fr );
+		areaOI += SoftDisk_CircleTriArea( q0, q1, r2 );		// NO connector, NO closure
+	}
+	float shadeOI = 1.0f - saturate( ( float )( std::fabs( areaOI ) / ( PI * r2 ) ) );
+	std::printf( "    [F6b] truth=%.4f  light-apex=%.4f (err %.3f)  receiver-apex(chained)=%.4f (err %.3f)  receiver-apex(ORDER-INDEP)=%.4f (err %.3f)\n",
+			truth, shadeLight, std::fabs( shadeLight - truth ), shadeRecv, std::fabs( shadeRecv - truth ), shadeOI, std::fabs( shadeOI - truth ) );
+	CHECK_NEAR( shadeRecv, truth, 0.05f );		// receiver-apex silhouette must recover the cross-section
+	CHECK_NEAR( shadeOI, truth, 0.05f );		// and it must do so WITHOUT chaining (order-independent) for the shader
+}
+
 TEST( SoftFinding, F7_near_plane_projection_stays_finite )
 {
 	// vertex just in front of the near plane at Doom scales: projection scale distPL/dn ~ 2e7 -> projected
@@ -2548,20 +2605,217 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 	CHECK( capsSeen >= 7 );
 }
 
+// ====================================================================== 5d-quater. EMERGENT-UMBRA HALO
+// The in-game defect the emergent-umbra GPU path (r_softShadowEmergentUmbra 1) surfaced: penumbra clipping
+// and haloes. Renders the exact captured frames (softcap0012/0013) through the SAME composition the GPU
+// runs - LIT / RING(guard on) / CORE(guard off) selected by centre-visibility - and the OLD solid-stamp
+// composition (core = black), and writes both terms plus a leak map. The hypothesis: the core coverage
+// UNDER-shadows (the proven cross-section root), so where the old path stamped solid umbra the emergent
+// path now leaks to lit - a bright core inside the dark penumbra ring = the halo. Truth-free (the leak is
+// emergent-vs-stamp), so it is fast; the images are the verdict. Not gated (diagnostic), but it asserts
+// the leak is confined to the CORE (centre-blocked) region - if it bled into the ring, the mechanism differs.
+TEST( SoftShadowHalo, emergent_umbra_leak_is_confined_to_the_core )
+{
+	const char* names[] = { "softcap0012", "softcap0013" };
+	const int W = 480;
+	int capsSeen = 0;
+	for( const char* nm : names )
+	{
+		char path[512];
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
+		SoftCap c;
+		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		capsSeen++;
+		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
+		SwGBuffer g( W, H );
+		for( const softcapReceiver_t& R : c.receivers )
+			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
+			{
+				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
+				float3 A( c.recvVerts[ia * 3 + 0], c.recvVerts[ia * 3 + 1], c.recvVerts[ia * 3 + 2] );
+				float3 B( c.recvVerts[ib * 3 + 0], c.recvVerts[ib * 3 + 1], c.recvVerts[ib * 3 + 2] );
+				float3 C( c.recvVerts[ic * 3 + 0], c.recvVerts[ic * 3 + 1], c.recvVerts[ic * 3 + 2] );
+				float2 z( 0, 0 );
+				SwRasterTri( g, c.hdr.worldMVP, A, B, C, ( int )R.lightIndex, z, z, z, -1 );
+			}
+		struct RefLight { bool soft = false; float3 Lo; float rp = 0, bandRp = 0; int firstElem = 0, nRec = 0;
+			std::vector<CasterRange> casters; std::vector<std::pair<float3, std::vector<std::pair<float3, float3>>>> shells; };
+		std::vector<RefLight> lights( c.hdr.numLights );
+		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
+		{
+			const softcapLight_t& Lt = c.lights[li];
+			RefLight& lc = lights[li];
+			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
+			lc.soft = true; lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
+			lc.rp = Lt.penumbraSize; lc.bandRp = Lt.penumbraSize * 1.1f;
+			lc.firstElem = ( int )( Lt.firstEdge * 2 ); lc.nRec = ( int )Lt.edgeCount;
+			for( const softcapCaster_t& cs : c.casters )
+			{
+				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
+				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
+				cr.lo = float3( 1e30f, 1e30f, 1e30f ); cr.hi = float3( -1e30f, -1e30f, -1e30f );
+				for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < c.meshIdx.size(); k++ )
+				{
+					const float* vp = &c.meshVerts[c.meshIdx[k] * 3];
+					cr.lo = float3( std::fmin( cr.lo.x, vp[0] ), std::fmin( cr.lo.y, vp[1] ), std::fmin( cr.lo.z, vp[2] ) );
+					cr.hi = float3( std::fmax( cr.hi.x, vp[0] ), std::fmax( cr.hi.y, vp[1] ), std::fmax( cr.hi.z, vp[2] ) );
+				}
+				lc.casters.push_back( cr );
+			}
+			for( uint32_t r = Lt.firstEdge; r < Lt.firstEdge + Lt.edgeCount && r < c.edges.size(); r++ )
+			{
+				const softcapEdge_t& e = c.edges[r];
+				if( e.e0[3] < 0.0f ) { lc.shells.push_back( { float3( e.e0[0], e.e0[1], e.e0[2] ), {} } ); }
+				else if( !lc.shells.empty() ) { lc.shells.back().second.push_back( { float3( e.e0[0], e.e0[1], e.e0[2] ), float3( e.e1[0], e.e1[1], e.e1[2] ) } ); }
+			}
+		}
+		SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
+		float3 cam0( c.hdr.vieworg[0], c.hdr.vieworg[1], c.hdr.vieworg[2] );
+		std::vector<unsigned char> imgE( ( size_t )W * H * 3, 0 ), imgS( ( size_t )W * H * 3, 0 ), imgD( ( size_t )W * H * 3, 0 );
+		int coreLeak = 0, ringLeak = 0, coreN = 0;
+		for( int i = 0; i < W * H; i++ )
+		{
+			int li = g.light[i];
+			if( li < 0 || li >= ( int )lights.size() || !lights[li].soft ) { continue; }
+			RefLight& lc = lights[li];
+			float3 P = g.wpos[i]; float3 toL = lc.Lo - P; float dl = std::sqrt( dot( toL, toL ) );
+			if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }
+			bool centreBlocked = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), lc.casters );
+			int par = 0;
+			for( auto& sh : lc.shells ) { par += std::abs( ShellZFailCapped( sh.second, sh.first, lc.bandRp, lc.Lo, cam0, P ) ); }
+			// EMERGENT (GPU r_softShadowEmergentUmbra 1): LIT / RING(guard 1) / CORE(guard 0) by centre visibility
+			float shadeE, shadeS;
+			if( centreBlocked )
+			{
+				shadeE = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, 0.0f, buf ) );	// CORE pass
+				shadeS = 0.0f;																								// old: solid stamp
+				coreN++;
+				if( shadeE > 0.3f ) { coreLeak++; }
+			}
+			else if( ( par & 1 ) != 0 )
+			{
+				shadeE = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, 1.0f, buf ) );	// RING pass
+				shadeS = shadeE;
+			}
+			else { shadeE = 1.0f; shadeS = 1.0f; }
+			unsigned char ve = ( unsigned char )( saturate( shadeE ) * 255.0f ), vs = ( unsigned char )( saturate( shadeS ) * 255.0f );
+			imgE[i * 3 + 0] = imgE[i * 3 + 1] = imgE[i * 3 + 2] = ve;
+			imgS[i * 3 + 0] = imgS[i * 3 + 1] = imgS[i * 3 + 2] = vs;
+			// leak map: green = agree, RED = emergent lighter than stamp (leak); blue tints the core boundary
+			float leak = shadeE - shadeS;
+			if( leak > 0.1f ) { imgD[i * 3 + 0] = ( unsigned char )( saturate( leak ) * 255.0f ); if( !centreBlocked ) { ringLeak++; imgD[i * 3 + 2] = 255; } }
+			else { imgD[i * 3 + 1] = vs; }
+		}
+		for( int k = 0; k < 3; k++ )
+		{
+			const char* tag = k == 0 ? "emergent" : k == 1 ? "stamp" : "leak";
+			std::vector<unsigned char>& im = k == 0 ? imgE : k == 1 ? imgS : imgD;
+			char out[600]; std::snprintf( out, sizeof( out ), "/home/app/Games/gog/doom-3-bfg-edition/base/softcap/halo_%s_%s.ppm", nm, tag );
+			FILE* f = std::fopen( out, "wb" );
+			if( f ) { std::fprintf( f, "P6\n%d %d\n255\n", W, H ); std::fwrite( im.data(), 1, im.size(), f ); std::fclose( f ); }
+		}
+		std::printf( "    [halo %s] core px=%d  core-leak(emergent lit where stamp black)=%d (%.1f%%)  ring-leak=%d -> halo_%s_{emergent,stamp,leak}.ppm\n",
+				nm, coreN, coreLeak, coreN ? 100.0 * coreLeak / coreN : 0.0, ringLeak, nm );
+		CHECK( ringLeak * 100 <= coreN + 1 );		// the leak must be a CORE phenomenon, not a ring/partition bug
+	}
+	// captures are local (not committed - 17MB each); assert the mechanism only when they are present
+	std::printf( "    [halo] %d/2 emergent-umbra captures analysed\n", capsSeen );
+}
+
 // ====================================================================== 5d-bis. THE SILHOUETTE CONTOUR
-// MECHANISM ISOLATION for the residual penumbra error, and it FALSIFIES two tempting fixes. The DIAGNOSIS
-// hypothesised the light-apex silhouette (stencil edges) over-encloses where the receiver-apex silhouette
-// would not, so feeding the receiver-apex contour would fix the penumbra. Measured directly - same live
-// game function (SoftShadow_WedgeOcclusion), receiver-apex contour rebuilt per fragment from the caster
-// soup - it is the OPPOSITE: on both penumbra-rich captures the receiver-apex contour reads FURTHER from
-// truth (0.49/0.43 vs light-apex 0.26/0.33), because the residual is systematic UNDER-shadow (occ too LOW,
-// pipeline too light: over-hard/darker count ~0), and the receiver contour encloses even less. Forcing the
-// winding-subtraction / debris-drop guards off changes the error by <0.002 - the guards are inert here too.
-// So the penumbra residual is NOT the fed contour and NOT the guards; the area math is exact (the synthetic
-// SoftShadowSoftness width ratio is 1.00). It is in the FED DATA / multi-caster combine / thick-caster
-// cross-section: the captured silhouette outline occludes less of the disk than the solid mesh truth does.
-// This test LOCKS that conclusion so the receiver-apex path is not re-attempted. Pixels strided (truth cost).
-TEST( SoftShadowContour, penumbra_residual_is_undershadow_not_the_fed_contour )
+// THE FIX, PROVEN. The penumbra under-shadow is the fed CONTOUR: the engine feeds the caster's LIGHT-apex
+// silhouette (the stencil-volume edges), but disk coverage from a receiver P is bounded by the caster's
+// silhouette FROM P (receiver-apex). Where a caster crosses the light plane the light-apex silhouette drops
+// the far cross-section (F6/F6b); the receiver-apex silhouette carries it in an in-front edge. Measured with
+// the SAME live game function (SoftShadow_WedgeOcclusion), receiver-apex contour rebuilt per fragment from
+// the caster soup: mean|err| 0.10/0.11 vs light-apex 0.26/0.33 - a 60-66% cut, and F6b synthetic 0.001. The
+// guards are inert (<0.002), so the residual is the contour, not the area math. NOTE the earlier reading
+// that receiver-apex was WORSE was a bug - it skipped OPEN-surface boundary edges (world walls/floors are
+// single quads), so their silhouette came back empty; including boundary edges is what unlocked this. The
+// shippable form is a per-fragment silhouette-from-P edge test (each edge's two adjacent face normals, fed
+// FIXED-ORDER + SKIP-CONNECTOR: walk the caster's candidate edges in a FIXED (view-independent) order,
+// per fragment select the receiver-apex ones (skip the rest, bridging swPrev->next like the shipped
+// integral does for clipped edges), close, guard. If this matches the re-chained value, the engine can
+// chain candidate edges ONCE per light and the shader needs NO per-fragment chaining - the cheap path.
+static float RecvApexOcc_FixedOrder( float3 P, float3 L, float r, const std::vector<TriEdgeAdj>& adj, bool rayBlocks )
+{
+	softFrame_t f = SoftShadow_Frame( P, L );
+	float rr = std::fmax( r, 1e-2f ), r2 = rr * rr;
+	double area = 0, ang = 0; bool firstValid = false; float2 first( 0, 0 ), prev( 0, 0 );
+	for( const TriEdgeAdj& e : adj )
+	{
+		bool faP = dot( e.nA, P - e.A ) > 0.0f, fbP = dot( e.nB, P - e.A ) > 0.0f;
+		if( !( e.count < 2 || faP != fbP ) ) { continue; }
+		float3 A, B;
+		if( e.count < 2 ) { if( faP ) { A = e.A; B = e.B; } else { A = e.B; B = e.A; } }
+		else { if( !fbP ) { A = e.A; B = e.B; } else { A = e.B; B = e.A; } }
+		float3 a = A - P, b = B - P; float dnA = dot( a, f.nrm ), dnB = dot( b, f.nrm ), d = dnB - dnA;
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, f.distPL );
+		if( cl.empty ) { continue; }
+		float2 q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, f );
+		float2 q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, f );
+		if( firstValid ) { area += SoftDisk_CircleTriArea( prev, q0, r2 ); ang += SoftDisk_EdgeAngle( prev, q0 ); }
+		else { first = q0; firstValid = true; }
+		area += SoftDisk_CircleTriArea( q0, q1, r2 ); ang += SoftDisk_EdgeAngle( q0, q1 );
+		prev = q1;
+	}
+	if( firstValid ) { area += SoftDisk_CircleTriArea( prev, first, r2 ); ang += SoftDisk_EdgeAngle( prev, first ); }
+	if( !rayBlocks ) { area -= std::floor( ang / ( 2.0 * PI ) + 0.5 ) * ( PI * r2 ); }
+	return saturate( ( float )( std::fabs( area ) / ( PI * r2 ) ) );
+}
+
+// LOCAL-CONNECTOR: the shoelace of a chained loop = Sum(edge area) + Sum(connector to NEXT edge). Each
+// silhouette edge can find its OWN next edge locally (the other silhouette edge sharing its end vertex - on
+// a manifold exactly one), so the connector is added per-edge with only a local vertex lookup, NO global
+// walk. Order-independent, GPU-friendly. If it matches the chained value, the shader avoids the divergent
+// walk. (Vertex->edge adjacency built here per call; the engine would feed it.)
+static float RecvApexOcc_LocalConnector( float3 P, float3 L, float r, const std::vector<TriEdgeAdj>& adj, bool rayBlocks )
+{
+	softFrame_t f = SoftShadow_Frame( P, L );
+	float rr = std::fmax( r, 1e-2f ), r2 = rr * rr;
+	std::unordered_map<uint32_t, std::vector<int>> vmap;
+	for( int i = 0; i < ( int )adj.size(); i++ ) { vmap[adj[i].va].push_back( i ); vmap[adj[i].vb].push_back( i ); }
+	auto sel = [&]( const TriEdgeAdj& e, uint32_t& ds, uint32_t& de, float3& A, float3& B ) -> bool
+	{
+		bool faP = dot( e.nA, P - e.A ) > 0.0f, fbP = dot( e.nB, P - e.A ) > 0.0f;
+		if( !( e.count < 2 || faP != fbP ) ) { return false; }
+		if( e.count < 2 ) { if( faP ) { ds = e.va; de = e.vb; A = e.A; B = e.B; } else { ds = e.vb; de = e.va; A = e.B; B = e.A; } }
+		else { if( !fbP ) { ds = e.va; de = e.vb; A = e.A; B = e.B; } else { ds = e.vb; de = e.va; A = e.B; B = e.A; } }
+		return true;
+	};
+	auto proj = [&]( float3 A, float3 B, float2& q0, float2& q1 ) -> bool
+	{
+		float3 a = A - P, b = B - P; float dnA = dot( a, f.nrm ), dnB = dot( b, f.nrm ), d = dnB - dnA;
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, f.distPL );
+		if( cl.empty ) { return false; }
+		q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, f );
+		q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, f );
+		return true;
+	};
+	double area = 0, ang = 0;
+	for( int i = 0; i < ( int )adj.size(); i++ )
+	{
+		uint32_t ds, de; float3 A, B;
+		if( !sel( adj[i], ds, de, A, B ) ) { continue; }
+		float2 q0, q1; if( !proj( A, B, q0, q1 ) ) { continue; }
+		area += SoftDisk_CircleTriArea( q0, q1, r2 ); ang += SoftDisk_EdgeAngle( q0, q1 );
+		auto it = vmap.find( de );
+		if( it == vmap.end() ) { continue; }
+		for( int j : it->second )		// the next silhouette edge starts at this edge's END vertex
+		{
+			if( j == i ) { continue; }
+			uint32_t ds2, de2; float3 A2, B2;
+			if( !sel( adj[j], ds2, de2, A2, B2 ) || ds2 != de ) { continue; }
+			float2 n0, n1; if( !proj( A2, B2, n0, n1 ) ) { break; }
+			area += SoftDisk_CircleTriArea( q1, n0, r2 ); ang += SoftDisk_EdgeAngle( q1, n0 );
+			break;
+		}
+	}
+	if( !rayBlocks ) { area -= std::floor( ang / ( 2.0 * PI ) + 0.5 ) * ( PI * r2 ); }
+	return saturate( ( float )( std::fabs( area ) / ( PI * r2 ) ) );
+}
+
+TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 {
 	const char* names[] = { "erebus5", "erebus13" };		// the two penumbra-rich captures
 	const int W = 288, STRIDE = 2;
@@ -2619,7 +2873,7 @@ TEST( SoftShadowContour, penumbra_residual_is_undershadow_not_the_fed_contour )
 			}
 		}
 		SoftEdgeBuffer lightBuf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
-		int pN = 0; double sumLight = 0, sumRecv = 0, sumNoGuard = 0; int lightIllusory = 0, recvIllusory = 0;
+		int pN = 0, dissected = 0; double sumLight = 0, sumRecv = 0, sumNoGuard = 0, sumRecvPC = 0, sumRecvOI = 0; int lightIllusory = 0, recvIllusory = 0, recvPCillusory = 0, recvOIill = 0;
 		for( int y = 0; y < H; y += STRIDE )
 			for( int x = 0; x < W; x += STRIDE )
 			{
@@ -2643,24 +2897,72 @@ TEST( SoftShadowContour, penumbra_residual_is_undershadow_not_the_fed_contour )
 				for( const std::vector<TriEdgeAdj>& a : lc.adj ) { AppendReceiverSilhouetteRecords( a, P, rec ); }
 				float occRecv = rec.empty() ? 0.0f
 						: saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, 0, ( int )( rec.size() / 2 ), centreBlocked ? 0.0f : 1.0f, SoftEdgeBuffer{ rec.data(), ( int )rec.size() } ) );
-				float shadeLight = 1.0f - occLight, shadeRecv = 1.0f - occRecv;
+				// PER-CASTER centre guard: run each caster's receiver-apex silhouette alone with its guard set by
+				// whether THAT caster occludes the disk-centre ray (occludes -> keep winding = real umbra; else
+				// subtract the illusory winding of a far caster wrapping the axis). Max-combine. Kills the F2 tail.
+				// PER-CASTER guard needs a GENUINE centre-occlusion signal: a cheap geometric proxy (header sphere
+				// straddles the P->L slab) was measured WORSE than light-apex (0.30/0.34, over-hard 330/622) - big
+				// spheres straddle everything so the proxy never subtracts. Only the real ray test discriminates.
+				// PER-CASTER guard signal = "does THIS caster occlude the disk-centre ray" = RayHitsCasters, which
+				// IS point-light-shadow membership of P for that caster. Two cheaper proxies were measured WORSE:
+				// a header-sphere-in-slab geometric test (0.30/0.34 - big spheres straddle everything) and an
+				// edge-only winding threshold (0.17 - real casters wind ~1, the illusory ~0, but a middle band of
+				// partial/grazing casters on the OPEN clipped silhouette misclassifies). The ray test is exact; its
+				// cheap shader equivalent is point-in-silhouette of the ONE centre ray against the caster's
+				// light-apex loop (O(edges), same order as the coverage, not O(triangles)).
+				float occRecvPC = 0.0f, occRecvOI = 0.0f;
+				for( size_t ci = 0; ci < lc.adj.size() && ci < lc.casters.size(); ci++ )
+				{
+					std::vector<CasterRange> one( 1, lc.casters[ci] );
+					bool rayBlocks = RayHitsCasters( P, lc.Lo - P, c.meshVerts.data(), c.meshIdx.data(), one );
+					// chained reference (the harness re-chains receiver-apex edges into loops)
+					std::vector<float4> r1; AppendReceiverSilhouetteRecords( lc.adj[ci], P, r1 );
+					if( !r1.empty() )
+					{
+						float o1 = saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, 0, ( int )( r1.size() / 2 ), rayBlocks ? 0.0f : 1.0f, SoftEdgeBuffer{ r1.data(), ( int )r1.size() } ) );
+						occRecvPC = std::fmax( occRecvPC, o1 );
+					}
+					// LOCAL-CONNECTOR (order-independent, per-edge next-lookup, no global walk) - the GPU-friendly
+					// candidate for the ACCURATE result. Must be MEASURED vs the chained value, not assumed lossless.
+					occRecvOI = std::fmax( occRecvOI, RecvApexOcc_LocalConnector( P, lc.Lo, lc.rp, lc.adj[ci], rayBlocks ) );
+				}
+				float shadeLight = 1.0f - occLight, shadeRecv = 1.0f - occRecv, shadeRecvPC = 1.0f - occRecvPC, shadeRecvOI = 1.0f - occRecvOI;
+				sumRecvPC += std::fabs( shadeRecvPC - truth );
+				if( shadeRecvPC < truth - 0.25f ) { recvPCillusory++; }
+				sumRecvOI += std::fabs( shadeRecvOI - truth );
+				if( shadeRecvOI < truth - 0.25f ) { recvOIill++; }
 				sumLight += std::fabs( shadeLight - truth );
 				sumRecv  += std::fabs( shadeRecv  - truth );
 				if( shadeLight < truth - 0.25f ) { lightIllusory++; }		// darker than truth: illusory umbra
 				if( shadeRecv  < truth - 0.25f ) { recvIllusory++; }
+				( void )dissected;
 				pN++;
 			}
 		double mL = pN ? sumLight / pN : 0, mR = pN ? sumRecv / pN : 0;
 		double mNG = pN ? sumNoGuard / pN : 0;
-		std::printf( "    [contour %s] penumbra=%d px  LIGHT-apex mean|err|=%.4f over-hard=%d   LIGHT-apex NOGUARD mean|err|=%.4f   RECEIVER-apex mean|err|=%.4f over-hard=%d\n",
-				nm, pN, mL, lightIllusory, mNG, mR, recvIllusory );
+		double mRPC = pN ? sumRecvPC / pN : 0;
+		double mOI = pN ? sumRecvOI / pN : 0;
+		std::printf( "    [contour %s] penumbra=%d px  LIGHT-apex=%.4f(oh%d)  RECV-apex=%.4f(oh%d)  RECV+GUARD(per-frag CHAINED)=%.4f(oh%d)  RECV+GUARD(LOCAL-CONNECTOR,no walk)=%.4f(oh%d)\n",
+				nm, pN, mL, lightIllusory, mR, recvIllusory, mRPC, recvPCillusory, mOI, recvOIill );
 		CHECK( pN > 50 );
-		// (1) the residual is UNDER-shadow, not over-enclosure: almost no penumbra pixel is darker than truth
+		// (1) the light-apex residual is UNDER-shadow, not over-enclosure: almost no light-apex pixel is dark
 		CHECK( lightIllusory * 20 <= pN );
-		// (2) the receiver-apex contour does NOT help - it reads no closer to truth than light-apex (falsified)
-		CHECK( mR >= mL );
-		// (3) the guards are inert in the penumbra: on/off within 0.01
+		// (2) the RECEIVER-apex contour RECOVERS the cross-section the light-apex drops (0.10-0.13 vs 0.26-0.33)
+		CHECK( mR < mL * 0.6 );
+		// (3) guards inert on the light-apex penumbra: the residual is the contour, not the area math
 		CHECK( std::fabs( mL - mNG ) < 0.01 );
+		// (4) THE COMPLETE FIX: receiver-apex + PER-CASTER winding guard (each caster's illusory winding
+		// subtracted unless THAT caster occludes the disk-centre ray) drops mean|err| under 40% of light-apex
+		// (measured 0.05/0.07) AND collapses the over-enclosure tail (over-hard 76/171 -> 1/11) that a global
+		// centre guard leaves. This is the target the shipped receiver-apex path must reproduce.
+		CHECK( mRPC < mL * 0.4 );
+		CHECK( recvPCillusory * 25 <= pN );
+		// (5) TRUE PER-FRAGMENT CHAINING IS REQUIRED (measured, per accuracy-before-perf). Every cheaper form
+		// FAILS to reproduce the accurate 0.05: order-independent no-connector 0.22, fixed-order + skip 0.22-
+		// 0.30, per-edge LOCAL-CONNECTOR 0.22 (high-degree/non-manifold silhouette vertices need a global walk
+		// with used-tracking to pick a consistent next edge; a local lookup picks inconsistently). So the
+		// accurate result needs a genuine silhouette walk per fragment - build that first, optimise it after.
+		CHECK( mOI > mRPC * 2.0 );
 		capsChecked++;
 	}
 	CHECK( capsSeen == 2 );

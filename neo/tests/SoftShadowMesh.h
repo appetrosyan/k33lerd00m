@@ -332,6 +332,18 @@ struct TriEdgeAdj
 // have disjoint indices, so this never fuses two objects into a non-manifold junction).
 inline void BuildTriEdgeAdj( const float* verts, const uint32_t* idx, uint32_t numIdx, std::vector<TriEdgeAdj>& out )
 {
+	// Adjacency MUST weld by POSITION, not vertex index: game meshes duplicate verts at UV/normal seams, so
+	// keying by index reports genuinely-interior edges as boundary (count 1). That inflated the receiver-apex
+	// silhouette with hundreds of false boundary edges -> gross over-enclosure. Map each welded position to a
+	// canonical id and key edges on that (the shipped engine's tri->silEdges are already properly welded).
+	std::unordered_map<uint64_t, uint32_t> vid;
+	auto canon = [&]( float3 p ) -> uint32_t
+	{
+		uint64_t k = SoftPosKey( p );
+		auto it = vid.find( k );
+		if( it != vid.end() ) { return it->second; }
+		uint32_t id = ( uint32_t )vid.size(); vid[k] = id; return id;
+	};
 	std::unordered_map<uint64_t, int> m;
 	m.reserve( numIdx );
 	for( uint32_t i = 0; i + 2 < numIdx; i += 3 )
@@ -340,10 +352,11 @@ inline void BuildTriEdgeAdj( const float* verts, const uint32_t* idx, uint32_t n
 		float3 T[3] = { float3( verts[v[0] * 3 + 0], verts[v[0] * 3 + 1], verts[v[0] * 3 + 2] ),
 						float3( verts[v[1] * 3 + 0], verts[v[1] * 3 + 1], verts[v[1] * 3 + 2] ),
 						float3( verts[v[2] * 3 + 0], verts[v[2] * 3 + 1], verts[v[2] * 3 + 2] ) };
+		uint32_t cv[3] = { canon( T[0] ), canon( T[1] ), canon( T[2] ) };
 		float3 n = normalize( cross( T[1] - T[0], T[2] - T[0] ) );
 		for( int e = 0; e < 3; e++ )
 		{
-			uint32_t a = v[e], b = v[( e + 1 ) % 3];
+			uint32_t a = cv[e], b = cv[( e + 1 ) % 3];
 			uint64_t key = a < b ? ( ( uint64_t )a << 32 | b ) : ( ( uint64_t )b << 32 | a );
 			auto it = m.find( key );
 			if( it == m.end() )
@@ -370,12 +383,23 @@ inline void AppendReceiverSilhouetteRecords( const std::vector<TriEdgeAdj>& adj,
 	float3 lo( 1e30f, 1e30f, 1e30f ), hi( -1e30f, -1e30f, -1e30f );
 	for( const TriEdgeAdj& e : adj )
 	{
-		if( e.count < 2 ) { continue; }
-		bool fa = dot( e.nA, P - e.A ) > 0.0f, fb = dot( e.nB, P - e.A ) > 0.0f;
-		if( fa == fb ) { continue; }									// not a silhouette from P
 		DEdge d;
-		if( !fb ) { d.a = e.va; d.b = e.vb; d.pa = e.A; d.pb = e.B; }	// orient by the front-facing triangle
-		else      { d.a = e.vb; d.b = e.va; d.pa = e.B; d.pb = e.A; }
+		if( e.count < 2 )
+		{
+			// BOUNDARY edge of an OPEN surface (world walls/floors are single quads): always on the
+			// receiver-apex silhouette - the surface outline - regardless of facing (a thin surface occludes
+			// from either side). Orient by its one face so the loop winds consistently with interior edges.
+			bool fa = dot( e.nA, P - e.A ) > 0.0f;
+			if( fa ) { d.a = e.va; d.b = e.vb; d.pa = e.A; d.pb = e.B; }
+			else     { d.a = e.vb; d.b = e.va; d.pa = e.B; d.pb = e.A; }
+		}
+		else
+		{
+			bool fa = dot( e.nA, P - e.A ) > 0.0f, fb = dot( e.nB, P - e.A ) > 0.0f;
+			if( fa == fb ) { continue; }									// not a silhouette from P
+			if( !fb ) { d.a = e.va; d.b = e.vb; d.pa = e.A; d.pb = e.B; }	// orient by the front-facing triangle
+			else      { d.a = e.vb; d.b = e.va; d.pa = e.B; d.pb = e.A; }
+		}
 		es.push_back( d );
 		for( int k = 0; k < 3; k++ ) { float v = ( &d.pa.x )[k]; ( &lo.x )[k] = std::fmin( ( &lo.x )[k], v ); ( &hi.x )[k] = std::fmax( ( &hi.x )[k], v ); }
 	}
