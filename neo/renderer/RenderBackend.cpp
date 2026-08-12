@@ -1855,7 +1855,12 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 		// fragments the band prepass left at stencil == 0, which are provably fully lit (outside every
 		// silhouette's penumbra wedge => coverage exactly 0). Bind the plain unshadowed interaction variant
 		// - no coverage loop, no shadow map, texunit 5 ignored - which is bit-identical to shadow = 1.
-		if( softBandStencilRef == 0 )
+		// r_softShadowStencilOnly also draws the RING (ref 1) lit, so ONLY the stencil core (point-light hard
+		// shadow) is shadowed: the analytic coverage is dropped entirely. Measured to zero out both the
+		// false-shadow and missing-umbra pathologies (the coverage artifacts), leaving a hard penumbra edge
+		// for a later soft pass (PCSS) to fill. Use with r_softShadowEmergentUmbra 0 (core stays unlit = umbra).
+		extern idCVar r_softShadowStencilOnly;
+		if( softBandStencilRef == 0 || ( softBandStencilRef == 1 && r_softShadowStencilOnly.GetBool() ) )
 		{
 			if( pbr )
 			{
