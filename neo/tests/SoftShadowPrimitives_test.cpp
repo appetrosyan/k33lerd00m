@@ -44,6 +44,9 @@ the Free Software Foundation, either version 3 of the License, or
 #include <cmath>
 #include <vector>
 #include <string>
+#include <map>
+#include <tuple>
+#include <algorithm>
 
 using namespace swtest;
 
@@ -2403,6 +2406,352 @@ bool LoadPPM( const char* path, std::vector<unsigned char>& rgb, int& w, int& h 
 }
 }
 
+// ---- FIX #1 (proper): build the SHIPPED SoftShadow_ProcCaster candidate-edge feed from the mesh. Verts
+// are position-welded to canonical ids (so the receiver-apex chaining connects), each undirected edge gets
+// its two adjacent face normals + boundary flag, serialised as the 4-float4 record ProcCaster reads. This
+// exercises the real chained, culled, guarded receiver-apex path - not the lean shoelace that garbaged.
+namespace
+{
+inline std::vector<float4> BuildProcFeed( const float* verts, const uint32_t* idx, uint32_t first, uint32_t num )
+{
+	std::map<std::tuple<int, int, int>, int> weld;
+	auto vidOf = [&]( uint32_t vi ) -> int
+	{
+		const float* p = &verts[vi * 3];
+		std::tuple<int, int, int> k( ( int )std::lround( p[0] * 256.0 ), ( int )std::lround( p[1] * 256.0 ), ( int )std::lround( p[2] * 256.0 ) );
+		auto it = weld.find( k );
+		if( it != weld.end() ) { return it->second; }
+		int id = ( int )weld.size(); weld[k] = id; return id;
+	};
+	struct E { float3 a, b; int va, vb; float3 nA, nB; bool bnd; };
+	std::map<std::pair<int, int>, int> emap;
+	std::vector<E> es;
+	for( uint32_t k = first; k + 2 < first + num; k += 3 )
+	{
+		uint32_t vi[3] = { idx[k], idx[k + 1], idx[k + 2] };
+		float3 v[3]; int id[3];
+		for( int j = 0; j < 3; j++ ) { v[j] = float3( verts[vi[j] * 3], verts[vi[j] * 3 + 1], verts[vi[j] * 3 + 2] ); id[j] = vidOf( vi[j] ); }
+		float3 nf = cross( v[1] - v[0], v[2] - v[0] );
+		for( int e = 0; e < 3; e++ )
+		{
+			int a = id[e], b = id[( e + 1 ) % 3];
+			std::pair<int, int> key( std::min( a, b ), std::max( a, b ) );
+			auto it = emap.find( key );
+			if( it == emap.end() )
+			{
+				E ne; ne.a = v[e]; ne.b = v[( e + 1 ) % 3]; ne.va = a; ne.vb = b; ne.nA = nf; ne.nB = float3( 0, 0, 0 ); ne.bnd = true;
+				emap[key] = ( int )es.size(); es.push_back( ne );
+			}
+			else { es[it->second].nB = nf; es[it->second].bnd = false; }
+		}
+	}
+	std::vector<float4> rec; rec.reserve( es.size() * 4 );
+	for( const E& e : es )
+	{
+		rec.push_back( float4( e.a.x, e.a.y, e.a.z, ( float )e.va ) );
+		rec.push_back( float4( e.b.x, e.b.y, e.b.z, ( float )e.vb ) );
+		rec.push_back( float4( e.nA.x, e.nA.y, e.nA.z, e.bnd ? 1.0f : 0.0f ) );
+		rec.push_back( float4( e.nB.x, e.nB.y, e.nB.z, 0.0f ) );
+	}
+	return rec;
+}
+
+inline float SegDist2( float2 q0, float2 q1 );		// fwd decl (defined below)
+// PRECISE UMBRA: does the caster's RECEIVER-apex silhouette fully enclose the light disk? Winding about
+// the disk centre is an order-free sum of edge angles (no chaining, no O(n^2)); enclosure = winding != 0 AND
+// no silhouette edge cuts the disk. Receiver-apex has no illusory umbra, so enclosure == true umbra. This is
+// the strictly-smaller-than-point-shadow umbra contour: no inner-penumbra over-stamp, no parallax false shadow.
+struct RAEdge { float3 a, b, nA, nB; bool boundary; };
+inline std::vector<RAEdge> BuildCasterEdges( const float* verts, const uint32_t* idx, uint32_t first, uint32_t num )
+{
+	std::map<std::pair<uint32_t, uint32_t>, int> emap;
+	std::vector<RAEdge> out;
+	for( uint32_t k = first; k + 2 < first + num; k += 3 )
+	{
+		uint32_t vi[3] = { idx[k], idx[k + 1], idx[k + 2] };
+		float3 v[3];
+		for( int j = 0; j < 3; j++ ) { v[j] = float3( verts[vi[j] * 3], verts[vi[j] * 3 + 1], verts[vi[j] * 3 + 2] ); }
+		float3 nf = cross( v[1] - v[0], v[2] - v[0] );
+		for( int e = 0; e < 3; e++ )
+		{
+			uint32_t u = vi[e], w = vi[( e + 1 ) % 3];
+			std::pair<uint32_t, uint32_t> key( std::min( u, w ), std::max( u, w ) );
+			auto it = emap.find( key );
+			if( it == emap.end() ) { RAEdge re; re.a = v[e]; re.b = v[( e + 1 ) % 3]; re.nA = nf; re.nB = float3( 0, 0, 0 ); re.boundary = true; emap[key] = ( int )out.size(); out.push_back( re ); }
+			else { out[it->second].nB = nf; out[it->second].boundary = false; }
+		}
+	}
+	return out;
+}
+inline bool RecvApexEncloses( const std::vector<RAEdge>& edges, float3 centre, float radius, float3 P, float3 L, float r )
+{
+	r = std::fmax( r, 1e-2f );
+	softFrame_t f = SoftShadow_Frame( P, L );
+	float r2 = r * r;
+	float sinA = saturate( r / f.distPL ), cosA = std::sqrt( 1.0f - sinA * sinA );
+	if( SoftShadow_CullCaster( centre - P, radius, f, sinA, cosA, SW_NEAR_EPS ) ) { return false; }
+	double ang = 0.0; float minD2 = 1e30f;
+	for( const RAEdge& e : edges )
+	{
+		bool va = dot( e.nA, P - e.a ) > 0.0f;
+		bool sil, flip;
+		if( e.boundary ) { sil = true; flip = !va; }
+		else { bool vb = dot( e.nB, P - e.a ) > 0.0f; sil = ( va != vb ); flip = !va; }
+		if( !sil ) { continue; }
+		float3 A = flip ? e.b : e.a, B = flip ? e.a : e.b;
+		float3 a = A - P, b = B - P;
+		float dnA = dot( a, f.nrm ), dnB = dot( b, f.nrm ), d = dnB - dnA;
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, SW_NEAR_EPS, f.distPL );
+		if( cl.empty ) { continue; }
+		float2 q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, f );
+		float2 q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, f );
+		ang += SoftDisk_EdgeAngle( q0, q1 );
+		minD2 = std::fmin( minD2, SegDist2( q0, q1 ) );
+	}
+	float wind = std::floor( ( float )( ang * ( 0.5 / PI ) ) + 0.5f );
+	return ( std::fabs( wind ) >= 0.5f ) && ( minD2 >= r2 );		// disk fully inside the receiver-apex loop
+}
+
+// squared distance from the disk centre (origin) to the projected segment q0->q1
+inline float SegDist2( float2 q0, float2 q1 )
+{
+	float2 ab = q1 - q0;
+	float den = dot( ab, ab );
+	float t = den > 1e-12f ? saturate( ( -dot( q0, ab ) ) / den ) : 0.0f;
+	float2 cP = float2( q0.x + ab.x * t, q0.y + ab.y * t );
+	return dot( cP, cP );
+}
+
+// squared distance from point p to triangle (a,b,c) - Ericson, closest-point-on-triangle
+inline float PointTriDist2( float3 p, float3 a, float3 b, float3 c )
+{
+	float3 ab = b - a, ac = c - a, ap = p - a;
+	float d1 = dot( ab, ap ), d2 = dot( ac, ap );
+	if( d1 <= 0 && d2 <= 0 ) { float3 v = p - a; return dot( v, v ); }
+	float3 bp = p - b; float d3 = dot( ab, bp ), d4 = dot( ac, bp );
+	if( d3 >= 0 && d4 <= d3 ) { float3 v = p - b; return dot( v, v ); }
+	float vc = d1 * d4 - d3 * d2;
+	if( vc <= 0 && d1 >= 0 && d3 <= 0 ) { float t = d1 / ( d1 - d3 ); float3 q = a + ab * t; float3 v = p - q; return dot( v, v ); }
+	float3 cp = p - c; float d5 = dot( ab, cp ), d6 = dot( ac, cp );
+	if( d6 >= 0 && d5 <= d6 ) { float3 v = p - c; return dot( v, v ); }
+	float vb = d5 * d2 - d1 * d6;
+	if( vb <= 0 && d2 >= 0 && d6 <= 0 ) { float t = d2 / ( d2 - d6 ); float3 q = a + ac * t; float3 v = p - q; return dot( v, v ); }
+	float va = d3 * d6 - d5 * d4;
+	if( va <= 0 && ( d4 - d3 ) >= 0 && ( d5 - d6 ) >= 0 ) { float t = ( d4 - d3 ) / ( ( d4 - d3 ) + ( d5 - d6 ) ); float3 q = b + ( c - b ) * t; float3 v = p - q; return dot( v, v ); }
+	float den = 1.0f / ( va + vb + vc ); float v = vb * den, w = vc * den; float3 q = a + ab * v + ac * w; float3 vv = p - q; return dot( vv, vv );
+}
+// Moller-Trumbore, returns ray parameter t>0 of the hit or -1. Ray P + t*D, D need not be unit.
+inline float RayTriT( float3 P, float3 D, float3 a, float3 b, float3 c )
+{
+	float3 e1 = b - a, e2 = c - a, pv = cross( D, e2 );
+	float det = dot( e1, pv );
+	if( std::fabs( det ) < 1e-12f ) { return -1.0f; }
+	float inv = 1.0f / det;
+	float3 tv = P - a; float u = dot( tv, pv ) * inv;
+	if( u < 0.0f || u > 1.0f ) { return -1.0f; }
+	float3 qv = cross( tv, e1 ); float v = dot( D, qv ) * inv;
+	if( v < 0.0f || u + v > 1.0f ) { return -1.0f; }
+	return dot( e2, qv ) * inv;
+}
+// point-in-solid by crossing parity (ray in +x). Guards the inscribed sphere against void-centred casters.
+inline bool PointInMesh( float3 p, const float* verts, const uint32_t* idx, uint32_t first, uint32_t num )
+{
+	int cross = 0;
+	for( uint32_t k = first; k + 2 < first + num; k += 3 )
+	{
+		float3 a( verts[idx[k] * 3], verts[idx[k] * 3 + 1], verts[idx[k] * 3 + 2] );
+		float3 b( verts[idx[k + 1] * 3], verts[idx[k + 1] * 3 + 1], verts[idx[k + 1] * 3 + 2] );
+		float3 cc( verts[idx[k + 2] * 3], verts[idx[k + 2] * 3 + 1], verts[idx[k + 2] * 3 + 2] );
+		float t = RayTriT( p, float3( 1, 0, 0 ), a, b, cc );
+		if( t > 1e-4f ) { cross++; }
+	}
+	return ( cross & 1 ) != 0;
+}
+// largest sphere centred at `ctr` that fits inside the caster's surface = min distance to any triangle.
+// CONSERVATIVE inner bound (the sphere is provably inside a closed convex-ish caster), so any umbra it
+// reports is a GUARANTEE, never a false positive - the whole point of a short-circuit test.
+inline float InscribedRadius( float3 ctr, const float* verts, const uint32_t* idx, uint32_t first, uint32_t num )
+{
+	float best = 1e30f;
+	for( uint32_t k = first; k + 2 < first + num; k += 3 )
+	{
+		float3 a( verts[idx[k] * 3], verts[idx[k] * 3 + 1], verts[idx[k] * 3 + 2] );
+		float3 b( verts[idx[k + 1] * 3], verts[idx[k + 1] * 3 + 1], verts[idx[k + 1] * 3 + 2] );
+		float3 c( verts[idx[k + 2] * 3], verts[idx[k + 2] * 3 + 1], verts[idx[k + 2] * 3 + 2] );
+		best = std::fmin( best, PointTriDist2( ctr, a, b, c ) );
+	}
+	return best < 1e29f ? std::sqrt( best ) : 0.0f;
+}
+// does a SINGLE triangle, projected from P, fully contain the light disk? => guaranteed umbra (a triangle
+// is unquestionably solid; no interior/inscribed-sphere needed, so it works for thin brush geometry).
+inline bool TriCoversDisk( float3 P, float3 L, float r, float3 t0, float3 t1, float3 t2 )
+{
+	softFrame_t f = SoftShadow_Frame( P, L );
+	float3 vs[3] = { t0 - P, t1 - P, t2 - P };
+	float2 q[3];
+	for( int i = 0; i < 3; i++ )
+	{
+		float dn = dot( vs[i], f.nrm );
+		if( dn <= SW_NEAR_EPS || dn >= f.distPL ) { return false; }		// vert not strictly between P and light
+		q[i] = SoftShadow_ProjectVert( vs[i], dn, f );
+	}
+	// disk (origin, r) inside triangle q iff origin is >= r from all three edge lines on a consistent side.
+	float sd[3];
+	for( int i = 0; i < 3; i++ )
+	{
+		float2 a = q[i], b = q[( i + 1 ) % 3], e = b - a;
+		float len = std::sqrt( dot( e, e ) );
+		if( len < 1e-6f ) { return false; }
+		sd[i] = ( e.x * ( -a.y ) - e.y * ( -a.x ) ) / len;			// signed distance origin->edge (+left)
+	}
+	bool allL = ( sd[0] >= r && sd[1] >= r && sd[2] >= r );
+	bool allR = ( sd[0] <= -r && sd[1] <= -r && sd[2] <= -r );
+	return allL || allR;
+}
+// does an inscribed sphere (Cc, Rc) fully occlude the light disk (L, r) from P? cone-in-cone containment.
+// true => GUARANTEED umbra (a sphere inside the caster blocks every rim point).
+inline bool SphereBlocksDisk( float3 Cc, float Rc, float3 P, float3 L, float r )
+{
+	if( Rc <= 0.0f ) { return false; }
+	float3 toC = Cc - P; float dc = std::sqrt( dot( toC, toC ) );
+	if( dc <= Rc ) { return true; }			// receiver inside the caster
+	float3 toL = L - P; float dl = std::sqrt( dot( toL, toL ) );
+	if( dc - Rc >= dl ) { return false; }		// sphere entirely beyond the light - cannot block
+	float ac = std::asin( saturate( Rc / dc ) );
+	float al = std::asin( saturate( r / dl ) );
+	float ct = saturate( ( dot( toC, toL ) / ( dc * dl ) + 1.0f ) * 0.5f ) * 2.0f - 1.0f;	// clamp cos to [-1,1]
+	float theta = std::acos( ct );
+	return ( theta + al ) <= ac;			// caster cone contains the whole light cone
+}
+
+// WINDING-ENCLOSURE CLAMP: the emergent light-apex coverage, PLUS a saturation short-circuit. Per caster
+// we track the winding about the disk centre (swAng) and the nearest projected edge to the centre. When the
+// loop ENCLOSES the whole disk (winding != 0 AND no edge enters radius r) the disk is fully covered -> clamp
+// occ = 1, even when the signed shoelace has drained (erebus13 cancellation). This fires at the TRUE umbra
+// contour (full enclosure), not the 50% point-light contour, so it does not crush the inner penumbra.
+inline float WedgeOccClamp( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit SW_EDGEBUF_PARAM )
+{
+	swR = std::fmax( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float swDistPL = swF.distPL, swR2 = swR * swR, swInvDiskArea = 1.0f / ( PI * swR2 );
+	float3 swNrm = swF.nrm;
+	float swSinA = saturate( swR / swDistPL ), swCosA = std::sqrt( 1.0f - swSinA * swSinA );
+	const float swEps = SW_NEAR_EPS;
+	float swOcc = 0.0f, swArea = 0.0f, swAng = 0.0f, minD2 = 1e30f;
+	bool haveCaster = true, swSkip = false, swFirstValid = false, havePrevE1 = false;
+	float2 swFirst = float2( 0, 0 ), swPrev = float2( 0, 0 );
+	float3 prevE1w = float3( 0, 0, 0 );
+	auto finalize = [&]()
+	{
+		if( !haveCaster ) { return; }
+		float aOcc;
+		if( swCentreLit > 0.5f )
+		{
+			float w = std::floor( swAng * ( 0.5f / PI ) + 0.5f );
+			swArea -= w * ( PI * swR2 );
+			if( std::fabs( swArea ) > 1.2f * ( PI * swR2 ) ) { swArea = 0.0f; }
+		}
+		aOcc = saturate( std::fabs( swArea ) * swInvDiskArea );
+		float wind = std::floor( swAng * ( 0.5f / PI ) + 0.5f );
+		bool enclosed = ( std::fabs( wind ) >= 0.5f ) && ( minD2 >= swR2 );		// disk fully inside the loop
+		swOcc = std::fmax( swOcc, enclosed ? 1.0f : aOcc );
+	};
+	for( int se = 0; se < swN; se++ )
+	{
+		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ], e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
+		if( e0.w < 0.0f )
+		{
+			if( haveCaster && swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 ); swAng += SoftDisk_EdgeAngle( swPrev, swFirst ); minD2 = std::fmin( minD2, SegDist2( swPrev, swFirst ) ); }
+			finalize();
+			haveCaster = true; swArea = 0; swAng = 0; minD2 = 1e30f; swSkip = false; swFirstValid = false; havePrevE1 = false;
+			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
+			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
+			continue;
+		}
+		if( swSkip ) { continue; }
+		float3 A = float3( e0.x, e0.y, e0.z ), B = float3( e1.x, e1.y, e1.z );
+		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 ); swAng += SoftDisk_EdgeAngle( swPrev, swFirst ); minD2 = std::fmin( minD2, SegDist2( swPrev, swFirst ) ); swFirstValid = false;
+		}
+		havePrevE1 = true; prevE1w = B;
+		float3 a = A - swP, b = B - swP;
+		float dnA = dot( a, swNrm ), dnB = dot( b, swNrm ), d = dnB - dnA;
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, swEps, swDistPL );
+		if( cl.empty ) { continue; }
+		float2 q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, swF );
+		float2 q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, swF );
+		if( swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 ); swAng += SoftDisk_EdgeAngle( swPrev, q0 ); minD2 = std::fmin( minD2, SegDist2( swPrev, q0 ) ); }
+		else { swFirst = q0; swFirstValid = true; }
+		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 ); swAng += SoftDisk_EdgeAngle( q0, q1 ); minD2 = std::fmin( minD2, SegDist2( q0, q1 ) ); swPrev = q1;
+	}
+	if( haveCaster && swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 ); swAng += SoftDisk_EdgeAngle( swPrev, swFirst ); minD2 = std::fmin( minD2, SegDist2( swPrev, swFirst ) ); }
+	finalize();
+	return swOcc;
+}
+
+// WEDGE-model coverage: returns the guarded disk-coverage (max over casters, as the current path), and
+// OUTPUTS the global nearest projected-edge distance^2 to the disk centre. That distance is the wedge-band
+// signal: an edge crossing/near the disk (minD2 < r^2) means the fragment is in some edge's PENUMBRA; far
+// from every edge means it is deep umbra or lit, to be resolved by the stamp - not by the (under-shadowing)
+// coverage integral. This is how the wedge pipeline keeps the umbra off the coverage path.
+inline float WedgeCovMinD( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit, float* minD2Out SW_EDGEBUF_PARAM )
+{
+	swR = std::fmax( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float swDistPL = swF.distPL, swR2 = swR * swR, swInvDiskArea = 1.0f / ( PI * swR2 );
+	float3 swNrm = swF.nrm;
+	float swSinA = saturate( swR / swDistPL ), swCosA = std::sqrt( 1.0f - swSinA * swSinA );
+	const float swEps = SW_NEAR_EPS;
+	float swOcc = 0.0f, swArea = 0.0f, swAng = 0.0f, gMinD2 = 1e30f;
+	bool haveCaster = true, swSkip = false, swFirstValid = false, havePrevE1 = false;
+	float2 swFirst = float2( 0, 0 ), swPrev = float2( 0, 0 );
+	float3 prevE1w = float3( 0, 0, 0 );
+	auto acc = [&]( float2 a, float2 b ) { swArea += SoftDisk_CircleTriArea( a, b, swR2 ); swAng += SoftDisk_EdgeAngle( a, b ); gMinD2 = std::fmin( gMinD2, SegDist2( a, b ) ); };
+	auto finalize = [&]()
+	{
+		if( !haveCaster ) { return; }
+		if( swCentreLit > 0.5f )
+		{
+			float w = std::floor( swAng * ( 0.5f / PI ) + 0.5f );
+			swArea -= w * ( PI * swR2 );
+			if( std::fabs( swArea ) > 1.2f * ( PI * swR2 ) ) { swArea = 0.0f; }
+		}
+		swOcc = std::fmax( swOcc, saturate( std::fabs( swArea ) * swInvDiskArea ) );
+	};
+	for( int se = 0; se < swN; se++ )
+	{
+		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ], e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
+		if( e0.w < 0.0f )
+		{
+			if( haveCaster && swFirstValid ) { acc( swPrev, swFirst ); }
+			finalize();
+			haveCaster = true; swArea = 0; swAng = 0; swSkip = false; swFirstValid = false; havePrevE1 = false;
+			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
+			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
+			continue;
+		}
+		if( swSkip ) { continue; }
+		float3 A = float3( e0.x, e0.y, e0.z ), B = float3( e1.x, e1.y, e1.z );
+		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid ) { acc( swPrev, swFirst ); swFirstValid = false; }
+		havePrevE1 = true; prevE1w = B;
+		float3 a = A - swP, b = B - swP;
+		float dnA = dot( a, swNrm ), dnB = dot( b, swNrm ), d = dnB - dnA;
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, swEps, swDistPL );
+		if( cl.empty ) { continue; }
+		float2 q0 = SoftShadow_ProjectVert( a + cl.t0 * ( b - a ), dnA + cl.t0 * d, swF );
+		float2 q1 = SoftShadow_ProjectVert( a + cl.t1 * ( b - a ), dnA + cl.t1 * d, swF );
+		if( swFirstValid ) { acc( swPrev, q0 ); }
+		else { swFirst = q0; swFirstValid = true; }
+		acc( q0, q1 ); swPrev = q1;
+	}
+	if( haveCaster && swFirstValid ) { acc( swPrev, swFirst ); }
+	finalize();
+	*minD2Out = gMinD2;
+	return swOcc;
+}
+} // namespace
+
 // ====================================================================== 5d. FULL-FRAME RT REFERENCE
 // The whole shipped composition versus a full ray-traced reference on EVERY covered pixel of EVERY
 // readable capture - no prefilters, no candidate sampling. Emits side-by-side images per capture
@@ -2493,7 +2842,28 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		}
 		SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
 		float3 cam0( c.hdr.vieworg[0], c.hdr.vieworg[1], c.hdr.vieworg[2] );
-
+		// GUARANTEED-UMBRA short-circuit: the K largest triangles per light (candidate disk coverers). A big
+		// world triangle projects large and is the likeliest single primitive to contain the whole disk.
+		struct CTri { float3 a, b, c; };
+		const size_t K_COVER = 96;
+		std::vector<std::vector<CTri>> coverTris( lights.size() );
+		for( size_t li2 = 0; li2 < lights.size(); li2++ )
+		{
+			std::vector<std::pair<float, CTri>> all;
+			for( const CasterRange& cr : lights[li2].casters )
+			{
+				for( uint32_t k = cr.first; k + 2 < cr.first + cr.num; k += 3 )
+				{
+					float3 a( c.meshVerts[c.meshIdx[k] * 3], c.meshVerts[c.meshIdx[k] * 3 + 1], c.meshVerts[c.meshIdx[k] * 3 + 2] );
+					float3 b( c.meshVerts[c.meshIdx[k + 1] * 3], c.meshVerts[c.meshIdx[k + 1] * 3 + 1], c.meshVerts[c.meshIdx[k + 1] * 3 + 2] );
+					float3 cc( c.meshVerts[c.meshIdx[k + 2] * 3], c.meshVerts[c.meshIdx[k + 2] * 3 + 1], c.meshVerts[c.meshIdx[k + 2] * 3 + 2] );
+					float3 n = cross( b - a, cc - a );
+					all.push_back( { std::sqrt( dot( n, n ) ), CTri{ a, b, cc } } );
+				}
+			}
+			std::sort( all.begin(), all.end(), []( const std::pair<float, CTri>& x, const std::pair<float, CTri>& y ) { return x.first > y.first; } );
+			for( size_t i = 0; i < all.size() && i < K_COVER; i++ ) { coverTris[li2].push_back( all[i].second ); }
+		}
 		// The SHIPPED emergent-umbra shade, factored so it can be called at a perturbed (P,Lo) to
 		// measure temporal stability: any discrete decision that flips under an infinitesimal camera/
 		// light move (band parity, centre-block guard) is what makes the penumbra HARDEN frame-to-frame.
@@ -2520,6 +2890,11 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		std::vector<unsigned char> covered( ( size_t )W * H, 0 );
 		int n = 0, exN = 0, misN = 0, gross = 0;
 		int pN = 0, pGross = 0, pOverHard = 0;
+		int falseShadow = 0, missUmbra = 0, litN = 0, umbraN = 0;		// the two pathologies + their region sizes
+		int pcFalseShadow = 0, pcMissUmbra = 0;							// stencil-only pathologies
+		double pcPenumSum = 0; int pcPenumN = 0, pcPenumGross = 0;		// stencil-only PENUMBRA loss vs oracle
+		int missUmbraCoreMiss = 0, missUmbraRing = 0;					// cause split: centre-ray-miss vs ring-undershadow
+		double falseShadowSev = 0, missUmbraSev = 0;
 		double sumAbs = 0, pSum = 0;
 		float worst = 0;
 		for( int i = 0; i < W * H; i++ )
@@ -2589,6 +2964,39 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 			if( std::fabs( d ) > 0.25f ) { gross++; }
 			if( d < -0.5f ) { exN++; }		// pipeline much darker than reference (extraneous shadow)
 			if( d > 0.5f ) { misN++; }		// pipeline much lighter than reference (missing shadow)
+			// THE TWO PATHOLOGIES, heavily penalised as first-class gates (region-conditioned, not whole-frame
+			// L1 that dilutes them). (1) SHADOW WHERE THERE SHOULD BE NONE: truth says LIT (>=0.85) but the
+			// candidate darkens it. (2) NO SHADOW WHERE THERE SHOULD BE SIGNIFICANT DARKENING: truth says UMBRA
+			// (<=0.15) but the candidate leaves it lit - the umbra-deletion the penumbra-only metrics never saw.
+			// UMBRA SHORT-CIRCUIT: a cheap GUARANTEED-umbra test (inscribed-sphere cone contains the light
+			// cone) forces occ=1; everything it does not claim falls to the emergent analytic integral, which
+			// saturates to umbra where it can. Conservative by construction, so it can only ADD correct umbra.
+			{
+				float scShade = centreBlocked ? 0.0f : 1.0f;		// STENCIL-ONLY: total shadow = stencil hard shadow, no coverage
+				float pd = scShade - truth;
+				if( truth >= 0.85f && pd <= -0.25f ) { pcFalseShadow++; }
+				if( truth <= 0.15f && pd >=  0.25f ) { pcMissUmbra++; }
+				// PENUMBRA LOSS: how wrong is the hard edge where truth is a gradient? This is the error PCSS (or
+				// an analytic penumbra) must recover. Whole penumbra band, mean|err| against the ray oracle.
+				if( truth > 0.02f && truth < 0.98f )
+				{
+					pcPenumN++;
+					pcPenumSum += std::fabs( pd );
+					if( std::fabs( pd ) > 0.25f ) { pcPenumGross++; }
+				}
+			}
+			if( truth >= 0.85f && d <= -0.25f ) { falseShadow++; falseShadowSev += ( double )( -d ); }
+			if( truth <= 0.15f && d >=  0.25f )
+			{
+				missUmbra++;
+				missUmbraSev += ( double )( d );
+				// classify the cause: (core-miss) point-light ray missed a true umbra -> core returns lit;
+				// (ring-undershadow) coverage in the ring did not saturate to 1 (the F6/F9 cross-section gap).
+				if( !( par & 1 ) && !centreBlocked ) { missUmbraCoreMiss++; }
+				else { missUmbraRing++; }
+			}
+			if( truth >= 0.85f ) { litN++; }
+			if( truth <= 0.15f ) { umbraN++; }
 			// PENUMBRA-CONDITIONAL metrics: the whole point of the technique lives in the pixels whose
 			// true value is BETWEEN lit and umbra. Whole-frame means dilute them to invisibility (a few-
 			// pixel band in a 50k-pixel frame reads as single-digit error while the penumbra itself is
@@ -2694,7 +3102,19 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 				nm, pEps, tMaxJump, tHard, tPenum, tPenum ? 100.0 * tHard / tPenum : 0.0, tParFlip, tCbFlip, tInternal );
 		std::printf( "    [snap %s] vs RAYTRACE: candidate HARD=%d  oracle HARD=%d (physical)  SNAP ARTIFACT (cand excess>0.25)=%d/%d (%.1f%%) maxExcess=%.3f\n",
 				nm, tHard, tTruthJump, tSnapArtifact, tPenum, tPenum ? 100.0 * tSnapArtifact / tPenum : 0.0, tMaxExcess );
+		std::printf( "    [pathology %s] FALSE-SHADOW (shadow in a LIT pixel)=%d/%d (%.2f%%, sev %.1f)  MISSING-UMBRA (lit in a DARK pixel)=%d/%d (%.2f%%, sev %.1f)  cause: coreMiss=%d ringUnder=%d\n",
+				nm, falseShadow, litN, litN ? 100.0 * falseShadow / litN : 0.0, falseShadowSev,
+				missUmbra, umbraN, umbraN ? 100.0 * missUmbra / umbraN : 0.0, missUmbraSev, missUmbraCoreMiss, missUmbraRing );
+		std::printf( "    [stencil-only %s] FALSE-SHADOW=%d/%d (%.2f%%)  MISSING-UMBRA=%d/%d (%.2f%%)   [emergent was: false %.2f%%  miss %.2f%%]\n",
+				nm, pcFalseShadow, litN, litN ? 100.0 * pcFalseShadow / litN : 0.0, pcMissUmbra, umbraN, umbraN ? 100.0 * pcMissUmbra / umbraN : 0.0,
+				litN ? 100.0 * falseShadow / litN : 0.0, umbraN ? 100.0 * missUmbra / umbraN : 0.0 );
+		std::printf( "    [stencil-only %s] PENUMBRA LOSS (0.02<truth<0.98): mean|err|=%.4f gross(>0.25)=%.1f%%  vs emergent-coverage mean|err|=%.4f  (%d penumbra px)\n",
+				nm, pcPenumN ? pcPenumSum / pcPenumN : 0.0, pcPenumN ? 100.0 * pcPenumGross / pcPenumN : 0.0, pN ? pSum / pN : 0.0, pcPenumN );
 		CHECK( n > 1000 );
+		// THE TWO PATHOLOGIES - heavily penalised, near-zero tolerance. A false shadow on lit ground and a
+		// deleted umbra are the defects that read as "broken" in game; they dominate the verdict.
+		CHECK( falseShadow * 200 <= litN );		// < 0.5% of lit pixels may carry a false shadow
+		CHECK( missUmbra * 200 <= umbraN );		// < 0.5% of umbra pixels may be missing their darkening
 		CHECK( exN == 0 );						// no pixel grossly darker than the ray reference
 		CHECK( misN == 0 );						// no pixel grossly lighter than the ray reference
 		CHECK( gross * 100 <= n );				// and <=1% above truth-quantization disagreement
