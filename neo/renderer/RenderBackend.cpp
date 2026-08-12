@@ -1904,10 +1904,13 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			// SoftShadowDefects "guilty caster" isolation). Off (0) outside AAM ring passes: without the
 			// hard-base guarantee the same subtraction would delete REAL umbra.
 			extern idCVar r_softShadowAAM;
+			extern idCVar r_softShadowContinuous;
 			// Ring pass (ref 1) guarantees the disk centre is VISIBLE -> guard on (1). The emergent-umbra CORE
 			// pass (ref 2) is exactly where the centre is BLOCKED -> guard off (0) so the integral can saturate
 			// to a real umbra instead of having its winding subtracted away. Only ref 1 gets the centre-lit guard.
-			const float swCentreLit = ( r_softShadowAAM.GetBool() && softBandStencilRef == 1 ) ? 1.0f : 0.0f;
+			// r_softShadowContinuous forces the guard ON in the single ungated pass (ref -1): continuous coverage
+			// everywhere, no core stamp - least over-darkening + most temporal stability (see the cvar help).
+			const float swCentreLit = ( r_softShadowContinuous.GetBool() || ( r_softShadowAAM.GetBool() && softBandStencilRef == 1 ) ) ? 1.0f : 0.0f;
 			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, 0.0f, 0.0f };
 			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
 		}

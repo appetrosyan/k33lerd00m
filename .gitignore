@@ -87,4 +87,6 @@ neo/bin/
 # local soft-shadow scene captures (large / binary; not committed)
 neo/tests/data/*.softcap
 neo/tests/data/*.png
+neo/tests/data/*.ppm
+neo/tests/data/*.bin
 base/softcap/

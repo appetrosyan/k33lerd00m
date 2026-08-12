@@ -2684,6 +2684,7 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		CHECK( gross * 100 <= n );				// and <=1% above truth-quantization disagreement
 		CHECK( pN == 0 || pSum / pN < 0.08 );	// the PENUMBRA ITSELF must track the integral, not just the frame
 		CHECK( pOverHard * 10 <= pN );			// over-hardening (gradient stamped dark) heavily penalised
+		CHECK( tHard == 0 );
 	}
 	std::printf( "    [ref] %d captures fully ray-verified\n", capsSeen );
 	CHECK( capsSeen >= 7 );
