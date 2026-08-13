@@ -2887,11 +2887,15 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		int tTruthJump = 0, tSnapArtifact = 0; double tMaxExcess = 0;		// snap measured AGAINST the raytraced oracle
 
 		std::vector<float> imgP( ( size_t )W * H, 1.0f ), imgR( ( size_t )W * H, 1.0f );
+		std::vector<float> imgHard( ( size_t )W * H, 1.0f ), imgRamp( ( size_t )W * H, 1.0f );	// stencil-only vs distance-ramp
+		std::vector<float> distB( ( size_t )W * H, 1e30f );	// screen-space world-distance to the stencil boundary
 		std::vector<unsigned char> covered( ( size_t )W * H, 0 );
+		std::vector<unsigned char> cbMask( ( size_t )W * H, 0 );		// stencil (point-light) shadow mask, for screen-space softening
 		int n = 0, exN = 0, misN = 0, gross = 0;
 		int pN = 0, pGross = 0, pOverHard = 0;
 		int falseShadow = 0, missUmbra = 0, litN = 0, umbraN = 0;		// the two pathologies + their region sizes
 		int pcFalseShadow = 0, pcMissUmbra = 0;							// stencil-only pathologies
+		int gFalse = 0, gMiss = 0, gRuns = 0, gTot = 0; double gPenumSum = 0; int gPenumN = 0;	// PCF-gated analytic (locator test)
 		double pcPenumSum = 0; int pcPenumN = 0, pcPenumGross = 0;		// stencil-only PENUMBRA loss vs oracle
 		int missUmbraCoreMiss = 0, missUmbraRing = 0;					// cause split: centre-ray-miss vs ring-undershadow
 		double falseShadowSev = 0, missUmbraSev = 0;
@@ -2955,6 +2959,8 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 				}
 				if( exmax > 0.25f ) { tSnapArtifact++; }			// SNAP: candidate steps hard where the raytrace is smooth
 			}
+			cbMask[i] = centreBlocked ? 1 : 0;
+			imgHard[i] = centreBlocked ? 0.0f : 1.0f;		// stencil-only hard shadow
 			imgP[i] = shadow;
 			imgR[i] = truth;
 			n++;
@@ -2985,6 +2991,23 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 					if( std::fabs( pd ) > 0.25f ) { pcPenumGross++; }
 				}
 			}
+			{
+				// PCF-GATED ANALYTIC (the locator architecture). A cheap low-tap occlusion (PCF proxy) classifies
+				// lit / penumbra / umbra; the analytic integral runs ONLY in the penumbra + umbra-boundary band
+				// (locOcc in (0.02, 0.985)), never where the locator says fully lit - so the illusory umbra (false
+				// shadow), which lives far from any real shadow, can never fire. Deep umbra -> 0 (no eval), lit ->
+				// 1 (no eval). Measures pathologies, penumbra tracking, and how FEW pixels run the integral.
+				float locOcc = 1.0f - TruthShadowCulled( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), lc.casters, 2 );
+				float gShade; bool ran = false;
+				if( locOcc <= 0.02f ) { gShade = 1.0f; }
+				else if( locOcc >= 0.985f ) { gShade = 0.0f; }
+				else { gShade = 1.0f - saturate( SoftShadow_WedgeOcclusion( P, lc.Lo, lc.rp, lc.firstElem, lc.nRec, centreBlocked ? 0.0f : 1.0f, buf ) ); ran = true; }
+				gTot++; if( ran ) { gRuns++; }
+				float gd = gShade - truth;
+				if( truth >= 0.85f && gd <= -0.25f ) { gFalse++; }
+				if( truth <= 0.15f && gd >=  0.25f ) { gMiss++; }
+				if( truth > 0.02f && truth < 0.98f ) { gPenumN++; gPenumSum += std::fabs( gd ); }
+			}
 			if( truth >= 0.85f && d <= -0.25f ) { falseShadow++; falseShadowSev += ( double )( -d ); }
 			if( truth <= 0.15f && d >=  0.25f )
 			{
@@ -3009,6 +3032,103 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 				if( std::fabs( d ) > 0.25f ) { pGross++; }
 				if( d < -0.25f ) { pOverHard++; }		// darker than truth by >0.25 inside the penumbra
 			}
+		}
+		// SCREEN-SPACE SYMMETRIC RAMP: the stencil boundary IS the ~50% occlusion contour, so the WHOLE
+		// penumbra is one ramp around it - shadow 0 (deep umbra) -> 0.5 (at the boundary) -> 1 (lit), driven by
+		// the WORLD distance to the boundary (nearest opposite-class fragment). Inner side reads distance to the
+		// nearest LIT fragment, outer side to the nearest SHADOWED fragment. Pure distance (no truth gating, so
+		// it is engine-faithful), no coverage integral, anchored on the exact stencil edge.
+		{
+			const int R = 24;
+			for( int y = 0; y < H; y++ )
+				for( int x = 0; x < W; x++ )
+				{
+					int i = y * W + x;
+					if( !covered[i] ) { continue; }
+					bool inside = cbMask[i] != 0;
+					float half = std::fmax( lights[g.light[i]].rp, 1e-3f );
+					float3 P = g.wpos[i];
+					float best = 1e30f;
+					for( int dy = -R; dy <= R; dy++ )
+						for( int dx = -R; dx <= R; dx++ )
+						{
+							int xx = x + dx, yy = y + dy;
+							if( xx < 0 || yy < 0 || xx >= W || yy >= H ) { continue; }
+							int j = yy * W + xx;
+							if( !covered[j] || ( ( cbMask[j] != 0 ) == inside ) ) { continue; }	// nearest OPPOSITE-class = the boundary
+							float3 dv = g.wpos[j] - P;
+							best = std::fmin( best, std::sqrt( dot( dv, dv ) ) );
+						}
+					distB[i] = best;
+					float t = saturate( best / half );					// 0 at boundary -> 1 a half-width away
+					imgRamp[i] = inside ? ( 0.5f * ( 1.0f - t ) ) : ( 1.0f - 0.5f * ( 1.0f - t ) );
+				}
+			// LOCATOR TIGHTNESS: PCF flags a FIXED-width band around the edge; PCSS flags the ACTUAL penumbra
+			// width (contact hardening from the blocker distance). Both must cover the real penumbra; PCSS runs
+			// the integral on fewer pixels where the real penumbra is narrower than the fixed band. Count both.
+			{
+				int pcfEval = 0, pcssEval = 0, pcssMaxEval = 0, pcssFracEval = 0, realPen = 0, evalTot = 0;
+				for( int i = 0; i < W * H; i++ )
+				{
+					if( !covered[i] ) { continue; }
+					evalTot++;
+					if( imgR[i] > 0.02f && imgR[i] < 0.98f ) { realPen++; }
+					float3 P = g.wpos[i];
+					const RefLight& lc2 = lights[g.light[i]];
+					float wFixed = lc2.rp * 2.0f;						// PCF: fixed band (sized to cover the widest penumbra)
+					if( distB[i] < wFixed ) { pcfEval++; }
+					// Kernel search pre-gated to a GENEROUS band (4*rp) so wide penumbrae are not clipped. Rays to
+					// points ACROSS the light disk. From the same samples: AVG-blocker width (standard PCSS), MAX-
+					// blocker width (conservative), and blocker FRACTION (partial occlusion = penumbra, conservative).
+					if( distB[i] < lc2.rp * 4.0f )
+					{
+						softFrame_t f = SoftShadow_Frame( P, lc2.Lo );
+						const float2 dk[13] = { {0,0}, {0.5f,0}, {-0.5f,0}, {0,0.5f}, {0,-0.5f}, {0.7f,0.7f}, {-0.7f,0.7f}, {0.7f,-0.7f}, {-0.7f,-0.7f}, {1,0}, {-1,0}, {0,1}, {0,-1} };
+						double sumT = 0; int hitCnt = 0; float maxT = 0.0f;
+						for( int s = 0; s < 13; s++ )
+						{
+							float3 Li = lc2.Lo + f.u * ( dk[s].x * lc2.rp ) + f.v * ( dk[s].y * lc2.rp );
+							float3 D = Li - P;
+							float th = 1e30f;
+							for( const CasterRange& cr : lc2.casters )
+								for( uint32_t k = cr.first; k + 2 < cr.first + cr.num; k += 3 )
+								{
+									float3 a( c.meshVerts[c.meshIdx[k] * 3], c.meshVerts[c.meshIdx[k] * 3 + 1], c.meshVerts[c.meshIdx[k] * 3 + 2] );
+									float3 b( c.meshVerts[c.meshIdx[k + 1] * 3], c.meshVerts[c.meshIdx[k + 1] * 3 + 1], c.meshVerts[c.meshIdx[k + 1] * 3 + 2] );
+									float3 cc( c.meshVerts[c.meshIdx[k + 2] * 3], c.meshVerts[c.meshIdx[k + 2] * 3 + 1], c.meshVerts[c.meshIdx[k + 2] * 3 + 2] );
+									float tt = RayTriT( P, D, a, b, cc );
+									if( tt > 1e-3f && tt < 1.0f && tt < th ) { th = tt; }
+								}
+							if( th < 1.0f ) { sumT += th; hitCnt++; maxT = std::fmax( maxT, th ); }
+						}
+						if( hitCnt > 0 )
+						{
+							float avgT = ( float )( sumT / hitCnt );
+							float wAvg = lc2.rp * avgT / std::fmax( 1.0f - avgT, 1e-3f );
+							float wMax = lc2.rp * maxT / std::fmax( 1.0f - maxT, 1e-3f );	// farthest blocker = widest penumbra
+							if( distB[i] < wAvg ) { pcssEval++; }
+							if( distB[i] < wMax ) { pcssMaxEval++; }
+						}
+						if( hitCnt > 0 && hitCnt < 13 ) { pcssFracEval++; }				// partial disk occlusion = penumbra (conservative)
+					}
+				}
+				std::printf( "    [locator-tightness %s] integral eval region of %d px: PCF fixed=%.1f%%  PCSS avg=%.1f%%  PCSS max(cons)=%.1f%%  PCSS frac(cons)=%.1f%%  REAL penumbra=%.1f%%\n",
+						nm, evalTot, evalTot ? 100.0 * pcfEval / evalTot : 0.0, evalTot ? 100.0 * pcssEval / evalTot : 0.0,
+						evalTot ? 100.0 * pcssMaxEval / evalTot : 0.0, evalTot ? 100.0 * pcssFracEval / evalTot : 0.0,
+						evalTot ? 100.0 * realPen / evalTot : 0.0 );
+			}
+			double fullHard = 0, fullRamp = 0; int fullN = 0;
+			for( int i = 0; i < W * H; i++ )
+			{
+				if( !covered[i] ) { continue; }
+				float truth = imgR[i];
+				if( !( truth > 0.02f && truth < 0.98f ) ) { continue; }		// whole penumbra
+				fullHard += std::fabs( imgHard[i] - truth );
+				fullRamp += std::fabs( imgRamp[i] - truth );
+				fullN++;
+			}
+			std::printf( "    [ramp %s] FULL PENUMBRA (0.02<truth<0.98, %d px): hard-stencil mean|err|=%.4f  symmetric-ramp mean|err|=%.4f  (analytic-coverage %.4f)\n",
+					nm, fullN, fullN ? fullHard / fullN : 0.0, fullN ? fullRamp / fullN : 0.0, pN ? pSum / pN : 0.0 );
 		}
 		// side-by-side sheet: SHADED pipeline | SHADED ray reference | signed-error heatmap. The two left
 		// panes are lit renders (world-space checker albedo x N.L x warm light tint x shadow term + ambient)
@@ -3094,6 +3214,26 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 			}
 			std::fclose( f );
 		}
+		// VISCON: hard-stencil | symmetric distance-ramp | ray truth, all lit-shaded, so the penumbra softening
+		// reads in a game-like context. The middle pane is the candidate: stencil umbra + screen-space soft edge.
+		char rout[512];
+		std::snprintf( rout, sizeof( rout ), "/home/app/Games/gog/doom-3-bfg-edition/base/softcap/ramp_%s.ppm", nm );
+		std::FILE* rf = std::fopen( rout, "wb" );
+		if( rf )
+		{
+			std::fprintf( rf, "P6\n%d %d\n255\n", W * 3, H );
+			for( int y = 0; y < H; y++ )
+				for( int pane = 0; pane < 3; pane++ )
+					for( int x = 0; x < W; x++ )
+					{
+						int i = y * W + x;
+						unsigned char rgb[3];
+						if( !covered[i] ) { rgb[0] = rgb[1] = rgb[2] = 24; }
+						else { shadePixel( i, pane == 0 ? imgHard[i] : ( pane == 1 ? imgRamp[i] : imgR[i] ), rgb ); }
+						std::fwrite( rgb, 1, 3, rf );
+					}
+			std::fclose( rf );
+		}
 		std::printf( "    [ref %s] %d px: mean|err|=%.4f worst=%.3f gross(>0.25)=%d (%.2f%%) extraneous(<-0.5)=%d missing(>0.5)=%d -> ref_%s.ppm\n",
 				nm, n, n ? sumAbs / n : 0.0, worst, gross, n ? 100.0 * gross / n : 0.0, exN, misN, nm );
 		std::printf( "    [ref %s] PENUMBRA (%d px, truth in 0.02..0.98): mean|err|=%.4f gross=%.1f%% OVER-HARDENED=%.1f%%\n",
@@ -3110,6 +3250,10 @@ TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 				litN ? 100.0 * falseShadow / litN : 0.0, umbraN ? 100.0 * missUmbra / umbraN : 0.0 );
 		std::printf( "    [stencil-only %s] PENUMBRA LOSS (0.02<truth<0.98): mean|err|=%.4f gross(>0.25)=%.1f%%  vs emergent-coverage mean|err|=%.4f  (%d penumbra px)\n",
 				nm, pcPenumN ? pcPenumSum / pcPenumN : 0.0, pcPenumN ? 100.0 * pcPenumGross / pcPenumN : 0.0, pN ? pSum / pN : 0.0, pcPenumN );
+		std::printf( "    [PCF-gated %s] FALSE-SHADOW=%d/%d (%.2f%%)  MISSING-UMBRA=%d/%d (%.2f%%)  penumbra mean|err|=%.4f  integral ran on %d/%d px (%.1f%%)  [always-on analytic: false %.2f%% miss %.2f%% penum %.4f]\n",
+				nm, gFalse, litN, litN ? 100.0 * gFalse / litN : 0.0, gMiss, umbraN, umbraN ? 100.0 * gMiss / umbraN : 0.0,
+				gPenumN ? gPenumSum / gPenumN : 0.0, gRuns, gTot, gTot ? 100.0 * gRuns / gTot : 0.0,
+				litN ? 100.0 * falseShadow / litN : 0.0, umbraN ? 100.0 * missUmbra / umbraN : 0.0, pN ? pSum / pN : 0.0 );
 		CHECK( n > 1000 );
 		// THE TWO PATHOLOGIES - heavily penalised, near-zero tolerance. A false shadow on lit ground and a
 		// deleted umbra are the defects that read as "broken" in game; they dominate the verdict.
