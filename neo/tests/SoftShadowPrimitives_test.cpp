@@ -1930,7 +1930,7 @@ TEST( SoftContract, coverage_area_physical_bound )
 namespace
 {
 
-struct CasterRange { uint32_t first, num; float3 lo, hi; };
+// CasterRange now lives in SoftShadowRender.h (the shadow-map locator needs it too).
 
 bool RayAabb( float3 P, float3 D, float3 lo, float3 hi )	// segment P..P+D vs AABB (slab test)
 {
@@ -2021,6 +2021,96 @@ float TruthShadowCulled( float3 P, float3 L, float r, const float* verts, const 
 	return total ? 1.0f - ( float )inside / total : 1.0f;
 }
 
+}
+
+TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
+{
+	// THE GAP that let the false-shadow-everywhere regression ship: every prior locator metric used the RAY
+	// oracle (TruthShadowCulled) as the classifier, but the engine's PCSS locator projects into a RASTERISED,
+	// front-face-culled shadow-map and blocker-searches it (interactionSM.ps.hlsl, USE_SHADOW_ATLAS branch).
+	// Shadow-map failure modes - depth acne, insufficient bias, wrong face/UV - are invisible to a ray cast.
+	// Here we render the caster mesh from each light EXACTLY as ShadowMapPassFast does (front-face culled ->
+	// back-face depth) and run the identical blocker-fraction gate, then assert it fires NO shadow where the
+	// light is provably fully visible (ray truth == lit). Red-until-fixed.
+	const char* names[] = { "erebus2", "erebus3", "erebus4", "erebus5", "erebus6", "erebus7", "erebus13" };
+	const int W = 320;
+	const float pcssScale = 4.0f;		// r_shadowMapPCSSScale default; the shader's blocker-search radius in texels
+	int capsSeen = 0;
+	long litTotal = 0, falseTotal = 0;
+	for( const char* nm : names )
+	{
+		char path[512];
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
+		SoftCap c;
+		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		capsSeen++;
+		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
+		SwGBuffer g( W, H );
+		for( const softcapReceiver_t& R : c.receivers )
+			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
+			{
+				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
+				float3 A( c.recvVerts[ia * 3 + 0], c.recvVerts[ia * 3 + 1], c.recvVerts[ia * 3 + 2] );
+				float3 B( c.recvVerts[ib * 3 + 0], c.recvVerts[ib * 3 + 1], c.recvVerts[ib * 3 + 2] );
+				float3 C( c.recvVerts[ic * 3 + 0], c.recvVerts[ic * 3 + 1], c.recvVerts[ic * 3 + 2] );
+				SwRasterTri( g, c.hdr.worldMVP, A, B, C, ( int )R.lightIndex );
+			}
+		struct L2 { bool soft = false, hasSM = false; float3 Lo; float rp = 0; std::vector<CasterRange> casters; SwShadowMap sm; };
+		std::vector<L2> lights( c.hdr.numLights );
+		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
+		{
+			const softcapLight_t& Lt = c.lights[li];
+			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
+			L2& lc = lights[li];
+			lc.soft = true;
+			lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
+			lc.rp = Lt.penumbraSize;
+			float3 ctr( 0, 0, 0 );
+			int nc = 0;
+			for( const softcapCaster_t& cs : c.casters )
+			{
+				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
+				CasterRange cr;
+				cr.first = cs.firstIndex;
+				cr.num = cs.numIndex;
+				cr.lo = float3( 1e30f, 1e30f, 1e30f );
+				cr.hi = float3( -1e30f, -1e30f, -1e30f );
+				for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < c.meshIdx.size(); k++ )
+				{
+					const float* vp = &c.meshVerts[c.meshIdx[k] * 3];
+					cr.lo = float3( std::fmin( cr.lo.x, vp[0] ), std::fmin( cr.lo.y, vp[1] ), std::fmin( cr.lo.z, vp[2] ) );
+					cr.hi = float3( std::fmax( cr.hi.x, vp[0] ), std::fmax( cr.hi.y, vp[1] ), std::fmax( cr.hi.z, vp[2] ) );
+				}
+				ctr = ctr + ( cr.lo + cr.hi ) * 0.5f;
+				nc++;
+				lc.casters.push_back( cr );
+			}
+			if( nc == 0 ) { lc.soft = false; continue; }
+			ctr = ctr * ( 1.0f / nc );
+			lc.sm = SwRenderShadowMap( lc.Lo, ctr, c.meshVerts.data(), c.meshIdx.data(), lc.casters, 1024 );
+			lc.hasSM = true;
+		}
+		for( int i = 0; i < W * H; i++ )
+		{
+			int li = g.light[i];
+			if( li < 0 || !lights[li].soft || !lights[li].hasSM ) { continue; }
+			L2& lc = lights[li];
+			float3 P = g.wpos[i];
+			float3 toL = lc.Lo - P;
+			float dl = std::sqrt( dot( toL, toL ) );
+			if( dl > 1e-4f ) { P = P + toL * ( 2.0f / dl ); }			// lift off the surface (same as the frame loop)
+			float truth = TruthShadowCulled( P, lc.Lo, lc.rp, c.meshVerts.data(), c.meshIdx.data(), lc.casters, 8 );
+			if( truth < 0.98f ) { continue; }							// only the provably-lit region
+			float frac = SwLocatorBlockerFrac( P, lc.sm, pcssScale );
+			if( frac < 0.0f ) { continue; }								// receiver outside this map's face
+			litTotal++;
+			if( frac > 0.02f ) { falseTotal++; }						// locator fires shadow where the light is fully visible
+		}
+	}
+	if( capsSeen == 0 ) { std::printf( "    [locator] no captures found - skipping\n" ); return; }
+	double rate = litTotal ? ( double )falseTotal / litTotal : 0.0;
+	std::printf( "    [locator false-shadow] %ld / %ld provably-lit px misclassified as shadow = %.1f%%\n", falseTotal, litTotal, rate * 100.0 );
+	CHECK( rate < 0.02 );
 }
 
 TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )

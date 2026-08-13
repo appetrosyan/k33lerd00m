@@ -23,6 +23,9 @@ It is free software under the GNU GPL v3 (or later).
 namespace swtest
 {
 
+// a caster's triangle range in the mesh index stream + its world AABB (ray/frustum culling).
+struct CasterRange { uint32_t first, num; float3 lo, hi; };
+
 // world point -> screen (x,y in [0,W)x[0,H)), returns clip.w (>0 = in front). Fills ndcZ for the depth test.
 inline bool SwProject( const float* mvp, float3 P, int W, int H, float& sx, float& sy, float& clipW, float& ndcZ )
 {
@@ -95,6 +98,134 @@ inline void SwWritePGM( const char* file, int W, int H, const std::vector<float>
 	std::fprintf( f, "P5\n%d %d\n255\n", W, H );
 	for( int i = 0; i < W * H; i++ ) { unsigned char c = ( unsigned char )( std::fmax( 0.0f, std::fmin( 1.0f, v[i] ) ) * 255.0f + 0.5f ); std::fwrite( &c, 1, 1, f ); }
 	std::fclose( f );
+}
+
+// ============================================================================================
+// Shadow-map LOCATOR fidelity (closes the gap the ray-cast locator left): the engine's PCSS
+// locator does NOT ray-cast - it projects the receiver into a RASTERISED depth map and blocker-
+// searches it. Shadow-map failure modes (depth acne, insufficient bias, back/front-face storage,
+// wrong face/UV) are invisible to a ray oracle. This renders the caster mesh from the light EXACTLY
+// as ShadowMapPassFast does - FRONT-FACE CULLED, so the stored depth is the occluder's BACK face -
+// then runs the identical blocker-fraction gate the shader (interactionSM.ps.hlsl) runs.
+// ============================================================================================
+
+// row-major world->clip look-at + D3D perspective (depth 0..1, cw>0 in front) - matches SwProject's
+// convention (the same one c.hdr.worldMVP uses), so SwProject works unchanged on the result.
+inline void SwLookAtPersp( float3 eye, float3 target, float3 upHint, float fovY, float aspect,
+						   float nearZ, float farZ, float* mvp )
+{
+	float3 z = normalize( eye - target );			// camera looks down -z (view space)
+	float3 x = normalize( cross( upHint, z ) );
+	float3 y = cross( z, x );
+	// view (world->view), row-major
+	float V[16] =
+	{
+		x.x, x.y, x.z, -dot( x, eye ),
+		y.x, y.y, y.z, -dot( y, eye ),
+		z.x, z.y, z.z, -dot( z, eye ),
+		0, 0, 0, 1
+	};
+	float g = 1.0f / std::tan( fovY * 0.5f );
+	float A = farZ / ( nearZ - farZ );
+	float B = nearZ * farZ / ( nearZ - farZ );
+	float P[16] =
+	{
+		g / aspect, 0, 0, 0,
+		0, g, 0, 0,
+		0, 0, A, B,
+		0, 0, -1, 0
+	};
+	for( int r = 0; r < 4; r++ )
+		for( int col = 0; col < 4; col++ )
+		{
+			float s = 0;
+			for( int k = 0; k < 4; k++ ) { s += P[r * 4 + k] * V[k * 4 + col]; }
+			mvp[r * 4 + col] = s;
+		}
+}
+
+struct SwShadowMap
+{
+	int res = 0;
+	std::vector<float> depth;		// window z in [0,1], 1 = far/empty
+	float mvp[16];					// world -> clip (SwProject-compatible)
+	float3 eye;
+};
+
+// Render the caster mesh into a single square depth map from the light toward `target`. FRONT-FACE
+// CULLED against the light (keep triangles whose outward normal faces AWAY from the light => stored
+// depth is the BACK face), reproducing GLS_CULL_FRONTSIDED. `bias` pushes stored depth away from the
+// light (the engine's GL_PolygonOffset on the shadow pass).
+inline SwShadowMap SwRenderShadowMap( float3 L, float3 target, const float* verts, const uint32_t* idx,
+									  const std::vector<CasterRange>& casters, int res, float bias = 0.0f )
+{
+	SwShadowMap sm;
+	sm.res = res;
+	sm.eye = L;
+	sm.depth.assign( ( size_t )res * res, 1e30f );
+	// frustum bounds from the caster AABBs (radius around the light->target axis)
+	float3 up( 0, 0, 1 );
+	if( std::fabs( dot( normalize( target - L ), up ) ) > 0.95f ) { up = float3( 0, 1, 0 ); }
+	SwLookAtPersp( L, target, up, 1.5708f /*90deg*/, 1.0f, 1.0f, 8192.0f, sm.mvp );
+	for( const CasterRange& cr : casters )
+		for( uint32_t t = cr.first; t + 2 < cr.first + cr.num; t += 3 )
+		{
+			uint32_t ia = idx[t], ib = idx[t + 1], ic = idx[t + 2];
+			float3 A( verts[ia * 3 + 0], verts[ia * 3 + 1], verts[ia * 3 + 2] );
+			float3 B( verts[ib * 3 + 0], verts[ib * 3 + 1], verts[ib * 3 + 2] );
+			float3 C( verts[ic * 3 + 0], verts[ic * 3 + 1], verts[ic * 3 + 2] );
+			float3 fN = cross( B - A, C - A );
+			float3 ctr( ( A.x + B.x + C.x ) / 3, ( A.y + B.y + C.y ) / 3, ( A.z + B.z + C.z ) / 3 );
+			if( dot( fN, ctr - L ) <= 0.0f ) { continue; }	// front-facing to light -> culled (keep back faces)
+			float ax, ay, aw, az, bx, by, bw, bz, cx, cy, cw, cz;
+			if( !SwProject( sm.mvp, A, res, res, ax, ay, aw, az ) ) { continue; }
+			if( !SwProject( sm.mvp, B, res, res, bx, by, bw, bz ) ) { continue; }
+			if( !SwProject( sm.mvp, C, res, res, cx, cy, cw, cz ) ) { continue; }
+			int minx = std::max( 0, ( int )std::floor( std::fmin( ax, std::fmin( bx, cx ) ) ) );
+			int maxx = std::min( res - 1, ( int )std::ceil( std::fmax( ax, std::fmax( bx, cx ) ) ) );
+			int miny = std::max( 0, ( int )std::floor( std::fmin( ay, std::fmin( by, cy ) ) ) );
+			int maxy = std::min( res - 1, ( int )std::ceil( std::fmax( ay, std::fmax( by, cy ) ) ) );
+			float area = ( bx - ax ) * ( cy - ay ) - ( by - ay ) * ( cx - ax );
+			if( std::fabs( area ) < 1e-9f ) { continue; }
+			float inv = 1.0f / area;
+			for( int y = miny; y <= maxy; y++ )
+				for( int x = minx; x <= maxx; x++ )
+				{
+					float px = x + 0.5f, py = y + 0.5f;
+					float w0 = ( ( bx - px ) * ( cy - py ) - ( by - py ) * ( cx - px ) ) * inv;
+					float w1 = ( ( cx - px ) * ( ay - py ) - ( cy - py ) * ( ax - px ) ) * inv;
+					float w2 = 1.0f - w0 - w1;
+					if( w0 < 0.0f || w1 < 0.0f || w2 < 0.0f ) { continue; }
+					float z = w0 * az + w1 * bz + w2 * cz + bias;
+					size_t di = ( size_t )y * res + x;
+					if( z < sm.depth[di] ) { sm.depth[di] = z; }
+				}
+		}
+	return sm;
+}
+
+// The EXACT shader locator (interactionSM.ps.hlsl USE_SHADOW_ATLAS branch): project P, 16-tap Vogel
+// blocker search, fraction gate. Returns hits/16, or -1 if P falls outside this map's frustum.
+inline float SwLocatorBlockerFrac( float3 P, const SwShadowMap& sm, float pcssScale, float recvBias = 0.999f )
+{
+	float sx, sy, sw, sz;
+	if( !SwProject( sm.mvp, P, sm.res, sm.res, sx, sy, sw, sz ) ) { return -1.0f; }
+	if( sx < 0 || sy < 0 || sx >= sm.res || sy >= sm.res ) { return -1.0f; }
+	float recvZ = sz * recvBias;
+	float searchPx = pcssScale;					// search radius in texels (pcssScale is a texel-count in the shader)
+	const float golden = 2.4f, phi = 0.37f;
+	float hits = 0.0f;
+	for( int bi = 0; bi < 16; bi++ )
+	{
+		float rr = std::sqrt( ( bi + 0.5f ) / 16.0f );
+		float th = bi * golden + phi;
+		int tx = ( int )( sx + std::cos( th ) * rr * searchPx );
+		int ty = ( int )( sy + std::sin( th ) * rr * searchPx );
+		if( tx < 0 || ty < 0 || tx >= sm.res || ty >= sm.res ) { continue; }
+		float bd = sm.depth[( size_t )ty * sm.res + tx];
+		if( bd < recvZ ) { hits += 1.0f; }
+	}
+	return hits / 16.0f;
 }
 
 } // namespace swtest

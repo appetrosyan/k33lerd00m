@@ -157,6 +157,23 @@ class  idCmdArgs;
 // console command: `captureSoftShadow` arms a one-shot capture.
 void  R_CaptureSoftShadow_f( const idCmdArgs& args );
 void  R_CaptureShadowRefs_f( const idCmdArgs& args );
+// Automated in-engine self-check: renders the RT oracle vs the soft+PCSS-locator hybrid from one frozen view
+// and prints a PASS/FAIL false-shadow verdict (exercises the real frontend/shader/atlas/uniform plumbing).
+void  R_TestSoftShadowLocator_f( const idCmdArgs& args );
+
+// Skip the intro cinematic and pin the view at a .softcap camera over the next ~120 frames, driven by the NORMAL
+// frame loop (Common::Frame calls R_SoftShadowGotoTick). Run `softShadowGoto <cap>` + `wait 90` before the test.
+void  R_SoftShadowGoto_f( const idCmdArgs& args );
+void  R_SoftShadowGotoTick();
+// Pin every shadow-relevant cvar to the explicit soft-shadow test baseline (RT off, soft on, atlas+PCSS, etc.),
+// so the self-test NEVER inherits an archived D3BFGConfig value (e.g. r_useRTShadows 1 silently disabling the
+// soft-wedge path). verbose = log each value + WARN on any archived override.
+void  R_SoftShadowPinTestConfig( bool verbose );
+
+// MINIMAL-INIT variant: Common.cpp calls this right after renderSystem->Init() (before game/sound/menu/player)
+// when com_softShadowSelfTest names a map. Loads that map's renderWorld + real .map lights + the paired
+// capture camera, renders RT-oracle vs soft+PCSS hybrid, prints the verdict. Returns false-shadow px (0=pass).
+int   R_SoftShadowSelfTest( const char* mapName );
 
 // True when a one-shot capture has been armed by the `captureSoftShadow` console command.
 bool  R_SoftShadowCaptureArmed();

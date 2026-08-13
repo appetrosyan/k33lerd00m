@@ -2205,12 +2205,17 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 			// float4
 			idVec4 shadowOffsets[6];
 
+			extern idCVar r_shadowMapPCSS;
+			extern idCVar r_shadowMapPCSSScale;
+			const float pcssScale = r_shadowMapPCSS.GetBool() ? r_shadowMapPCSSScale.GetFloat() : 0.0f;	// .z carries the PCSS light size (0 = off)
 			for( int i = 0; i < 6; i++ )
 			{
 				shadowOffsets[ i ].x = vLight->imageAtlasOffset[ i ].x * ( 1.0f / r_shadowMapAtlasSize.GetInteger() );
 				shadowOffsets[ i ].y = vLight->imageAtlasOffset[ i ].y * ( 1.0f / r_shadowMapAtlasSize.GetInteger() );
-				shadowOffsets[ i ].z = 0.0f;
-				shadowOffsets[ i ].w = 0.0f;
+				shadowOffsets[ i ].z = pcssScale;
+				// atlas rect scale, duplicated from rpJitterTexScale.y so the soft-wedge PCSS locator can read
+				// it: the soft path overwrites rpJitterTexScale with (R, minWidth, numEdges), clobbering .y.
+				shadowOffsets[ i ].w = vLight->imageSize.x / float( r_shadowMapAtlasSize.GetInteger() );
 			}
 
 			SetVertexParms( RENDERPARM_SHADOW_ATLAS_OFFSET_0, &shadowOffsets[0][0], 6 );
@@ -2284,7 +2289,11 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 		// texture 5 will be the shadow maps array (or the RT visibility mask, which the
 		// RT interaction variant Loads in screen space instead of projecting)
 		GL_SelectTexture( INTERACTION_TEXUNIT_SHADOWMAPS );
-		if( R_LightUsesShadowMask( rtShadowsActiveThisView, vLight ) )
+		// Only ACTUAL RT lights read the screen-space mask at t5. A soft-wedge light's shader reads t5 as the
+		// shadow ATLAS (t_ShadowAtlas) for the PCSS locator - binding the RT mask here (R_LightUsesShadowMask is
+		// true for soft lights too) made the locator sample an empty mask -> 0 < recvZ everywhere -> whole-scene
+		// false umbra. Gate on R_LightUsesRTShadows (RT only) so soft/shadow-map lights get the atlas.
+		if( R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
 		{
 			globalImages->rtShadowMaskImage->Bind();
 		}
@@ -2398,6 +2407,15 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 				SetVertexParm( RENDERPARM_LIGHTFALLOFF_S, lightProjection[3].ToFloatPtr() );
 
 				// RB begin
+				// publish this soft light's atlas placement so the soft-shadow self-test can dump the exact tiles
+				// the PCSS locator samples (r_softShadowSelfTest / R_TestSoftShadowLocator_f in RenderCapture.cpp).
+				if( r_useSoftShadowVolumes.GetBool() && vLight->softEdgeCount > 0 && vLight->ImageAtlasPlaced() && vLight->imageSize.x > 0 )
+				{
+					extern idVec2i g_softDbgAtlasOff[6];
+					extern idVec2i g_softDbgAtlasSize;
+					for( int fdbg = 0; fdbg < 6; fdbg++ ) { g_softDbgAtlasOff[fdbg] = vLight->imageAtlasOffset[fdbg]; }
+					g_softDbgAtlasSize = vLight->imageSize;
+				}
 				if( !r_skipShadows.GetBool() && vLight->ImageAtlasPlaced() )
 				{
 					if( vLight->parallel )
@@ -4315,6 +4333,14 @@ void idRenderBackend::StencilShadowPass( const drawSurf_t* drawSurfs, const view
 		}
 
 		if( drawSurf->numIndexes == 0 )
+		{
+			continue;
+		}
+
+		// soft-wedge lights also link real OCCLUDER surfs (shadowCache==0) into globalShadows so the PCSS
+		// locator's atlas gets true occluder depth; those are for the shadow-MAP atlas pass, NOT stencil
+		// volumes - drawing them here as volumes (they have no shadowCache) would be garbage. Skip them.
+		if( drawSurf->shadowCache == 0 )
 		{
 			continue;
 		}

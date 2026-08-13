@@ -68,6 +68,8 @@ idCVar r_useStencilShadows( "r_useStencilShadows", "0", CVAR_RENDERER | CVAR_ARC
 // M2 diagnostics: cumulative tallies of stencil-volume caster gate outcomes (see R_AddSingleModel).
 // Printed by DrawInteractions when r_showShadows is set; names the missing prerequisite when 0 volumes build.
 int fe_stencilBuilt = 0;
+int fe_softEdgesCollected = 0;	// cumulative soft-shadow silhouette edges collected (diagnostic: 0 => soft-wedge inert)
+int fe_occludersBuilt = 0;		// cumulative PCSS-locator atlas OCCLUDER surfs built (diagnostic: 0 => atlas empty for soft lights)
 int fe_rejSilEdges = 0;
 int fe_rejSurfInter = 0;
 int fe_rejNumIdx = 0;
@@ -1322,6 +1324,8 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					R_CollectPenumbraEdges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
 											vEntity->modelMatrix, &sedges, &nedges );
 					tr.pc.softShadowMicroSec += Sys_Microseconds() - swCollectStart;
+					extern int fe_softEdgesCollected;
+					fe_softEdgesCollected += nedges;
 					if( nedges > 0 )
 					{
 						drawSurf_t* edgeSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *edgeSurf ), FRAME_ALLOC_DRAW_SURFACE );
@@ -1335,6 +1339,65 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 						edgeSurf->linkChain = &vLight->softShadowWedges;
 						edgeSurf->nextOnLight = vEntity->drawSurfs;
 						vEntity->drawSurfs = edgeSurf;
+					}
+				}
+
+				// PCSS LOCATOR ATLAS: the soft-wedge PCSS locator (r_shadowMapPCSS) samples the shadow ATLAS to
+				// classify lit / penumbra / umbra, but the volume surf built above is material==NULL, which
+				// ShadowMapPassFast skips - leaving the soft light's atlas EMPTY, so the locator reads far
+				// everywhere and (with receiver depth beyond the far plane) false-shadows the whole frame. Also
+				// build a real OCCLUDER surf (ambientCache + material, shadowCache 0) into globalShadows so the
+				// atlas gets true occluder depth. The two passes over globalShadows separate cleanly by cache:
+				// StencilShadowPass skips shadowCache==0 (this occluder), ShadowMapPassFast skips material==NULL
+				// (the volume). Only needed when the atlas-locator is actually in use.
+				extern idCVar r_useShadowAtlas;
+				extern idCVar r_shadowMapPCSS;
+				if( r_useShadowAtlas.GetBool() && r_shadowMapPCSS.GetBool() &&
+						( surfInter == NULL || surfInter->lightTrisIndexCache > 0 ) )
+				{
+					drawSurf_t* occ = ( drawSurf_t* )R_FrameAlloc( sizeof( *occ ), FRAME_ALLOC_DRAW_SURFACE );
+					memset( occ, 0, sizeof( *occ ) );
+					if( surfInter != NULL )
+					{
+						occ->numIndexes = surfInter->numLightTrisIndexes;
+						occ->indexCache = surfInter->lightTrisIndexCache;
+					}
+					else
+					{
+						if( !vertexCache.CacheIsCurrent( tri->indexCache ) )
+						{
+							tri->indexCache = vertexCache.AllocIndex( tri->indexes, tri->numIndexes );
+						}
+						occ->numIndexes = tri->numIndexes;
+						occ->indexCache = tri->indexCache;
+					}
+					if( !vertexCache.CacheIsCurrent( tri->ambientCache ) )
+					{
+						if( shader->ReceivesLighting() && !tri->tangentsCalculated )
+						{
+							R_DeriveTangents( tri );
+						}
+						tri->ambientCache = vertexCache.AllocVertex( tri->verts, tri->numVerts );
+					}
+					if( occ->numIndexes > 0 && vertexCache.CacheIsCurrent( occ->indexCache ) && vertexCache.CacheIsCurrent( tri->ambientCache ) )
+					{
+						occ->ambientCache = tri->ambientCache;
+						occ->shadowCache = 0;			// NOT a volume: StencilShadowPass skips shadowCache==0; the atlas draws it
+						occ->frontEndGeo = tri;
+						occ->space = vEntity;
+						occ->material = shader;
+						occ->scissorRect = vLight->scissorRect;
+						occ->sort = 0.0f;
+						if( shader->Coverage() == MC_PERFORATED )
+						{
+							R_SetupDrawSurfShader( occ, shader, renderEntity );
+						}
+						R_SetupDrawSurfJoints( occ, tri, shader );
+						occ->linkChain = &vLight->globalShadows;
+						occ->nextOnLight = vEntity->drawSurfs;
+						vEntity->drawSurfs = occ;
+						extern int fe_occludersBuilt;
+						fe_occludersBuilt++;
 					}
 				}
 

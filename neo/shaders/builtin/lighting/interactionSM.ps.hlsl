@@ -143,12 +143,122 @@ void main( PS_IN fragment, out PS_OUT result )
 	// explicit first element (this light's edges start here), passed in rpJitterTexOffset.x.
 	int swFirstElem = int( pc.rpJitterTexOffset.x );
 
+	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
+
 	// Light-disk coverage: sum each caster's silhouette against the area-light disk (see
 	// softwedge_coverage.inc.hlsl). This is the SAME function the unit tests compile as C++
 	// (neo/tests/SoftShadowCoverage_test.cpp via hlsl_compat.h), so the tested math IS the shipped math.
+	float shadow;
+	float swLocFr = -1.0;		// DIAG (swDbg 10): blocker fraction; -1 = pcss off / receiver outside the face
+	float swLocRecv = 0.0;		// DIAG (swDbg 11): receiver depth [0,1]
+	float swLocSamp = 0.0;		// DIAG (swDbg 12): shadow-map depth sampled at the receiver's projected texel
+	float2 swLocUV = float2( -1, -1 );	// DIAG 13: projected shadow xy (should land in [0,1] within the face)
+	float swLocW = 0.0;			// DIAG 14: perspective divisor w (sign matters)
+	float swLocFace = 0.0;		// DIAG 15: selected cube face / 5
+#if USE_SHADOW_ATLAS
+	// PCSS LOCATOR (r_shadowMapPCSS): the shadow atlas classifies each fragment lit / penumbra / umbra so the
+	// expensive coverage integral runs ONLY in the penumbra band. Blocker-search FRACTION of the light-disk
+	// footprint (validated in SoftShadowPrimitives_test as the tightest conservative locator): 0 blockers ->
+	// fully lit (analytic can't fire a false shadow), all blockers -> hard umbra (sharp, temporally stable),
+	// partial -> run the analytic. pcssScale (rpShadowAtlasOffsets[].z, 0 when r_shadowMapPCSS off) gates the
+	// whole locator: off -> the pure analytic everywhere, so the two are A/B-comparable live. The atlas depth,
+	// shadow matrices, offsets and screen-correction are all bound because the light is ImageAtlasPlaced.
+	// ponytail: correctness rides on r_useShadowAtlas (atlas depth must be bound at t5); pcssScale>0 implies it.
+	float pcssScale = pc.rpShadowAtlasOffsets[ 0 ].z;
+	if( pcssScale <= 0.0 )
+	{
+		float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
+		shadow = 1.0 - saturate( swOcc );
+	}
+	else
+	{
+		// pick the cube face the receiver faces (mirrors the shadow-map projection path)
+		int swSI = 0;
+#if LIGHT_POINT
+		float3 swTL = normalize( fragment.texcoord8.xyz );
+		float swAx[6] = { -swTL.x, swTL.x, -swTL.y, swTL.y, -swTL.z, swTL.z };
+		for( int fi = 1; fi < 6; fi++ )
+		{
+			if( swAx[fi] > swAx[swSI] )
+			{
+				swSI = fi;
+			}
+		}
+#endif
+		float4 swSTC;
+		swSTC.x = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 0 ] );
+		swSTC.y = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 1 ] );
+		swSTC.z = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 2 ] );
+		swSTC.w = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 3 ] );
+		swLocW = swSTC.w;			// DIAG (pre-divide)
+		swLocFace = float( swSI ) / 5.0;	// DIAG
+		swSTC.xyz /= swSTC.w;
+		swLocUV = swSTC.xy;			// DIAG (post-divide projected xy)
+		float swRecv = swSTC.z * pc.rpScreenCorrectionFactor.w;
+		float swFrac = pc.rpShadowAtlasOffsets[ swSI ].w;	// atlas rect scale (plumbed here; rpJitterTexScale.y holds the soft minWidth)
+		float2 swBase = swSTC.xy * swFrac + pc.rpShadowAtlasOffsets[ swSI ].xy;
+		float swSearch = pcssScale * pc.rpScreenCorrectionFactor.z;
+		float swPhi = BlueNoise( fragment.position.xy, 1.0 );
+		// RECEIVER-PLANE DEPTH BIAS: recvZ varies across a sloped receiver, so each blocker sample must be compared
+		// against the receiver depth AT that sample's atlas UV, not the fragment centre. Without it a large flat
+		// floor at a grazing angle from a small embedded light SELF-SHADOWS: one shadow texel spans a wide depth
+		// range, the far floor reads the near floor's stored depth (recvZ 0.99 vs stored 0.76) -> 16/16 blockers ->
+		// false umbra everywhere. Solve d(recvZ)/d(swBase) from screen-space derivatives (Isidoro 2006).
+		float2 swDuvdx = ddx( swBase );
+		float2 swDuvdy = ddy( swBase );
+		float  swDzdx  = ddx( swRecv );
+		float  swDzdy  = ddy( swRecv );
+		float  swDet   = swDuvdx.x * swDuvdy.y - swDuvdx.y * swDuvdy.x;
+		float2 swGrad  = float2( 0.0, 0.0 );
+		if( abs( swDet ) > 1e-12 )
+		{
+			swGrad.x = ( swDuvdy.y * swDzdx - swDuvdx.y * swDzdy ) / swDet;
+			swGrad.y = ( swDuvdx.x * swDzdy - swDuvdy.x * swDzdx ) / swDet;
+		}
+		// cap the plane extrapolation to one search radius of depth so a near-degenerate gradient can't invert the test
+		float swBiasCap = abs( swGrad.x * swSearch ) + abs( swGrad.y * swSearch );
+		// slope-adaptive constant bias: on a grazing receiver one texel spans a wide depth range (swBiasCap), so the
+		// stored nearest-in-texel depth sits well in front of recvZ and self-shadows. Scale the guard with that range
+		// (falls to a tiny acne term on a face-on receiver where swBiasCap ~ 0). ddx/ddy can be garbage at cube-face
+		// seams, so also floor via a small constant.
+		float swConstBias = max( 0.0015, 1.5 * swBiasCap );	// slope-adaptive self-shadow guard (see swBiasCap above)
+		float swHits = 0.0;
+		for( float bi = 0.0; bi < 16.0; bi += 1.0 )
+		{
+			float2 bj = VogelDiskSample( bi, 16.0, swPhi );
+			float2 swOff = bj * swSearch;
+			// receiver depth expected at this sample's UV (planar extrapolation), clamped so it stays a valid bias.
+			float swRecvAt = swRecv + clamp( dot( swGrad, swOff ), -swBiasCap, swBiasCap ) - swConstBias;
+			// COMPARISON sampler: the atlas is a DEPTH texture (TD_DEPTH); a raw SampleLevel(s_Lighting) reads 0 on
+			// it (only the base shadow's SampleCmp path can read depth), which made the locator see 0 < recvZ
+			// everywhere -> whole-scene false umbra. SampleCmpLevelZero returns the LIT fraction (stored passes vs
+			// swRecvAt); the blocker/umbra fraction is 1 - lit. Cleared-far texels (1.0 >= recvZ) read lit => never
+			// a false blocker, so the < 0.999 guard is no longer needed.
+			float swLit = t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, swBase + swOff, swRecvAt );
+			swHits += ( 1.0 - swLit );
+		}
+		float swFr = swHits / 16.0;
+		swLocFr = swFr;											// DIAG (r_softShadowDebugShader 10)
+		swLocRecv = swRecv;										// DIAG (11); no extra sample in the hot path for 12
+		swLocSamp = swFr;										// DIAG (12): reuse the blocker fraction
+		if( swFr <= 0.02 )
+		{
+			shadow = 1.0;	// fully lit: skip the integral, no false shadow
+		}
+		else if( swFr >= 0.98 )
+		{
+			shadow = 0.0;	// hard umbra straight from the shadow map
+		}
+		else
+		{
+			float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
+			shadow = 1.0 - saturate( swOcc );	// penumbra band: the analytic gradient
+		}
+	}
+#else
 	float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
-	float shadow = 1.0 - saturate( swOcc );
-	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
+	shadow = 1.0 - saturate( swOcc );
+#endif
 #elif USE_RT_SHADOW
 	// Ray-traced visibility: RtShadowsPass wrote a screen-space mask for this light.
 	// SV_Position matches the mask 1:1 (both at render resolution), so a direct Load
@@ -398,6 +508,36 @@ void main( PS_IN fragment, out PS_OUT result )
 	//float vogelPhi = InterleavedGradientNoiseAnim( fragment.position.xy, pc.rpJitterTexOffset.w );
 
 	float shadowTexelSize = pc.rpScreenCorrectionFactor.z * pc.rpJitterTexScale.x;
+#if USE_SHADOW_ATLAS
+	// PCSS: rpShadowAtlasOffsets[shadowIndex].z carries the light-size scale (0 = off). Blocker search reads
+	// the RAW atlas depth (non-comparison s_Lighting), averages blockers closer than the receiver, and scales
+	// the PCF radius by the similar-triangles penumbra width -> contact hardening. That width is also the
+	// coarse penumbra locator for the analytic hybrid (near-zero => fully lit or fully shadowed).
+	float pcssScale = pc.rpShadowAtlasOffsets[ shadowIndex ].z;
+	if( pcssScale > 0.0 )
+	{
+		float2 atlasBase = shadowTexcoord.xy * pc.rpJitterTexScale.y + pc.rpShadowAtlasOffsets[ shadowIndex ].xy;
+		float searchR = pcssScale * pc.rpScreenCorrectionFactor.z;
+		float blockerSum = 0.0;
+		float blockerCnt = 0.0;
+		for( float bi = 0.0; bi < 16.0; bi += 1.0 )
+		{
+			float2 bj = VogelDiskSample( bi, 16.0, vogelPhi );
+			float bd = t_ShadowAtlas.SampleLevel( s_Lighting, atlasBase + bj * searchR, 0 ).r;
+			if( bd < receiver )
+			{
+				blockerSum += bd;
+				blockerCnt += 1.0;
+			}
+		}
+		if( blockerCnt > 0.0 )
+		{
+			float avgBlocker = blockerSum / blockerCnt;
+			float penumbra = ( receiver - avgBlocker ) / max( avgBlocker, 1e-4 ) * pcssScale;
+			shadowTexelSize = penumbra * pc.rpScreenCorrectionFactor.z;
+		}
+	}
+#endif
 	for( float si = 0.0; si < numSamples; si += 1.0 )
 	{
 		float2 jitter = VogelDiskSample( si, numSamples, vogelPhi );
@@ -640,8 +780,14 @@ void main( PS_IN fragment, out PS_OUT result )
 	//   0 = real shadows.
 	if( swDbg == 7 )      { result.color = float4( 1.0, 0.0, 0.0, 1.0 ); }				// solid red for any soft-lit fragment (does the soft path run?)
 	else if( swDbg == 2 ) { result.color = float4( frac( swP / 64.0 ), 1.0 ); }			// receiver world pos (smooth gradient => swP valid)
-	else if( swDbg == 6 ) { result.color = float4( saturate( swOcc ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
+	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
 	else if( swDbg == 9 ) { result.color = float4( frac( float( swFirstElem ) / 256.0 ), frac( float( swN ) / 64.0 ), 0.0, 1.0 ); }	// R = first-element param, G = edge count param
 		else if( swDbg == 8 ) { result.color = float4( shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
+		else if( swDbg == 10 ) { result.color = ( swLocFr < 0.0 ) ? float4( 0.0, 0.0, 0.4, 1.0 ) : float4( swLocFr, 1.0 - swLocFr, 0.0, 1.0 ); }	// LOCATOR: green = lit (frac 0), red = umbra (frac 1), blue = pcss off / outside face
+		else if( swDbg == 11 ) { result.color = float4( swLocRecv, swLocRecv, swLocRecv, 1.0 ); }	// receiver depth [0,1] (smooth gradient => projection sane)
+		else if( swDbg == 12 ) { result.color = float4( swLocSamp, swLocSamp, swLocSamp, 1.0 ); }	// shadow-map depth at the receiver's texel (should track receiver depth in lit regions)
+		else if( swDbg == 13 ) { result.color = float4( saturate( swLocUV.x ), saturate( swLocUV.y ), ( swLocUV.x < 0.0 || swLocUV.x > 1.0 || swLocUV.y < 0.0 || swLocUV.y > 1.0 ) ? 1.0 : 0.0, 1.0 ); }	// projected in-face UV (blue = OUT of [0,1] => bad projection)
+		else if( swDbg == 14 ) { result.color = float4( saturate( swLocW * 0.0005 ), saturate( -swLocW * 0.0005 ), 0.0, 1.0 ); }	// perspective w: red = positive, green = negative (behind)
+		else if( swDbg == 15 ) { result.color = float4( swLocFace, 1.0 - swLocFace, 0.0, 1.0 ); }	// selected cube face / 5
 #endif
 }

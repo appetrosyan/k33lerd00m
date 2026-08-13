@@ -730,7 +730,15 @@ void idRenderBackend::DrawStencilShadowPass( const drawSurf_t* drawSurf, const b
 		if( frameNum != ( ( vertexCache.currentFrame - 1 ) & VERTCACHE_FRAME_MASK ) )
 		{
 			rb_stencilVolNull++;
-			idLib::Warning( "DrawStencilShadowPass, vertexBuffer == NULL" );
+			// THROTTLED: repeated frozen re-renders (the soft-shadow self-test's A/B + debug passes) stale every
+			// dynamic stencil-volume surf each pass, flooding tens of thousands of lines/frame; rb_stencilVolNull
+			// still counts them all.
+			static int s_stencilVBNull = 0;
+			if( s_stencilVBNull < 8 )
+			{
+				idLib::Warning( "DrawStencilShadowPass, vertexBuffer == NULL (stale frame cache; further occurrences suppressed, see rb_stencilVolNull)" );
+				s_stencilVBNull++;
+			}
 			return;
 		}
 		vertexBuffer = &vertexCache.frameData[vertexCache.drawListNum].vertexBuffer;
@@ -764,7 +772,12 @@ void idRenderBackend::DrawStencilShadowPass( const drawSurf_t* drawSurf, const b
 		const uint64 frameNum = static_cast<uint64>( ibHandle >> VERTCACHE_FRAME_SHIFT ) & VERTCACHE_FRAME_MASK;
 		if( frameNum != ( ( vertexCache.currentFrame - 1 ) & VERTCACHE_FRAME_MASK ) )
 		{
-			idLib::Warning( "DrawStencilShadowPass, indexBuffer == NULL" );
+			static int s_stencilIBNull = 0;
+			if( s_stencilIBNull < 8 )
+			{
+				idLib::Warning( "DrawStencilShadowPass, indexBuffer == NULL (stale frame cache; further occurrences suppressed)" );
+				s_stencilIBNull++;
+			}
 			return;
 		}
 		indexBuffer = &vertexCache.frameData[vertexCache.drawListNum].indexBuffer;
@@ -1715,7 +1728,7 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 			nvrhi::BindingSetItem::Texture_SRV( 2, ( nvrhi::ITexture* )GetImageAt( 2 )->GetTextureID() )
 		};
 
-		// light projection: 2
+		// light projection: 2 (t5 = shadow atlas for the PCSS locator; bound in RenderInteractions)
 		desc[2].bindings =
 		{
 			nvrhi::BindingSetItem::Texture_SRV( 3, ( nvrhi::ITexture* )GetImageAt( 3 )->GetTextureID() ),

@@ -254,6 +254,8 @@ idCVar r_shadowMapJitterScale( "r_shadowMapJitterScale", "3", CVAR_RENDERER | CV
 //idCVar r_shadowMapBiasScale( "r_shadowMapBiasScale", "0.0001", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "scale factor for jitter bias" );
 idCVar r_shadowMapRandomizeJitter( "r_shadowMapRandomizeJitter", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "randomly offset jitter texture each draw" );
 idCVar r_shadowMapSamples( "r_shadowMapSamples", "3", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "Vogel-disk PCF taps per shadow lookup (fewer = crisper; 3 is the tuned crisp default, 16 the old soft look)", 1, 64 );
+idCVar r_shadowMapPCSS( "r_shadowMapPCSS", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "PCSS on the shadow-map path: a blocker-search estimates an average blocker depth and scales the PCF filter radius by the similar-triangles penumbra width, so shadows contact-harden (sharp at contact, soft with distance). Reads the raw depth atlas (non-comparison). Intended as the cheap conservative PENUMBRA LOCATOR for the analytic soft-shadow hybrid. 0 = fixed-radius PCF; 1 = PCSS." );
+idCVar r_shadowMapPCSSScale( "r_shadowMapPCSSScale", "4", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "PCSS light-source size / penumbra scale (drives both the blocker-search radius and the penumbra width). Larger = softer, wider penumbra. Tune per content.", 0.0f, 64.0f );
 idCVar r_shadowMapSplits( "r_shadowMapSplits", "3", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "number of splits for cascaded shadow mapping with parallel lights", 0, 4 );
 idCVar r_shadowMapSplitWeight( "r_shadowMapSplitWeight", "0.9", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "" );
 idCVar r_shadowMapLodScale( "r_shadowMapLodScale", "1.4", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "" );
@@ -1868,6 +1870,8 @@ void R_InitCommands()
 	cmdSystem->AddCommand( "screenshot", R_ScreenShot_f, CMD_FL_RENDERER, "takes a screenshot" );
 	cmdSystem->AddCommand( "captureSoftShadow", R_CaptureSoftShadow_f, CMD_FL_RENDERER, "arms a one-shot soft-shadow scene capture (.softcap + .png)" );
 	cmdSystem->AddCommand( "captureShadowRefs", R_CaptureShadowRefs_f, CMD_FL_RENDERER, "self-contained: freezes time, cycles RT-ref/analytic-bandoff/analytic-bandon, dumps frame+term PNG columns, restores cvars" );
+	cmdSystem->AddCommand( "testSoftShadowLocator", R_TestSoftShadowLocator_f, CMD_FL_RENDERER, "automated self-check: RT oracle vs soft+PCSS-locator hybrid from one frozen view; prints PASS/FAIL false-shadow rate" );
+	cmdSystem->AddCommand( "softShadowGoto", R_SoftShadowGoto_f, CMD_FL_RENDERER, "skip the intro cinematic and pin the view at a .softcap camera over the next frames (run before testSoftShadowLocator)" );
 	cmdSystem->AddCommand( "envshot", R_EnvShot_f, CMD_FL_RENDERER, "takes an environment shot" );
 	cmdSystem->AddCommand( "envToSky", R_TransformEnvToSkybox_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "transforms environment textures to sky box textures" );
 	cmdSystem->AddCommand( "skyToEnv", R_TransformSkyboxToEnv_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "transforms sky box textures to environment textures" );

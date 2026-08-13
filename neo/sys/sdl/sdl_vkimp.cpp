@@ -88,6 +88,13 @@ bool DeviceManager::CreateWindowDeviceAndSwapChain( const glimpParms_t& parms, c
 	{
 		flags |= SDL_WINDOW_BORDERLESS;
 	}
+	// RBDOOM_HIDDEN_WINDOW: create the window UNMAPPED (offscreen automated runs - e.g. testSoftShadowLocator).
+	// The GPU still renders into the offscreen targets that readback reads; the swapchain just never presents to
+	// a visible surface, so an automated self-check disrupts no visible display.
+	if( SDL_getenv( "RBDOOM_HIDDEN_WINDOW" ) != NULL )
+	{
+		flags |= SDL_WINDOW_HIDDEN;
+	}
 
 	window = SDL_CreateWindow( GAME_NAME,
 							   parms.x,

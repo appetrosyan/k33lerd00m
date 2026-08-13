@@ -326,7 +326,16 @@ void BasicTriangle::Render( nvrhi::IFramebuffer* framebuffer )
 			const uint64 frameNum = ( int )( vertexBlock >> VERTCACHE_FRAME_SHIFT ) & VERTCACHE_FRAME_MASK;
 			if( frameNum != ( ( vertexCache.currentFrame ) & VERTCACHE_FRAME_MASK ) )
 			{
-				idLib::Warning( "RB_DrawElementsWithCounters, vertexBuffer == NULL" );
+				// a stale frame-cached block (its geometry belongs to an earlier frame) - just skip the draw.
+				// THROTTLED: rendering the same frozen frame repeatedly (e.g. the soft-shadow self-test's A/B +
+				// debug passes) stales every dynamic surf each pass, so an un-throttled per-surf Warning here
+				// floods tens of thousands of lines per frame and starves the frame on log I/O.
+				static int s_staleVB = 0;
+				if( s_staleVB < 8 )
+				{
+					idLib::Warning( "RB_DrawElementsWithCounters, vertexBuffer == NULL (stale frame cache; further occurrences suppressed)" );
+					s_staleVB++;
+				}
 				return;
 			}
 			vertexBuffer = &vertexCache.frameData[vertexCache.drawListNum].vertexBuffer;

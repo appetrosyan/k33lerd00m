@@ -946,6 +946,11 @@ void idCommonLocal::Frame()
 #endif
 		// RB end
 
+		// soft-shadow self-test: skip the intro cinematic + pin the view at an armed .softcap camera through the
+		// normal frame (see R_SoftShadowGoto_f). No-op unless `softShadowGoto` armed it.
+		extern void R_SoftShadowGotoTick();
+		R_SoftShadowGotoTick();
+
 		// start the game / draw command generation thread going in the background
 		gameReturn_t ret = gameThread.RunGameAndDraw( numGameFrames, userCmdMgr, IsClient(), gameFrame - numGameFrames );
 

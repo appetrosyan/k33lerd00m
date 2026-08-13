@@ -19,6 +19,7 @@ the Free Software Foundation, either version 3 of the License, or
 #pragma hdrstop
 
 #include "RenderCommon.h"
+#include "RenderWorld_local.h"
 #include "RenderCapture.h"
 #include "../framework/Common_local.h"
 
@@ -26,8 +27,112 @@ the Free Software Foundation, either version 3 of the License, or
 
 #include <vector>
 #include <map>
+#include <cstdio>
+#include <algorithm>
 
 extern DeviceManager* deviceManager;
+
+// soft light's real atlas placement, published by the backend (RenderBackend.cpp) so the tile dump
+// reads the tiles the locator actually samples instead of a stale hardcoded offset.
+idVec2i g_softDbgAtlasOff[6] = { {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1} };
+idVec2i g_softDbgAtlasSize = { -1, -1 };
+
+// --- soft-shadow "goto" ---------------------------------------------------------------------------------------
+// Positioning the view at a capture can't be done inside a command handler (re-entrant commonLocal.Frame() unloads
+// the map), and a bare setviewpos is overridden by the map's OPENING CINEMATIC camera. So arm a countdown here and
+// let the NORMAL frame loop (Common::Frame -> R_SoftShadowGotoTick) skip the cinematic and pin the viewpoint over
+// several real frames before the A/B test renders. Usage: `softShadowGoto <cap>` ; `wait 90` ; `testSoftShadowLocator <cap>`.
+static idVec3   s_gotoOrg;
+static idAngles s_gotoAng;
+static int      s_gotoFrames = 0;
+
+// EXPLICIT soft-shadow test config. The self-test must NOT inherit archived cvars from D3BFGConfig.cfg: e.g.
+// r_useRTShadows 1 silently makes the whole soft-wedge path INERT (frontend gate is `... && !r_useRTShadows`), so
+// the test measures RT instead of what it claims to. Pin every shadow-relevant cvar to a documented value BEFORE
+// the frontend runs (i.e. from softShadowGoto, which precedes the geometry-building frames), and LOUDLY log any
+// that differed from the live/archived value so a stale config can never masquerade as a code result again.
+struct SoftPin { const char* name; const char* value; };
+static const SoftPin s_softTestConfig[] =
+{
+	{ "r_useRTShadows",          "0" },	// CRITICAL: RT off, else the soft-wedge path is inert and RT renders instead
+	{ "r_useStencilShadows",     "0" },
+	{ "r_useSoftShadowVolumes",  "1" },
+	{ "r_useShadowMapping",      "0" },
+	{ "r_useShadowAtlas",        "1" },
+	{ "r_shadowMapPCSS",         "1" },
+	{ "r_shadowMapPCSSScale",    "4" },
+	{ "r_softShadowAAM",         "0" },	// PURE PCSS: no AAM band. The PCSS locator alone gates lit/penumbra/umbra.
+	{ "r_softShadowBandMask",    "0" },
+	{ "r_softShadowStencilOnly", "0" },
+	{ "r_softShadowEmergentUmbra", "0" },
+	{ "r_softShadowContinuous",  "0" },
+	{ "r_useTemporalAA",         "0" },
+	{ "r_softShadowDebugShader", "0" },
+};
+
+void R_SoftShadowPinTestConfig( bool verbose )
+{
+	int overridden = 0;
+	if( verbose ) { common->Printf( "[softtest] ==== pinning soft-shadow test config (archived cvars are IGNORED) ====\n" ); }
+	for( int i = 0; i < ( int )( sizeof( s_softTestConfig ) / sizeof( s_softTestConfig[0] ) ); i++ )
+	{
+		const char* was = cvarSystem->GetCVarString( s_softTestConfig[i].name );
+		const bool diff = ( idStr::Cmp( was, s_softTestConfig[i].value ) != 0 );
+		if( verbose )
+		{
+			if( diff )	{ common->Printf( "[softtest]   %-26s %s -> %s   <== ARCHIVED VALUE OVERRIDDEN\n", s_softTestConfig[i].name, was, s_softTestConfig[i].value ); }
+			else		{ common->Printf( "[softtest]   %-26s = %s\n", s_softTestConfig[i].name, s_softTestConfig[i].value ); }
+		}
+		if( diff ) { overridden++; }
+		cvarSystem->SetCVarString( s_softTestConfig[i].name, s_softTestConfig[i].value );
+	}
+	if( verbose ) { common->Printf( "[softtest] ==== %d archived cvar(s) overridden ====\n", overridden ); }
+}
+
+void R_SoftShadowGotoTick()
+{
+	if( s_gotoFrames <= 0 )
+	{
+		return;
+	}
+	// re-pin every frame the goto is active: the frontend that builds soft edges/occluders runs on THESE frames,
+	// so the config must be correct now, not just at test time (a menu/console tick could otherwise re-archive one).
+	R_SoftShadowPinTestConfig( false );
+	if( common->Game() != NULL && common->Game()->CheckInCinematic() )
+	{
+		common->Game()->SkipCinematicScene();		// same path as pressing ESC during the intro
+	}
+	// EXEC_NOW (not APPEND): this runs right before the game think, so the teleport lands BEFORE the player rebuilds
+	// its render view this frame - otherwise the pose is always one frame stale and the no-input usercmd reverts the
+	// view angle, so every capture rendered the same (quicksave) view regardless of its yaw.
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "setviewpos %f %f %f %f %f\n",
+							s_gotoOrg.x, s_gotoOrg.y, s_gotoOrg.z, s_gotoAng.yaw, s_gotoAng.pitch ) );
+	s_gotoFrames--;
+}
+
+void R_SoftShadowGoto_f( const idCmdArgs& args )
+{
+	if( args.Argc() < 2 )
+	{
+		common->Warning( "usage: softShadowGoto <capture.softcap>  (then `wait 90` before testSoftShadowLocator)" );
+		return;
+	}
+	FILE* cf = fopen( args.Argv( 1 ), "rb" );
+	softcapHeader_t hdr;
+	if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC )
+	{
+		if( cf != NULL ) { fclose( cf ); }
+		common->Warning( "softShadowGoto: cannot read capture %s", args.Argv( 1 ) );
+		return;
+	}
+	fclose( cf );
+	s_gotoOrg.Set( hdr.vieworg[0], hdr.vieworg[1], hdr.vieworg[2] );
+	s_gotoAng = idVec3( hdr.viewaxis[0], hdr.viewaxis[1], hdr.viewaxis[2] ).ToAngles();
+	s_gotoFrames = 120;
+	R_SoftShadowPinTestConfig( true );	// pin+log the full config NOW, before the frontend builds geometry
+	common->Printf( "[softtest] goto armed: (%.0f %.0f %.0f) yaw %.0f pitch %.0f - skipping cinematic + pinning for 120 frames\n",
+					s_gotoOrg.x, s_gotoOrg.y, s_gotoOrg.z, s_gotoAng.yaw, s_gotoAng.pitch );
+}
 
 // One-shot capture of a live soft-shadow view, reconstructable headless. See RenderCapture.h. The capture is
 // two-phase within one frame: the FRONTEND half snapshots the view/lights/edges/caster-meshes (all CPU-side),
@@ -692,4 +797,480 @@ void R_CaptureShadowRefs_f( const idCmdArgs& args )
 		cvarSystem->SetCVarString( touched[i], prev[i].c_str() );
 	}
 	common->Printf( "shadowref: done (%d configs) -> shadowref_{rt_ref,ana_bandoff,ana_bandon}_{frame,term}.png + shadowref.cvars.cfg; restored cvars\n", nCfg );
+}
+
+// ---------------------------------------------------------- in-engine AUTOMATED locator self-check
+// Runs the REAL renderer twice from the same frozen viewpoint - once with the ray-traced oracle (1024 rays),
+// once with the soft-shadow + PCSS-locator hybrid - and measures FALSE SHADOW: pixels the oracle leaves lit
+// but the hybrid darkens. This exercises the actual frontend, shaders, shadow atlas and uniform plumbing (the
+// exact surface the offline CPU test cannot reach), so a regression like "locator shadows everywhere" fails
+// here automatically instead of needing a human to eyeball debug modes. Prints a PASS/FAIL verdict.
+// Load a map first, then: `testSoftShadowLocator`. Needs ray-query hardware for the oracle.
+static float SoftTestLum( const uint8_t* p )
+{
+	return ( 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2] ) / 255.0f;
+}
+
+// ---------------------------------------------------------- MINIMAL-INIT self-test (no game/sound/menu/player)
+// The canonical game-free spawnargs->renderLight parser, copied VERBATIM from tools/compilers/dmap/map.cpp
+// (its DMAP branch). Kept identical so the harness's lights match exactly what dmap and the editor build - the
+// game's idGameEdit::ParseSpawnArgsToRenderLight is the same code, but lives in the game DLL we deliberately
+// don't boot here.
+static void SelfTestParseLight( const idDict* args, renderLight_t* renderLight )
+{
+	bool gotTarget, gotUp, gotRight;
+	const char* texture;
+	idVec3 color;
+
+	memset( renderLight, 0, sizeof( *renderLight ) );
+
+	if( !args->GetVector( "light_origin", "", renderLight->origin ) )
+	{
+		args->GetVector( "origin", "", renderLight->origin );
+	}
+	gotTarget = args->GetVector( "light_target", "", renderLight->target );
+	gotUp = args->GetVector( "light_up", "", renderLight->up );
+	gotRight = args->GetVector( "light_right", "", renderLight->right );
+	args->GetVector( "light_start", "0 0 0", renderLight->start );
+	if( !args->GetVector( "light_end", "", renderLight->end ) )
+	{
+		renderLight->end = renderLight->target;
+	}
+	if( ( gotTarget || gotUp || gotRight ) != ( gotTarget && gotUp && gotRight ) )
+	{
+		return;
+	}
+	if( !gotTarget )
+	{
+		renderLight->pointLight = true;
+		args->GetVector( "light_center", "0 0 0", renderLight->lightCenter );
+		if( !args->GetVector( "light_radius", "300 300 300", renderLight->lightRadius ) )
+		{
+			float radius;
+			args->GetFloat( "light", "300", radius );
+			renderLight->lightRadius[0] = renderLight->lightRadius[1] = renderLight->lightRadius[2] = radius;
+		}
+	}
+	idAngles angles;
+	idMat3 mat;
+	if( !args->GetMatrix( "light_rotation", "1 0 0 0 1 0 0 0 1", mat ) )
+	{
+		if( !args->GetMatrix( "rotation", "1 0 0 0 1 0 0 0 1", mat ) )
+		{
+			if( args->GetAngles( "light_angles", "0 0 0", angles ) || args->GetAngles( "angles", "0 0 0", angles ) )
+			{
+				angles[0] = idMath::AngleNormalize360( angles[0] );
+				angles[1] = idMath::AngleNormalize360( angles[1] );
+				angles[2] = idMath::AngleNormalize360( angles[2] );
+				mat = angles.ToMat3();
+			}
+			else
+			{
+				args->GetFloat( "angle", "0", angles[1] );
+				angles[0] = 0;
+				angles[1] = idMath::AngleNormalize360( angles[1] );
+				angles[2] = 0;
+				mat = angles.ToMat3();
+			}
+		}
+	}
+	mat[0].FixDegenerateNormal();
+	mat[1].FixDegenerateNormal();
+	mat[2].FixDegenerateNormal();
+	renderLight->axis = mat;
+
+	args->GetVector( "_color", "1 1 1", color );
+	renderLight->shaderParms[SHADERPARM_RED]   = color[0];
+	renderLight->shaderParms[SHADERPARM_GREEN] = color[1];
+	renderLight->shaderParms[SHADERPARM_BLUE]  = color[2];
+	args->GetFloat( "shaderParm3", "1", renderLight->shaderParms[SHADERPARM_TIMESCALE] );
+	renderLight->shaderParms[SHADERPARM_TIMEOFFSET] = 0;
+	args->GetFloat( "shaderParm5", "0", renderLight->shaderParms[5] );
+	args->GetFloat( "shaderParm6", "0", renderLight->shaderParms[6] );
+	args->GetFloat( "shaderParm7", "0", renderLight->shaderParms[SHADERPARM_MODE] );
+	args->GetBool( "noshadows", "0", renderLight->noShadows );
+	args->GetBool( "nospecular", "0", renderLight->noSpecular );
+	args->GetBool( "parallel", "0", renderLight->parallel );
+	args->GetString( "texture", "lights/squarelight1", &texture );
+	renderLight->shader = declManager->FindMaterial( texture, false );
+}
+
+// RenderScene -> flush to GPU -> read back the LDR result (mirrors the envprobe bake path: pure tr.* calls, no
+// commonLocal.Draw, so it works at minimal init with no game thread).
+static bool SelfTestRenderReadback( idRenderWorld* rw, renderView_t* rv, std::vector<uint8_t>& out, int& w, int& h )
+{
+	fprintf( stderr, "[bread]  RenderScene...\n" ); fflush( stderr );
+	rw->RenderScene( rv );
+	fprintf( stderr, "[bread]  swap1...\n" ); fflush( stderr );
+	const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+	fprintf( stderr, "[bread]  RenderCommandBuffers...\n" ); fflush( stderr );
+	tr.RenderCommandBuffers( cmd );
+	fprintf( stderr, "[bread]  swap2...\n" ); fflush( stderr );
+	tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+	fprintf( stderr, "[bread]  readback...\n" ); fflush( stderr );
+	bool ok = ReadImageRGBA8( globalImages->currentRenderHDRImage, out, w, h );
+	fprintf( stderr, "[bread]  readback done\n" ); fflush( stderr );
+	return ok;
+}
+
+// Minimal-init soft-shadow self-test. Common.cpp diverts here right after renderSystem->Init(), before the
+// game/sound/menu/player boot - so ONLY device+shaders+images+vertexCache+decls are up. Loads the map's
+// renderWorld + its real .map lights + the paired capture's camera, renders the RT oracle vs the soft+PCSS
+// hybrid through the REAL backend, and prints a false-shadow verdict. Returns false-shadow pixel count (0=pass,
+// -1=setup error).
+int R_SoftShadowSelfTest( const char* mapName )
+{
+	// paired capture (neo/tests/data/<basename>.softcap) supplies the artifact CAMERA the user captured
+	globalImages->LoadDeferredImages();		// splash/base images the render stack deferred at boot
+
+	idRenderWorld* rw = renderSystem->AllocRenderWorld();
+	if( !rw->InitFromMap( mapName ) )
+	{
+		common->Printf( "[selftest] FAIL: renderWorld InitFromMap(%s) failed\n", mapName );
+		renderSystem->FreeRenderWorld( rw );
+		return -1;
+	}
+
+	// Gather the map's REAL lights (game-free parse), and DERIVE the camera from them: the .softcap camera is
+	// in a different coordinate frame than the loaded .proc here, so we instead sit the camera among the lights
+	// (guaranteed to be in the lit, geometry-filled part of the world) and look into the cluster.
+	idMapFile map;
+	if( !map.Parse( mapName ) )
+	{
+		common->Printf( "[selftest] FAIL: could not parse %s.map\n", mapName );
+		renderSystem->FreeRenderWorld( rw );
+		return -1;
+	}
+	std::vector<renderLight_t> lights;
+	idVec3 centroid( 0, 0, 0 );
+	for( int e = 0; e < map.GetNumEntities(); e++ )
+	{
+		idMapEntity* ent = map.GetEntity( e );
+		if( ent == NULL || idStr::Icmp( ent->epairs.GetString( "classname" ), "light" ) != 0 ) { continue; }
+		renderLight_t rl;
+		SelfTestParseLight( &ent->epairs, &rl );
+		if( rl.shader == NULL ) { continue; }
+		lights.push_back( rl );
+		centroid += rl.origin;
+	}
+	if( lights.empty() )
+	{
+		common->Printf( "[selftest] FAIL: %s has no lights\n", mapName );
+		renderSystem->FreeRenderWorld( rw );
+		return -1;
+	}
+	centroid /= ( float )lights.size();
+
+	// anchor = the light FARTHEST from the centroid (a corner of the lit area); camera sits just behind it and
+	// looks toward the centroid, so the lit cluster fills the frame. Add every light within radius of the camera.
+	int anchor = 0;
+	float bestD = -1.0f;
+	for( int i = 0; i < ( int )lights.size(); i++ )
+	{
+		float d = ( lights[i].origin - centroid ).LengthSqr();
+		if( d > bestD ) { bestD = d; anchor = i; }
+	}
+	idVec3 look = centroid - lights[anchor].origin;
+	if( look.LengthSqr() < 1.0f ) { look = idVec3( 1, 0, 0 ); }
+	look.Normalize();
+	idVec3 camOrg = lights[anchor].origin - look * 48.0f;		// just behind the corner light, not on top of it
+
+	// the NEAREST few lights only - a couple of shadow-casting lights expose the systematic false-shadow bug,
+	// and the stencil oracle (single-threaded, whole-world shadow volumes per light) is far too slow with more.
+	std::vector<int> order;
+	for( int i = 0; i < ( int )lights.size(); i++ ) { order.push_back( i ); }
+	std::sort( order.begin(), order.end(), [&]( int a, int b )
+	{
+		return ( lights[a].origin - camOrg ).LengthSqr() < ( lights[b].origin - camOrg ).LengthSqr();
+	} );
+	int nLights = 0;
+	for( int k = 0; k < ( int )order.size() && nLights < 3; k++ )
+	{
+		rw->AddLightDef( &lights[order[k]] );
+		nLights++;
+	}
+	fprintf( stderr, "[selftest] BREAD: %d/%d lights, cam (%.0f %.0f %.0f) look (%.2f %.2f %.2f)\n",
+			 nLights, ( int )lights.size(), camOrg.x, camOrg.y, camOrg.z, look.x, look.y, look.z ); fflush( stderr );
+
+	renderView_t rv;
+	memset( &rv, 0, sizeof( rv ) );
+	rv.vieworg = camOrg;
+	rv.viewaxis = look.ToMat3();		// idVec3::ToMat3 puts the vector on the forward (X) view axis
+	rv.fov_x = 90.0f;
+	rv.fov_y = 73.74f;
+
+	cvarSystem->SetCVarInteger( "r_useTemporalAA", 0 );
+	cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 0 );
+	cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", cvarSystem->GetCVarFloat( "r_shadowPenumbraSize" ) );
+
+	// Never present: this is a hidden/headless render. GL_BlockingSwapBuffers would block forever on an
+	// unmapped surface. The readback's own executeCommandList + mapStagingTexture provides GPU sync (the
+	// envprobe bake path relies on exactly this).
+	tr.InvalidateSwapBuffers();
+
+	// ORACLE: exact HARD shadows via stencil z-fail (no RT accel structure needed - that is built by the game
+	// map load, which minimal init skips). Stencil gives an exact lit/shadowed reference, which is all the
+	// FALSE-SHADOW metric needs (hybrid darker than a fully-lit oracle pixel = false shadow). Then HYBRID
+	// (soft-shadow volumes + PCSS locator).
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW,
+								  "r_useRTShadows 0 ; r_useSoftShadowVolumes 0 ; r_shadowMapPCSS 0 ; r_useStencilShadows 1\n" );
+	fprintf( stderr, "[selftest] BREAD: rendering ORACLE...\n" ); fflush( stderr );
+	std::vector<uint8_t> ref;
+	int rw2 = 0, rh2 = 0;
+	SelfTestRenderReadback( rw, &rv, ref, rw2, rh2 );
+	fprintf( stderr, "[selftest] BREAD: oracle done %dx%d, rendering HYBRID...\n", rw2, rh2 ); fflush( stderr );
+
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_useRTShadows 0 ; r_useSoftShadowVolumes 1 ; r_shadowMapPCSS 1\n" );
+	std::vector<uint8_t> test;
+	int tw2 = 0, th2 = 0;
+	SelfTestRenderReadback( rw, &rv, test, tw2, th2 );
+	fprintf( stderr, "[selftest] BREAD: hybrid done %dx%d\n", tw2, th2 ); fflush( stderr );
+
+	renderSystem->FreeRenderWorld( rw );
+
+	if( ref.empty() || test.empty() || rw2 != tw2 || rh2 != th2 || rw2 <= 0 )
+	{
+		common->Printf( "[selftest] FAIL: readback mismatch (%dx%d vs %dx%d)\n", rw2, rh2, tw2, th2 );
+		return -1;
+	}
+
+	const float litThresh = 0.12f, darkenFrac = 0.5f;
+	long litN = 0, falseN = 0;
+	std::vector<uint8_t> diff( ( size_t )rw2 * rh2 * 3, 0 );
+	for( int i = 0; i < rw2 * rh2; i++ )
+	{
+		float lr = SoftTestLum( &ref[( size_t )i * 4] ), ls = SoftTestLum( &test[( size_t )i * 4] );
+		diff[( size_t )i * 3 + 0] = ( uint8_t )( lr * 255.0f );
+		diff[( size_t )i * 3 + 1] = ( uint8_t )( ls * 255.0f );
+		if( lr < litThresh ) { continue; }
+		litN++;
+		if( ls < darkenFrac * lr ) { falseN++; diff[( size_t )i * 3 + 2] = 255; }
+	}
+	double rate = litN ? ( double )falseN / litN : 0.0;
+	const bool pass = ( litN > 1000 ) && ( rate < 0.02 );
+	idFile* d = fileSystem->OpenFileWrite( "softtest_falseshadow.ppm", "fs_savepath" );
+	if( d != NULL )
+	{
+		d->Printf( "P6\n%d %d\n255\n", rw2, rh2 );
+		d->Write( diff.data(), ( int )diff.size() );
+		fileSystem->CloseFile( d );
+	}
+	common->Printf( "[selftest] map=%s lights=%d  false-shadow %ld / %ld lit px = %.2f%%  ->  %s\n",
+					mapName, nLights, falseN, litN, rate * 100.0, pass ? "PASS" : "FAIL" );
+	return ( int )falseN;
+}
+
+void R_TestSoftShadowLocator_f( const idCmdArgs& args )
+{
+	if( tr.primaryWorld == NULL )
+	{
+		common->Warning( "testSoftShadowLocator: no map loaded" );
+		return;
+	}
+	if( args.Argc() < 2 )
+	{
+		common->Warning( "usage: testSoftShadowLocator <capture.softcap>  (load its map first - all erebusN are game/erebus1)" );
+		return;
+	}
+
+	// Camera = the capture's EXACT artifact viewpoint. We move the (noclipping) player there and render via the
+	// real Draw() path: Draw() applies shadow-cvar changes between configs, whereas a bare RenderScene reuses
+	// the interactions cached at map load and renders every config identically.
+	FILE* cf = fopen( args.Argv( 1 ), "rb" );
+	softcapHeader_t hdr;
+	if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC )
+	{
+		if( cf != NULL ) { fclose( cf ); }
+		common->Warning( "testSoftShadowLocator: cannot read capture %s", args.Argv( 1 ) );
+		return;
+	}
+	fclose( cf );
+	idVec3 camOrg( hdr.vieworg[0], hdr.vieworg[1], hdr.vieworg[2] );
+	idAngles ang = idVec3( hdr.viewaxis[0], hdr.viewaxis[1], hdr.viewaxis[2] ).ToAngles();
+	common->Printf( "[softtest] capture camera (%.0f %.0f %.0f) yaw %.0f pitch %.0f from %s\n",
+					camOrg.x, camOrg.y, camOrg.z, ang.yaw, ang.pitch, args.Argv( 1 ) );
+
+	// pin the full config again right before the A/B renders (in case the test is run WITHOUT softShadowGoto, or a
+	// frame in between re-archived something). Verbose so the exact config under test is in the log every time.
+	R_SoftShadowPinTestConfig( true );
+
+	static const char* const touched[] =
+	{
+		"g_stopTime", "r_useStencilShadows", "r_useSoftShadowVolumes", "r_useRTShadows",
+		"r_shadowMapPCSS", "r_softShadowDebugShader", "r_useTemporalAA", "r_skipShadows", "r_useShadowAtlas",
+	};
+	const int nTouched = ( int )( sizeof( touched ) / sizeof( touched[0] ) );
+	idStrList prev;
+	for( int i = 0; i < nTouched; i++ ) { prev.Append( cvarSystem->GetCVarString( touched[i] ) ); }
+	cvarSystem->SetCVarInteger( "r_useTemporalAA", 0 );
+	cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 0 );
+
+	// move the player to the capture viewpoint (issue `noclip` yourself once before sweeping many captures, so
+	// the camera can sit inside geometry). setviewpos only moves the PLAYER ENTITY - a bare Draw() then re-renders
+	// the STALE view built by the last game tick (every capture came out identical: the spawn view). Run several
+	// FULL game frames (sim unfrozen) so the player teleports and the game rebuilds the render view AT the capture
+	// position; only THEN freeze the sim and do the A/B renders.
+	// the VIEWPOINT + cinematic-skip must already be applied by `softShadowGoto <cap>` + a `wait` ahead of this
+	// command (it runs through the normal frame loop; doing it here re-entrantly unloads the map). We only render
+	// the current view. One Draw settles the latest view, then freeze the sim for the deterministic A/B pair.
+	R_RenderOneFrame();
+	cvarSystem->SetCVarInteger( "g_stopTime", 1 );
+
+	// ORACLE: exact stencil hard shadows (deterministic; RT is unsuitable - real-time-optimised, temporally
+	// noisy). Its lit region is a conservative "should be lit" set, so it never false-accuses a real penumbra.
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_skipShadows 0 ; r_useRTShadows 0 ; r_useStencilShadows 0 ; r_useShadowAtlas 1 ; r_useSoftShadowVolumes 1 ; r_shadowMapPCSS 0\n" );	// DIAG: soft-wedge, locator OFF
+	R_RenderOneFrame();
+	std::vector<uint8_t> ref;
+	int rw = 0, rh = 0;
+	ReadImageRGBA8( globalImages->currentRenderHDRImage, ref, rw, rh );
+	R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+					  globalImages->currentRenderHDRImage->GetTextureHandle(), nvrhi::ResourceStates::ShaderResource, "softtest_oracle.png" );
+
+	// HYBRID: soft-shadow volumes + PCSS locator gating the analytic
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_skipShadows 0 ; r_useStencilShadows 0 ; r_useRTShadows 0 ; r_useShadowAtlas 1 ; r_useSoftShadowVolumes 1 ; r_shadowMapPCSS 1\n" );
+	R_RenderOneFrame();
+	std::vector<uint8_t> test;
+	int tw = 0, th = 0;
+	ReadImageRGBA8( globalImages->currentRenderHDRImage, test, tw, th );
+	R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+					  globalImages->currentRenderHDRImage->GetTextureHandle(), nvrhi::ResourceStates::ShaderResource, "softtest_hybrid.png" );
+
+	// CONFIG + why soft edges did/didn't generate (the frontend tallies caster acceptance/rejection)
+	{
+		extern int fe_stencilBuilt, fe_softEdgesCollected, fe_rejSilEdges, fe_rejSurfInter, fe_rejNumIdx, fe_rejIdxStale, fe_rejShadowCache;
+		int softEdges = 0;
+		idRenderWorldLocal* rwl2 = ( idRenderWorldLocal* )tr.primaryWorld;
+		for( viewLight_t* vl = tr.viewDef ? tr.viewDef->viewLights : NULL; vl != NULL; vl = vl->next ) { softEdges += vl->softEdgeCount; }
+		( void )rwl2;
+		common->Printf( "[softtest] cfg soft=%d pcss=%d atlas=%d RT=%d stencil=%d shadowMapping=%d band=%d AAM=%d penumbra=%.1f\n",
+						cvarSystem->GetCVarInteger( "r_useSoftShadowVolumes" ), cvarSystem->GetCVarInteger( "r_shadowMapPCSS" ),
+						cvarSystem->GetCVarInteger( "r_useShadowAtlas" ), cvarSystem->GetCVarInteger( "r_useRTShadows" ),
+						cvarSystem->GetCVarInteger( "r_useStencilShadows" ), cvarSystem->GetCVarInteger( "r_useShadowMapping" ),
+						cvarSystem->GetCVarInteger( "r_softShadowBandMask" ), cvarSystem->GetCVarInteger( "r_softShadowAAM" ),
+						cvarSystem->GetCVarFloat( "r_shadowPenumbraSize" ) );
+		common->Printf( "[softtest] frontend softEdges(view)=%d  softEdgesCollected(cumulative)=%d  stencilBuilt=%d rejSil=%d rejNumIdx=%d\n",
+						softEdges, fe_softEdgesCollected, fe_stencilBuilt, fe_rejSilEdges, fe_rejNumIdx );
+	}
+
+	// dump the locator's own inputs/outputs (soft+PCSS config): mode 10 = classification (red=umbra/false
+	// shadow, green=lit), 11 = receiver depth, 12 = shadow-atlas depth the blocker search samples. These reveal
+	// whether the atlas holds real occluders or volume/garbage, and whether the projection is sane.
+	{
+		struct DbgDump { int mode; const char* file; };
+		static const DbgDump dumps[] = { { 10, "softtest_dbg10_locator.png" }, { 11, "softtest_dbg11_recvdepth.png" }, { 12, "softtest_dbg12_atlasdepth.png" }, { 13, "softtest_dbg13_uv.png" }, { 14, "softtest_dbg14_w.png" }, { 15, "softtest_dbg15_face.png" } };
+		for( int di = 0; di < 6; di++ )
+		{
+			cvarSystem->SetCVarInteger( "r_softShadowDebugShader", dumps[di].mode );
+			R_RenderOneFrame();
+			R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+							  globalImages->currentRenderHDRImage->GetTextureHandle(), nvrhi::ResourceStates::ShaderResource, dumps[di].file );
+			// numeric probe: mean R (and for locator, red-fraction) over the lit central band, so recvZ (11) vs
+			// atlas sample (12) can be compared directly - a big gap is the depth-encoding (plumbing) mismatch.
+			std::vector<uint8_t> pb; int pw = 0, ph = 0;
+			ReadImageRGBA8( globalImages->currentRenderHDRImage, pb, pw, ph );
+			if( pw > 0 && ph > 0 )
+			{
+				double sumR = 0, sumG = 0; long n = 0;
+				for( int y = ph / 4; y < 3 * ph / 4; y++ )
+					for( int x = pw / 4; x < 3 * pw / 4; x++ )
+					{
+						sumR += pb[( ( size_t )y * pw + x ) * 4 + 0]; sumG += pb[( ( size_t )y * pw + x ) * 4 + 1]; n++;
+					}
+				common->Printf( "[softtest] dbg%d central meanR=%.3f meanG=%.3f (of 255)\n", dumps[di].mode, n ? sumR / n : 0.0, n ? sumG / n : 0.0 );
+			}
+		}
+		cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 0 );
+	}
+
+	// dump the soft light's ATLAS TILE (what the blocker search actually samples): near depth = dark. Real
+	// occluders show as small dark silhouettes on a far/white field; volume geometry fills the tile dark.
+	{
+		extern int fe_occludersBuilt;
+		common->Printf( "[softtest] occludersBuilt(cumulative)=%d  softDbgAtlasSize=(%d,%d) off0=(%d,%d)\n",
+						fe_occludersBuilt, g_softDbgAtlasSize.x, g_softDbgAtlasSize.y, g_softDbgAtlasOff[0].x, g_softDbgAtlasOff[0].y );
+		const int AS = cvarSystem->GetCVarInteger( "r_shadowMapAtlasSize" );
+		float* atlas = NULL;
+		const bool readOK = AS > 0 && R_ReadPixelsR32F( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+						globalImages->shadowAtlasImage->GetTextureHandle(), nvrhi::ResourceStates::ShaderResource, &atlas, AS, AS ) && atlas != NULL;
+		if( !readOK )
+		{
+			common->Printf( "[softtest] atlas readback FAILED (AS=%d)\n", AS );
+		}
+		if( readOK )
+		{
+			extern idVec2i g_softDbgAtlasOff[6];
+			extern idVec2i g_softDbgAtlasSize;
+			const int sz = g_softDbgAtlasSize.x;
+			for( int face = 0; face < 6; face++ )
+			{
+				const int ox = g_softDbgAtlasOff[face].x, oy = g_softDbgAtlasOff[face].y;
+				if( ox < 0 || oy < 0 || sz <= 0 || ox + sz > AS || oy + sz > AS ) { continue; }
+				idStr name = va( "softtest_atlastile_f%d.pgm", face );
+				idFile* f = fileSystem->OpenFileWrite( name, "fs_savepath" );
+				if( f != NULL )
+				{
+					f->Printf( "P5\n%d %d\n255\n", sz, sz );
+					double sum = 0;
+					int nnear = 0;
+					for( int y = 0; y < sz; y++ )
+						for( int x = 0; x < sz; x++ )
+						{
+							float d = atlas[( size_t )( oy + y ) * AS + ( ox + x )];
+							sum += d;
+							if( d < 0.99f ) { nnear++; }
+							unsigned char c = ( unsigned char )( Max( 0.0f, Min( 1.0f, d ) ) * 255.0f );
+							f->Write( &c, 1 );
+						}
+					fileSystem->CloseFile( f );
+					common->Printf( "[softtest] atlas tile f%d (%d,%d,%d): meanDepth=%.4f  nearPx(<0.99)=%d/%d\n", face, ox, oy, sz, sum / ( sz * sz ), nnear, sz * sz );
+				}
+			}
+			R_StaticFree( atlas );
+		}
+	}
+
+	tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );	// present the last frame
+	for( int i = 0; i < nTouched; i++ ) { cvarSystem->SetCVarString( touched[i], prev[i].c_str() ); }
+
+	if( ref.empty() || test.empty() || rw != tw || rh != th || rw <= 0 )
+	{
+		common->Warning( "testSoftShadowLocator: readback failed or size mismatch (ref %dx%d, test %dx%d)", rw, rh, tw, th );
+		return;
+	}
+
+	// FALSE SHADOW = the oracle leaves the pixel lit but the hybrid darkens it by more than half. Self-masking:
+	// unlit/background pixels (low oracle luminance) are excluded, so texture darkness never reads as a shadow.
+	const float litThresh = 0.12f;		// oracle luminance above which the pixel is "meaningfully lit"
+	const float darkenFrac = 0.5f;		// hybrid < this * oracle => a false shadow
+	long litN = 0, falseN = 0, deltaN = 0;
+	std::vector<uint8_t> diff( ( size_t )rw * rh * 3, 0 );
+	for( int i = 0; i < rw * rh; i++ )
+	{
+		float lr = SoftTestLum( &ref[( size_t )i * 4] );
+		float ls = SoftTestLum( &test[( size_t )i * 4] );
+		diff[( size_t )i * 3 + 0] = ( uint8_t )( lr * 255.0f );
+		diff[( size_t )i * 3 + 1] = ( uint8_t )( ls * 255.0f );
+		if( idMath::Fabs( lr - ls ) > 0.1f ) { deltaN++; }	// oracle vs hybrid differ at all (shadow present in view)
+		if( lr < litThresh ) { continue; }
+		litN++;
+		if( ls < darkenFrac * lr ) { falseN++; diff[( size_t )i * 3 + 2] = 255; }	// mark false-shadow pixels blue
+	}
+	double rate = litN ? ( double )falseN / litN : 0.0;
+	const bool pass = ( litN > 1000 ) && ( rate < 0.02 );
+
+	// write a diff image (R=oracle lum, G=hybrid lum, B=false-shadow mask) for eyeballing a failure
+	idFile* d = fileSystem->OpenFileWrite( "softtest_falseshadow.ppm", "fs_savepath" );
+	if( d != NULL )
+	{
+		d->Printf( "P6\n%d %d\n255\n", rw, rh );
+		d->Write( diff.data(), ( int )diff.size() );
+		fileSystem->CloseFile( d );
+	}
+
+	if( litN <= 1000 )
+	{
+		common->Warning( "testSoftShadowLocator: only %ld lit px - no usable oracle (ray-query hardware? map loaded?)", litN );
+	}
+	common->Printf( "[softtest] %s : false-shadow %ld / %ld lit = %.2f%%  shadowDelta %ld px  ->  %s\n",
+					args.Argv( 1 ), falseN, litN, rate * 100.0, deltaN, pass ? "PASS" : "FAIL" );
 }

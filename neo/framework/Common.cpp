@@ -128,6 +128,12 @@ idCommon* 		common = &commonLocal;
 	idCVar com_skipIntroVideos( "com_skipIntroVideos", "1", CVAR_BOOL , "skips intro videos" );
 #endif
 
+// MINIMAL-INIT soft-shadow self-test: when set to a map name (e.g. "maps/game/erebus2"), Common::Init boots
+// only the render stack (device/shaders/images/vertexCache/decls), runs R_SoftShadowSelfTest on that map, and
+// quits - no game/sound/menu/player. Renders the RT oracle vs the soft+PCSS hybrid and prints a false-shadow
+// PASS/FAIL verdict. Empty = normal boot.
+idCVar com_softShadowSelfTest( "com_softShadowSelfTest", "", CVAR_SYSTEM, "run the minimal-init soft-shadow locator self-test on this map, then quit" );
+
 // For doom classic
 struct Globals;
 
@@ -1302,6 +1308,17 @@ void idCommonLocal::Init( int argc, const char* const* argv, const char* cmdline
 		renderSystem->Init();
 
 		whiteMaterial = declManager->FindMaterial( "_white" );
+
+		// MINIMAL-INIT soft-shadow self-test: the render stack is now up (device/shaders/images/vertexCache/
+		// decls); everything below this point is game/sound/menu/session/intro that the self-test does not need.
+		// Divert here, run the headless RT-vs-hybrid false-shadow check, and quit - no game boot, no player.
+		if( com_softShadowSelfTest.GetString()[0] != '\0' )
+		{
+			extern int R_SoftShadowSelfTest( const char* mapName );
+			R_SoftShadowSelfTest( com_softShadowSelfTest.GetString() );
+			cmdSystem->AppendCommandText( "quit\n" );
+			return;
+		}
 
 		if( idStr::Icmp( sys_lang.GetString(), ID_LANG_FRENCH ) == 0 )
 		{
