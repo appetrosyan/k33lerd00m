@@ -196,61 +196,79 @@ void main( PS_IN fragment, out PS_OUT result )
 			}
 		}
 #endif
+		float swFrac = pc.rpShadowAtlasOffsets[ swSI ].w;	// atlas rect scale (plumbed here; rpJitterTexScale.y holds the soft minWidth)
+		// NORMAL-OFFSET BIAS: lift the receiver's SAMPLE POSITION along its surface normal toward the light BEFORE
+		// projecting, instead of biasing the compared DEPTH. On a grazing floor a depth bias cannot stop self-shadow
+		// acne without receding the occluder's contact by a large world distance - acne and peter-pan are the SAME
+		// knob there. Offsetting the position off the surface removes self-shadowing WITHOUT moving the occluder's
+		// shadow, so the contact stays under the caster like RT (which has no bias at all). Offset scales with the
+		// WORLD size of a shadow texel at the receiver (~ dist-to-light / tile-resolution); r_shadowMapPCSSBias = the
+		// texel count. Geometric normal from screen derivatives (no per-vertex normal plumbing needed).
+		float3 swNrmW = cross( ddx( swP ), ddy( swP ) );
+		float4 swMPb  = swMP;
+		if( length( swNrmW ) > 1e-8 )
+		{
+			float3 swNrmM  = normalize( cross( ddx( swMP.xyz ), ddy( swMP.xyz ) ) );
+			float  swNSign = ( dot( swNrmW, swL - swP ) < 0.0 ) ? -1.0 : 1.0;	// point toward the light
+			// 2.07 = 2*tan(46deg), the per-texel angular span of the 92deg shadow cube face (r_shadowMapFrustumFOV);
+			// approximate - the whole offset is a heuristic re-tunable via r_shadowMapPCSSBias, so a plumbed FOV isn't
+			// worth a uniform. worldTexel = dist-to-light * angular-texel / tile-fraction.
+			float  swWorldTexel = length( swL - swP ) * 2.07 * pc.rpScreenCorrectionFactor.z / max( swFrac, 1e-6 );
+			swMPb.xyz += swNSign * swNrmM * ( pc.rpJitterTexOffset.z * 4.0 * swWorldTexel );
+		}
 		float4 swSTC;
-		swSTC.x = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 0 ] );
-		swSTC.y = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 1 ] );
-		swSTC.z = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 2 ] );
-		swSTC.w = dot4( swMP, pc.rpShadowMatrices[ swSI * 4 + 3 ] );
+		swSTC.x = dot4( swMPb, pc.rpShadowMatrices[ swSI * 4 + 0 ] );
+		swSTC.y = dot4( swMPb, pc.rpShadowMatrices[ swSI * 4 + 1 ] );
+		swSTC.z = dot4( swMPb, pc.rpShadowMatrices[ swSI * 4 + 2 ] );
+		swSTC.w = dot4( swMPb, pc.rpShadowMatrices[ swSI * 4 + 3 ] );
 		swLocW = swSTC.w;			// DIAG (pre-divide)
 		swLocFace = float( swSI ) / 5.0;	// DIAG
 		swSTC.xyz /= swSTC.w;
 		swLocUV = swSTC.xy;			// DIAG (post-divide projected xy)
-		float swRecv = swSTC.z * pc.rpScreenCorrectionFactor.w;
-		float swFrac = pc.rpShadowAtlasOffsets[ swSI ].w;	// atlas rect scale (plumbed here; rpJitterTexScale.y holds the soft minWidth)
+		// Raw projected depth - NO multiplicative receiver bias. rpScreenCorrectionFactor.w
+		// (r_shadowMapRegularDepthBiasScale ~= 0.999) receded the compare depth by ~0.001, which on a grazing floor
+		// is a visible contact GAP (the shadow starts away from the caster). The normal-offset above already prevents
+		// self-shadow, so no depth bias belongs here; only the tiny swConstBias noise margin remains.
+		float swRecv = swSTC.z;
 		float2 swBase = swSTC.xy * swFrac + pc.rpShadowAtlasOffsets[ swSI ].xy;
-		float swSearch = pcssScale * pc.rpScreenCorrectionFactor.z;
+		// FAITHFUL PCSS blocker-search radius: the light-disk footprint projected to THIS receiver scales with
+		// (d_receiver - d_near)/d_receiver. For this infinite-far D3D projection (d = 1 - n/z_eye) that factor reduces
+		// exactly to the window depth swRecv, so the search - and the penumbra it feeds - grows with distance-to-light
+		// instead of being a fixed texel count. Floored at one texel so a near-light receiver still samples.
+		float swSearch = max( pcssScale * pc.rpScreenCorrectionFactor.z * swRecv, pc.rpScreenCorrectionFactor.z );
 		float swPhi = BlueNoise( fragment.position.xy, 1.0 );
-		// RECEIVER-PLANE DEPTH BIAS: recvZ varies across a sloped receiver, so each blocker sample must be compared
-		// against the receiver depth AT that sample's atlas UV, not the fragment centre. Without it a large flat
-		// floor at a grazing angle from a small embedded light SELF-SHADOWS: one shadow texel spans a wide depth
-		// range, the far floor reads the near floor's stored depth (recvZ 0.99 vs stored 0.76) -> 16/16 blockers ->
-		// false umbra everywhere. Solve d(recvZ)/d(swBase) from screen-space derivatives (Isidoro 2006).
-		float2 swDuvdx = ddx( swBase );
-		float2 swDuvdy = ddy( swBase );
-		float  swDzdx  = ddx( swRecv );
-		float  swDzdy  = ddy( swRecv );
-		float  swDet   = swDuvdx.x * swDuvdy.y - swDuvdx.y * swDuvdy.x;
-		float2 swGrad  = float2( 0.0, 0.0 );
-		if( abs( swDet ) > 1e-12 )
-		{
-			swGrad.x = ( swDuvdy.y * swDzdx - swDuvdx.y * swDzdy ) / swDet;
-			swGrad.y = ( swDuvdx.x * swDzdy - swDuvdy.x * swDzdx ) / swDet;
-		}
-		// cap the plane extrapolation to one search radius of depth so a near-degenerate gradient can't invert the test
-		float swBiasCap = abs( swGrad.x * swSearch ) + abs( swGrad.y * swSearch );
-		// slope-adaptive constant bias: on a grazing receiver one texel spans a wide depth range (swBiasCap), so the
-		// stored nearest-in-texel depth sits well in front of recvZ and self-shadows. Scale the guard with that range
-		// (falls to a tiny acne term on a face-on receiver where swBiasCap ~ 0). ddx/ddy can be garbage at cube-face
-		// seams, so also floor via a small constant.
-		float swConstBias = max( 0.0015, pc.rpJitterTexOffset.z * swBiasCap );	// r_shadowMapPCSSBias * slope range (peter-pan vs acne; see swBiasCap)
+		// The receiver-plane depth bias (Isidoro) and its slope-scaled constant - the peter-pan source - are GONE,
+		// replaced by the position normal-offset above. All that remains is a tiny fixed float/derivative-noise
+		// margin so a texel exactly on the receiver plane doesn't flicker; it is slope-INDEPENDENT so it can never
+		// recede the contact.
+		float swConstBias = 0.00005;
 		// STANDALONE PCSS (Fernando 2005), full contact-hardening variant. The atlas IS depth-readable with the
 		// non-comparison sampler (s_Lighting) now that t5 binds the real atlas (was the empty rtShadowMask, which
 		// read 0 -> the old "TD_DEPTH can't be read raw" note); dbg12 raw depth tracks dbg11 receiver depth 1:1.
 		// PASS 1 - BLOCKER SEARCH: average the raw stored depth of texels CLOSER than the receiver over the
 		// light-disk footprint. That average distance drives the penumbra width; no blocker in the footprint =>
 		// fully lit, skip pass 2.
+		// Clamp every atlas fetch to THIS light's tile rect (minus a half-texel guard). A large penumbra (big
+		// swFilter) or a small tile (fit-budget shrink) can push swBase+off outside the tile into a NEIGHBOURING
+		// light's atlas texels, giving garbage blocker depth and a wrong PCF - a localized shadow smear. Clamping
+		// keeps all samples inside the caster's own tile.
+		float2 swTileLo = pc.rpShadowAtlasOffsets[ swSI ].xy + 0.5 * pc.rpScreenCorrectionFactor.z;
+		float2 swTileHi = pc.rpShadowAtlasOffsets[ swSI ].xy + swFrac - 0.5 * pc.rpScreenCorrectionFactor.z;
+		// Loop-invariant, hoisted: no per-tap depth bias (the normal-offset already lifted the sample off the
+		// surface), so compare stored depth directly against the receiver depth minus the tiny noise margin.
+		float swRecvAt = swRecv - swConstBias;
 		float swBlkSum = 0.0;
 		float swBlkCnt = 0.0;
+		float swBlkMax = 0.0;	// NEAREST-to-receiver blocker (largest stored depth) - drives CONTACT hardening
 		for( float bi = 0.0; bi < 16.0; bi += 1.0 )
 		{
 			float2 swOff = VogelDiskSample( bi, 16.0, swPhi ) * swSearch;
-			// receiver depth expected at this sample's UV (planar extrapolation), clamped so it stays a valid bias.
-			float swRecvAt = swRecv + clamp( dot( swGrad, swOff ), -swBiasCap, swBiasCap ) - swConstBias;
-			float bd = t_ShadowAtlas.SampleLevel( s_Lighting, swBase + swOff, 0 ).r;
+			float bd = t_ShadowAtlas.SampleLevel( s_Lighting, clamp( swBase + swOff, swTileLo, swTileHi ), 0 ).r;
 			if( bd < swRecvAt && bd < 0.999 )	// stored 1.0 = cleared/far: never a blocker
 			{
 				swBlkSum += bd;
 				swBlkCnt += 1.0;
+				swBlkMax = max( swBlkMax, bd );
 			}
 		}
 		swLocFr = swBlkCnt / 16.0;								// DIAG (10): blocker fraction
@@ -271,8 +289,18 @@ void main( PS_IN fragment, out PS_OUT result )
 			// k cancels, no near plane needed. Dividing by raw swAvgBlk instead (the old bug) collapsed the ratio
 			// toward 0 near the far plane - exactly where an elevated caster's floor receiver sits - so a crate
 			// floating well above the floor got a HARD blob instead of the widest, softest penumbra.
-			float swAvgBlk = swBlkSum / swBlkCnt;
-			float swPen    = ( swRecv - swAvgBlk ) / max( 1.0 - swRecv, 1e-4 ) * pcssScale;
+			float swAvgBlk = swBlkSum / swBlkCnt;	// kept for DIAG (dbg12)
+			// CONTACT HARDENING: size the penumbra from the NEAREST blocker (swBlkMax, deepest stored depth), not
+			// the average. A resting/embedded object's search footprint also catches its own RAISED BODY, which
+			// inflates the average blocker distance and keeps the penumbra wide even AT the contact - so the umbra
+			// softens and pulls away from the object (the peter-panning gap; RT, which resolves per-ray occlusion,
+			// keeps the contact hard). The nearest blocker at a contact point IS the object's base (~receiver
+			// depth) => swPen ~ 0 => crisp contact; away from the object the nearest blocker is the raised
+			// silhouette => swPen grows => soft. Matches the RT reference: sharp at contact, soft with distance.
+			// max(1-swRecv, 1e-3) floors the denominator: near the far plane (swRecv -> 1) a tiny depth error would
+			// otherwise swing swPen by ~1e4; 1e-3 caps the ratio so the penumbra can't explode (the swFilter clamp is
+			// the second backstop). Only affects receivers past swRecv ~0.999.
+			float swPen    = ( swRecv - swBlkMax ) / max( 1.0 - swRecv, 1e-3 ) * pcssScale;
 			// The PCF (filter) radius must be free to grow to the full penumbra - it is NOT the blocker-search
 			// radius. Capping it at swSearch (= pcssScale texels, the SEARCH footprint) is the bug that made every
 			// elevated caster hard: a crate floating high above the floor wants a penumbra far wider than the few
@@ -283,9 +311,8 @@ void main( PS_IN fragment, out PS_OUT result )
 			for( float fi = 0.0; fi < 24.0; fi += 1.0 )
 			{
 				float2 fOff = VogelDiskSample( fi, 24.0, swPhi ) * swFilter;
-				float swRecvAt = swRecv + clamp( dot( swGrad, fOff ), -swBiasCap, swBiasCap ) - swConstBias;
-				// COMPARISON sampler on the TD_DEPTH atlas returns the LIT fraction (stored passes vs swRecvAt).
-				swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, swBase + fOff, swRecvAt );
+				// swRecvAt hoisted above; COMPARISON sampler returns the LIT fraction (stored passes vs swRecvAt).
+				swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, clamp( swBase + fOff, swTileLo, swTileHi ), swRecvAt );
 			}
 			shadow = swLitSum / 24.0;	// soft penumbra gradient, contact-hardened
 		}

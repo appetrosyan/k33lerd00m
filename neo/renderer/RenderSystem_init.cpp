@@ -246,7 +246,7 @@ idCVar r_useVirtualScreenResolution( "r_useVirtualScreenResolution", "0", CVAR_R
 
 // RB: shadow mapping parameters
 idCVar r_useShadowAtlas( "r_useShadowAtlas", "1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "" );
-idCVar r_shadowMapAtlasSize( "r_shadowMapAtlasSize", "8192", CVAR_RENDERER | CVAR_INTEGER | CVAR_ROM | CVAR_NEW, "size of the shadowmap atlas" );
+idCVar r_shadowMapAtlasSize( "r_shadowMapAtlasSize", "8192", CVAR_RENDERER | CVAR_INTEGER | CVAR_INIT | CVAR_NEW, "size of the shadowmap atlas (launch-only). Bigger = the fit-budget affords larger per-light tiles -> sharper shadows in busy scenes. 8192 ~= 256MB depth; 16384 ~= 1GB. In a many-light scene 8192 caps tiles to 256px; 16384 restores 1024px." );
 idCVar r_shadowMapFrustumFOV( "r_shadowMapFrustumFOV", "92", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "oversize FOV for point light side matching" );
 idCVar r_shadowMapSingleSide( "r_shadowMapSingleSide", "-1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "only draw a single side (0-5) of point lights" );
 idCVar r_shadowMapImageSize( "r_shadowMapImageSize", "1024", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW, "", 128, 2048 );
