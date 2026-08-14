@@ -46,6 +46,12 @@ the Free Software Foundation, either version 3 of the License, or
 	#define SW_FAST_ATAN 1
 #endif
 
+// SW_JUMP_SKIP: 1 = a culled caster jumps its whole edge span via the header's edgeCount (e1.y); 0 = the
+// old per-edge idle 'continue'. Bit-exact either way (cull is conservative); flip to 0 for an A/B.
+#ifndef SW_JUMP_SKIP
+	#define SW_JUMP_SKIP 1
+#endif
+
 // --------------------------------------------------------------------------- decomposed primitives
 // Every intermediate step is a named pure function so each behaviour is unit-testable in isolation
 // (neo/tests/SoftShadowPrimitives_test.cpp). Same source compiles as HLSL and C++.
@@ -385,6 +391,12 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 			havePrevE1 = false;
 			float3 dCv  = float3( e0.x, e0.y, e0.z ) - swP;			// caster bounding sphere: centre, radius e1.x
 			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
+#if SW_JUMP_SKIP
+			if( swSkip )											// culled: jump the whole edge span (e1.y = edgeCount) instead
+			{														// of an idle 'continue' per edge - cull is conservative so
+				se += ( int )e1.y;									// the skipped edges contribute exactly 0 (bit-exact).
+			}
+#endif
 			continue;
 		}
 		if( swSkip ) { continue; }

@@ -189,7 +189,7 @@ inline std::vector<float4> BuildCaster( const std::vector<std::vector<float3>>& 
 	float3 c = ( lo + hi ) * 0.5f;
 	float rad = 0.5f * len3( hi - lo );
 	rec.push_back( float4( c.x, c.y, c.z, -1.0f ) );
-	rec.push_back( float4( rad, 0, 0, 0 ) );
+	rec.push_back( float4( rad, ( float )nVerts, 0, 0 ) );	// e1.y = edgeCount (closed loops -> one edge per vertex), for shader jump-skip
 	for( auto& l : loops )
 	{
 		int m = ( int )l.size();

@@ -1746,7 +1746,7 @@ void R_AddModels()
 						const idVec3 c = ( gmn + gmx ) * 0.5f;
 						const float  rad = ( gmx - gmn ).Length() * 0.5f;
 						flat[headerIdx].e0 = idVec4( c.x, c.y, c.z, -1.0f );		// e0 = ( centre, -1 marker )
-						flat[headerIdx].e1 = idVec4( rad, 0.0f, 0.0f, casterId );	// e1 = ( radius, 0, 0, casterId )
+						flat[headerIdx].e1 = idVec4( rad, ( float )( n - headerIdx - 1 ), 0.0f, casterId );	// e1 = ( radius, edgeCount, 0, casterId )
 						casterId += 1.0f;
 					}
 					headerIdx = n++;		// reserve this entity's header slot
@@ -1776,7 +1776,7 @@ void R_AddModels()
 				const idVec3 c = ( gmn + gmx ) * 0.5f;
 				const float  rad = ( gmx - gmn ).Length() * 0.5f;
 				flat[headerIdx].e0 = idVec4( c.x, c.y, c.z, -1.0f );
-				flat[headerIdx].e1 = idVec4( rad, 0.0f, 0.0f, casterId );
+				flat[headerIdx].e1 = idVec4( rad, ( float )( n - headerIdx - 1 ), 0.0f, casterId );	// e1.y = edgeCount (shader jump-skip)
 				casterId += 1.0f;
 			}
 			// AllocJoint (not AllocVertex): the joint buffer is the SRV-capable StructuredBuffer the
