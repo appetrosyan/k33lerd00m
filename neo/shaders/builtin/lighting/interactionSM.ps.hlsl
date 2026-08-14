@@ -156,16 +156,27 @@ void main( PS_IN fragment, out PS_OUT result )
 	float swLocW = 0.0;			// DIAG 14: perspective divisor w (sign matters)
 	float swLocFace = 0.0;		// DIAG 15: selected cube face / 5
 #if USE_SHADOW_ATLAS
-	// PCSS LOCATOR (r_shadowMapPCSS): the shadow atlas classifies each fragment lit / penumbra / umbra so the
-	// expensive coverage integral runs ONLY in the penumbra band. Blocker-search FRACTION of the light-disk
-	// footprint (validated in SoftShadowPrimitives_test as the tightest conservative locator): 0 blockers ->
-	// fully lit (analytic can't fire a false shadow), all blockers -> hard umbra (sharp, temporally stable),
-	// partial -> run the analytic. pcssScale (rpShadowAtlasOffsets[].z, 0 when r_shadowMapPCSS off) gates the
-	// whole locator: off -> the pure analytic everywhere, so the two are A/B-comparable live. The atlas depth,
+	// STANDALONE PCSS soft shadow (r_shadowMapPCSS): the shadow atlas alone produces the full contact-hardened
+	// soft shadow (Fernando 2005) - a blocker search sizes the penumbra, a penumbra-scaled PCF draws the gradient,
+	// no analytic coverage integral. pcssScale (rpShadowAtlasOffsets[].z, 0 when r_shadowMapPCSS off) gates the
+	// path: off -> the pure analytic wedge everywhere, so the cheap PCSS and the analytic are A/B-comparable live.
+	// The atlas depth,
 	// shadow matrices, offsets and screen-correction are all bound because the light is ImageAtlasPlaced.
 	// ponytail: correctness rides on r_useShadowAtlas (atlas depth must be bound at t5); pcssScale>0 implies it.
+	// pcssScale sign is a 3-way mode select (set in RenderBackend per light):
+	//   > 0  this light owns an atlas tile -> run PCSS (the cheap standalone path below).
+	//   < 0  PCSS MODE but this light got NO atlas tile (atlas exhausted). PCSS is a SEPARATE, cheaper mode chosen
+	//        on hardware that cannot afford the analytic wedge, so regressing to the wedge here is NOT acceptable -
+	//        it would spike exactly the machines that opted out of it. There is no tile to sample, so leave this one
+	//        light unshadowed (cheap, honest degradation). The fit-budget tile cap makes this essentially
+	//        unreachable; the branch exists only so an atlas overflow can never resurrect the wedge under PCSS.
+	//   == 0 ANALYTIC mode (r_shadowMapPCSS off): the pure wedge, as explicitly chosen.
 	float pcssScale = pc.rpShadowAtlasOffsets[ 0 ].z;
-	if( pcssScale <= 0.0 )
+	if( pcssScale < 0.0 )
+	{
+		shadow = 1.0;
+	}
+	else if( pcssScale == 0.0 )
 	{
 		float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
 		shadow = 1.0 - saturate( swOcc );
@@ -222,37 +233,61 @@ void main( PS_IN fragment, out PS_OUT result )
 		// (falls to a tiny acne term on a face-on receiver where swBiasCap ~ 0). ddx/ddy can be garbage at cube-face
 		// seams, so also floor via a small constant.
 		float swConstBias = max( 0.0015, 1.5 * swBiasCap );	// slope-adaptive self-shadow guard (see swBiasCap above)
-		float swHits = 0.0;
+		// STANDALONE PCSS (Fernando 2005), full contact-hardening variant. The atlas IS depth-readable with the
+		// non-comparison sampler (s_Lighting) now that t5 binds the real atlas (was the empty rtShadowMask, which
+		// read 0 -> the old "TD_DEPTH can't be read raw" note); dbg12 raw depth tracks dbg11 receiver depth 1:1.
+		// PASS 1 - BLOCKER SEARCH: average the raw stored depth of texels CLOSER than the receiver over the
+		// light-disk footprint. That average distance drives the penumbra width; no blocker in the footprint =>
+		// fully lit, skip pass 2.
+		float swBlkSum = 0.0;
+		float swBlkCnt = 0.0;
 		for( float bi = 0.0; bi < 16.0; bi += 1.0 )
 		{
-			float2 bj = VogelDiskSample( bi, 16.0, swPhi );
-			float2 swOff = bj * swSearch;
+			float2 swOff = VogelDiskSample( bi, 16.0, swPhi ) * swSearch;
 			// receiver depth expected at this sample's UV (planar extrapolation), clamped so it stays a valid bias.
 			float swRecvAt = swRecv + clamp( dot( swGrad, swOff ), -swBiasCap, swBiasCap ) - swConstBias;
-			// COMPARISON sampler: the atlas is a DEPTH texture (TD_DEPTH); a raw SampleLevel(s_Lighting) reads 0 on
-			// it (only the base shadow's SampleCmp path can read depth), which made the locator see 0 < recvZ
-			// everywhere -> whole-scene false umbra. SampleCmpLevelZero returns the LIT fraction (stored passes vs
-			// swRecvAt); the blocker/umbra fraction is 1 - lit. Cleared-far texels (1.0 >= recvZ) read lit => never
-			// a false blocker, so the < 0.999 guard is no longer needed.
-			float swLit = t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, swBase + swOff, swRecvAt );
-			swHits += ( 1.0 - swLit );
+			float bd = t_ShadowAtlas.SampleLevel( s_Lighting, swBase + swOff, 0 ).r;
+			if( bd < swRecvAt && bd < 0.999 )	// stored 1.0 = cleared/far: never a blocker
+			{
+				swBlkSum += bd;
+				swBlkCnt += 1.0;
+			}
 		}
-		float swFr = swHits / 16.0;
-		swLocFr = swFr;											// DIAG (r_softShadowDebugShader 10)
-		swLocRecv = swRecv;										// DIAG (11); no extra sample in the hot path for 12
-		swLocSamp = swFr;										// DIAG (12): reuse the blocker fraction
-		if( swFr <= 0.02 )
+		swLocFr = swBlkCnt / 16.0;								// DIAG (10): blocker fraction
+		swLocRecv = swRecv;										// DIAG (11)
+		swLocSamp = ( swBlkCnt > 0.0 ) ? swBlkSum / swBlkCnt : 1.0;	// DIAG (12): average blocker depth
+		if( swBlkCnt < 0.5 )
 		{
-			shadow = 1.0;	// fully lit: skip the integral, no false shadow
-		}
-		else if( swFr >= 0.98 )
-		{
-			shadow = 0.0;	// hard umbra straight from the shadow map
+			shadow = 1.0;	// no blocker in the search footprint => fully lit, skip the PCF
 		}
 		else
 		{
-			float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
-			shadow = 1.0 - saturate( swOcc );	// penumbra band: the analytic gradient
+			// PASS 2 - PENUMBRA WIDTH by similar triangles, then a PCF over a kernel scaled to it: the closer the
+			// blocker sits to the receiver the smaller the kernel -> sharp CONTACT shadow that softens with distance.
+			// Clamp to [1 texel, full light footprint] so contact stays crisp and the kernel can't exceed the light.
+			// The similar-triangles ratio (zRecv - zBlk)/zBlk MUST be in LINEAR light-space distance, but swRecv /
+			// swAvgBlk are non-linear shadow-map z. For this point-light projection (far plane at infinity, window
+			// z = 0.5*ndc+0.5) linear distance z_eye = k/(1-d), so the ratio reduces to (dRecv-dBlk)/(1-dRecv) - the
+			// k cancels, no near plane needed. Dividing by raw swAvgBlk instead (the old bug) collapsed the ratio
+			// toward 0 near the far plane - exactly where an elevated caster's floor receiver sits - so a crate
+			// floating well above the floor got a HARD blob instead of the widest, softest penumbra.
+			float swAvgBlk = swBlkSum / swBlkCnt;
+			float swPen    = ( swRecv - swAvgBlk ) / max( 1.0 - swRecv, 1e-4 ) * pcssScale;
+			// The PCF (filter) radius must be free to grow to the full penumbra - it is NOT the blocker-search
+			// radius. Capping it at swSearch (= pcssScale texels, the SEARCH footprint) is the bug that made every
+			// elevated caster hard: a crate floating high above the floor wants a penumbra far wider than the few
+			// texels used to FIND its blocker, but the clamp pinned it there. Allow up to 6x the search footprint
+			// (still bounded so 24 taps stay adequately dense); contact (swPen~0) still clamps to 1 texel = crisp.
+			float swFilter = clamp( swPen * pc.rpScreenCorrectionFactor.z, pc.rpScreenCorrectionFactor.z, 6.0 * swSearch );
+			float swLitSum = 0.0;
+			for( float fi = 0.0; fi < 24.0; fi += 1.0 )
+			{
+				float2 fOff = VogelDiskSample( fi, 24.0, swPhi ) * swFilter;
+				float swRecvAt = swRecv + clamp( dot( swGrad, fOff ), -swBiasCap, swBiasCap ) - swConstBias;
+				// COMPARISON sampler on the TD_DEPTH atlas returns the LIT fraction (stored passes vs swRecvAt).
+				swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, swBase + fOff, swRecvAt );
+			}
+			shadow = swLitSum / 24.0;	// soft penumbra gradient, contact-hardened
 		}
 	}
 #else

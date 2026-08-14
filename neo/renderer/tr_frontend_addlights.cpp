@@ -468,6 +468,20 @@ static void R_AddSingleLight( viewLight_t* vLight )
 			}
 
 			vLight->shadowLOD = lod;
+
+			// STANDALONE PCSS uses the shadow map AS the shadow (not just a lit/umbra locator), so the
+			// distance-based LOD that drops point lights to a 256 tile is far too coarse - the penumbra shows the
+			// shadow-map texels. Pin soft-wedge point lights to a fixed atlas LOD (r_softShadowMapLod, default 0 =
+			// 1024, the sharpest). The atlas allocator (RB_ShadowMapPass tileMap) already fails a light gracefully
+			// to no-shadow when the higher-res tiles don't fit, so this can't crash - it only spends atlas budget.
+			// ponytail: flat res for every soft light; add a screen-coverage LOD only if the atlas overflows.
+			extern idCVar r_useSoftShadowVolumes;
+			extern idCVar r_shadowMapPCSS;
+			extern idCVar r_softShadowMapLod;
+			if( lod >= 0 && !light->parms.parallel && r_useSoftShadowVolumes.GetBool() && r_shadowMapPCSS.GetBool() )
+			{
+				vLight->shadowLOD = idMath::ClampInt( 0, MAX_SHADOWMAP_RESOLUTIONS - 1, r_softShadowMapLod.GetInteger() );
+			}
 		}
 		// RB end
 	}

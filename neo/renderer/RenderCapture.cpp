@@ -114,7 +114,20 @@ void R_SoftShadowGoto_f( const idCmdArgs& args )
 {
 	if( args.Argc() < 2 )
 	{
-		common->Warning( "usage: softShadowGoto <capture.softcap>  (then `wait 90` before testSoftShadowLocator)" );
+		common->Warning( "usage: softShadowGoto <capture.softcap> | <x y z yaw pitch>  (then `wait 90` before testSoftShadowLocator)" );
+		return;
+	}
+	// FREE-CAM form: 5+ args -> raw "x y z yaw pitch", so the harness can render ANY spot in the live map, not just
+	// a captured viewpoint (dynamic props / elevated casters that no .softcap covers). testSoftShadowLocator takes
+	// the same form. No file needed - the goto tick just teleports the player there.
+	if( args.Argc() >= 6 )
+	{
+		s_gotoOrg.Set( atof( args.Argv( 1 ) ), atof( args.Argv( 2 ) ), atof( args.Argv( 3 ) ) );
+		s_gotoAng.Set( atof( args.Argv( 5 ) ), atof( args.Argv( 4 ) ), 0.0f );	// (pitch, yaw, roll)
+		s_gotoFrames = 120;
+		R_SoftShadowPinTestConfig( true );
+		common->Printf( "[softtest] goto armed (free-cam): (%.0f %.0f %.0f) yaw %.0f pitch %.0f - pinning for 120 frames\n",
+						s_gotoOrg.x, s_gotoOrg.y, s_gotoOrg.z, s_gotoAng.yaw, s_gotoAng.pitch );
 		return;
 	}
 	FILE* cf = fopen( args.Argv( 1 ), "rb" );
@@ -1069,26 +1082,38 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 	}
 	if( args.Argc() < 2 )
 	{
-		common->Warning( "usage: testSoftShadowLocator <capture.softcap>  (load its map first - all erebusN are game/erebus1)" );
+		common->Warning( "usage: testSoftShadowLocator <capture.softcap> | <x y z yaw pitch>  (load its map first - all erebusN are game/erebus1)" );
 		return;
 	}
 
-	// Camera = the capture's EXACT artifact viewpoint. We move the (noclipping) player there and render via the
-	// real Draw() path: Draw() applies shadow-cvar changes between configs, whereas a bare RenderScene reuses
-	// the interactions cached at map load and renders every config identically.
-	FILE* cf = fopen( args.Argv( 1 ), "rb" );
-	softcapHeader_t hdr;
-	if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC )
+	// Camera = the capture's EXACT artifact viewpoint (or a free-cam "x y z yaw pitch", see softShadowGoto). We move
+	// the (noclipping) player there via the goto tick and render via the real Draw() path: Draw() applies shadow-cvar
+	// changes between configs, whereas a bare RenderScene reuses the interactions cached at map load and renders every
+	// config identically. The file/args only supply the camera for the log line; the actual pose is set by the goto.
+	idVec3 camOrg;
+	idAngles ang;
+	if( args.Argc() >= 6 )
 	{
-		if( cf != NULL ) { fclose( cf ); }
-		common->Warning( "testSoftShadowLocator: cannot read capture %s", args.Argv( 1 ) );
-		return;
+		camOrg.Set( atof( args.Argv( 1 ) ), atof( args.Argv( 2 ) ), atof( args.Argv( 3 ) ) );
+		ang.Set( atof( args.Argv( 5 ) ), atof( args.Argv( 4 ) ), 0.0f );
+		common->Printf( "[softtest] free-cam (%.0f %.0f %.0f) yaw %.0f pitch %.0f\n", camOrg.x, camOrg.y, camOrg.z, ang.yaw, ang.pitch );
 	}
-	fclose( cf );
-	idVec3 camOrg( hdr.vieworg[0], hdr.vieworg[1], hdr.vieworg[2] );
-	idAngles ang = idVec3( hdr.viewaxis[0], hdr.viewaxis[1], hdr.viewaxis[2] ).ToAngles();
-	common->Printf( "[softtest] capture camera (%.0f %.0f %.0f) yaw %.0f pitch %.0f from %s\n",
-					camOrg.x, camOrg.y, camOrg.z, ang.yaw, ang.pitch, args.Argv( 1 ) );
+	else
+	{
+		FILE* cf = fopen( args.Argv( 1 ), "rb" );
+		softcapHeader_t hdr;
+		if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC )
+		{
+			if( cf != NULL ) { fclose( cf ); }
+			common->Warning( "testSoftShadowLocator: cannot read capture %s", args.Argv( 1 ) );
+			return;
+		}
+		fclose( cf );
+		camOrg.Set( hdr.vieworg[0], hdr.vieworg[1], hdr.vieworg[2] );
+		ang = idVec3( hdr.viewaxis[0], hdr.viewaxis[1], hdr.viewaxis[2] ).ToAngles();
+		common->Printf( "[softtest] capture camera (%.0f %.0f %.0f) yaw %.0f pitch %.0f from %s\n",
+						camOrg.x, camOrg.y, camOrg.z, ang.yaw, ang.pitch, args.Argv( 1 ) );
+	}
 
 	// pin the full config again right before the A/B renders (in case the test is run WITHOUT softShadowGoto, or a
 	// frame in between re-archived something). Verbose so the exact config under test is in the log every time.

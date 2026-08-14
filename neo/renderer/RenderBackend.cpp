@@ -2236,6 +2236,23 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 			jitterTexScale[2] = vLight->shadowFadeOut;
 			jitterTexScale[3] = shadowMapSamples;
 			SetFragmentParm( RENDERPARM_JITTERTEXSCALE, jitterTexScale ); // rpJitterTexScale
+
+			// PCSS is a SEPARATE, cheaper mode than the analytic wedge. A soft light that failed atlas placement must
+			// NOT regress to the wedge - that would spike exactly the hardware that opted into PCSS. Publish a
+			// NEGATIVE pcssScale sentinel so the soft shader takes its cheap no-tile path (this light unshadowed)
+			// instead of the wedge. Placed lights set pcssScale>0 above; r_shadowMapPCSS off leaves it 0 = the
+			// intended analytic mode. (fit-budget makes this path rare, but the sentinel makes the wedge structurally
+			// unreachable under PCSS no matter how many lights overflow the atlas.)
+			extern idCVar r_shadowMapPCSS;
+			if( r_useShadowAtlas.GetBool() && r_shadowMapPCSS.GetBool() )
+			{
+				idVec4 pcssSentinel[6];
+				for( int i = 0; i < 6; i++ )
+				{
+					pcssSentinel[i].Set( 0.0f, 0.0f, -1.0f, 0.0f );
+				}
+				SetVertexParms( RENDERPARM_SHADOW_ATLAS_OFFSET_0, &pcssSentinel[0][0], 6 );
+			}
 		}
 
 	}
@@ -4055,6 +4072,29 @@ void idRenderBackend::ShadowAtlasPass( const viewDef_t* _viewDef )
 		}
 	}
 
+	// FIT BUDGET (standalone PCSS): forcing every soft light to a big tile (r_softShadowMapLod pins 1024)
+	// overflows the atlas when many soft lights are in view - most then get NO tile, drop to pcssScale 0, and
+	// revert to the analytic wedge (the speckled acne). Cap every requested tile to the largest power-of-two at
+	// which ALL requested sides fit the atlas (90% fill headroom for quad-tree fragmentation). Few-light scenes
+	// keep 1024; a 17-light room auto-drops to 512 so every light keeps a PCSS tile. Graceful quality, no wedge.
+	if( inputSizes.Num() > 0 )
+	{
+		const double atlasSz = ( double )r_shadowMapAtlasSize.GetInteger();
+		const double budgetPerSide = atlasSz * atlasSz * 0.9 / inputSizes.Num();
+		int affordRes = 256;
+		while( affordRes * 2 <= shadowMapResolutions[0] && ( double )( affordRes * 2 ) * ( affordRes * 2 ) <= budgetPerSide )
+		{
+			affordRes *= 2;
+		}
+		for( int i = 0; i < inputSizes.Num(); i++ )
+		{
+			if( inputSizes[i].x > affordRes )
+			{
+				inputSizes[i].Set( affordRes, affordRes );
+			}
+		}
+	}
+
 	idList<idVec2i>	outputPositions;
 	idList<int>		outputSizes;
 	//idVec2i	totalSize;
@@ -4091,6 +4131,16 @@ void idRenderBackend::ShadowAtlasPass( const viewDef_t* _viewDef )
 
 		Tile tile;
 		bool result = tileMap.GetTile( area, tile );
+
+		// STANDALONE PCSS must never drop a soft light to the analytic wedge: a light that fails to get a tile has
+		// pcssScale 0 in the shader, which reverts it to the wedge coverage - the speckled "ants" PCSS is meant to
+		// replace - and building that light's silhouette edges is wasted work too. With many soft lights a top-res
+		// (1024) tile can't fit, so instead of dropping the light, retry at successively smaller tiles: every soft
+		// light keeps a PCSS tile (all 6*N faces fit easily at 256). Quality degrades gracefully; the ants don't appear.
+		for( int retryArea = area >> 1; !result && retryArea >= 256; retryArea >>= 1 )
+		{
+			result = tileMap.GetTile( retryArea, tile );
+		}
 
 		if( !result )
 		{
