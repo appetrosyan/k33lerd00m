@@ -1916,8 +1916,9 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			// r_softShadowContinuous forces the guard ON in the single ungated pass (ref -1): continuous coverage
 			// everywhere, no core stamp - least over-darkening + most temporal stability (see the cvar help).
 			const float swCentreLit = ( r_softShadowContinuous.GetBool() || ( r_softShadowAAM.GetBool() && softBandStencilRef == 1 ) ) ? 1.0f : 0.0f;
-			extern idCVar r_shadowMapPCSSBias;	// .z = PCSS receiver-plane constant-bias multiplier (peter-pan vs acne)
-			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, r_shadowMapPCSSBias.GetFloat(), 0.0f };
+			extern idCVar r_shadowMapPCSSBias;			// .z = PCSS normal-offset (texels)
+			extern idCVar r_shadowMapPCSSAnalyticContact;	// .w = PCSS->analytic contact hybrid gate
+			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, r_shadowMapPCSSBias.GetFloat(), r_shadowMapPCSSAnalyticContact.GetBool() ? 1.0f : 0.0f };
 			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
 		}
 

@@ -271,6 +271,10 @@ void main( PS_IN fragment, out PS_OUT result )
 				swBlkMax = max( swBlkMax, bd );
 			}
 		}
+		// Centre tap (the light-disk-centre ray): swCentreLit = 1 if the centre is visible (penumbra RING),
+		// 0 if blocked (umbra CORE). Drives the analytic wedge's winding handling and the deep-umbra fast-out.
+		float swBdC = t_ShadowAtlas.SampleLevel( s_Lighting, clamp( swBase, swTileLo, swTileHi ), 0 ).r;
+		float swCentreLit = ( swBdC < swRecvAt && swBdC < 0.999 ) ? 0.0 : 1.0;
 		swLocFr = swBlkCnt / 16.0;								// DIAG (10): blocker fraction
 		swLocRecv = swRecv;										// DIAG (11)
 		swLocSamp = ( swBlkCnt > 0.0 ) ? swBlkSum / swBlkCnt : 1.0;	// DIAG (12): average blocker depth
@@ -314,7 +318,36 @@ void main( PS_IN fragment, out PS_OUT result )
 				// swRecvAt hoisted above; COMPARISON sampler returns the LIT fraction (stored passes vs swRecvAt).
 				swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, clamp( swBase + fOff, swTileLo, swTileHi ), swRecvAt );
 			}
-			shadow = swLitSum / 24.0;	// soft penumbra gradient, contact-hardened
+			float pcssLit = swLitSum / 24.0;	// soft penumbra gradient, contact-hardened
+
+			// HYBRID (r_shadowMapPCSSAnalyticContact, plumbed in rpJitterTexOffset.w): in the conservative PENUMBRA
+			// band (partial occlusion), run the EXACT analytic silhouette-edge integral for physically correct contact
+			// hardening and a smooth edge (kills the shadow-map texel staircase), then take the MORE-occluded of it and
+			// the PCSS PCF so edge-less dynamic casters (silEdges==NULL -> invisible to the analytic) keep their atlas
+			// shadow. Full UMBRA (all taps blocked AND centre blocked) and the LIT case both skip the analytic, so the
+			// O(edges) integral runs only in the thin band. swCentreLit (centre tap) picks the wedge's ring/core winding.
+			// DEEP-UMBRA FAST-OUT (perf only): skip the O(edges) analytic where it would add nothing. All 16 search taps
+			// blocked AND the centre blocked marks umbra, but that set INCLUDES the inner boundary band: the narrow search
+			// footprint (swSearch) saturates to 16/16 one texel INSIDE the silhouette, while the WIDE penumbra PCF
+			// (24 taps over swFilter, the full penumbra width) still catches lit shadow-map texels there -> pcssLit > 0.
+			// That band is exactly the penumbra->umbra transition whose contour the analytic must draw pixel-exact instead
+			// of the shadow-map staircase, so it must NOT be skipped. pcssLit collapses to ~0 only once the fragment is
+			// deeper than a full penumbra-width inside the umbra - no part of the filter kernel reaches past the silhouette
+			// - which is the genuine deep interior. Gate on pcssLit so the thin boundary band runs the analytic (exact umbra
+			// contour) and only the saturated interior fast-outs; the analytic's own occ>=0.999 early-break is the backstop.
+			bool swDeepUmbra = ( swBlkCnt > 15.5 ) && ( swCentreLit < 0.5 ) && ( pcssLit < 0.002 );
+			if( pc.rpJitterTexOffset.w > 0.5 && !swDeepUmbra )
+			{
+				float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit );
+				// Use the EXACT analytic wherever it sees ANY occlusion (edge-having casters); fall back to the PCSS
+				// PCF only where the analytic is fully lit - i.e. edge-less dynamic casters it can't see. max() over-
+				// darkened: it double-counted the same caster where PCSS's over-soft tail read darker than the exact value.
+				shadow = ( swOcc > 0.003 ) ? ( 1.0 - saturate( swOcc ) ) : pcssLit;
+			}
+			else
+			{
+				shadow = pcssLit;
+			}
 		}
 	}
 #else
