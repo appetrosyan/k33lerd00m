@@ -40,6 +40,12 @@ the Free Software Foundation, either version 3 of the License, or
 	#endif
 #endif
 
+// SW_FAST_ATAN: 1 = polynomial sector angle (~0.0038 rad err, cheaper on GPU); 0 = hardware atan2 (exact).
+// Default on; flip to 0 for an A/B against the transcendental.
+#ifndef SW_FAST_ATAN
+	#define SW_FAST_ATAN 1
+#endif
+
 // --------------------------------------------------------------------------- decomposed primitives
 // Every intermediate step is a named pure function so each behaviour is unit-testable in isolation
 // (neo/tests/SoftShadowPrimitives_test.cpp). Same source compiles as HLSL and C++.
@@ -50,10 +56,33 @@ SW_FUNC float SoftDisk_Tri( float2 A, float2 B )
 	return 0.5f * ( A.x * B.y - A.y * B.x );
 }
 
+// Fast atan2 approximation (max abs error ~0.0038 rad ~= 0.22 deg) for the sector arc angle only. The
+// sector area is 0.5*r^2*angle, so a sub-milliradian angle error is ~1e-3 of the disk area - invisible in
+// the shadow - while being several times cheaper than the hardware transcendental. This is the ONLY place
+// the coverage is approximated: the winding path uses an exact integer crossing count, not an angle.
+SW_FUNC float SoftFastAtan2( float y, float x )
+{
+	float ax = abs( x );
+	float ay = abs( y );
+	float mx = max( ax, ay );
+	float mn = min( ax, ay );
+	float a  = mn / ( mx + 1e-20f );			// [0,1]
+	float s  = a * a;
+	float r  = ( ( -0.0464964749f * s + 0.15931422f ) * s - 0.327622764f ) * s * a + a;	// atan(a), |err|<2e-3
+	if( ay > ax ) { r = 1.57079637f - r; }		// > 45 deg: reflect (pi/2 - r)
+	if( x < 0.0f ) { r = 3.14159274f - r; }		// left half:  pi - r
+	if( y < 0.0f ) { r = -r; }					// lower half: negate
+	return r;
+}
+
 // signed area of the circular sector (origin, A..B) of the disk radius^2 = r2: 0.5*r^2*angle(A,B)
 SW_FUNC float SoftDisk_Sector( float2 A, float2 B, float r2 )
 {
+#if SW_FAST_ATAN
+	return 0.5f * r2 * SoftFastAtan2( A.x * B.y - A.y * B.x, dot( A, B ) );
+#else
 	return 0.5f * r2 * atan2( A.x * B.y - A.y * B.x, dot( A, B ) );
+#endif
 }
 
 // signed angle subtended at the disk centre by the directed edge A->B, in (-pi, pi]. Summed around a

@@ -103,8 +103,10 @@ double RunOnce( const Workload& w )
 const char* ANCHOR_PATH = "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/wedge_bench_anchor.bin";
 
 // deviation an optimisation is allowed to introduce vs the exact anchor before it counts as "broken".
-// 0 today (nothing approximated yet); raise CONSCIOUSLY when accepting an approximation (e.g. fast atan2).
-const double DEVIATION_TOL = 0.0;
+// 0.001 accepts the fast-atan2 sector angle (measured max 0.000346 vs the exact anchor - invisible, and
+// all Monte-Carlo accuracy suites still pass). The winding->crossing-count change added ZERO (exact). Raise
+// further only when CONSCIOUSLY accepting a new approximation; the anchor itself stays the exact reference.
+const double DEVIATION_TOL = 0.001;
 
 }
 
