@@ -92,6 +92,26 @@ SW_FUNC float SoftDisk_EdgeAngle( float2 A, float2 B )
 	return atan2( A.x * B.y - A.y * B.x, dot( A, B ) );
 }
 
+// Signed contribution of directed edge A->B to the loop's WINDING NUMBER about the disk centre: +1 if it
+// crosses the +X axis upward, -1 downward, else 0. Summed around a closed loop this is the winding number
+// as an EXACT INTEGER - the same value as round( sum(EdgeAngle)/2pi ) but with NO transcendental. The
+// half-open y>0 test counts a vertex exactly on the axis once, never twice (standard ray-cast convention).
+SW_FUNC float SoftDisk_Crossing( float2 A, float2 B )
+{
+	bool ay = ( A.y > 0.0f );
+	bool by = ( B.y > 0.0f );
+	if( ay == by )
+	{
+		return 0.0f;											// both endpoints same side of y=0: no crossing
+	}
+	float x = A.x + ( B.x - A.x ) * ( -A.y ) / ( B.y - A.y );	// x where the edge meets y=0
+	if( x <= 0.0f )
+	{
+		return 0.0f;											// crossing is on the -X ray: ignore
+	}
+	return by ? 1.0f : -1.0f;									// upward crossing = +1, downward = -1
+}
+
 // intersection parameters of segment A + t*D with the circle |X|^2 = r2. disc <= 0 = no crossing;
 // otherwise t1 <= t2 are the entry/exit parameters (on the infinite line; the caller range-checks).
 struct softSegRoots_t
@@ -317,7 +337,7 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 
 	float swOcc = 0.0f;
 	float swArea = 0.0f;
-	float swAng = 0.0f;		// summed centre angle of the clipped loop = 2*pi * winding number (swCentreLit)
+	float swCross = 0.0f;	// signed +X-axis crossings of the clipped loop = winding number (integer, swCentreLit)
 	// haveCaster starts TRUE: edge records arriving before any header (an engine offset bug, or a caller
 	// without cull data) are treated as a caster and still occlude. They used to be fully computed and
 	// then silently DISCARDED at finalization - an invisible missing-shadow failure mode (finding F14).
@@ -341,13 +361,13 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 			if( haveCaster && swFirstValid )
 			{
 				swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the previous caster's open chain
-				swAng  += SoftDisk_EdgeAngle( swPrev, swFirst );
+				swCross += SoftDisk_Crossing( swPrev, swFirst );
 			}
 			if( haveCaster )
 			{
 				if( swCentreLit > 0.5f )
 				{
-					float swWind = floor( swAng * ( 0.5f / PI ) + 0.5f );		// loop winding about the disk centre
+					float swWind = swCross;										// crossing count IS the integer winding
 					swArea -= swWind * ( PI * swR2 );							// centre visible => winding is illusory
 					if( abs( swArea ) > 1.2f * ( PI * swR2 ) )					// beyond the physical bound |area| <= pi r^2:
 					{
@@ -359,7 +379,7 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 			}
 			haveCaster = true;
 			swArea = 0.0f;
-			swAng = 0.0f;
+			swCross = 0.0f;
 			swSkip = false;
 			swFirstValid = false;
 			havePrevE1 = false;
@@ -374,7 +394,7 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid )
 		{
 			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close a finished chain before the next
-			swAng  += SoftDisk_EdgeAngle( swPrev, swFirst );
+			swCross += SoftDisk_Crossing( swPrev, swFirst );
 			swFirstValid = false;
 		}
 		havePrevE1 = true;
@@ -398,22 +418,22 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 		float2 q0 = SoftShadow_ProjectVert( pa, dna, swF );
 		float2 q1 = SoftShadow_ProjectVert( pb, dnb, swF );
 
-		if( swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 ); swAng += SoftDisk_EdgeAngle( swPrev, q0 ); }
+		if( swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 ); swCross += SoftDisk_Crossing( swPrev, q0 ); }
 		else               { swFirst = q0; swFirstValid = true; }
 		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
-		swAng  += SoftDisk_EdgeAngle( q0, q1 );
+		swCross += SoftDisk_Crossing( q0, q1 );
 		swPrev = q1;
 	}
 	if( haveCaster && swFirstValid )
 	{
 		swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );		// close the last caster's open chain
-		swAng  += SoftDisk_EdgeAngle( swPrev, swFirst );
+		swCross += SoftDisk_Crossing( swPrev, swFirst );
 	}
 	if( haveCaster )
 	{
 		if( swCentreLit > 0.5f )
 		{
-			float swWind = floor( swAng * ( 0.5f / PI ) + 0.5f );
+			float swWind = swCross;										// crossing count IS the integer winding
 			swArea -= swWind * ( PI * swR2 );
 			if( abs( swArea ) > 1.2f * ( PI * swR2 ) )
 			{
