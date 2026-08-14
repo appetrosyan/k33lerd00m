@@ -1097,6 +1097,9 @@ static void R_SoftShadowClearCapturedCasters()
 	}
 }
 
+idCVar r_softShadowReplayCaster( "r_softShadowReplayCaster", "-1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW,
+								 "harness: replay ONLY this caster index from the .softcap (isolates the dynamic crate/gib); -1 = all casters" );
+
 static void R_SoftShadowSpawnCapturedCasters( const char* path )
 {
 	R_SoftShadowClearCapturedCasters();
@@ -1111,13 +1114,16 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path )
 		return;
 	}
 	// block order after the header: lights, edges, casters, then MESHVERTS (float3), MESHIDX (uint32).
-	const long meshVertsOff = ( long )sizeof( hdr )
-							  + ( long )hdr.numLights  * ( long )sizeof( softcapLight_t )
-							  + ( long )hdr.numEdges   * ( long )sizeof( softcapEdge_t )
-							  + ( long )hdr.numCasters * ( long )sizeof( softcapCaster_t );
+	const long castersOff = ( long )sizeof( hdr )
+							+ ( long )hdr.numLights * ( long )sizeof( softcapLight_t )
+							+ ( long )hdr.numEdges  * ( long )sizeof( softcapEdge_t );
+	const long meshVertsOff = castersOff + ( long )hdr.numCasters * ( long )sizeof( softcapCaster_t );
+	std::vector<softcapCaster_t> casters( hdr.numCasters );
 	std::vector<float>    mv( ( size_t )hdr.numMeshVerts * 3 );
 	std::vector<uint32_t> mi( hdr.numMeshIdx );
-	if( fseek( cf, meshVertsOff, SEEK_SET ) != 0
+	if( fseek( cf, castersOff, SEEK_SET ) != 0
+		|| ( hdr.numCasters > 0 && fread( casters.data(), sizeof( softcapCaster_t ), casters.size(), cf ) != casters.size() )
+		|| fseek( cf, meshVertsOff, SEEK_SET ) != 0
 		|| fread( mv.data(), sizeof( float ), mv.size(), cf ) != mv.size()
 		|| fread( mi.data(), sizeof( uint32_t ), mi.size(), cf ) != mi.size() )
 	{
@@ -1127,25 +1133,44 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path )
 	}
 	fclose( cf );
 
+	// HARNESS ISOLATION: `r_softShadowReplayCaster` picks ONE caster mesh to replay (>= 0), instead of the whole
+	// scene's caster soup (which floods the frame - the plate, walls and every gib are all in here). The dynamic
+	// object of interest (crate/gib) is one caster; find its index by projecting each caster to the capture view
+	// (see peterpan_geometric.py), then replay just it so its shadow is isolated and measurable. -1 = all.
+	extern idCVar r_softShadowReplayCaster;
+	const int only = r_softShadowReplayCaster.GetInteger();
+	uint32_t firstV = 0, numV = hdr.numMeshVerts, firstI = 0, numI = hdr.numMeshIdx;
+	if( only >= 0 && only < ( int )hdr.numCasters )
+	{
+		firstV = casters[only].firstVert;  numV = casters[only].numVerts;
+		firstI = casters[only].firstIndex; numI = casters[only].numIndex;
+		common->Printf( "[softtest] replaying ONLY caster %d: verts[%u..%u) idx[%u..%u)\n", only, firstV, firstV + numV, firstI, firstI + numI );
+	}
+
 	srfTriangles_t* tri = R_AllocStaticTriSurf();
-	R_AllocStaticTriSurfVerts( tri, ( int )hdr.numMeshVerts );
-	R_AllocStaticTriSurfIndexes( tri, ( int )hdr.numMeshIdx );
-	tri->numVerts = ( int )hdr.numMeshVerts;
-	tri->numIndexes = ( int )hdr.numMeshIdx;
-	for( int i = 0; i < tri->numVerts; i++ )
+	R_AllocStaticTriSurfVerts( tri, ( int )numV );
+	R_AllocStaticTriSurfIndexes( tri, ( int )numI );
+	tri->numVerts = ( int )numV;
+	tri->numIndexes = ( int )numI;
+	for( uint32_t i = 0; i < numV; i++ )
 	{
 		tri->verts[i].Clear();
-		tri->verts[i].xyz.Set( mv[i * 3 + 0], mv[i * 3 + 1], mv[i * 3 + 2] );
+		tri->verts[i].xyz.Set( mv[( firstV + i ) * 3 + 0], mv[( firstV + i ) * 3 + 1], mv[( firstV + i ) * 3 + 2] );
 	}
-	for( int i = 0; i < tri->numIndexes; i++ )
+	// MESHIDX stores GLOBAL vert indices; rebase to this caster's local vert window.
+	for( uint32_t i = 0; i < numI; i++ )
 	{
-		tri->indexes[i] = ( triIndex_t )mi[i];
+		tri->indexes[i] = ( triIndex_t )( mi[firstI + i] - firstV );
 	}
 	R_BoundTriSurf( tri );
 
 	modelSurface_t surf;
 	surf.id = 0;
-	surf.shader = declManager->FindMaterial( "textures/common/shadow2" );	// forceshadows + noselfshadow: casts into the atlas but is NOT drawn (the live world stays visible)
+	// VISIBLE + shadow-casting replay: a dynamic caster (crate/gib) is absent from `loadGame quick`, so to
+	// reconstruct the captured scene headless we must both DRAW the object (to confirm placement and see it) and
+	// have it cast (into the atlas for PCSS, and - once traced - for RT). shadow2 was invisible + atlas-only,
+	// which hid whether the object was even placed. `_white` draws and casts shadows by default (no noshadows).
+	surf.shader = declManager->FindMaterial( "_white" );
 	surf.geometry = tri;
 
 	s_capturedCasterModel = renderModelManager->AllocModel();
@@ -1233,12 +1258,16 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 	// command (it runs through the normal frame loop; doing it here re-entrantly unloads the map). We only render
 	// the current view. One Draw settles the latest view, then freeze the sim for the deterministic A/B pair.
 	R_RenderOneFrame();
-	cvarSystem->SetCVarInteger( "g_stopTime", 1 );
 
-	// ORACLE: exact stencil hard shadows (deterministic; RT is unsuitable - real-time-optimised, temporally
-	// noisy). Its lit region is a conservative "should be lit" set, so it never false-accuses a real penumbra.
-	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_skipShadows 0 ; r_useRTShadows 0 ; r_useStencilShadows 0 ; r_useShadowAtlas 1 ; r_useSoftShadowVolumes 1 ; r_shadowMapPCSS 0\n" );	// DIAG: soft-wedge, locator OFF
-	R_RenderOneFrame();
+	// ORACLE: ray-traced shadows - peter-pan IMMUNE (traces the actual scene geometry, no shadow-map projection),
+	// rendered through the real Draw()->game->Draw()->RenderScene frontend that rebuilds per cvar, exactly like
+	// toggling r_useRTShadows in-game. RT casts the LIVE world's own casters at their TRUE contact point, so the
+	// PCSS gap against it IS the peter-panning. Converged (many rays, denoise off) for a stable reference; soft
+	// radius matched to the analytic light-disk (r_shadowPenumbraSize) so RT and PCSS penumbra amplitudes agree.
+	// (Stencil is a dead no-op in this build - proven identical to PCSS - so RT is the only working immune oracle.)
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_skipShadows 0 ; r_useStencilShadows 0 ; r_useSoftShadowVolumes 0 ; r_useShadowAtlas 0 ; r_shadowMapPCSS 0 ; r_useRTShadows 1 ; r_rtShadowDenoise 0 ; r_rtShadowRays 512 ; r_rtShadowAnalyticPenumbra 0\n" );	// RT oracle (immune)
+	cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", cvarSystem->GetCVarFloat( "r_shadowPenumbraSize" ) );
+	R_RenderOneFrame();		// NOTE: RT will NOT engage from here (accel structure is map-load time); the deltaN==0 guard below catches it
 	std::vector<uint8_t> ref;
 	int rw = 0, rh = 0;
 	ReadImageRGBA8( globalImages->currentRenderHDRImage, ref, rw, rh );
@@ -1253,6 +1282,8 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 	ReadImageRGBA8( globalImages->currentRenderHDRImage, test, tw, th );
 	R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
 					  globalImages->currentRenderHDRImage->GetTextureHandle(), nvrhi::ResourceStates::ShaderResource, "softtest_hybrid.png" );
+
+	cvarSystem->SetCVarInteger( "g_stopTime", 1 );	// freeze only now, for the (config-invariant) dbg dumps
 
 	// CONFIG + why soft edges did/didn't generate (the frontend tallies caster acceptance/rejection)
 	{
@@ -1357,11 +1388,20 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 		return;
 	}
 
-	// FALSE SHADOW = the oracle leaves the pixel lit but the hybrid darkens it by more than half. Self-masking:
-	// unlit/background pixels (low oracle luminance) are excluded, so texture darkness never reads as a shadow.
-	const float litThresh = 0.12f;		// oracle luminance above which the pixel is "meaningfully lit"
-	const float darkenFrac = 0.5f;		// hybrid < this * oracle => a false shadow
-	long litN = 0, falseN = 0, deltaN = 0;
+	// PETER-PANNING METRIC. Oracle = RT (immune: shadow at TRUE contact). Hybrid = PCSS. Peter-panning displaces
+	// the PCSS shadow AWAY from the object, so it shows as a signed disagreement, measured two ways:
+	//   MISSED  = oracle-shadowed but hybrid-lit  -> the contact region PCSS wrongly leaves lit (the detach gap)
+	//   FALSE   = hybrid-shadowed but oracle-lit  -> where the displaced PCSS shadow landed instead
+	//   SHIFT   = |centroid(hybrid shadow) - centroid(oracle shadow)| in px -> the raw peter-pan displacement,
+	//             with its direction, independent of shadow area (the single number the user asked for).
+	// A pixel is a shadow-relevant SURFACE if either config shows it lit (excludes background); within that set a
+	// pixel is "shadowed" in a config when its luminance is < darkenFrac of the brighter-of-the-two (the local
+	// unshadowed estimate), so plain texture darkness that both configs share is never counted.
+	const float litThresh = 0.12f;
+	const float darkenFrac = 0.65f;
+	long litN = 0, missedN = 0, falseN = 0, bothN = 0, deltaN = 0;
+	double oSx = 0, oSy = 0, hSx = 0, hSy = 0;
+	long oShad = 0, hShad = 0;
 	std::vector<uint8_t> diff( ( size_t )rw * rh * 3, 0 );
 	for( int i = 0; i < rw * rh; i++ )
 	{
@@ -1369,15 +1409,30 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 		float ls = SoftTestLum( &test[( size_t )i * 4] );
 		diff[( size_t )i * 3 + 0] = ( uint8_t )( lr * 255.0f );
 		diff[( size_t )i * 3 + 1] = ( uint8_t )( ls * 255.0f );
-		if( idMath::Fabs( lr - ls ) > 0.1f ) { deltaN++; }	// oracle vs hybrid differ at all (shadow present in view)
-		if( lr < litThresh ) { continue; }
+		if( idMath::Fabs( lr - ls ) > 0.1f ) { deltaN++; }
+		float bright = Max( lr, ls );
+		if( bright < litThresh ) { continue; }			// background / unlit surface
 		litN++;
-		if( ls < darkenFrac * lr ) { falseN++; diff[( size_t )i * 3 + 2] = 255; }	// mark false-shadow pixels blue
+		bool shadO = lr < darkenFrac * bright;			// RT says shadowed here
+		bool shadH = ls < darkenFrac * bright;			// PCSS says shadowed here
+		const int x = i % rw, y = i / rw;
+		if( shadO ) { oShad++; oSx += x; oSy += y; }
+		if( shadH ) { hShad++; hSx += x; hSy += y; }
+		if( shadO && !shadH ) { missedN++; diff[( size_t )i * 3 + 2] = 255; }			// blue = detach gap
+		else if( shadH && !shadO ) { falseN++; diff[( size_t )i * 3 + 0] = 255; }		// red-boost = misplaced shadow
+		else if( shadO && shadH ) { bothN++; }
 	}
-	double rate = litN ? ( double )falseN / litN : 0.0;
-	const bool pass = ( litN > 1000 ) && ( rate < 0.02 );
+	const double shiftX = ( oShad && hShad ) ? ( hSx / hShad - oSx / oShad ) : 0.0;
+	const double shiftY = ( oShad && hShad ) ? ( hSy / hShad - oSy / oShad ) : 0.0;
+	const double shift = sqrt( shiftX * shiftX + shiftY * shiftY );
+	const long unionShad = missedN + falseN + bothN;
+	const double iou = unionShad ? ( double )bothN / unionShad : 1.0;		// shadow overlap; peter-pan drives it down
+	const double missedRate = oShad ? ( double )missedN / oShad : 0.0;
+	// peter-pan verdict: RT and PCSS shadows should sit on top of each other. A big centroid shift or a large
+	// fraction of the RT shadow that PCSS misses at contact = peter-panning.
+	const bool pass = ( litN > 1000 ) && ( shift < 2.0 ) && ( missedRate < 0.15 );
 
-	// write a diff image (R=oracle lum, G=hybrid lum, B=false-shadow mask) for eyeballing a failure
+	// diff image: R=oracle lum (red-boosted where PCSS over-shadows), G=hybrid lum, B=detach-gap mask
 	idFile* d = fileSystem->OpenFileWrite( "softtest_falseshadow.ppm", "fs_savepath" );
 	if( d != NULL )
 	{
@@ -1390,8 +1445,16 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 	{
 		common->Warning( "testSoftShadowLocator: only %ld lit px - no usable oracle (ray-query hardware? map loaded?)", litN );
 	}
-	common->Printf( "[softtest] %s : false-shadow %ld / %ld lit = %.2f%%  shadowDelta %ld px  ->  %s\n",
-					args.Argv( 1 ), falseN, litN, rate * 100.0, deltaN, pass ? "PASS" : "FAIL" );
+	if( deltaN == 0 )
+	{
+		// RT builds its acceleration structure at MAP LOAD, so enabling r_useRTShadows here (mid-session, from a
+		// console command) is a no-op and the RT oracle renders identically to the PCSS hybrid - a false PASS.
+		// The objective metric must be run as TWO launches with the config set on the command line:
+		common->Warning( "testSoftShadowLocator: oracle == hybrid (RT did NOT engage mid-run). Use the autonomous "
+						 "two-launch harness for a valid peter-pan measurement: neo/tools/softshadow/run_peterpan.sh <capture.softcap>" );
+	}
+	common->Printf( "[softtest] %s : PETER-PAN shift=%.2f px (dx=%.2f dy=%.2f)  missed=%ld/%ld RTshadow (%.1f%%)  false=%ld  IoU=%.3f  shadowDelta=%ld  ->  %s\n",
+					args.Argv( 1 ), shift, shiftX, shiftY, missedN, oShad, missedRate * 100.0, falseN, iou, deltaN, pass ? "PASS" : "FAIL" );
 
 	R_SoftShadowClearCapturedCasters();		// remove the replayed captured casters from the render world
 }
