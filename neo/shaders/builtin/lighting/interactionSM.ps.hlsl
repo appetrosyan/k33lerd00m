@@ -232,7 +232,7 @@ void main( PS_IN fragment, out PS_OUT result )
 		// stored nearest-in-texel depth sits well in front of recvZ and self-shadows. Scale the guard with that range
 		// (falls to a tiny acne term on a face-on receiver where swBiasCap ~ 0). ddx/ddy can be garbage at cube-face
 		// seams, so also floor via a small constant.
-		float swConstBias = max( 0.0015, 1.5 * swBiasCap );	// slope-adaptive self-shadow guard (see swBiasCap above)
+		float swConstBias = max( 0.0015, pc.rpJitterTexOffset.z * swBiasCap );	// r_shadowMapPCSSBias * slope range (peter-pan vs acne; see swBiasCap)
 		// STANDALONE PCSS (Fernando 2005), full contact-hardening variant. The atlas IS depth-readable with the
 		// non-comparison sampler (s_Lighting) now that t5 binds the real atlas (was the empty rtShadowMask, which
 		// read 0 -> the old "TD_DEPTH can't be read raw" note); dbg12 raw depth tracks dbg11 receiver depth 1:1.
