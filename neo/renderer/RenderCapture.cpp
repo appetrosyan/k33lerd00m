@@ -1073,6 +1073,98 @@ int R_SoftShadowSelfTest( const char* mapName )
 	return ( int )falseN;
 }
 
+// ---- captured-geometry replay ---------------------------------------------------------------------------------
+// The harness renders the LIVE loadGame-quick world at the capture viewpoint, but a DYNAMIC caster present at
+// capture time (a physics gib, a moved crate) is absent from that world - so its shadow simply cannot be
+// reproduced (verified: softcap0019's lights show casters glob=n loc=n at replay though the capture recorded 37).
+// To reproduce the EXACT captured frame we rebuild the caster meshes the .softcap embeds (MESHVERTS/MESHIDX, world
+// space) into one static model and add it to the render world as a shadow-casting entity, so the normal atlas
+// occluder path renders it. Cleared after the A/B renders.
+static qhandle_t     s_capturedCasterEntity = -1;
+static idRenderModel* s_capturedCasterModel = NULL;
+
+static void R_SoftShadowClearCapturedCasters()
+{
+	if( s_capturedCasterEntity != -1 && tr.primaryWorld != NULL )
+	{
+		tr.primaryWorld->FreeEntityDef( s_capturedCasterEntity );
+		s_capturedCasterEntity = -1;
+	}
+	if( s_capturedCasterModel != NULL )
+	{
+		renderModelManager->FreeModel( s_capturedCasterModel );
+		s_capturedCasterModel = NULL;
+	}
+}
+
+static void R_SoftShadowSpawnCapturedCasters( const char* path )
+{
+	R_SoftShadowClearCapturedCasters();
+
+	FILE* cf = fopen( path, "rb" );
+	if( cf == NULL ) { return; }
+	softcapHeader_t hdr;
+	if( fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC || hdr.numMeshVerts == 0 || hdr.numMeshIdx == 0 )
+	{
+		fclose( cf );
+		common->Printf( "[softtest] no captured caster geometry to replay\n" );
+		return;
+	}
+	// block order after the header: lights, edges, casters, then MESHVERTS (float3), MESHIDX (uint32).
+	const long meshVertsOff = ( long )sizeof( hdr )
+							  + ( long )hdr.numLights  * ( long )sizeof( softcapLight_t )
+							  + ( long )hdr.numEdges   * ( long )sizeof( softcapEdge_t )
+							  + ( long )hdr.numCasters * ( long )sizeof( softcapCaster_t );
+	std::vector<float>    mv( ( size_t )hdr.numMeshVerts * 3 );
+	std::vector<uint32_t> mi( hdr.numMeshIdx );
+	if( fseek( cf, meshVertsOff, SEEK_SET ) != 0
+		|| fread( mv.data(), sizeof( float ), mv.size(), cf ) != mv.size()
+		|| fread( mi.data(), sizeof( uint32_t ), mi.size(), cf ) != mi.size() )
+	{
+		fclose( cf );
+		common->Warning( "testSoftShadowLocator: failed to read captured caster meshes" );
+		return;
+	}
+	fclose( cf );
+
+	srfTriangles_t* tri = R_AllocStaticTriSurf();
+	R_AllocStaticTriSurfVerts( tri, ( int )hdr.numMeshVerts );
+	R_AllocStaticTriSurfIndexes( tri, ( int )hdr.numMeshIdx );
+	tri->numVerts = ( int )hdr.numMeshVerts;
+	tri->numIndexes = ( int )hdr.numMeshIdx;
+	for( int i = 0; i < tri->numVerts; i++ )
+	{
+		tri->verts[i].Clear();
+		tri->verts[i].xyz.Set( mv[i * 3 + 0], mv[i * 3 + 1], mv[i * 3 + 2] );
+	}
+	for( int i = 0; i < tri->numIndexes; i++ )
+	{
+		tri->indexes[i] = ( triIndex_t )mi[i];
+	}
+	R_BoundTriSurf( tri );
+
+	modelSurface_t surf;
+	surf.id = 0;
+	surf.shader = declManager->FindMaterial( "textures/common/shadow2" );	// forceshadows + noselfshadow: casts into the atlas but is NOT drawn (the live world stays visible)
+	surf.geometry = tri;
+
+	s_capturedCasterModel = renderModelManager->AllocModel();
+	s_capturedCasterModel->InitEmpty( "_softShadowCapturedCasters" );
+	s_capturedCasterModel->AddSurface( surf );		// model takes ownership of tri
+	s_capturedCasterModel->FinishSurfaces( false );
+
+	renderEntity_t re;
+	memset( &re, 0, sizeof( re ) );
+	re.hModel = s_capturedCasterModel;
+	re.axis = mat3_identity;				// MESHVERTS are already world space
+	re.origin.Zero();
+	re.shaderParms[0] = re.shaderParms[1] = re.shaderParms[2] = re.shaderParms[3] = 1.0f;
+	re.noShadow = false;
+	s_capturedCasterEntity = tr.primaryWorld->AddEntityDef( &re );
+	common->Printf( "[softtest] REPLAY captured casters: %u verts / %u tris -> entity %d\n",
+					hdr.numMeshVerts, hdr.numMeshIdx / 3, s_capturedCasterEntity );
+}
+
 void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 {
 	if( tr.primaryWorld == NULL )
@@ -1113,6 +1205,8 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 		ang = idVec3( hdr.viewaxis[0], hdr.viewaxis[1], hdr.viewaxis[2] ).ToAngles();
 		common->Printf( "[softtest] capture camera (%.0f %.0f %.0f) yaw %.0f pitch %.0f from %s\n",
 						camOrg.x, camOrg.y, camOrg.z, ang.yaw, ang.pitch, args.Argv( 1 ) );
+		// reproduce the captured DYNAMIC casters (absent from the live loadGame-quick world) so their shadows render
+		R_SoftShadowSpawnCapturedCasters( args.Argv( 1 ) );
 	}
 
 	// pin the full config again right before the A/B renders (in case the test is run WITHOUT softShadowGoto, or a
@@ -1298,4 +1392,6 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 	}
 	common->Printf( "[softtest] %s : false-shadow %ld / %ld lit = %.2f%%  shadowDelta %ld px  ->  %s\n",
 					args.Argv( 1 ), falseN, litN, rate * 100.0, deltaN, pass ? "PASS" : "FAIL" );
+
+	R_SoftShadowClearCapturedCasters();		// remove the replayed captured casters from the render world
 }
