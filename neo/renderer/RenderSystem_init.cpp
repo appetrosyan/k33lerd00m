@@ -1889,6 +1889,29 @@ void R_TestVRS_f( const idCmdArgs& args )
 
 /*
 =================
+R_DumpHDR_f
+
+Dump the current final (LDR) frame to <name>.png in fs_savepath, respecting whatever config was applied
+at launch. captureShadowRefs cycles cvars mid-process and re-renders with R_RenderOneFrame, which does NOT
+re-run the frontend (soft-edge collection / RT TLAS), so every column came out identical and could not show
+the RT-soft vs analytic-hard difference. The reliable A/B is a SEPARATE launch per config (config applied at
+startup, frontend builds correctly over the wait frames) then this one dump. Renders one backend frame from
+the current command buffer, like R_ScreenShot_f.
+=================
+*/
+void R_DumpHDR_f( const idCmdArgs& args )
+{
+	idStr fn = ( args.Argc() > 1 ) ? args.Argv( 1 ) : "dumphdr";
+	fn += ".png";
+	const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+	tr.RenderCommandBuffers( cmd );
+	tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+	R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->ldrImage->GetTextureHandle(), nvrhi::ResourceStates::RenderTarget, fn.c_str() );
+	common->Printf( "dumpHDR: wrote %s\n", fn.c_str() );
+}
+
+/*
+=================
 R_InitCommands
 =================
 */
@@ -1901,6 +1924,7 @@ void R_InitCommands()
 	cmdSystem->AddCommand( "touchGui", R_TouchGui_f, CMD_FL_RENDERER, "touches a gui" );
 	cmdSystem->AddCommand( "screenshot", R_ScreenShot_f, CMD_FL_RENDERER, "takes a screenshot" );
 	cmdSystem->AddCommand( "testVRS", R_TestVRS_f, CMD_FL_RENDERER, "report hardware variable-rate-shading availability + rate-image tile size" );
+	cmdSystem->AddCommand( "dumpHDR", R_DumpHDR_f, CMD_FL_RENDERER, "dump the current final frame to <name>.png (config-respecting; for headless A/B via separate launches)" );
 	cmdSystem->AddCommand( "captureSoftShadow", R_CaptureSoftShadow_f, CMD_FL_RENDERER, "arms a one-shot soft-shadow scene capture (.softcap + .png)" );
 	cmdSystem->AddCommand( "captureShadowRefs", R_CaptureShadowRefs_f, CMD_FL_RENDERER, "self-contained: freezes time, cycles RT-ref/analytic-bandoff/analytic-bandon, dumps frame+term PNG columns, restores cvars" );
 	cmdSystem->AddCommand( "testSoftShadowLocator", R_TestSoftShadowLocator_f, CMD_FL_RENDERER, "automated self-check: RT oracle vs soft+PCSS-locator hybrid from one frozen view; prints PASS/FAIL false-shadow rate" );
