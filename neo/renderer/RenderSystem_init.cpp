@@ -1860,6 +1860,34 @@ void R_TouchGui_f( const idCmdArgs& args )
 
 /*
 =================
+R_TestVRS_f
+
+Report hardware variable-rate-shading availability + the rate-image tile size. VRS is the vehicle
+for the width-driven analytic soft-shadow sub-sampling (shade the inline wedge at a coarse rate in the
+smooth wide penumbra, full rate at contact/kinks). The rate-image is sized ceil(screen / tileSize), so
+the tile size printed here is what the width pre-pass and the rate image must use.
+=================
+*/
+void R_TestVRS_f( const idCmdArgs& args )
+{
+	nvrhi::IDevice* dev = deviceManager != NULL ? deviceManager->GetDevice() : NULL;
+	if( dev == NULL )
+	{
+		common->Printf( "VRS: no device.\n" );
+		return;
+	}
+	if( !dev->queryFeatureSupport( nvrhi::Feature::VariableRateShading ) )
+	{
+		common->Printf( "VRS: image-based fragment shading rate NOT supported on this device.\n" );
+		return;
+	}
+	nvrhi::VariableRateShadingFeatureInfo info = {};
+	dev->queryFeatureSupport( nvrhi::Feature::VariableRateShading, &info, sizeof( info ) );
+	common->Printf( "VRS: image-based fragment shading rate AVAILABLE; rate-image tile size = %u px.\n", info.shadingRateImageTileSize );
+}
+
+/*
+=================
 R_InitCommands
 =================
 */
@@ -1871,6 +1899,7 @@ void R_InitCommands()
 	cmdSystem->AddCommand( "listGuis", R_ListGuis_f, CMD_FL_RENDERER, "lists guis" );
 	cmdSystem->AddCommand( "touchGui", R_TouchGui_f, CMD_FL_RENDERER, "touches a gui" );
 	cmdSystem->AddCommand( "screenshot", R_ScreenShot_f, CMD_FL_RENDERER, "takes a screenshot" );
+	cmdSystem->AddCommand( "testVRS", R_TestVRS_f, CMD_FL_RENDERER, "report hardware variable-rate-shading availability + rate-image tile size" );
 	cmdSystem->AddCommand( "captureSoftShadow", R_CaptureSoftShadow_f, CMD_FL_RENDERER, "arms a one-shot soft-shadow scene capture (.softcap + .png)" );
 	cmdSystem->AddCommand( "captureShadowRefs", R_CaptureShadowRefs_f, CMD_FL_RENDERER, "self-contained: freezes time, cycles RT-ref/analytic-bandoff/analytic-bandon, dumps frame+term PNG columns, restores cvars" );
 	cmdSystem->AddCommand( "testSoftShadowLocator", R_TestSoftShadowLocator_f, CMD_FL_RENDERER, "automated self-check: RT oracle vs soft+PCSS-locator hybrid from one frozen view; prints PASS/FAIL false-shadow rate" );
