@@ -27,7 +27,6 @@ This file is part of the Doom 3 BFG Edition GPL Source Code. Free software under
 #include <vector>
 #include <cstdio>
 #include <cmath>
-#include <algorithm>
 
 using namespace swtest;
 
@@ -40,6 +39,41 @@ struct Cfg
 	float3      boxH;
 	float       R;			// light-disk radius = penumbra size
 };
+
+// 2D crossing-number point-in-polygon
+inline bool PtInPoly( const std::vector<float2>& p, float x, float y )
+{
+	bool in = false;
+	int n = ( int )p.size();
+	for( int a = 0, b = n - 1; a < n; b = a++ )
+	{
+		if( ( ( p[a].y > y ) != ( p[b].y > y ) ) &&
+				( x < ( p[b].x - p[a].x ) * ( y - p[a].y ) / ( p[b].y - p[a].y ) + p[a].x ) )
+		{
+			in = !in;
+		}
+	}
+	return in;
+}
+
+// The GPU SHELL band region on the floor: each silhouette vertex is inflated RADIALLY about the caster
+// centre by r' = R*margin (softband.vs.hlsl), then projected from the light centre onto z=0. This is the
+// region where the analytic is allowed to run; outside it the classifier forces LIT. Replicated here to
+// test whether it actually contains the outer penumbra.
+inline std::vector<float2> ShellFloorPoly( const std::vector<float3>& loop, float3 centre, float3 L, float rPrime )
+{
+	std::vector<float2> poly;
+	for( size_t k = 0; k < loop.size(); k++ )
+	{
+		float3 V = loop[k];
+		float3 d = V - centre;
+		float  len = std::sqrt( d.x * d.x + d.y * d.y + d.z * d.z );
+		float3 Vp = ( len > 1e-4f ) ? float3( V.x + rPrime * d.x / len, V.y + rPrime * d.y / len, V.z + rPrime * d.z / len ) : V;
+		float t = L.z / ( L.z - Vp.z );			// project L->Vp onto z=0
+		poly.push_back( float2( L.x + t * ( Vp.x - L.x ), L.y + t * ( Vp.y - L.y ) ) );
+	}
+	return poly;
+}
 }
 
 TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
@@ -57,7 +91,7 @@ TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 	const float EL = 0.02f;			// "lit"   threshold on occlusion
 	const float EH = 0.15f;			// "shadow/penumbra" threshold on occlusion
 
-	double worstFL = 0.0, worstFS = 0.0;
+	double worstFL = 0.0, worstFS = 0.0, worstShell = 0.0;
 	float3 worstFLp( 0, 0, 0 ), worstFSp( 0, 0, 0 );
 
 	for( const Cfg& cf : cfgs )
@@ -72,10 +106,11 @@ TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 		std::vector<float4> rec = BuildCaster( loops );
 		int numRec = ( int )( rec.size() / 2 );
 		SoftEdgeBuffer buf{ rec.data(), ( int )rec.size() };
+		std::vector<float2> shell = ShellFloorPoly( loop, cf.boxC, L, cf.R * 1.1f );	// the actual GPU shell region
 
 		long fl = 0, fs = 0, pen = 0, lit = 0;
-		long outerPen = 0, outerPenArea = 0;	// penumbra where the CENTRE ray is visible = beyond the point-light shadow
-		double wfl = 0.0, wfs = 0.0, worstOuter = 0.0;
+		long outerPen = 0, shellMiss = 0;		// penumbra beyond point-light shadow; penumbra the SHELL fails to cover
+		double wfl = 0.0, wfs = 0.0, worstOuter = 0.0, worstShellMiss = 0.0;
 		for( int j = 0; j < N; j++ )
 		{
 			for( int i = 0; i < N; i++ )
@@ -96,6 +131,13 @@ TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 					{
 						outerPen++;										// a point-light-shadow band would FALSE-LIT this
 						if( truthOcc > worstOuter ) { worstOuter = truthOcc; }
+					}
+					// does the ACTUAL shell region cover this real-penumbra point? if not, the classifier
+					// forces it lit regardless of the (correct) wedge -> the sharp cutoff.
+					if( !PtInPoly( shell, P.x, P.y ) )
+					{
+						shellMiss++;
+						if( truthOcc > worstShellMiss ) { worstShellMiss = truthOcc; }
 					}
 				}
 
@@ -122,17 +164,21 @@ TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 				}
 			}
 		}
-		( void )outerPenArea;
-		std::printf( "    [%-11s R=%2.0f] penumbra=%4ld lit=%4ld | WEDGE(correct class): FALSE-LIT=%4ld(worst %.2f) FALSE-SHADOW=%4ld(worst %.2f)"
-					 " | CLASSIFIER: OUTER-penumbra beyond point-light shadow=%4ld (%5.1f%% of penumbra, worst occ %.2f) <- these FALSE-LIT if the band is the stencil hard shadow\n",
-					 cf.name, cf.R, pen, lit, fl, wfl, fs, wfs,
-					 outerPen, pen ? 100.0 * outerPen / pen : 0.0, worstOuter );
+		std::printf( "    [%-11s R=%2.0f] penumbra=%4ld | WEDGE(correct class) false-lit=%ld(%.2f) false-shadow=%ld(%.2f)"
+					 " | OUTER=%ld(%.0f%%) | SHELL-MISS=%4ld (%5.1f%% of penumbra NOT covered by the shell, worst occ %.2f)\n",
+					 cf.name, cf.R, pen, fl, wfl, fs, wfs,
+					 outerPen, pen ? 100.0 * outerPen / pen : 0.0,
+					 shellMiss, pen ? 100.0 * shellMiss / pen : 0.0, worstShellMiss );
+		( void )lit;
+		if( worstShellMiss > worstShell ) { worstShell = worstShellMiss; }
 	}
 	std::printf( "    [worst] false-lit %.3f at (%.1f,%.1f)   false-shadow %.3f at (%.1f,%.1f)\n",
 				 worstFL, worstFLp.x, worstFLp.y, worstFS, worstFSp.x, worstFSp.y );
 
 	// A correct classifier must never call a shadowed point fully lit, nor a lit point shadowed, by a large
-	// margin. These are strict on purpose - this instrument is meant to go RED where the analytic diverges.
-	CHECK( worstFL <= 0.10 );
-	CHECK( worstFS <= 0.10 );
+	// margin, and its conservative band (the shell) must CONTAIN the whole penumbra. Strict on purpose -
+	// this instrument is meant to go RED where the analytic (or its classifier geometry) diverges.
+	CHECK( worstFL <= 0.10 );		// wedge must not miss shadow
+	CHECK( worstFS <= 0.10 );		// wedge must not add shadow
+	CHECK( worstShell <= 0.05 );	// the shell band must cover the penumbra (elevated casters currently miss ~0.20)
 }
