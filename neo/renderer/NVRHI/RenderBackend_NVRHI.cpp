@@ -567,6 +567,22 @@ void idRenderBackend::DrawElementsWithCounters( const drawSurf_t* surf, bool sha
 			}
 		}
 
+		// Variable-rate shading of the analytic soft-wedge interaction draw (per-draw dynamic rate; the
+		// pipeline declares VRS capability in PipelineCache). Constant rate for stage-1 bring-up; the
+		// image-driven width rate replaces it next. Gated to the soft-wedge programs by the cvar.
+		{
+			extern idCVar r_softShadowVRS;
+			const int vrs = r_softShadowVRS.GetInteger();
+			if( vrs > 0 &&
+					( program == BUILTIN_INTERACTION_SOFT_WEDGE_SPOT || program == BUILTIN_INTERACTION_SOFT_WEDGE_SPOT_SKINNED ||
+					  program == BUILTIN_INTERACTION_SOFT_WEDGE_POINT || program == BUILTIN_INTERACTION_SOFT_WEDGE_POINT_SKINNED ||
+					  program == BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL || program == BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL_SKINNED ) )
+			{
+				state.shadingRateState.setEnabled( true )
+				.setShadingRate( vrs >= 2 ? nvrhi::VariableShadingRate::e4x4 : nvrhi::VariableShadingRate::e2x2 );
+			}
+		}
+
 		commandList->setGraphicsState( state );
 
 		renderProgManager.CommitPushConstants( commandList, bindingLayoutType );

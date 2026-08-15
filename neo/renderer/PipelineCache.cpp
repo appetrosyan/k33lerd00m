@@ -88,6 +88,18 @@ nvrhi::GraphicsPipelineHandle PipelineCache::GetOrCreatePipeline( const Pipeline
 	// Specialize the state with the state key.
 	GetRenderState( key.state, key, pipelineDesc.renderState );
 
+	// Variable-rate shading on the analytic soft-wedge interaction programs: the per-fragment wedge
+	// integral is the cost, and its coverage field is band-limited by the penumbra width (heavily
+	// over-sampled in a wide penumbra). Declare VRS CAPABILITY on these pipelines unconditionally (default
+	// rate 1x1 = no change) so the ACTUAL rate, set per-draw from r_softShadowVRS, toggles live without a
+	// vid_restart. Gated to these programs so nothing else in the frame is affected.
+	if( key.program == BUILTIN_INTERACTION_SOFT_WEDGE_SPOT || key.program == BUILTIN_INTERACTION_SOFT_WEDGE_SPOT_SKINNED ||
+			key.program == BUILTIN_INTERACTION_SOFT_WEDGE_POINT || key.program == BUILTIN_INTERACTION_SOFT_WEDGE_POINT_SKINNED ||
+			key.program == BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL || key.program == BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL_SKINNED )
+	{
+		pipelineDesc.shadingRateState.setEnabled( true );	// capability only; rate stays 1x1 unless a draw overrides
+	}
+
 	auto pipeline = device->createGraphicsPipeline( pipelineDesc, key.framebuffer->GetApiObject() );
 
 	pipelineHash.Add( h, pipelines.Append( { key, pipeline } ) );
