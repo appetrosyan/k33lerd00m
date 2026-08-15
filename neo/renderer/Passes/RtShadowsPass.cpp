@@ -35,7 +35,7 @@ extern idCVar r_useRTShadows;
 
 // Pass-local tuning cvars (mirrors the ReflectionsPass convention of file-scope statics).
 idCVar r_rtShadowBias( "r_rtShadowBias", "1.5", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: ray origin bias along the surface normal (self-intersection)" );
-idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: visibility rays per pixel (1 = hard shadow; >1 = brute-force soft, spatial-denoised)", 1, 16 );
+idCVar r_rtShadowRays( "r_rtShadowRays", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER | CVAR_NEW, "RT shadows: visibility rays per pixel (1 = hard shadow; >1 = brute-force soft, spatial-denoised). High counts (256+) with r_rtShadowDenoise 0 give the converged PHYSICAL REFERENCE in-game (slow).", 1, 1024 );
 idCVar r_rtShadowDenoise( "r_rtShadowDenoise", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL | CVAR_NEW, "RT shadows: spatial edge-aware denoise of the soft-shadow penumbra (only active with r_rtShadowRays > 1)" );
 idCVar r_rtShadowDenoiseRadius( "r_rtShadowDenoiseRadius", "6", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT | CVAR_NEW, "RT shadows: soft-shadow penumbra denoise radius in pixels (0 = off)", 0.0f, 16.0f );
 idCVar r_rtShadowDenoiseDepthSigma( "r_rtShadowDenoiseDepthSigma", "0.001", CVAR_RENDERER | CVAR_FLOAT | CVAR_NEW, "RT shadows: penumbra denoise depth edge-stop sigma (hardware-depth units)" );
