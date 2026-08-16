@@ -331,14 +331,25 @@ void main( PS_IN fragment, out PS_OUT result )
 			// texels used to FIND its blocker, but the clamp pinned it there. Allow up to 6x the search footprint
 			// (still bounded so 24 taps stay adequately dense); contact (swPen~0) still clamps to 1 texel = crisp.
 			float swFilter = clamp( swPen * pc.rpScreenCorrectionFactor.z, pc.rpScreenCorrectionFactor.z, 6.0 * swSearch );
-			float swLitSum = 0.0;
-			for( float fi = 0.0; fi < 24.0; fi += 1.0 )
+			// PCF ONLY WHERE ITS RESULT IS CONSUMED (perf). In face+analytic-contact mode the term is purely
+			// analytic, so the 24-tap PCF's ONLY consumer is the deep-umbra fast-out confirmation - and that
+			// is only reachable when all 16 search taps AND the centre are blocked. Everywhere else in face
+			// mode the 24 atlas taps were computed and discarded, on every soft fragment. The wedge path and
+			// plain-PCSS mode still consume pcssLit as the term, so they keep the unconditional PCF.
+			bool swFaceAnalytic = swFace && ( pc.rpJitterTexOffset.w > 0.5 );
+			bool swWantPCF = !swFaceAnalytic || ( ( swBlkCnt > 15.5 ) && ( swCentreLit < 0.5 ) );
+			float pcssLit = 0.0;				// only read when swWantPCF computed it (deep-umbra gate / non-face term)
+			if( swWantPCF )
 			{
-				float2 fOff = VogelDiskSample( fi, 24.0, swPhi ) * swFilter;
-				// swRecvAt hoisted above; COMPARISON sampler returns the LIT fraction (stored passes vs swRecvAt).
-				swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, clamp( swBase + fOff, swTileLo, swTileHi ), swRecvAt );
+				float swLitSum = 0.0;
+				for( float fi = 0.0; fi < 24.0; fi += 1.0 )
+				{
+					float2 fOff = VogelDiskSample( fi, 24.0, swPhi ) * swFilter;
+					// swRecvAt hoisted above; COMPARISON sampler returns the LIT fraction (stored passes vs swRecvAt).
+					swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, clamp( swBase + fOff, swTileLo, swTileHi ), swRecvAt );
+				}
+				pcssLit = swLitSum / 24.0;		// soft penumbra gradient, contact-hardened
 			}
-			float pcssLit = swLitSum / 24.0;	// soft penumbra gradient, contact-hardened
 
 			// HYBRID (r_shadowMapPCSSAnalyticContact, plumbed in rpJitterTexOffset.w): in the conservative PENUMBRA
 			// band (partial occlusion), run the EXACT analytic silhouette-edge integral for physically correct contact

@@ -620,7 +620,9 @@ SW_FUNC int SoftPopcount32( uint x )
 }
 
 #ifndef SW_FACE_SAMPLES
-	#define SW_FACE_SAMPLES 16			// equal-area disk samples (16 or 32); <=32 to pack the occlusion mask in one uint
+	#define SW_FACE_SAMPLES 16			// equal-area disk samples (8, 16 or 32); <=32 to pack the occlusion mask in one uint.
+	//									   8 = extra perf tier; 16 = the accuracy set (the analytic-light budget is
+	//									   the primary 60-FPS lever, so the granted lights keep the full ray set)
 #endif
 
 
@@ -635,7 +637,23 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 
 	// unit-disk sample coords (golden-angle sunflower: equal area => coverage = occluded/N is unbiased) and the
 	// 6 nearest disk-neighbours of each, packed 5 bits each (for the morphological crack-close below).
-#if SW_FACE_SAMPLES == 16
+#if SW_FACE_SAMPLES == 8
+	// PERF TIER (explicit 60-FPS directive): half the ray budget of the 16 set, same golden-angle
+	// equal-area construction, so coverage stays unbiased - just coarser (1/8 quantum). The gate
+	// prices the accuracy cost per build; regenerate via the neighbour-packing script in-tree.
+	const float2 swDisk[8] =
+	{
+		float2( 0.250000f, 0.000000f), float2(-0.319290f, 0.292496f),
+		float2( 0.048872f,-0.556877f), float2( 0.402444f, 0.524918f),
+		float2(-0.738535f,-0.130636f), float2( 0.699605f,-0.445031f),
+		float2(-0.234004f, 0.870484f), float2(-0.446271f,-0.859268f),
+	};
+	const uint swNbr[8] =
+	{
+		0x08609443u, 0x0e218086u, 0x06121407u, 0x082284c0u,
+		0x066008e1u, 0x08138c40u, 0x0a220061u, 0x06508082u,
+	};
+#elif SW_FACE_SAMPLES == 16
 	const float2 swDisk[16] =
 	{
 		float2( 0.176777f, 0.000000f), float2(-0.225772f, 0.206826f),
@@ -724,10 +742,14 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
 			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
 			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
+			// NOTE: do NOT jump `se += e1.y` over a culled caster here. It looks like a free win over
+			// per-record skipping, but it MEASURED SLOWER (24 -> 30 ms worst-scene): the data-dependent
+			// jump diverges the wave's loop trip counts, and the whole wave then serialises on its
+			// slowest lane, costing more than the uniform cheap skip iterations it saves.
 			continue;
 		}
 		if( se + 1 >= swN ) { break; }		// malformed tail (needs the triangle's second record)
-		if( swSkip ) { se++; continue; }	// culled: consume both records of this triangle
+		if( swSkip ) { se++; continue; }	// culled: consume both records of this triangle (safety)
 
 		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
 		float4 g1 = t_SoftEdges[ swFirstElem + ( se + 1 ) * 2 + 1 ];	// record B's e1 carries v2
