@@ -4607,6 +4607,17 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 
 		// ray-traced shadows: trace this light's visibility into the shadow mask before
 		// its interactions draw. DrawSingleInteraction then binds the RT variant + mask.
+		{
+			extern idCVar r_rtAccelDebug;
+			if( r_rtAccelDebug.GetBool() && r_useRTShadows.GetBool() )
+			{
+				common->Printf( "RT light gate: %s active=%d globalShadows=%d localShadows=%d parallel=%d ambient=%d -> %s\n",
+								lightShader->GetName(), rtShadowsActiveThisView,
+								vLight->globalShadows != NULL, vLight->localShadows != NULL,
+								vLight->parallel, lightShader->IsAmbientLight(),
+								R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) ? "DISPATCH" : "skip" );
+			}
+		}
 		if( R_LightUsesRTShadows( rtShadowsActiveThisView, vLight ) )
 		{
 			renderLog.BeginShadowGen( RLS_RTMASK );

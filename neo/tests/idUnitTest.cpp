@@ -27,8 +27,8 @@ std::vector<idUnitTestCase*>& idUnitTestRegistry()
 	return registry;
 }
 
-idUnitTestCase::idUnitTestCase( const char* s, const char* n, idTestFn f, bool pipe )
-	: suite( s ), name( n ), fn( f ), pipeline( pipe )
+idUnitTestCase::idUnitTestCase( const char* s, const char* n, idTestFn f, bool pipe, bool stud )
+	: suite( s ), name( n ), fn( f ), pipeline( pipe ), study( stud )
 {
 	idUnitTestRegistry().push_back( this );
 }
@@ -43,20 +43,26 @@ int RunAllUnitTests( const char* filter )
 	int totalTests = 0, failedTests = 0, totalChecks = 0, totalFailures = 0;
 	int pipeTests = 0, pipeFailed = 0, unitTests = 0, unitFailed = 0;
 	double totalMs = 0.0, unitMs = 0.0;
-	// filter: "@unit" runs only the fast isolated tier, "@pipe" only the pipeline gate, otherwise a suite
-	// substring. `./rbdoom3bfg_tests @unit` is the seconds-long dev loop; `@pipe` is the correctness gate.
-	const bool onlyUnit = ( filter != NULL && std::strcmp( filter, "@unit" ) == 0 );
-	const bool onlyPipe = ( filter != NULL && std::strcmp( filter, "@pipe" ) == 0 );
+	// filter: "@unit" runs only the fast isolated tier, "@pipe" only the pipeline gate, "@study" only the
+	// heavy CPU frame-emulation studies (excluded from EVERY other run - they are instruments, not tests),
+	// otherwise a suite substring. `./rbdoom3bfg_tests @unit` is the seconds-long dev loop.
+	const bool onlyUnit  = ( filter != NULL && std::strcmp( filter, "@unit" ) == 0 );
+	const bool onlyPipe  = ( filter != NULL && std::strcmp( filter, "@pipe" ) == 0 );
+	const bool onlyStudy = ( filter != NULL && std::strcmp( filter, "@study" ) == 0 );
+	int studySkipped = 0;
 	for( idUnitTestCase* tc : idUnitTestRegistry() )
 	{
-		if( onlyUnit ) { if( tc->pipeline ) { continue; } }
+		if( onlyStudy ) { if( !tc->study ) { continue; } }
+		else if( tc->study ) { studySkipped++; continue; }
+		else if( onlyUnit ) { if( tc->pipeline ) { continue; } }
 		else if( onlyPipe ) { if( !tc->pipeline ) { continue; } }
 		else if( filter != NULL && std::strstr( tc->suite, filter ) == NULL )
 		{
 			continue;
 		}
-		// PIPE = drives the shipped rendering pipeline (a real correctness gate); unit = ISOLATED sanity.
-		const char* tag = tc->pipeline ? "PIPE" : "unit";
+		// PIPE = drives the shipped rendering pipeline (a real correctness gate); unit = ISOLATED sanity;
+		// STDY = CPU frame-emulation instrument (opt-in only).
+		const char* tag = tc->study ? "STDY" : ( tc->pipeline ? "PIPE" : "unit" );
 		std::printf( "[....] (%s) %s.%s\n", tag, tc->suite, tc->name );	// pre-run marker: a hanging/slow test is identifiable
 		idTestResult tr;
 		auto _t0 = std::chrono::steady_clock::now();
@@ -90,18 +96,20 @@ int RunAllUnitTests( const char* filter )
 	std::printf( "\n%d tests, %d passed, %d failed  (%d checks, %d failures)  [%.0fms total]\n",
 			totalTests, totalTests - failedTests, failedTests, totalChecks, totalFailures, totalMs );
 	std::printf( "  unit suite time: %.0fms  <-- must stay in the low seconds; MC/full-frame work belongs in PIPELINE tests\n", unitMs );
-	// Split the score by class - the ONLY line that speaks to whether the renderer is correct is the PIPELINE
-	// one. A green unit set is dev-time sanity; it stays green while the rendered frame is unusable, so it is
-	// NOT evidence of anything shipping-visible. (This split exists because isolated-green once masked a total
-	// in-game breakage - see memory run-full-suite-before-handoff.)
-	std::printf( "  PIPELINE gate (correctness): %d passed, %d failed  <-- the only line that means the image is right\n",
-			pipeTests - pipeFailed, pipeFailed );
+	// Split the score by class. NOTHING in this binary renders through the GPU pipeline, so no line here is
+	// evidence the image is right - the CPU frame-emulation "pipeline" tier stayed green through a total
+	// in-game breakage and was demoted to @study for exactly that reason. The renderer verdict lives in the
+	// engine gate (printed below).
+	std::printf( "  in-process checks: %d passed, %d failed\n", pipeTests - pipeFailed, pipeFailed );
 	std::printf( "  unit/sanity (dev only)     : %d passed, %d failed  <-- passing proves NOTHING about the rendered image\n",
 			unitTests - unitFailed, unitFailed );
-	if( pipeTests == 0 )
+	if( studySkipped > 0 )
 	{
-		std::printf( "  !! NO pipeline tests ran - this suite says NOTHING about rendering correctness.\n" );
+		std::printf( "  %d study instrument(s) skipped (CPU frame emulation, not tests) - run with `@study` if you want them\n", studySkipped );
 	}
+	// The renderer-correctness gate is NOT in this binary: it is the com_softShadowGate ENGINE run, which
+	// renders every .softcap through the real GPU pipeline vs the RT reference and counts defects.
+	std::printf( "  image gate: RBDOOM_HIDDEN_WINDOW=1 ./RBDoom3BFG +set com_softShadowGate corpus  <-- the ONLY renderer verdict\n" );
 	return totalFailures;
 }
 

@@ -950,6 +950,9 @@ void idCommonLocal::Frame()
 		// normal frame (see R_SoftShadowGoto_f). No-op unless `softShadowGoto` armed it.
 		extern void R_SoftShadowGotoTick();
 		R_SoftShadowGotoTick();
+		// headless corpus render state machine (softShadowShots): advances goto -> settle -> dumpHDR -> next -> quit
+		extern void R_SoftShadowBatchTick();
+		R_SoftShadowBatchTick();
 
 		// start the game / draw command generation thread going in the background
 		gameReturn_t ret = gameThread.RunGameAndDraw( numGameFrames, userCmdMgr, IsClient(), gameFrame - numGameFrames );

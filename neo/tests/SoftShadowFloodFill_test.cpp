@@ -242,7 +242,7 @@ Result GroundTruth( const Scene& s, float tol, long& umbra, long& penumbra, long
 }
 
 // ---------------------------------------------------------------------------------------------------
-TEST( SoftShadowFloodFill, accuracy_and_evalcount_vs_unconditional )
+STUDY_TEST( SoftShadowFloodFill, accuracy_and_evalcount_vs_unconditional )
 {
 	const int   N = 96;		// coarse grid: this is a measurement (flood-fill was ruled out), not a per-pixel gate
 	const float tol = 0.003f;		// saturation tolerance (matches the wedge's umbra early-break scale)
@@ -502,7 +502,7 @@ void Report( const char* scheme, float knob, float r, long evals, long full, dou
 
 }
 
-TEST( SoftShadowSubsample, accuracy_vs_evals_no_bias )
+STUDY_TEST( SoftShadowSubsample, accuracy_vs_evals_no_bias )
 {
 	const int   N = 65;			// 2^6 + 1 -> clean quadtree halving; coarse (this is a sub-sampling MEASUREMENT, not a gate)
 	const float tolSat = 0.003f;

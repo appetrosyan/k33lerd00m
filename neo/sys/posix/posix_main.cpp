@@ -205,9 +205,18 @@ void idSysLocal::StartProcess( const char* exeName, bool quit )
 Sys_Quit
 ================
 */
+// headless harnesses (the soft-shadow defect gate) report their verdict through the exit code; a clean
+// quit otherwise stays EXIT_SUCCESS.
+static int sys_exitCode = EXIT_SUCCESS;
+
+void Sys_SetExitCode( int code )
+{
+	sys_exitCode = code;
+}
+
 void Sys_Quit()
 {
-	Posix_Exit( EXIT_SUCCESS );
+	Posix_Exit( sys_exitCode );
 }
 
 /*

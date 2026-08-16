@@ -62,7 +62,11 @@ struct idUnitTestCase
 	bool        pipeline;	// true = drives the full shipped stream->band->coverage->ray-truth path (a real
 	//                          correctness gate); false = ISOLATED unit/sanity (a passing one proves NOTHING
 	//                          about the rendered image - it can be green while the frame is unusable).
-	idUnitTestCase( const char* s, const char* n, idTestFn f, bool pipe = false );
+	bool        study;		// true = heavy CPU frame-EMULATION measurement. NOT a test: it evaluates the coverage
+	//                          math, not the GPU frame, and stayed green through a total in-game breakage. Excluded
+	//                          from every default run; opt in with the "@study" filter. The image gate is the
+	//                          com_softShadowGate ENGINE run over the softcap corpus.
+	idUnitTestCase( const char* s, const char* n, idTestFn f, bool pipe = false, bool stud = false );
 };
 
 // registry is a function-local static so registration order never depends on TU init order.
@@ -86,6 +90,14 @@ int RunAllUnitTests( const char* filter );
 #define PIPELINE_TEST( suite, name )                                                     \
 	static void suite##_##name##_fn( idTestResult& );                                    \
 	static idUnitTestCase suite##_##name##_reg( #suite, #name, suite##_##name##_fn, true ); \
+	static void suite##_##name##_fn( idTestResult& _tr )
+
+// CPU frame-EMULATION study: heavy coverage-math-vs-ray-oracle measurement that does NOT render through
+// the GPU pipeline, so it can be green while the shipped frame is unusable (that happened). Demoted from
+// the default run and from @pipe; run explicitly with `./rbdoom3bfg_tests @study` as a dev instrument.
+#define STUDY_TEST( suite, name )                                                        \
+	static void suite##_##name##_fn( idTestResult& );                                    \
+	static idUnitTestCase suite##_##name##_reg( #suite, #name, suite##_##name##_fn, false, true ); \
 	static void suite##_##name##_fn( idTestResult& _tr )
 
 // _tr is the hidden idTestResult& each TEST body receives.

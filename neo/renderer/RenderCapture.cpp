@@ -30,6 +30,8 @@ the Free Software Foundation, either version 3 of the License, or
 #include <cstdio>
 #include <algorithm>
 
+#include "../tests/SoftShadowGate.h"	// dependency-free defect analyzer, shared with rbdoom3bfg_tests
+
 extern DeviceManager* deviceManager;
 
 // soft light's real atlas placement, published by the backend (RenderBackend.cpp) so the tile dump
@@ -61,6 +63,7 @@ static const SoftPin s_softTestConfig[] =
 	{ "r_useShadowAtlas",        "1" },
 	{ "r_shadowMapPCSS",         "1" },
 	{ "r_shadowMapPCSSScale",    "4" },
+	{ "r_shadowMapPCSSAnalyticContact", "1" },	// the SHIPPED term: exact analytic over the penumbra, PCSS only as edge-less fallback (archived 0 = pure-PCSS acne)
 	{ "r_softShadowAAM",         "0" },	// PURE PCSS: no AAM band. The PCSS locator alone gates lit/penumbra/umbra.
 	{ "r_softShadowBandMask",    "0" },
 	{ "r_softShadowStencilOnly", "0" },
@@ -145,6 +148,82 @@ void R_SoftShadowGoto_f( const idCmdArgs& args )
 	R_SoftShadowPinTestConfig( true );	// pin+log the full config NOW, before the frontend builds geometry
 	common->Printf( "[softtest] goto armed: (%.0f %.0f %.0f) yaw %.0f pitch %.0f - skipping cinematic + pinning for 120 frames\n",
 					s_gotoOrg.x, s_gotoOrg.y, s_gotoOrg.z, s_gotoAng.yaw, s_gotoAng.pitch );
+}
+
+// ---------------------------------------------------------------------------------------------------
+// HEADLESS CORPUS RENDER. `softShadowShots <cap1> [cap2 ...]` renders each capture and quits, entirely
+// from CODE - no bash orchestration, no `+wait`, no `timeout`, no per-command races (which segfaulted).
+// It is a state machine driven by the normal frame loop (R_SoftShadowBatchTick, called next to the goto
+// tick): per capture, re-use `softShadowGoto` to pin+build the view for a settle window (real frontend
+// work, not idle waiting), then a buffered `dumpHDR` writes shot_<name>.png of that settled frame, then
+// advance; after the last, `quit`. The map/save load is paid ONCE up front.
+namespace
+{
+idStrList s_batchCaps;
+int  s_batchIdx = -1;
+int  s_batchState = 0;			// 0 = settling, 1 = captured (advance next tick)
+int  s_batchSettle = 0;
+const int SOFT_BATCH_SETTLE = 45;	// frames for the teleport to land + the frontend to (re)build soft edges
+idStr R_BatchName( const idStr& path )
+{
+	idStr n = path;
+	n.StripPath();
+	n.StripFileExtension();
+	return n;
+}
+}
+
+void R_SoftShadowBatchTick()
+{
+	if( s_batchIdx < 0 )
+	{
+		return;
+	}
+	if( s_batchState == 0 )				// settling: let the pinned view + frontend build, then capture
+	{
+		if( --s_batchSettle > 0 )
+		{
+			return;
+		}
+		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "dumpHDR shot_%s\n", R_BatchName( s_batchCaps[s_batchIdx] ).c_str() ) );
+		s_batchState = 1;
+		return;
+	}
+	s_batchIdx++;						// captured: advance to the next capture (or quit)
+	if( s_batchIdx < s_batchCaps.Num() )
+	{
+		// reproduce this capture's DYNAMIC casters (the rock etc.) THEN pin the view - both from the command buffer.
+		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowSpawnCasters %s\n", s_batchCaps[s_batchIdx].c_str() ) );
+		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowGoto %s\n", s_batchCaps[s_batchIdx].c_str() ) );
+		s_batchSettle = SOFT_BATCH_SETTLE;
+		s_batchState = 0;
+	}
+	else
+	{
+		common->Printf( "[softbatch] all captures rendered - quitting\n" );
+		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "quit\n" );
+		s_batchIdx = -1;
+	}
+}
+
+void R_SoftShadowShots_f( const idCmdArgs& args )
+{
+	if( args.Argc() < 2 )
+	{
+		common->Warning( "usage: softShadowShots <cap1.softcap> [cap2 ...] - renders each headless -> shot_<name>.png, then quits" );
+		return;
+	}
+	s_batchCaps.Clear();
+	for( int i = 1; i < args.Argc(); i++ )
+	{
+		s_batchCaps.Append( idStr( args.Argv( i ) ) );
+	}
+	s_batchIdx = 0;
+	s_batchState = 0;
+	s_batchSettle = SOFT_BATCH_SETTLE;
+	cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowSpawnCasters %s\n", s_batchCaps[0].c_str() ) );
+	cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowGoto %s\n", s_batchCaps[0].c_str() ) );
+	common->Printf( "[softbatch] armed %d captures, settle=%d frames each\n", s_batchCaps.Num(), SOFT_BATCH_SETTLE );
 }
 
 // One-shot capture of a live soft-shadow view, reconstructable headless. See RenderCapture.h. The capture is
@@ -912,18 +991,11 @@ static void SelfTestParseLight( const idDict* args, renderLight_t* renderLight )
 // commonLocal.Draw, so it works at minimal init with no game thread).
 static bool SelfTestRenderReadback( idRenderWorld* rw, renderView_t* rv, std::vector<uint8_t>& out, int& w, int& h )
 {
-	fprintf( stderr, "[bread]  RenderScene...\n" ); fflush( stderr );
 	rw->RenderScene( rv );
-	fprintf( stderr, "[bread]  swap1...\n" ); fflush( stderr );
 	const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
-	fprintf( stderr, "[bread]  RenderCommandBuffers...\n" ); fflush( stderr );
 	tr.RenderCommandBuffers( cmd );
-	fprintf( stderr, "[bread]  swap2...\n" ); fflush( stderr );
 	tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
-	fprintf( stderr, "[bread]  readback...\n" ); fflush( stderr );
-	bool ok = ReadImageRGBA8( globalImages->currentRenderHDRImage, out, w, h );
-	fprintf( stderr, "[bread]  readback done\n" ); fflush( stderr );
-	return ok;
+	return ReadImageRGBA8( globalImages->currentRenderHDRImage, out, w, h );
 }
 
 // Minimal-init soft-shadow self-test. Common.cpp diverts here right after renderSystem->Init(), before the
@@ -1002,9 +1074,6 @@ int R_SoftShadowSelfTest( const char* mapName )
 		rw->AddLightDef( &lights[order[k]] );
 		nLights++;
 	}
-	fprintf( stderr, "[selftest] BREAD: %d/%d lights, cam (%.0f %.0f %.0f) look (%.2f %.2f %.2f)\n",
-			 nLights, ( int )lights.size(), camOrg.x, camOrg.y, camOrg.z, look.x, look.y, look.z ); fflush( stderr );
-
 	renderView_t rv;
 	memset( &rv, 0, sizeof( rv ) );
 	rv.vieworg = camOrg;
@@ -1027,17 +1096,14 @@ int R_SoftShadowSelfTest( const char* mapName )
 	// (soft-shadow volumes + PCSS locator).
 	cmdSystem->BufferCommandText( CMD_EXEC_NOW,
 								  "r_useRTShadows 0 ; r_useSoftShadowVolumes 0 ; r_shadowMapPCSS 0 ; r_useStencilShadows 1\n" );
-	fprintf( stderr, "[selftest] BREAD: rendering ORACLE...\n" ); fflush( stderr );
 	std::vector<uint8_t> ref;
 	int rw2 = 0, rh2 = 0;
 	SelfTestRenderReadback( rw, &rv, ref, rw2, rh2 );
-	fprintf( stderr, "[selftest] BREAD: oracle done %dx%d, rendering HYBRID...\n", rw2, rh2 ); fflush( stderr );
 
 	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_useRTShadows 0 ; r_useSoftShadowVolumes 1 ; r_shadowMapPCSS 1\n" );
 	std::vector<uint8_t> test;
 	int tw2 = 0, th2 = 0;
 	SelfTestRenderReadback( rw, &rv, test, tw2, th2 );
-	fprintf( stderr, "[selftest] BREAD: hybrid done %dx%d\n", tw2, th2 ); fflush( stderr );
 
 	renderSystem->FreeRenderWorld( rw );
 
@@ -1082,14 +1148,16 @@ int R_SoftShadowSelfTest( const char* mapName )
 // occluder path renders it. Cleared after the A/B renders.
 static qhandle_t     s_capturedCasterEntity = -1;
 static idRenderModel* s_capturedCasterModel = NULL;
+static idRenderWorld* s_capturedCasterWorld = NULL;		// the world the entity was added to (primary OR a gate world)
 
 static void R_SoftShadowClearCapturedCasters()
 {
-	if( s_capturedCasterEntity != -1 && tr.primaryWorld != NULL )
+	if( s_capturedCasterEntity != -1 && s_capturedCasterWorld != NULL )
 	{
-		tr.primaryWorld->FreeEntityDef( s_capturedCasterEntity );
-		s_capturedCasterEntity = -1;
+		s_capturedCasterWorld->FreeEntityDef( s_capturedCasterEntity );
 	}
+	s_capturedCasterEntity = -1;
+	s_capturedCasterWorld = NULL;
 	if( s_capturedCasterModel != NULL )
 	{
 		renderModelManager->FreeModel( s_capturedCasterModel );
@@ -1100,9 +1168,18 @@ static void R_SoftShadowClearCapturedCasters()
 idCVar r_softShadowReplayCaster( "r_softShadowReplayCaster", "-1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW,
 								 "harness: replay ONLY this caster index from the .softcap (isolates the dynamic crate/gib); -1 = all casters" );
 
-static void R_SoftShadowSpawnCapturedCasters( const char* path )
+static void R_SoftShadowSpawnCapturedCasters( const char* path, idRenderWorld* world = NULL )
 {
 	R_SoftShadowClearCapturedCasters();
+	if( world == NULL )
+	{
+		world = tr.primaryWorld;
+	}
+	if( world == NULL )
+	{
+		common->Warning( "softShadowSpawnCasters: no render world" );
+		return;
+	}
 
 	FILE* cf = fopen( path, "rb" );
 	if( cf == NULL ) { return; }
@@ -1170,13 +1247,28 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path )
 	// reconstruct the captured scene headless we must both DRAW the object (to confirm placement and see it) and
 	// have it cast (into the atlas for PCSS, and - once traced - for RT). shadow2 was invisible + atlas-only,
 	// which hid whether the object was even placed. `_white` draws and casts shadows by default (no noshadows).
-	surf.shader = declManager->FindMaterial( "_white" );
+	// _white is UNLIT and NON-CASTING (castsShadow=0, receivesLighting=0 - measured), which silently
+	// drops the whole replayed model from every light list (ModelHasShadowCastingSurfaces()==false).
+	// _default is a normal LIT material that both receives and casts, so the replayed casters shadow
+	// and are shadowed like the gameplay originals.
+	surf.shader = declManager->FindMaterial( "_default" );
 	surf.geometry = tri;
 
 	s_capturedCasterModel = renderModelManager->AllocModel();
 	s_capturedCasterModel->InitEmpty( "_softShadowCapturedCasters" );
 	s_capturedCasterModel->AddSurface( surf );		// model takes ownership of tri
 	s_capturedCasterModel->FinishSurfaces( false );
+
+	// STATIC vertex/index buffers for the replayed mesh: the RT shadow TLAS only accepts
+	// static-cache surfaces, so without this the captured caster (the rock) silently vanishes
+	// from the ray-traced reference while the analytic path still shadows it.
+	{
+		nvrhi::CommandListHandle cl = deviceManager->GetDevice()->createCommandList();
+		cl->open();
+		R_CreateStaticBuffersForTri( *tri, cl );
+		cl->close();
+		deviceManager->GetDevice()->executeCommandList( cl );
+	}
 
 	renderEntity_t re;
 	memset( &re, 0, sizeof( re ) );
@@ -1185,9 +1277,848 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path )
 	re.origin.Zero();
 	re.shaderParms[0] = re.shaderParms[1] = re.shaderParms[2] = re.shaderParms[3] = 1.0f;
 	re.noShadow = false;
-	s_capturedCasterEntity = tr.primaryWorld->AddEntityDef( &re );
+	s_capturedCasterEntity = world->AddEntityDef( &re );
+	s_capturedCasterWorld = world;
 	common->Printf( "[softtest] REPLAY captured casters: %u verts / %u tris -> entity %d\n",
 					hdr.numMeshVerts, hdr.numMeshIdx / 3, s_capturedCasterEntity );
+}
+
+// command wrapper so the headless batch (softShadowShots) can reproduce a capture's DYNAMIC casters (the
+// scripted rock/crate/gibs that loadGame-quick does not spawn) from the command buffer - a safe point,
+// unlike the mid-frame batch tick. Without this the batch rendered the view but an empty floor.
+void R_SoftShadowSpawnCasters_f( const idCmdArgs& args )
+{
+	if( args.Argc() < 2 )
+	{
+		common->Warning( "usage: softShadowSpawnCasters <capture.softcap>" );
+		return;
+	}
+	R_SoftShadowSpawnCapturedCasters( args.Argv( 1 ) );
+}
+
+// =========================================================== com_softShadowGate: the GPU DEFECT GATE
+// Minimal-init (no game/sound/menu) corpus gate: every .softcap is reconstructed into a real render
+// world (its map + its captured dynamic casters + its captured lights), rendered through the SHIPPED
+// GPU soft-shadow path at the live resolution (>= 1920x1080 enforced), and the frames are analyzed
+// in-process by the shared defect counter (tests/SoftShadowGate.h) against three references:
+//   - itself, re-rendered (temporal stability: identical state must give identical frames),
+//   - itself, from slightly displaced views (continuity: world-space shadows must not pop),
+//   - the in-engine ray-traced oracle (agreement: turds/ants/lit-in-umbra/steps/extent).
+// EVERY defect instance is counted individually; the gate is green iff the grand total is ZERO.
+namespace
+{
+
+struct gateCap_t
+{
+	softcapHeader_t hdr;
+	std::vector<softcapLight_t> lights;
+	idStr mapName;
+	idStr path, name;
+};
+
+// header + lights + trailing MAPNAME block only - the caster spawn re-reads its own blocks.
+bool GateLoadCap( const char* path, gateCap_t& cap )
+{
+	FILE* f = fopen( path, "rb" );
+	if( f == NULL )
+	{
+		return false;
+	}
+	if( fread( &cap.hdr, sizeof( cap.hdr ), 1, f ) != 1 || cap.hdr.magic != SOFTCAP_MAGIC || cap.hdr.version < 4 )
+	{
+		fclose( f );
+		return false;
+	}
+	const softcapHeader_t& h = cap.hdr;
+	cap.lights.resize( h.numLights );
+	if( h.numLights > 0 && fread( cap.lights.data(), sizeof( softcapLight_t ), h.numLights, f ) != h.numLights )
+	{
+		fclose( f );
+		return false;
+	}
+	const long mapOff = ( long )sizeof( h )
+						+ ( long )h.numLights   * ( long )sizeof( softcapLight_t )
+						+ ( long )h.numEdges    * ( long )sizeof( softcapEdge_t )
+						+ ( long )h.numCasters  * ( long )sizeof( softcapCaster_t )
+						+ ( long )h.numMeshVerts * 3L * ( long )sizeof( float )
+						+ ( long )h.numMeshIdx  * ( long )sizeof( uint32_t )
+						+ ( h.hasDepth ? ( long )h.screenW * h.screenH * ( long )sizeof( float ) : 0L )
+						+ ( long )h.numReceivers * ( long )sizeof( softcapReceiver_t )
+						+ ( long )h.numRecvVerts * 3L * ( long )sizeof( float )
+						+ ( long )h.numRecvIdx  * ( long )sizeof( uint32_t );
+	const uint32_t mapLen = h.reserved[1];
+	if( mapLen > 0 && mapLen < 1024 && fseek( f, mapOff, SEEK_SET ) == 0 )
+	{
+		std::vector<char> buf( mapLen + 1, 0 );
+		if( fread( buf.data(), 1, mapLen, f ) == mapLen )
+		{
+			cap.mapName = buf.data();
+			// captures store the session name ("game/erebus1"); InitFromMap/idMapFile want "maps/game/erebus1"
+			if( cap.mapName.Icmpn( "maps/", 5 ) != 0 )
+			{
+				cap.mapName = "maps/" + cap.mapName;
+			}
+		}
+	}
+	fclose( f );
+	cap.path = path;
+	cap.name = path;
+	cap.name.StripPath();
+	cap.name.StripFileExtension();
+	return true;
+}
+
+void GateRenderFrame( idRenderWorld* rw, renderView_t* rv )
+{
+	rw->RenderScene( rv );
+	const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+	tr.RenderCommandBuffers( cmd );
+	tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+}
+
+// full-precision single-channel readback into the analyzer's image type (R = the shadow term)
+bool GateReadR32F( idImage* img, swgate::GateImg& out )
+{
+	if( img == NULL || img->GetTextureHandle() == NULL )
+	{
+		return false;
+	}
+	const int w = img->GetUploadWidth(), h = img->GetUploadHeight();
+	float* pic = NULL;
+	if( !R_ReadPixelsR32F( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), img->GetTextureHandle(),
+						   nvrhi::ResourceStates::ShaderResource, &pic, w, h ) || pic == NULL )
+	{
+		return false;
+	}
+	out.W = w;
+	out.H = h;
+	out.t.assign( pic, pic + ( size_t )w * h );
+	R_StaticFree( pic );
+	return true;
+}
+
+// The per-light slice of idRenderWorldLocal::GenerateAllInteractions: create the STATIC interactions
+// (light tris + static shadow-volume indexes) for a JUST-ADDED light against every entity in its areas.
+// Runtime-added lights otherwise only get lazy dynamic interactions with numShadowIndexes==0, and the
+// frontend's RT caster branch keys on numShadowIndexes>0 - so without this the RT reference sees no
+// casters for the probe light (measured: mask never dispatched, all-dark).
+void GateCreateStaticInteractionsForLight( idRenderWorld* world, qhandle_t lightHandle )
+{
+	idRenderWorldLocal* rwl = static_cast<idRenderWorldLocal*>( world );
+	if( lightHandle < 0 || lightHandle >= rwl->lightDefs.Num() || rwl->lightDefs[lightHandle] == NULL )
+	{
+		return;
+	}
+	idRenderLightLocal* ldef = rwl->lightDefs[lightHandle];
+	tr.viewDef = NULL;		// no view-specific optimizations, same as GenerateAllInteractions
+	tr.commandList->open();
+	int made = 0, seen = 0;
+	bool sawSpawned = false;
+	for( areaReference_t* lref = ldef->references; lref != NULL; lref = lref->ownerNext )
+	{
+		portalArea_t* area = lref->area;
+		for( areaReference_t* eref = area->entityRefs.areaNext; eref != &area->entityRefs; eref = eref->areaNext )
+		{
+			idRenderEntityLocal* edef = eref->entity;
+			seen++;
+			if( edef->parms.hModel != NULL && idStr::Icmp( edef->parms.hModel->Name(), "_softShadowCapturedCasters" ) == 0 )
+			{
+				// leave the replayed caster soup DYNAMIC: its non-manifold triangles have no silEdges and
+				// _white makes no static light tris, so a forced static interaction resolves to EMPTY -
+				// which the frontend treats as "statically proven no interaction" and drops the entity
+				// (and its shadows) from every list. The lazy dynamic path handles it, as in-game.
+				sawSpawned = true;
+				continue;
+			}
+			idInteraction* inter;
+			for( inter = edef->firstInteraction; inter != NULL; inter = inter->entityNext )
+			{
+				if( inter->lightDef == ldef )
+				{
+					break;
+				}
+			}
+			if( inter != NULL )
+			{
+				continue;
+			}
+			inter = idInteraction::AllocAndLink( edef, ldef );
+			inter->CreateStaticInteraction( tr.commandList );
+			made++;
+		}
+	}
+	tr.commandList->close();
+	deviceManager->GetDevice()->executeCommandList( tr.commandList );
+	if( cvarSystem->GetCVarBool( "r_rtAccelDebug" ) )
+	{
+		common->Printf( "[softgate] light interactions: %d entities in light areas, %d created, spawned-casters %s\n",
+						seen, made, sawSpawned ? "PRESENT" : "ABSENT" );
+	}
+}
+
+// float64 ground-truth visibility at a world point vs the light's RECORD triangles (the exact caster
+// set the shader consumed, retained by the capture hook): 16 Hammersley disk samples, double-precision
+// Moller-Trumbore. This is the ARBITER for reference-vs-analytic disagreements - the RT reference has a
+// world-units ray bias that blinds it to contact shadows in seams/cracks, which the exact trace sees.
+float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR )
+{
+	// disk basis
+	idVec3 ld = L - P;
+	double dist = ld.Length();
+	if( dist < 1e-3 )
+	{
+		return -1.0f;
+	}
+	idVec3 lz = ld * ( float )( 1.0 / dist );
+	idVec3 lx = ( idMath::Fabs( lz.x ) < 0.9f ) ? idVec3( 1, 0, 0 ).Cross( lz ) : idVec3( 0, 1, 0 ).Cross( lz );
+	lx.Normalize();
+	idVec3 ly = lz.Cross( lx );
+	int blocked = 0;
+	const int NS = 16;
+	for( int s = 0; s < NS; s++ )
+	{
+		// Hammersley radical-inverse angle + equal-area radius (matches the test oracles)
+		uint32_t bits = ( uint32_t )s;
+		bits = ( bits << 16 ) | ( bits >> 16 );
+		bits = ( ( bits & 0x55555555u ) << 1 ) | ( ( bits & 0xAAAAAAAAu ) >> 1 );
+		bits = ( ( bits & 0x33333333u ) << 2 ) | ( ( bits & 0xCCCCCCCCu ) >> 2 );
+		bits = ( ( bits & 0x0F0F0F0Fu ) << 4 ) | ( ( bits & 0xF0F0F0F0u ) >> 4 );
+		bits = ( ( bits & 0x00FF00FFu ) << 8 ) | ( ( bits & 0xFF00FF00u ) >> 8 );
+		double ri = ( double )bits * 2.3283064365386963e-10;
+		double r = sqrt( ( s + 0.5 ) / NS ) * diskR;
+		double th = ri * 6.283185307179586;
+		idVec3 tgt = L + lx * ( float )( r * cos( th ) ) + ly * ( float )( r * sin( th ) );
+		double Pd[3] = { P.x, P.y, P.z };
+		double Dd[3] = { tgt.x - P.x, tgt.y - P.y, tgt.z - P.z };
+		bool hit = false;
+		for( size_t k = 0; k + 1 < s_edges.size() && !hit; k++ )
+		{
+			const softcapEdge_t& A = s_edges[k];
+			if( A.e0[3] < 0.0f )
+			{
+				continue;    // header
+			}
+			const softcapEdge_t& B = s_edges[k + 1];
+			if( B.e0[3] < 0.0f )
+			{
+				continue;    // recB missing (chain end) - malformed, skip
+			}
+			// triangle = ( recA.e0, recA.e1, recB.e1 ); records come in pairs, advance one extra
+			double a[3] = { A.e0[0], A.e0[1], A.e0[2] };
+			double b[3] = { A.e1[0], A.e1[1], A.e1[2] };
+			double c[3] = { B.e1[0], B.e1[1], B.e1[2] };
+			k++;
+			double e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+			double e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+			double pv[3] = { Dd[1] * e2[2] - Dd[2] * e2[1], Dd[2] * e2[0] - Dd[0] * e2[2], Dd[0] * e2[1] - Dd[1] * e2[0] };
+			double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+			if( fabs( det ) < 1e-14 )
+			{
+				continue;
+			}
+			double inv = 1.0 / det;
+			double tv[3] = { Pd[0] - a[0], Pd[1] - a[1], Pd[2] - a[2] };
+			double u = ( tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2] ) * inv;
+			if( u < -1e-9 || u > 1.0 + 1e-9 )
+			{
+				continue;
+			}
+			double q[3] = { tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0] };
+			double v = ( Dd[0] * q[0] + Dd[1] * q[1] + Dd[2] * q[2] ) * inv;
+			if( v < -1e-9 || u + v > 1.0 + 1e-9 )
+			{
+				continue;
+			}
+			double t = ( e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2] ) * inv;
+			if( t > 1e-6 && t < 1.0 )
+			{
+				hit = true;
+			}
+		}
+		if( hit )
+		{
+			blocked++;
+		}
+	}
+	return 1.0f - ( float )blocked / NS;
+}
+
+void GateSetup( const gateCap_t& cap, const softcapLight_t& light )
+{
+	// pinned baseline first, then the per-probe overrides on top of it
+	R_SoftShadowPinTestConfig( false );
+	cvarSystem->SetCVarInteger( "r_skipAmbient", 1 );		// interaction term only: no emissive/ambient pollution
+	cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", light.penumbraSize );
+	cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", light.penumbraSize );
+}
+
+} // namespace
+
+// Iterates the corpus, prints one defect line per capture x light and the grand total; returns the
+// total defect count (the process exit code, clamped by the caller).
+int R_SoftShadowGate( const char* arg )
+{
+	using namespace swgate;
+
+	globalImages->LoadDeferredImages();
+	tr.InvalidateSwapBuffers();		// headless: never present (blocking swap would hang on a hidden surface)
+
+	// ---- corpus --------------------------------------------------------------------------------
+	extern int Sys_ListFiles( const char* directory, const char* extension, idStrList& list );
+	idStr dir = ( arg == NULL || arg[0] == '\0' || idStr::Icmp( arg, "corpus" ) == 0 ) ? "../tests/data" : arg;
+	idStrList files;
+	Sys_ListFiles( dir, ".softcap", files );
+	if( files.Num() > 1 )
+	{
+		std::sort( &files[0], &files[0] + files.Num(), []( const idStr& a, const idStr& b )
+		{
+			return idStr::Icmp( a, b ) < 0;
+		} );
+	}
+	common->Printf( "[softgate] corpus: %s  (%d captures)\n", dir.c_str(), files.Num() );
+
+	// every shadow-relevant cvar the gate touches is restored afterwards so an archived config is never polluted
+	static const char* const touched[] =
+	{
+		"r_useRTShadows", "r_useStencilShadows", "r_useSoftShadowVolumes", "r_useShadowMapping", "r_useShadowAtlas",
+		"r_shadowMapPCSS", "r_shadowMapPCSSScale", "r_softShadowAAM", "r_softShadowBandMask", "r_softShadowStencilOnly",
+		"r_softShadowEmergentUmbra", "r_softShadowContinuous", "r_useTemporalAA", "r_softShadowDebugShader",
+		"r_skipAmbient", "r_skipShadows", "r_shadowPenumbraSize", "r_rtShadowSoftRadius", "r_rtShadowRays",
+		"r_rtShadowDenoise", "r_rtShadowAnalyticPenumbra", "r_rtShadowBias",
+	};
+	const int nTouched = ( int )( sizeof( touched ) / sizeof( touched[0] ) );
+	idStrList prev;
+	for( int i = 0; i < nTouched; i++ )
+	{
+		prev.Append( cvarSystem->GetCVarString( touched[i] ) );
+	}
+
+	GateCfg cfg;
+	std::vector<GateDefect> all;
+	int capsRun = 0, lightsRun = 0;
+
+	// map world cache: consecutive captures share the map, load it once
+	idStr loadedMap;
+	idRenderWorld* rw = NULL;
+	std::vector<renderLight_t> mapLights;
+
+	for( int fi = 0; fi < files.Num(); fi++ )
+	{
+		gateCap_t cap;
+		idStr full = dir + "/" + files[fi];
+		if( !GateLoadCap( full.c_str(), cap ) )
+		{
+			common->Printf( "[softgate] %s: UNREADABLE capture -> SETUP defect\n", files[fi].c_str() );
+			GateDefect d;
+			d.kind = GATE_SETUP;
+			all.push_back( d );
+			continue;
+		}
+		if( cap.mapName.IsEmpty() )
+		{
+			common->Printf( "[softgate] %s: capture names no map -> SETUP defect\n", cap.name.c_str() );
+			GateDefect d;
+			d.kind = GATE_SETUP;
+			all.push_back( d );
+			continue;
+		}
+
+		// ---- world ----------------------------------------------------------------------------
+		if( rw == NULL || loadedMap != cap.mapName )
+		{
+			R_SoftShadowClearCapturedCasters();
+			if( rw != NULL )
+			{
+				renderSystem->FreeRenderWorld( rw );
+				rw = NULL;
+			}
+			mapLights.clear();
+			// complete the world the way a REAL map load does (Common_load.cpp order):
+			//  - Begin/EndLevelLoad pins every loaded model into the STATIC vertex cache; the RT
+			//    shadow TLAS only accepts static-cache surfaces, so without this the reference is
+			//    an empty TLAS (all-dark mask) and the gate measures nothing;
+			//  - GenerateAllInteractions allocates interactionTable, which the frontend's
+			//    R_AddSingleLight reads UNGUARDED once any entity exists (the minimal-init
+			//    self-test survived without it purely because it never added an entity).
+			renderSystem->BeginLevelLoad();
+			idRenderWorld* nw = renderSystem->AllocRenderWorld();
+			const bool mapOk = nw->InitFromMap( cap.mapName.c_str() );
+			renderSystem->EndLevelLoad();
+			if( !mapOk )
+			{
+				renderSystem->FreeRenderWorld( nw );
+				common->Printf( "[softgate] %s: InitFromMap(%s) FAILED -> SETUP defect\n", cap.name.c_str(), cap.mapName.c_str() );
+				GateDefect d;
+				d.kind = GATE_SETUP;
+				all.push_back( d );
+				continue;
+			}
+			rw = nw;
+			loadedMap = cap.mapName;
+			rw->GenerateAllInteractions();
+			idMapFile mapFile;
+			if( mapFile.Parse( cap.mapName.c_str() ) )
+			{
+				for( int e = 0; e < mapFile.GetNumEntities(); e++ )
+				{
+					idMapEntity* ent = mapFile.GetEntity( e );
+					if( idStr::Icmp( ent->epairs.GetString( "classname" ), "light" ) != 0 )
+					{
+						continue;
+					}
+					renderLight_t rl;
+					SelfTestParseLight( &ent->epairs, &rl );
+					mapLights.push_back( rl );
+				}
+			}
+			common->Printf( "[softgate] loaded %s (%d map lights)\n", cap.mapName.c_str(), ( int )mapLights.size() );
+		}
+
+		// NOTE: the captured DYNAMIC casters (the scripted rock etc.) are deliberately NOT replayed here.
+		// Duplicating gameplay-state geometry over a fresh-loaded map makes the probe scene inconsistent
+		// (the soup model paints unlit checkerboard over real receivers, and its RT-vs-analytic plumbing
+		// asymmetries mint defects that are capture-fidelity problems, not renderer problems). The gate
+		// tests the RENDERER on a self-consistent scene: the live map + its real lights. In-game replay
+		// via `softShadowSpawnCasters` still exists for scene-reconstruction work.
+
+		// ---- camera (straight from the capture; same map => same world frame) ------------------
+		renderView_t rv;
+		memset( &rv, 0, sizeof( rv ) );
+		rv.vieworg.Set( cap.hdr.vieworg[0], cap.hdr.vieworg[1], cap.hdr.vieworg[2] );
+		rv.viewaxis[0].Set( cap.hdr.viewaxis[0], cap.hdr.viewaxis[1], cap.hdr.viewaxis[2] );
+		rv.viewaxis[1].Set( cap.hdr.viewaxis[3], cap.hdr.viewaxis[4], cap.hdr.viewaxis[5] );
+		rv.viewaxis[2].Set( cap.hdr.viewaxis[6], cap.hdr.viewaxis[7], cap.hdr.viewaxis[8] );
+		rv.fov_x = cap.hdr.fovx;
+		rv.fov_y = cap.hdr.fovy;
+
+		capsRun++;
+
+		// ---- rank the captured lights by soft-edge count (most edge records = the light the
+		// soft-shadow work in this capture was about). ponytail: probe ONE light per capture (the
+		// first candidate that actually draws at this camera - a matched light can sit behind a
+		// closed door) to keep the whole corpus run in seconds; probe all lights if a defect ever
+		// hides on a secondary light.
+		std::vector<int> probeLights;
+		for( int li = 0; li < ( int )cap.lights.size(); li++ )
+		{
+			if( cap.lights[li].edgeCount > 0 )
+			{
+				probeLights.push_back( li );
+			}
+		}
+		std::sort( probeLights.begin(), probeLights.end(), [&]( int a, int b )
+		{
+			return cap.lights[a].edgeCount > cap.lights[b].edgeCount;
+		} );
+		if( probeLights.empty() )
+		{
+			common->Printf( "[softgate] %s: no light with soft edges -> SETUP defect (degenerate capture)\n", cap.name.c_str() );
+			GateDefect d;
+			d.kind = GATE_SETUP;
+			all.push_back( d );
+		}
+		bool capProbed = false;
+
+		// ---- per candidate light (first one that draws wins) -----------------------------------
+		for( int pi = 0; pi < ( int )probeLights.size() && !capProbed; pi++ )
+		{
+			const int li = probeLights[pi];
+			const softcapLight_t& cl = cap.lights[li];
+			idVec3 clOrg( cl.origin[0], cl.origin[1], cl.origin[2] );
+
+			// match the real .map light whose global origin is the captured one (globalLightOrigin
+			// includes light_center, so try both origin and origin+center)
+			int best = -1;
+			float bestD = 16.0f * 16.0f;
+			for( int m = 0; m < ( int )mapLights.size(); m++ )
+			{
+				float d0 = ( mapLights[m].origin - clOrg ).LengthSqr();
+				float d1 = ( mapLights[m].origin + mapLights[m].lightCenter - clOrg ).LengthSqr();
+				float d = Min( d0, d1 );
+				if( d < bestD )
+				{
+					bestD = d;
+					best = m;
+				}
+			}
+			renderLight_t rl;
+			if( best >= 0 )
+			{
+				rl = mapLights[best];
+			}
+			else
+			{
+				// purely dynamic light (no .map source): synthesize a point light at the captured
+				// origin. The probes are self-consistent (analytic and RT see the same light), so
+				// this still gates the renderer - just log the approximation loudly.
+				memset( &rl, 0, sizeof( rl ) );
+				rl.pointLight = true;
+				rl.origin = clOrg;
+				rl.axis = mat3_identity;
+				rl.lightRadius.Set( 300, 300, 300 );
+				rl.shaderParms[SHADERPARM_RED] = rl.shaderParms[SHADERPARM_GREEN] = rl.shaderParms[SHADERPARM_BLUE] = 1.0f;
+				rl.shaderParms[SHADERPARM_TIMESCALE] = 1.0f;
+				rl.shader = declManager->FindMaterial( "lights/squarelight1", false );
+				common->Printf( "[softgate] %s L%d: no .map light at (%.0f %.0f %.0f) - SYNTHESIZED point light\n",
+								cap.name.c_str(), li, clOrg.x, clOrg.y, clOrg.z );
+			}
+
+			qhandle_t lh = rw->AddLightDef( &rl );
+			GateCreateStaticInteractionsForLight( rw, lh );
+			GateSetup( cap, cl );
+			lightsRun++;
+
+			std::vector<GateDefect> defects;
+			swgate::GateImg mask1, rt, anaA, anaB, depthA;
+
+			// R0 - interaction-coverage mask: shadows skipped, term==1 exactly where this light's
+			// interaction draws. Everything outside is excluded from every probe.
+			cvarSystem->SetCVarInteger( "r_skipShadows", 1 );
+			cvarSystem->SetCVarInteger( "r_useRTShadows", 0 );
+			cvarSystem->SetCVarInteger( "r_useSoftShadowVolumes", 1 );
+			cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 8 );
+			GateRenderFrame( rw, &rv );
+			GateReadR32F( globalImages->currentRenderHDRImage, mask1 );
+
+			// R1 - the ray-traced reference (converged, no denoise); the mask image IS the term.
+			// r_useShadowMapping 1 is LOAD-BEARING: with RT on, the frontend's soft/stencil branch is
+			// skipped and only the shadow-map occluder path still fills vLight->globalShadows - which
+			// the RT dispatch gate (R_LightUsesRTShadows) requires as its "light has casters" signal.
+			// Without it the trace never dispatches and the mask reads all-dark (measured).
+			cvarSystem->SetCVarInteger( "r_skipShadows", 0 );
+			cvarSystem->SetCVarInteger( "r_useSoftShadowVolumes", 0 );
+			cvarSystem->SetCVarInteger( "r_useShadowMapping", 1 );
+			cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 0 );
+			cvarSystem->SetCVarInteger( "r_useRTShadows", 1 );
+			cvarSystem->SetCVarInteger( "r_rtShadowRays", 512 );
+			cvarSystem->SetCVarInteger( "r_rtShadowDenoise", 0 );
+			cvarSystem->SetCVarInteger( "r_rtShadowAnalyticPenumbra", 0 );
+			// reference ray bias stays at the mature default (1.5, slope-scaled): tightening it to see
+			// sub-unit contact shadows just trades seam blindness for the reference's own reconstruction
+			// acne (measured: LIT_IN_UMBRA 15 -> 206 at 0.25). The analyzer instead EXCLUDES agreement
+			// defects at depth creases, where the reference is structurally untrustworthy either way.
+			GateRenderFrame( rw, &rv );
+			GateReadR32F( globalImages->rtShadowMaskImage, rt );
+
+			// diagnostic mode (r_rtAccelDebug): dump what each reference render actually produced,
+			// so a degenerate probe is inspectable as an image instead of argued about from counts
+			extern idCVar r_rtAccelDebug;
+			if( r_rtAccelDebug.GetBool() )
+			{
+				R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
+								  nvrhi::ResourceStates::ShaderResource, va( "softgate_dbg_%s_L%d_rtframe.png", cap.name.c_str(), li ) );
+				R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->rtShadowMaskImage->GetTextureHandle(),
+								  nvrhi::ResourceStates::ShaderResource, va( "softgate_dbg_%s_L%d_rtmask.png", cap.name.c_str(), li ) );
+			}
+
+			// R2/R3 - the SHIPPED analytic term, twice back to back (temporal probe)
+			cvarSystem->SetCVarInteger( "r_useRTShadows", 0 );
+			cvarSystem->SetCVarInteger( "r_useShadowMapping", 0 );		// back to the pinned soft-path baseline
+			cvarSystem->SetCVarInteger( "r_useSoftShadowVolumes", 1 );
+			cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 8 );
+			// ALWAYS retain this render's edge records (the exact caster triangles the shader consumed)
+			// via the capture hook - the defect arbiter float64-traces against them. Diagnostic mode
+			// additionally writes the full .softcap for offline interrogation.
+			ResetAccumulators();
+			s_armed = true;
+			GateRenderFrame( rw, &rv );
+			if( r_rtAccelDebug.GetBool() )
+			{
+				R_CaptureBackendFinish();
+			}
+			s_armed = false;
+			GateReadR32F( globalImages->currentRenderHDRImage, anaA );
+			GateReadR32F( globalImages->currentDepthImage, depthA );
+			GateRenderFrame( rw, &rv );
+			GateReadR32F( globalImages->currentRenderHDRImage, anaB );
+			if( r_rtAccelDebug.GetBool() )
+			{
+				R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
+								  nvrhi::ResourceStates::ShaderResource, va( "softgate_dbg_%s_L%d_anaterm.png", cap.name.c_str(), li ) );
+				cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 0 );
+				GateRenderFrame( rw, &rv );
+				R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
+								  nvrhi::ResourceStates::ShaderResource, va( "softgate_dbg_%s_L%d_anaframe.png", cap.name.c_str(), li ) );
+				cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 8 );
+			}
+
+			if( !mask1.Valid() || !rt.Valid() || !anaA.Valid() || !anaB.Valid() || !depthA.Valid()
+					|| rt.W != anaA.W || rt.H != anaA.H )
+			{
+				common->Printf( "[softgate] %s L%d: readback FAILED -> SETUP defect\n", cap.name.c_str(), li );
+				GateDefect d;
+				d.kind = GATE_SETUP;
+				defects.push_back( d );
+				all.insert( all.end(), defects.begin(), defects.end() );
+				rw->FreeLightDef( lh );
+				continue;
+			}
+			const int W = anaA.W, H = anaA.H;
+			if( W < 1920 || H < 1080 )
+			{
+				common->Printf( "[softgate] FATAL: render %dx%d is below 1920x1080 - defects are invisible at this size. "
+								"Launch with +set r_windowWidth 1920 +set r_windowHeight 1080.\n", W, H );
+				GateDefect d;
+				d.kind = GATE_SETUP;
+				all.push_back( d );
+				rw->FreeLightDef( lh );
+				break;
+			}
+
+			std::vector<uint8_t> valid( ( size_t )W * H, 0 );
+			long validN = 0;
+			for( size_t i = 0; i < valid.size(); i++ )
+			{
+				if( std::fabs( mask1.t[i] - 1.0f ) <= 1e-3f )
+				{
+					valid[i] = 1;
+					validN++;
+				}
+			}
+			if( validN < 1000 && pi + 1 < ( int )probeLights.size() )
+			{
+				// the matched map light doesn't reach this camera (closed door, tiny scissor) -
+				// not a defect, just the wrong candidate; fall through to the next-ranked light
+				common->Printf( "[softgate] %s L%d: light drew only %ld px - trying next candidate light\n",
+								cap.name.c_str(), li, validN );
+				rw->FreeLightDef( lh );
+				continue;
+			}
+			capProbed = true;
+			if( validN < 1000 )
+			{
+				common->Printf( "[softgate] %s L%d: interaction mask covers only %ld px -> SETUP defect (no candidate light draws)\n",
+								cap.name.c_str(), li, validN );
+				GateDefect d;
+				d.kind = GATE_SETUP;
+				defects.push_back( d );
+			}
+			else
+			{
+				// a starved RT reference (empty TLAS -> fully-lit mask) must never silently pass the gate
+				long anaSh = 0, rtSh = 0;
+				for( size_t i = 0; i < valid.size(); i++ )
+				{
+					if( !valid[i] )
+					{
+						continue;
+					}
+					if( anaA.t[i] < 0.5f )
+					{
+						anaSh++;
+					}
+					if( rt.t[i] < 0.5f )
+					{
+						rtSh++;
+					}
+				}
+				// a dead reference must never pass OR flood the gate: all-lit (empty TLAS fell back
+				// to lit) or all-dark (mask never written, cleared to 0) while the analytic term
+				// disagrees wholesale is an oracle failure, not 2000 renderer defects.
+				const bool rtAllLit  = ( rtSh * 1000 < validN && anaSh * 20 > validN );
+				const bool rtAllDark = ( ( validN - rtSh ) * 1000 < validN && anaSh * 2 < validN );
+				if( rtAllLit || rtAllDark )
+				{
+					common->Printf( "[softgate] %s L%d: RT reference is degenerate (%s: rtShadow=%ld ana=%ld of %ld px) "
+									"-> SETUP defect, agreement probes skipped\n", cap.name.c_str(), li,
+									rtAllLit ? "all-lit" : "all-dark", rtSh, anaSh, validN );
+					GateDefect d;
+					d.kind = GATE_SETUP;
+					defects.push_back( d );
+				}
+
+				// ---- probes -------------------------------------------------------------------
+				GateTemporal( anaA, anaB, valid, cfg, defects );
+				std::vector<uint8_t> defectPx( ( size_t )W * H, 0 );
+				std::vector<uint8_t> crease = GateCreaseMask( depthA, cfg.guard );
+				if( !rtAllLit && !rtAllDark )
+				{
+					// float64 truth arbiter over the retained record triangles (see GateTruthVisibility)
+					idMat4 mvpArb, invArb;
+					memcpy( mvpArb.ToFloatPtr(), cap.hdr.worldMVP, sizeof( float ) * 16 );
+					invArb = mvpArb.Inverse();
+					const idVec3 gLightOrg = !s_lights.empty()
+											 ? idVec3( s_lights[0].origin[0], s_lights[0].origin[1], s_lights[0].origin[2] )
+											 : clOrg;
+					const float diskR = cl.penumbraSize;
+					std::function<float( int, int )> truthAt = [&]( int x, int y ) -> float
+					{
+						size_t i = ( size_t )y * W + x;
+						float dep = depthA.t[i];
+						if( dep <= 1e-6f || dep >= 1.0f - 1e-6f || s_edges.empty() )
+						{
+							return -1.0f;
+						}
+						float wp[3];
+						GateUnproject( invArb.ToFloatPtr(), x, y, W, H, dep, wp );
+						return GateTruthVisibility( idVec3( wp[0], wp[1], wp[2] ), gLightOrg, diskR );
+					};
+					GateAgreement( anaA, rt, valid, cfg, defects, &defectPx, &crease, truthAt );
+				}
+
+				// continuity needs the capture matrices to hold for THIS render: unproject->reproject
+				// must return to the same pixel (validated on a sample grid before trusting it).
+				// The unprojection is the TRUE inverse of the capture worldMVP, computed here - the
+				// capture's stored unprojectionToWorldMatrix is transposed relative to worldMVP and
+				// reconstructs garbage (measured), so it is deliberately not used.
+				idMat4 mvpM, invMvpM;
+				memcpy( mvpM.ToFloatPtr(), cap.hdr.worldMVP, sizeof( float ) * 16 );
+				invMvpM = mvpM.Inverse();
+				// sample the VALID pixels themselves (a fixed grid misses small interaction regions
+				// entirely and starved the check into a false SETUP defect)
+				int reprojTested = 0, reprojOk = 0;
+				const size_t reprojStride = ( validN > 64 ) ? ( size_t )( validN / 64 ) : 1;
+				size_t validSeen = 0;
+				for( size_t i = 0; i < valid.size() && reprojTested < 64; i++ )
+				{
+					if( !valid[i] )
+					{
+						continue;
+					}
+					if( ( validSeen++ % reprojStride ) != 0 )
+					{
+						continue;
+					}
+					{
+						int x = ( int )( i % W ), y = ( int )( i / W );
+						float dep = depthA.t[i];
+						if( dep <= 1e-6f || dep >= 1.0f - 1e-6f )
+						{
+							continue;
+						}
+						float wp[3], sx, sy, nz;
+						GateUnproject( invMvpM.ToFloatPtr(), x, y, W, H, dep, wp );
+						if( !GateProject( cap.hdr.worldMVP, wp, W, H, sx, sy, nz ) )
+						{
+							continue;
+						}
+						reprojTested++;
+						if( std::fabs( sx - x ) <= 2.0f && std::fabs( sy - y ) <= 2.0f )
+						{
+							reprojOk++;
+						}
+						else if( r_rtAccelDebug.GetBool() && reprojTested <= 5 )
+						{
+							common->Printf( "[softgate]   reproj (%d,%d) d=%.5f -> world (%.1f %.1f %.1f) -> (%.1f,%.1f)\n",
+											x, y, depthA.t[i], wp[0], wp[1], wp[2], sx, sy );
+						}
+					}
+				}
+				const bool matricesHold = ( reprojTested >= 8 && reprojOk * 10 >= reprojTested * 7 );
+				if( !matricesHold )
+				{
+					common->Printf( "[softgate] %s L%d: capture matrices do not reproject (%d/%d) -> SETUP defect, continuity skipped\n",
+									cap.name.c_str(), li, reprojOk, reprojTested );
+					GateDefect d;
+					d.kind = GATE_SETUP;
+					defects.push_back( d );
+				}
+				else
+				{
+					// displaced-view MVPs derived algebraically: V = P^-1 * MVP, then the translation
+					// column shifts by -R*delta (delta in world). Convention: row-major, clip = M*(P,1).
+					idMat4 P, MVP;
+					memcpy( P.ToFloatPtr(), cap.hdr.projectionMatrix, sizeof( float ) * 16 );
+					memcpy( MVP.ToFloatPtr(), cap.hdr.worldMVP, sizeof( float ) * 16 );
+					idMat4 V = P.Inverse() * MVP;
+					// ponytail: one horizontal + one vertical slide (not +-both) keeps the run fast and
+					// still catches view-dependent pops; add the mirrored pair if flips ever slip through.
+					const float DISP = 4.0f;
+					const idVec3 deltas[2] = { rv.viewaxis[1] * DISP, rv.viewaxis[2] * DISP };
+					for( int dv = 0; dv < 2; dv++ )
+					{
+						const idVec3& delta = deltas[dv];
+						renderView_t drv = rv;
+						drv.vieworg = rv.vieworg + delta;
+						// coverage mask of the DISPLACED view first (shadows skipped, term==1 where this
+						// light draws): the light's interaction region is screen-space and moves with the
+						// camera, so without it the region's edge reads as a giant lit->umbra "flip"
+						cvarSystem->SetCVarInteger( "r_skipShadows", 1 );
+						GateRenderFrame( rw, &drv );
+						swgate::GateImg dMask;
+						GateReadR32F( globalImages->currentRenderHDRImage, dMask );
+						cvarSystem->SetCVarInteger( "r_skipShadows", 0 );
+						GateRenderFrame( rw, &drv );
+						swgate::GateImg dTerm, dDepth;
+						GateReadR32F( globalImages->currentRenderHDRImage, dTerm );
+						GateReadR32F( globalImages->currentDepthImage, dDepth );
+						if( !dTerm.Valid() || !dDepth.Valid() || !dMask.Valid() )
+						{
+							continue;
+						}
+						std::vector<uint8_t> dispValid( ( size_t )W * H, 0 );
+						for( size_t vi = 0; vi < dispValid.size(); vi++ )
+						{
+							if( std::fabs( dMask.t[vi] - 1.0f ) <= 1e-3f )
+							{
+								dispValid[vi] = 1;
+							}
+						}
+						float rd[3];		// R*delta: rotation part of V applied to the world displacement
+						for( int r = 0; r < 3; r++ )
+						{
+							rd[r] = V[r][0] * delta.x + V[r][1] * delta.y + V[r][2] * delta.z;
+						}
+						GateView gv;
+						memcpy( gv.mvp, cap.hdr.worldMVP, sizeof( gv.mvp ) );
+						for( int r = 0; r < 4; r++ )
+						{
+							gv.mvp[r * 4 + 3] = cap.hdr.worldMVP[r * 4 + 3] - ( P[r][0] * rd[0] + P[r][1] * rd[1] + P[r][2] * rd[2] );
+						}
+						GateContinuity( anaA, depthA, valid, invMvpM.ToFloatPtr(), dTerm, dDepth, gv, cfg, defects, &crease, &defectPx, &dispValid );
+					}
+				}
+
+				if( !defects.empty() )
+				{
+					idStr ppm = va( "softgate_%s_L%d.ppm", cap.name.c_str(), li );
+					GateWritePPM( ppm.c_str(), anaA, valid, defectPx );
+				}
+			}
+
+			// endgame diagnostics: once a light is down to a handful of defects, print each one
+			if( !defects.empty() && defects.size() <= 24 )
+			{
+				for( const GateDefect& d : defects )
+				{
+					common->Printf( "[softgate]   %s area=%d bbox=(%d,%d)-(%d,%d)\n",
+									GateKindName( d.kind ), d.area, d.x0, d.y0, d.x1, d.y1 );
+				}
+			}
+			int counts[GATE_KIND_COUNT];
+			GateTally( defects, counts );
+			common->Printf( "[softgate] %-14s L%d (%dx%d, valid %ld px): TURD=%d ANT=%d LIT_IN_UMBRA=%d STEP=%d EXTENT=%d TEMPORAL=%d CONTINUITY=%d SETUP=%d\n",
+							cap.name.c_str(), li, W, H, validN,
+							counts[GATE_TURD], counts[GATE_ANT], counts[GATE_LIT_IN_UMBRA], counts[GATE_STEP],
+							counts[GATE_EXTENT], counts[GATE_TEMPORAL], counts[GATE_CONTINUITY], counts[GATE_SETUP] );
+			all.insert( all.end(), defects.begin(), defects.end() );
+
+			rw->FreeLightDef( lh );
+		}
+
+		R_SoftShadowClearCapturedCasters();
+	}
+
+	if( rw != NULL )
+	{
+		R_SoftShadowClearCapturedCasters();
+		renderSystem->FreeRenderWorld( rw );
+	}
+
+	for( int i = 0; i < nTouched; i++ )
+	{
+		cvarSystem->SetCVarString( touched[i], prev[i].c_str() );
+	}
+
+	int counts[GATE_KIND_COUNT];
+	GateTally( all, counts );
+	common->Printf( "[softgate] ==============================================================\n" );
+	common->Printf( "[softgate] TOTAL: TURD=%d ANT=%d LIT_IN_UMBRA=%d STEP=%d EXTENT=%d TEMPORAL=%d CONTINUITY=%d SETUP=%d\n",
+					counts[GATE_TURD], counts[GATE_ANT], counts[GATE_LIT_IN_UMBRA], counts[GATE_STEP],
+					counts[GATE_EXTENT], counts[GATE_TEMPORAL], counts[GATE_CONTINUITY], counts[GATE_SETUP] );
+	common->Printf( "[softgate] TOTAL DEFECTS: %d across %d captures, %d lights -> %s\n",
+					( int )all.size(), capsRun, lightsRun, all.empty() ? "PASS" : "FAIL" );
+	return ( int )all.size();
 }
 
 void R_TestSoftShadowLocator_f( const idCmdArgs& args )

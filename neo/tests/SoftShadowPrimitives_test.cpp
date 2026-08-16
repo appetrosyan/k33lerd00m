@@ -312,7 +312,7 @@ const double MC_PI = 3.14159265358979323846;
 // ====================================================================== 2. ORACLE SELF-VERIFICATION
 // The ray-cast/silhouette machinery every other verdict leans on. Wrong oracle = every conclusion void.
 
-TEST( SoftOracle, ray_hits_box_agrees_with_point_sampling )
+STUDY_TEST( SoftOracle, ray_hits_box_agrees_with_point_sampling )
 {
 	Rng rng( 424242u );
 	int tested = 0, skipped = 0;
@@ -558,7 +558,7 @@ void CheckCircleTriCase( idTestResult& _tr, float2 A, float2 B, float r, int wan
 }
 }
 
-TEST( SoftPrimA, circle_tri_area_every_branch_vs_mc )
+STUDY_TEST( SoftPrimA, circle_tri_area_every_branch_vs_mc )
 {
 	const float r = 1.0f;
 	CheckCircleTriCase( _tr, float2( 0.5f, 0.1f ), float2( 0.2f, 0.6f ), r, 0 );	// both inside
@@ -573,7 +573,7 @@ TEST( SoftPrimA, circle_tri_area_every_branch_vs_mc )
 	CheckCircleTriCase( _tr, float2( -4.0f, 0.3f ), float2( -2.0f, 0.3f ), r, 6 );	// segment before the crossings
 }
 
-TEST( SoftPrimA, circle_tri_area_fuzz_vs_mc )
+STUDY_TEST( SoftPrimA, circle_tri_area_fuzz_vs_mc )
 {
 	Rng rng( 8888u );
 	int perBranch[7] = { 0, 0, 0, 0, 0, 0, 0 };
@@ -594,7 +594,7 @@ TEST( SoftPrimA, circle_tri_area_fuzz_vs_mc )
 	CHECK( perBranch[0] > 0 && perBranch[2] > 0 && perBranch[3] > 0 && perBranch[4] > 0 && perBranch[5] > 0 && perBranch[6] > 0 );
 }
 
-TEST( SoftPrimA, loop_sum_matches_mc_polygon_area )
+STUDY_TEST( SoftPrimA, loop_sum_matches_mc_polygon_area )
 {
 	const float r = 1.0f;
 	// (a) small square fully inside: exact shoelace area
@@ -914,7 +914,7 @@ TEST( SoftPrimB, cap_arc_crossings_closed_form )
 	CHECK( cr2.nt == 0 );
 }
 
-TEST( SoftPrimB, cap_tri_every_case_vs_mc )
+STUDY_TEST( SoftPrimB, cap_tri_every_case_vs_mc )
 {
 	// closed spherical square loops in three regimes vs the cap-sampled winding MC. Summing CapTri around
 	// a closed loop must equal the winding-weighted cap-overlap solid angle.
@@ -945,7 +945,7 @@ TEST( SoftPrimB, cap_tri_every_case_vs_mc )
 	CHECK_NEAR( std::fabs( loopSum( off ) ), 0.0, 0.005 * capSolid );
 }
 
-TEST( SoftPrimB, dir_occlusion_fuzz_vs_mc_winding )
+STUDY_TEST( SoftPrimB, dir_occlusion_fuzz_vs_mc_winding )
 {
 	// whole-function check against the cap-sampled MC on floating planar loops in the FRONT hemisphere -
 	// no silhouette/parallax confounds, no ray-cast disk-vs-solid-angle mismatch: both sides measure the
@@ -1482,7 +1482,7 @@ int ShellZFailCapped( const std::vector<std::pair<float3, float3>>& edges, float
 
 }
 
-PIPELINE_TEST( SoftShadowPipeline, aam_shadow_term_is_camera_stable_tripod )
+STUDY_TEST( SoftShadowPipeline, aam_shadow_term_is_camera_stable_tripod )
 {
 	// THE tripod scene: three thin legs under an overhead light, receivers on the floor. The AAM band
 	// classifies each receiver by stencil counts along the camera ray: core (capped z-fail, exact and
@@ -1568,13 +1568,13 @@ PIPELINE_TEST( SoftShadowPipeline, aam_shadow_term_is_camera_stable_tripod )
 	CHECK( unstable == 0 );			// the shadow term is a function of WORLD geometry only
 }
 
-PIPELINE_TEST( SoftShadowPipeline, aam_full_pipeline_accuracy_and_stability_on_captures )
+STUDY_TEST( SoftShadowPipeline, aam_full_pipeline_accuracy_and_stability_on_captures )
 {
 	// Full shipped composition on real captures: core = captured capped shadow volumes counted z-fail
 	// (camera-independent), shell = capless z-pass of the inflated captured silhouettes along the
 	// camera ray, coverage only at stencil==1. Measured from the CAPTURED camera and from displaced
 	// cameras: accuracy vs ray truth AND camera stability.
-	const char* names[] = { "erebus2", "erebus5", "erebus13" };
+	const char* names[] = { "erebus1_03", "erebus1_06", "erebus1_09" };
 	int capsSeen = 0;
 	for( const char* nm : names )
 	{
@@ -1892,7 +1892,7 @@ TEST( SoftContract, coverage_area_physical_bound )
 	// live function: find receiver/caster pairs where ungated occlusion saturates but the centre-lit drop
 	// zeroes it - the exact pixels that shipped as ants before the physical bound existed.
 	SoftCap cw;
-	if( LoadSoftCap( "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/erebus7.softcap", cw ) && !cw.receivers.empty() )
+	if( LoadSoftCap( "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/erebus1_08.softcap", cw ) && !cw.receivers.empty() )
 	{
 		SoftEdgeBuffer bufW{ reinterpret_cast<const float4*>( cw.edges.data() ), ( int )( cw.edges.size() * 2 ) };
 		int dropped = 0, sampledW = 0;
@@ -2036,7 +2036,7 @@ float TruthShadowCulled( float3 P, float3 L, float r, const float* verts, const 
 
 }
 
-PIPELINE_TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
+STUDY_TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
 {
 	// THE GAP that let the false-shadow-everywhere regression ship: every prior locator metric used the RAY
 	// oracle (TruthShadowCulled) as the classifier, but the engine's PCSS locator projects into a RASTERISED,
@@ -2045,7 +2045,7 @@ PIPELINE_TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
 	// Here we render the caster mesh from each light EXACTLY as ShadowMapPassFast does (front-face culled ->
 	// back-face depth) and run the identical blocker-fraction gate, then assert it fires NO shadow where the
 	// light is provably fully visible (ray truth == lit). Red-until-fixed.
-	const char* names[] = { "erebus2", "erebus3", "erebus4", "erebus5", "erebus6", "erebus7", "erebus13" };
+	const char* names[] = { "erebus1_03", "erebus1_04", "erebus1_05", "erebus1_06", "erebus1_07", "erebus1_08", "erebus1_09" };
 	const int W = 320;
 	const float pcssScale = 4.0f;		// r_shadowMapPCSSScale default; the shader's blocker-search radius in texels
 	int capsSeen = 0;
@@ -2126,11 +2126,11 @@ PIPELINE_TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
 	CHECK( rate < 0.02 );
 }
 
-PIPELINE_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
+STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 {
 	// ALL readable captures - the full-frame reference run found the residual gross pixels precisely in
 	// the captures a shorter list never scanned (erebus7/6/13). Coverage gaps are how defects hide.
-	const char* names[] = { "erebus2", "erebus3", "erebus4", "erebus5", "erebus6", "erebus7", "erebus13" };
+	const char* names[] = { "erebus1_03", "erebus1_04", "erebus1_05", "erebus1_06", "erebus1_07", "erebus1_08", "erebus1_09" };
 	const int W = 320;
 	int totalTurds = 0, totalAnts = 0, totalHoles = 0, totalFlips = 0, capsSeen = 0;
 	for( const char* nm : names )
@@ -2452,9 +2452,9 @@ PIPELINE_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 // Validate the FRONT-FACE COVERAGE model on the real (partly open) erebus casters: in the penumbra ring
 // (centre-lit, coverage actually runs) it must beat the shipped L-silhouette WedgeOcclusion against the
 // converged ray oracle, and its error must be bounded (open-geometry drain would show here as a blow-up).
-TEST( SoftShadowFaceSum, erebus_analytic_matches_truth_over_whole_shadow )
+STUDY_TEST( SoftShadowFaceSum, erebus_analytic_matches_truth_over_whole_shadow )
 {
-	const char* names[] = { "erebus2", "erebus3", "erebus4", "erebus5", "erebus6", "erebus7", "erebus13" };
+	const char* names[] = { "erebus1_03", "erebus1_04", "erebus1_05", "erebus1_06", "erebus1_07", "erebus1_08", "erebus1_09" };
 	const int W = 64;	// coarse frame: enough penumbra px to compare face vs L-sil accuracy without a full-res MC sweep
 	double faceAbsAll = 0, lsilAbsAll = 0; long nAll = 0; int capsSeen = 0;
 	double worstFaceCap = 0, worstUmbraCap = 0;
@@ -2562,7 +2562,7 @@ TEST( SoftShadowFaceSum, erebus_analytic_matches_truth_over_whole_shadow )
 // where SoftShadow_FaceCoverage sees every disk-sample ray blocked. This asserts that holds on real,
 // partly-OPEN Doom3 geometry, not just a closed box: a coverage drain here = LIT HOLES in the umbra. The
 // union sampling + conservative crack dilation must keep those holes at zero even on non-manifold brush soup.
-TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
+STUDY_TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 {
 	// --- closed box corpus: coverage MUST saturate in the umbra ---
 	{
@@ -2596,7 +2596,7 @@ TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 	}
 	// --- real erebus geometry (partly open): the actual viability test for the emergent fix ---
 	{
-		const char* names[] = { "erebus2", "erebus5", "erebus13" };
+		const char* names[] = { "erebus1_03", "erebus1_06", "erebus1_09" };
 		const int W = 64;
 		long umbra = 0, holes = 0; float worst = 1.0f; int caps = 0;
 		for( const char* nm : names )
@@ -2672,11 +2672,11 @@ TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 // named modes, not a vague aggregate:
 //   (A) PHANTOM WEDGES  - the band marks provably-LIT ground as in-band and darkens it.
 //   (B) SILHOUETTE DISAGREEMENT - the composed shadow's lit/shadowed decision flips vs truth across the frame.
-PIPELINE_TEST( SoftShadowFacePipeline, face_mode_band_and_coverage_vs_truth )
+STUDY_TEST( SoftShadowFacePipeline, face_mode_band_and_coverage_vs_truth )
 {
 	// erebus (penumbra-rich receivers) + the TRIPOD (softcap0012/0013): thin legs whose soft shadow becomes
 	// an unrecognisable mess of phantom wedges in face mode - the user's named catastrophic case.
-	const char* names[] = { "erebus2", "erebus5", "erebus13", "softcap0012", "softcap0013" };
+	const char* names[] = { "erebus1_03", "erebus1_06", "erebus1_09", "erebus1_12", "erebus1_13" };
 	const int W = 96;	// coarse frame; the failure modes are FRACTIONS of the penumbra, resolution-robust
 	long totalPhantom = 0, totalDisagree = 0, totalPenum = 0, totalOversharp = 0, capsSeen = 0;
 	long totalPhantomFix = 0, totalDisagreeFix = 0, totalOversharpFix = 0;
@@ -3164,9 +3164,9 @@ inline float WedgeCovMinD( float3 swP, float3 swL, float swR, int swFirstElem, i
 // readable capture - no prefilters, no candidate sampling. Emits side-by-side images per capture
 // (pipeline / ray reference / signed-error heatmap) so the verdict is inspectable, and gates on
 // both error directions. Truth quantum at N=4 disk sampling is ~1/13, so the gates sit well above it.
-PIPELINE_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
+STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 {
-	const char* names[] = { "erebus2", "erebus3", "erebus4", "erebus5", "erebus6", "erebus7", "erebus13" };
+	const char* names[] = { "erebus1_03", "erebus1_04", "erebus1_05", "erebus1_06", "erebus1_07", "erebus1_08", "erebus1_09" };
 	const int W = 288;
 	int capsSeen = 0;
 	for( const char* nm : names )
@@ -3694,9 +3694,9 @@ PIPELINE_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 // path now leaks to lit - a bright core inside the dark penumbra ring = the halo. Truth-free (the leak is
 // emergent-vs-stamp), so it is fast; the images are the verdict. Not gated (diagnostic), but it asserts
 // the leak is confined to the CORE (centre-blocked) region - if it bled into the ring, the mechanism differs.
-PIPELINE_TEST( SoftShadowHalo, emergent_umbra_leak_is_confined_to_the_core )
+STUDY_TEST( SoftShadowHalo, emergent_umbra_leak_is_confined_to_the_core )
 {
-	const char* names[] = { "softcap0012", "softcap0013" };
+	const char* names[] = { "erebus1_12", "erebus1_13" };
 	const int W = 480;
 	int capsSeen = 0;
 	for( const char* nm : names )
@@ -3936,9 +3936,9 @@ static int DirWinding( const std::vector<std::vector<float3>>& loops, float3 d )
 	return ( int )std::lround( ang / ( 2.0 * PI ) );
 }
 
-TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
+STUDY_TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 {
-	const char* names[] = { "erebus5", "erebus13" };		// the two penumbra-rich captures
+	const char* names[] = { "erebus1_06", "erebus1_09" };		// the two penumbra-rich captures
 	const int W = 288, STRIDE = 2;	// full frame: this measurement needs >50 penumbra px to be statistically valid
 	int capsSeen = 0, capsChecked = 0;
 	for( const char* nm : names )
@@ -4209,9 +4209,9 @@ TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section )
 // truth over the penumbra pixels: MAX (shipped), clamp-SUM (min(1,sum)), and probabilistic UNION
 // (1-prod(1-occ)). If a union-style combine tracks truth markedly better than MAX, the fix is the
 // combine operator in the interaction path, not the contour or the area math.
-TEST( SoftShadowCombine, union_of_casters_beats_max_in_the_penumbra )
+STUDY_TEST( SoftShadowCombine, union_of_casters_beats_max_in_the_penumbra )
 {
-	const char* names[] = { "erebus5", "erebus13" };
+	const char* names[] = { "erebus1_06", "erebus1_09" };
 	const int W = 288, STRIDE = 2;	// full frame: this measurement needs >50 penumbra px to be statistically valid
 	int capsSeen = 0, unionWins = 0;
 	for( const char* nm : names )
@@ -4364,7 +4364,7 @@ TEST( SoftShadowCombine, union_of_casters_beats_max_in_the_penumbra )
 // distances and its 10%..90% transition width compared against the ray-traced truth. Stamping the
 // hard shadow as umbra halves the width (the inner penumbra is crushed to black) - which is exactly
 // "blur around a stencil shadow", not an analytic soft shadow - and fails this test.
-PIPELINE_TEST( SoftShadowSoftness, penumbra_width_tracks_truth_contact_hardening )
+STUDY_TEST( SoftShadowSoftness, penumbra_width_tracks_truth_contact_hardening )
 {
 	const float3 L( 0, 0, 96 );
 	const float  rp = 6.0f;
@@ -4417,8 +4417,8 @@ PIPELINE_TEST( SoftShadowSoftness, penumbra_width_tracks_truth_contact_hardening
 // bounding their edges, per-light ranges valid, winding consistent per chain.
 TEST( SoftCaptureInvariant, edge_stream_contract_on_all_committed_captures )
 {
-	const char* names[] = { "erebus0", "erebus1", "erebus2", "erebus3", "erebus4", "erebus5", "erebus6",
-							"erebus7", "erebus13" };
+	const char* names[] = { "erebus1_01", "erebus1_02", "erebus1_03", "erebus1_04", "erebus1_05", "erebus1_06", "erebus1_07",
+							"erebus1_08", "erebus1_09" };
 	int capsSeen = 0;
 	for( const char* nm : names )
 	{

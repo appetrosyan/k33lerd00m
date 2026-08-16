@@ -84,7 +84,7 @@ inline std::vector<float2> ShellFloorPoly( const std::vector<float3>& loop, floa
 }
 }
 
-TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
+STUDY_TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 {
 	const float3 L( 0.0f, 0.0f, 14.0f );
 	const Cfg cfgs[] =

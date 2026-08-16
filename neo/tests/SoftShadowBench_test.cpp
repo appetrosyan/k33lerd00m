@@ -111,7 +111,7 @@ const double DEVIATION_TOL = 0.001;
 }
 
 // -------------------------------------------------------------------------- latency baseline
-TEST( SoftShadowBench, wedge_throughput )
+STUDY_TEST( SoftShadowBench, wedge_throughput )
 {
 	Workload w = MakeWorkload( 30, 64, 20260815u );	// ~hundreds of records; 4096 receiver calls
 	volatile double sink = RunOnce( w );			// warm caches / pull code in
@@ -141,7 +141,7 @@ TEST( SoftShadowBench, wedge_throughput )
 // many box casters in ONE combined stream (edge stream for wedge, face stream for face), swept over a floor grid
 // spanning lit/penumbra/umbra - the same lit/umbra mix the pixel shader sees, so the per-sample early-out
 // (a blocked sample is never retested; a fully-occluded fragment breaks) is exercised realistically.
-TEST( SoftShadowBench, face_vs_wedge_throughput )
+STUDY_TEST( SoftShadowBench, face_vs_wedge_throughput )
 {
 	const int NBOX = 30, GRID = 64;
 	float3 L( 0, 0, 12 ); float r = 2.0f;
@@ -191,7 +191,7 @@ TEST( SoftShadowBench, face_vs_wedge_throughput )
 }
 
 // -------------------------------------------------------------------------- deviation-from-anchor gate
-TEST( SoftShadowBench, deviation_vs_anchor )
+STUDY_TEST( SoftShadowBench, deviation_vs_anchor )
 {
 	Workload w = MakeWorkload( 24, 48, 20260901u );		// fixed deterministic corpus (stable anchor)
 	SoftEdgeBuffer buf{ w.rec.data(), ( int )w.rec.size() };

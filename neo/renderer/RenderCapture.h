@@ -165,6 +165,11 @@ void  R_TestSoftShadowLocator_f( const idCmdArgs& args );
 // frame loop (Common::Frame calls R_SoftShadowGotoTick). Run `softShadowGoto <cap>` + `wait 90` before the test.
 void  R_SoftShadowGoto_f( const idCmdArgs& args );
 void  R_SoftShadowGotoTick();
+// Headless corpus render: `softShadowShots <cap...>` renders each capture (shot_<name>.png) and quits,
+// driven from the frame loop by R_SoftShadowBatchTick - no bash/+wait/timeout orchestration.
+void  R_SoftShadowShots_f( const idCmdArgs& args );
+void  R_SoftShadowBatchTick();
+void  R_SoftShadowSpawnCasters_f( const idCmdArgs& args );	// reproduce a capture's dynamic casters (the rock)
 // Pin every shadow-relevant cvar to the explicit soft-shadow test baseline (RT off, soft on, atlas+PCSS, etc.),
 // so the self-test NEVER inherits an archived D3BFGConfig value (e.g. r_useRTShadows 1 silently disabling the
 // soft-wedge path). verbose = log each value + WARN on any archived override.
@@ -174,6 +179,12 @@ void  R_SoftShadowPinTestConfig( bool verbose );
 // when com_softShadowSelfTest names a map. Loads that map's renderWorld + real .map lights + the paired
 // capture camera, renders RT-oracle vs soft+PCSS hybrid, prints the verdict. Returns false-shadow px (0=pass).
 int   R_SoftShadowSelfTest( const char* mapName );
+
+// MINIMAL-INIT corpus DEFECT GATE (com_softShadowGate): reconstructs every .softcap scene (map + captured
+// casters + captured lights), renders the SHIPPED GPU soft-shadow path at >=1920x1080 plus an in-engine RT
+// reference, and counts image defects individually (turds/ants/lit-in-umbra/penumbra steps/extent/temporal
+// jitter/view-continuity flips) via tests/SoftShadowGate.h. Green iff the returned total is ZERO.
+int   R_SoftShadowGate( const char* arg );
 
 // True when a one-shot capture has been armed by the `captureSoftShadow` console command.
 bool  R_SoftShadowCaptureArmed();

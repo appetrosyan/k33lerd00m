@@ -134,6 +134,13 @@ idCommon* 		common = &commonLocal;
 // PASS/FAIL verdict. Empty = normal boot.
 idCVar com_softShadowSelfTest( "com_softShadowSelfTest", "", CVAR_SYSTEM, "run the minimal-init soft-shadow locator self-test on this map, then quit" );
 
+// MINIMAL-INIT soft-shadow DEFECT GATE: when set to a directory of .softcap captures (or "corpus" for
+// neo/tests/data), Common::Init boots only the render stack, reconstructs every capture's scene, renders
+// the SHIPPED soft-shadow path vs the RT reference at >=1920x1080, counts every image defect individually,
+// prints the per-capture table + grand total, and quits with exit code = defect count (clamped to 125).
+// Green iff ZERO defects. Empty = normal boot.
+idCVar com_softShadowGate( "com_softShadowGate", "", CVAR_SYSTEM, "run the minimal-init soft-shadow GPU defect gate on this .softcap directory (or 'corpus'), then quit" );
+
 // For doom classic
 struct Globals;
 
@@ -1318,6 +1325,19 @@ void idCommonLocal::Init( int argc, const char* const* argv, const char* cmdline
 			R_SoftShadowSelfTest( com_softShadowSelfTest.GetString() );
 			cmdSystem->AppendCommandText( "quit\n" );
 			return;
+		}
+
+		// the GPU defect gate: same minimal-init divert; the defect count becomes the process exit code
+		// so CI/scripts read PASS/FAIL without parsing the log. Exit DIRECTLY (Sys_Quit) instead of the
+		// buffered `quit`: the frame/shutdown machinery was never fully booted here (no game/session), and
+		// running it half-initialized segfaults - which would clobber the exit code the gate exists to report.
+		if( com_softShadowGate.GetString()[0] != '\0' )
+		{
+			extern int R_SoftShadowGate( const char* arg );
+			extern void Sys_SetExitCode( int code );
+			int defects = R_SoftShadowGate( com_softShadowGate.GetString() );
+			Sys_SetExitCode( defects > 125 ? 125 : defects );
+			Sys_Quit();
 		}
 
 		if( idStr::Icmp( sys_lang.GetString(), ID_LANG_FRENCH ) == 0 )
