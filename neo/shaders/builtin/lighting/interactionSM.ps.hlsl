@@ -147,6 +147,14 @@ void main( PS_IN fragment, out PS_OUT result )
 	// explicit first element (this light's edges start here), passed in rpJitterTexOffset.x.
 	int swFirstElem = int( pc.rpJitterTexOffset.x );
 
+	// NO origin bias on the coverage rays: the analytic path traces the exact caster triangles from the
+	// exact interpolated receiver position, and the "phantom" shadows once blamed on self-intersection
+	// turned out to be REAL contact shadows in seams/cracks (gate finding: the blocking triangle exists
+	// in the mesh 0.45 units from the receiver - geometry the biased references skip). A lifted origin
+	// erased those true contact shadows and its quad-derivative normal made the term view-dependent
+	// (continuity defects 12 -> 369). Exactness is the analytic path's whole advantage; keep it.
+	float3 swCovP = swP;
+
 	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
 
 	// Light-disk coverage: sum each caster's silhouette against the area-light disk (see
@@ -182,7 +190,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	}
 	else if( pcssScale == 0.0 )
 	{
-		float swOcc = SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+		float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
 		shadow = 1.0 - saturate( swOcc );
 	}
 	else
@@ -218,7 +226,15 @@ void main( PS_IN fragment, out PS_OUT result )
 			// approximate - the whole offset is a heuristic re-tunable via r_shadowMapPCSSBias, so a plumbed FOV isn't
 			// worth a uniform. worldTexel = dist-to-light * angular-texel / tile-fraction.
 			float  swWorldTexel = length( swL - swP ) * 2.07 * pc.rpScreenCorrectionFactor.z / max( swFrac, 1e-6 );
-			swMPb.xyz += swNSign * swNrmM * ( pc.rpJitterTexOffset.z * 4.0 * swWorldTexel );
+			// SLOPE SCALING: the depth error a shadow texel induces on the receiver grows as tan(angle
+			// between surface and light) - at grazing incidence (floor lit by a near-floor light) a
+			// constant-texel offset is an order of magnitude short, which paints broad acne bands where
+			// the analytic sees nothing (gate finding: the erebus1_05 stripe). Scale the offset by
+			// 1/(N.L), capped so steep geometry keeps the small proven offset and the cap bounds any
+			// added contact recession to a few texels.
+			float  swNL = abs( dot( normalize( swNrmW ), normalize( swL - swP ) ) );
+			float  swSlope = min( 1.0 / max( swNL, 0.05 ), 20.0 );
+			swMPb.xyz += swNSign * swNrmM * ( pc.rpJitterTexOffset.z * 4.0 * swWorldTexel * swSlope );
 		}
 		float4 swSTC;
 		swSTC.x = dot4( swMPb, pc.rpShadowMatrices[ swSI * 4 + 0 ] );
@@ -342,11 +358,15 @@ void main( PS_IN fragment, out PS_OUT result )
 			bool swDeepUmbra = ( swBlkCnt > 15.5 ) && ( swCentreLit < 0.5 ) && ( pcssLit < 0.002 );
 			if( pc.rpJitterTexOffset.w > 0.5 && !swDeepUmbra )
 			{
-				float swOcc = SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, swCentreLit, swFace );
-				// Use the EXACT analytic wherever it sees ANY occlusion (edge-having casters); fall back to the PCSS
-				// PCF only where the analytic is fully lit - i.e. edge-less dynamic casters it can't see. max() over-
-				// darkened: it double-counted the same caster where PCSS's over-soft tail read darker than the exact value.
-				shadow = ( swOcc > 0.003 ) ? ( 1.0 - saturate( swOcc ) ) : pcssLit;
+				float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, swCentreLit, swFace );
+				// FACE mode: the analytic IS the complete answer. The front-face stream carries EVERY caster's
+				// triangles (world geometry and posed dynamic meshes alike - R_CollectPenumbraFaces reads
+				// posedShadowVerts), so "analytic sees nothing" MEANS lit, and falling back to the PCSS PCF
+				// there only re-imports PCSS's grazing-floor acne into analytically-lit pixels (softgate: the
+				// erebus1_05 stripe turds survived the analytic-contact default precisely through this fallback).
+				// The legacy L-sil wedge stream (swFace==false) still undershoots off-axis, so IT keeps the
+				// PCSS fallback for the occlusion it cannot see.
+				shadow = ( swFace || swOcc > 0.003 ) ? ( 1.0 - saturate( swOcc ) ) : pcssLit;
 			}
 			else
 			{
@@ -355,7 +375,7 @@ void main( PS_IN fragment, out PS_OUT result )
 		}
 	}
 #else
-	float swOcc = SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+	float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
 	shadow = 1.0 - saturate( swOcc );
 #endif
 #elif USE_RT_SHADOW
@@ -879,7 +899,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	//   0 = real shadows.
 	if( swDbg == 7 )      { result.color = float4( 1.0, 0.0, 0.0, 1.0 ); }				// solid red for any soft-lit fragment (does the soft path run?)
 	else if( swDbg == 2 ) { result.color = float4( frac( swP / 64.0 ), 1.0 ); }			// receiver world pos (smooth gradient => swP valid)
-	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
+	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
 	else if( swDbg == 9 ) { result.color = float4( frac( float( swFirstElem ) / 256.0 ), frac( float( swN ) / 64.0 ), 0.0, 1.0 ); }	// R = first-element param, G = edge count param
 		else if( swDbg == 8 ) { result.color = float4( shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
 		else if( swDbg == 10 ) { result.color = ( swLocFr < 0.0 ) ? float4( 0.0, 0.0, 0.4, 1.0 ) : float4( swLocFr, 1.0 - swLocFr, 0.0, 1.0 ); }	// LOCATOR: green = lit (frac 0), red = umbra (frac 1), blue = pcss off / outside face

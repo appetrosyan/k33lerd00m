@@ -1047,6 +1047,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 			idVec3 localLightOrigin;
 			R_GlobalPointToLocal( vEntity->modelMatrix, lightDef->globalLightOrigin, localLightOrigin );
 
+
 			//--------------------------
 			// surface light interactions
 			//--------------------------
@@ -1322,7 +1323,11 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				// fragment against the exact receiver position (no screen-space reconstruction); the umbra
 				// emerges from summing the edges. Same silhouette/winding as the stencil path.
 				//
-				if( r_useSoftShadowVolumes.GetBool() && tri->silEdges != NULL )
+				// silEdges are a WEDGE-path requirement (the light-silhouette walk). FACE coverage streams the
+				// raw triangles and needs no adjacency - and silEdges creation FAILS on non-2-manifold meshes
+				// (rails, grates, decor), which silently dropped those casters from the soft stream and left
+				// their shadows missing entirely (softgate: the erebus1_05 far-floor EXTENT defects).
+				if( r_useSoftShadowVolumes.GetBool() && ( tri->silEdges != NULL || r_softShadowFaceCoverage.GetBool() ) )
 				{
 					const int swCollectStart = Sys_Microseconds();
 					softShadowEdge_t* sedges = NULL;
