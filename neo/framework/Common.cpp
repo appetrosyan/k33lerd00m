@@ -140,6 +140,7 @@ idCVar com_softShadowSelfTest( "com_softShadowSelfTest", "", CVAR_SYSTEM, "run t
 // prints the per-capture table + grand total, and quits with exit code = defect count (clamped to 125).
 // Green iff ZERO defects. Empty = normal boot.
 idCVar com_softShadowGate( "com_softShadowGate", "", CVAR_SYSTEM, "run the minimal-init soft-shadow GPU defect gate on this .softcap directory (or 'corpus'), then quit" );
+idCVar com_softShadowGateBench( "com_softShadowGateBench", "0", CVAR_SYSTEM | CVAR_INTEGER, "softgate: additionally time N pipelined FULL frames (all map lights, real shading) per capture and print ms/FPS - the 60-FPS optimisation instrument. 0 = off" );
 
 // For doom classic
 struct Globals;

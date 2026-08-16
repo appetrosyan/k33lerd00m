@@ -1597,6 +1597,14 @@ int R_SoftShadowGate( const char* arg )
 	std::vector<GateDefect> all;
 	int capsRun = 0, lightsRun = 0;
 
+	// LAUNCH-time shadow config, restored for the BENCH renders: the probes pin their own baseline, but
+	// the bench must honour +set overrides so shadow methods can be A/B-timed from the command line.
+	const int launchSoft    = cvarSystem->GetCVarInteger( "r_useSoftShadowVolumes" );
+	const int launchPCSS    = cvarSystem->GetCVarInteger( "r_shadowMapPCSS" );
+	const int launchStencil = cvarSystem->GetCVarInteger( "r_useStencilShadows" );
+	const int launchMapping = cvarSystem->GetCVarInteger( "r_useShadowMapping" );
+	const int launchContact = cvarSystem->GetCVarInteger( "r_shadowMapPCSSAnalyticContact" );
+
 	// map world cache: consecutive captures share the map, load it once
 	idStr loadedMap;
 	idRenderWorld* rw = NULL;
@@ -2094,6 +2102,52 @@ int R_SoftShadowGate( const char* arg )
 			all.insert( all.end(), defects.begin(), defects.end() );
 
 			rw->FreeLightDef( lh );
+		}
+
+		// ---- BENCH (com_softShadowGateBench N): the FULL shipped frame at this scenario ----------
+		// Every parsed map light goes into the world (the frontend culls to the view, exactly like
+		// gameplay), full shading (no term debug, ambient on), and N pipelined frames are timed.
+		// This is the 60-FPS instrument: same launch, one ms/FPS line per capture.
+		const int benchFrames = cvarSystem->GetCVarInteger( "com_softShadowGateBench" );
+		if( benchFrames > 0 )
+		{
+			std::vector<qhandle_t> benchLights;
+			benchLights.reserve( mapLights.size() );
+			for( const renderLight_t& ml : mapLights )
+			{
+				benchLights.push_back( rw->AddLightDef( &ml ) );
+			}
+			R_SoftShadowPinTestConfig( false );
+			cvarSystem->SetCVarInteger( "r_skipAmbient", 0 );
+			cvarSystem->SetCVarInteger( "r_skipShadows", 0 );
+			cvarSystem->SetCVarInteger( "r_useRTShadows", 0 );
+			cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 0 );
+			// honour the LAUNCH shadow method so configs can be A/B-timed via +set
+			cvarSystem->SetCVarInteger( "r_useSoftShadowVolumes", launchSoft );
+			cvarSystem->SetCVarInteger( "r_shadowMapPCSS", launchPCSS );
+			cvarSystem->SetCVarInteger( "r_useStencilShadows", launchStencil );
+			cvarSystem->SetCVarInteger( "r_useShadowMapping", launchMapping );
+			cvarSystem->SetCVarInteger( "r_shadowMapPCSSAnalyticContact", launchContact );
+			for( int wu = 0; wu < 3; wu++ )		// warm-up: caches, atlas, pipelines
+			{
+				GateRenderFrame( rw, &rv );
+			}
+			const int t0 = Sys_Microseconds();
+			for( int f = 0; f < benchFrames; f++ )
+			{
+				// pipelined like the game loop: frontend builds frame f while the GPU draws f-1
+				rw->RenderScene( &rv );
+				const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+				tr.RenderCommandBuffers( cmd );
+			}
+			tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );	// drain the last frame
+			const double ms = ( Sys_Microseconds() - t0 ) / 1000.0 / benchFrames;
+			common->Printf( "[softgate] BENCH %-14s %6.2f ms/frame (%4.0f FPS) over %d frames, %d map lights\n",
+							cap.name.c_str(), ms, 1000.0 / ms, benchFrames, ( int )mapLights.size() );
+			for( qhandle_t bh : benchLights )
+			{
+				rw->FreeLightDef( bh );
+			}
 		}
 
 		R_SoftShadowClearCapturedCasters();
