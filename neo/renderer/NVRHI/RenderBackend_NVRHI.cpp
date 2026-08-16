@@ -3095,6 +3095,11 @@ idRenderBackend::idRenderBackend()
 	lastRenderWidth = 0;
 	lastRenderHeight = 0;
 	emberPass = nullptr;
+	softTileBinPass = nullptr;	// also nulled in Init(), but frames can run between ctor and Init -
+	// an uninitialised pointer here passes the != NULL guard in DrawInteractions on garbage (measured
+	// as a boot-order-dependent crash)
+	currentSoftTileBase = -1;
+	currentSoftTileOx = currentSoftTileOy = currentSoftTileTilesX = 0;
 	hdrGuiCompositePass = nullptr;
 
 	memset( &glConfig, 0, sizeof( glConfig ) );
