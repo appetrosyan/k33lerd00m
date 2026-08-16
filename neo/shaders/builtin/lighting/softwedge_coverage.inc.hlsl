@@ -52,6 +52,13 @@ the Free Software Foundation, either version 3 of the License, or
 	#define SW_JUMP_SKIP 1
 #endif
 
+// SW_FACE_PROFILE: TIMING PROBE ONLY, never ship non-zero. 1 = walk + caster culls (no triangle
+// work); 2 = + per-triangle cone culls (no setup/sample tests). Renders WRONG shadows by design;
+// used to decompose the integral's frame cost into walk / cull / sample masses on the bench.
+#ifndef SW_FACE_PROFILE
+	#define SW_FACE_PROFILE 0
+#endif
+
 // SW_FACE_LEGACY: 0 = the four LOSSLESS face-coverage hoists (precompute triRad from the stream, hoist the
 // per-sample ray dirs and the triangle-constant qq/e2qq out of the loop, skip the crack-close on trivial masks);
 // 1 = recompute everything in-loop as before. Bit-EXACT either way (same values); the toggle exists only to A/B
@@ -746,6 +753,12 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 	uint swMask = 0u;						// bit i set once sample i's ray is blocked by any triangle (union)
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
 	bool  swSkip = false;
+#if SW_FACE_PROFILE
+	// keeps the probed stages LIVE: the accumulator feeds an unprovable branch at the end, so the
+	// compiler cannot dead-code-eliminate the walk/culls the probe is supposed to time (it DID -
+	// the first probe benched BELOW the soft-off floor).
+	float swProbe = 0.0f;
+#endif
 	for( int se = 0; se < swN; se++ )
 	{
 		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
@@ -770,6 +783,9 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		}
 		if( se + 1 >= swN ) { break; }		// malformed tail (needs the triangle's second record)
 		if( swSkip ) { se++; continue; }	// culled: consume both records of this triangle (safety)
+#if SW_FACE_PROFILE == 1
+		swProbe += e0.x; se++; continue;	// TIMING PROBE ONLY: walk + caster culls, no triangle work
+#endif
 
 		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
 		float4 g1 = t_SoftEdges[ swFirstElem + ( se + 1 ) * 2 + 1 ];	// record B's e1 carries v2
@@ -798,6 +814,9 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		float3 perp = rc - cd * swF.nrm;
 		float  coneR = swR * ( cd + triRad ) / swDistPL;			// max cone radius over the triangle's depth span
 		if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }	// outside the sample cone: cannot occlude
+#if SW_FACE_PROFILE == 2
+		swProbe += cd; continue;			// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
+#endif
 		float3 edge1 = v1 - v0;
 		float3 edge2 = v2 - v0;
 		float3 sp = swP - v0;
@@ -870,6 +889,9 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		}
 		swMask = filled;
 	}
+#if SW_FACE_PROFILE
+	if( swProbe > 1e30f ) { swMask = swAll; }	// never true; makes the probe accumulator observable
+#endif
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
 
