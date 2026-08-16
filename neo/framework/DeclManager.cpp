@@ -828,8 +828,14 @@ int idDeclFile::LoadAndParse()
 			// update the existing copy
 			if( newDecl->sourceFile != this || newDecl->redefinedInReload )
 			{
-				src.Warning( "%s '%s' previously defined at %s:%i", declManagerLocal.GetDeclNameFromType( identifiedType ),
-							 name.c_str(), newDecl->sourceFile->fileName.c_str(), newDecl->sourceLine );
+				// redefinitions are pervasive in the shipped mod content (decal splats etc.) and flood the log
+				// (dozens per map load) with nothing actionable - the later definition simply wins. Keep the
+				// warning for developers, silence it for normal runs.
+				if( com_developer.GetBool() )
+				{
+					src.Warning( "%s '%s' previously defined at %s:%i", declManagerLocal.GetDeclNameFromType( identifiedType ),
+								 name.c_str(), newDecl->sourceFile->fileName.c_str(), newDecl->sourceLine );
+				}
 				continue;
 			}
 			if( newDecl->declState != DS_UNPARSED )

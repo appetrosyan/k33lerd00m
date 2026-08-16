@@ -826,7 +826,14 @@ void idImage::ActuallyLoadImage( bool fromBackEnd, nvrhi::ICommandList* commandL
 
 			if( pic == NULL )
 			{
-				idLib::Warning( "Couldn't load image: %s : %s", GetName(), generatedName.c_str() );
+				// Internal / procedural images (generated names starting with '_' - e.g. _cinematic*, _scratch -
+				// or material-parse artifacts like '{'/'}') never have a backing file, so this "load" always
+				// "fails" and floods the log. Only warn for real named textures that are genuinely missing.
+				const char firstCh = GetName()[0];
+				if( firstCh != '_' && firstCh != '{' && firstCh != '}' )
+				{
+					idLib::Warning( "Couldn't load image: %s : %s", GetName(), generatedName.c_str() );
+				}
 
 				// create a default so it doesn't get continuously reloaded
 				opts.width = 8;

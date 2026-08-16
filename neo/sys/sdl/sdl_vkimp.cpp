@@ -585,7 +585,13 @@ void VKimp_SetGamma( unsigned short red[256], unsigned short green[256], unsigne
 	// TODO remove
 	if( SDL_SetWindowGammaRamp( window, red, green, blue ) )
 	{
-		common->Warning( "Couldn't set gamma ramp: %s", SDL_GetError() );
+		// Wayland / many headless setups don't support hardware gamma at all - warn ONCE, not on every set.
+		static bool warnedGamma = false;
+		if( !warnedGamma )
+		{
+			common->Warning( "Couldn't set gamma ramp: %s (further gamma warnings suppressed)", SDL_GetError() );
+			warnedGamma = true;
+		}
 	}
 }
 
