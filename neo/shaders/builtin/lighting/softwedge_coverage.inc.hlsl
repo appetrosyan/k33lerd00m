@@ -631,8 +631,10 @@ SW_FUNC int SoftPopcount32( uint x )
 
 #ifndef SW_FACE_SAMPLES
 	#define SW_FACE_SAMPLES 16			// equal-area disk samples (8, 16 or 32); <=32 to pack the occlusion mask in one uint.
-	//									   8 = extra perf tier; 16 = the accuracy set (the analytic-light budget is
-	//									   the primary 60-FPS lever, so the granted lights keep the full ray set)
+	//									   8 = perf tier, GATE-REJECTED as the default (2026-08-16): 2 EXTENT
+	//									   defects (erebus1_10/11 - the 1/8 coverage quantum shrinks the penumbra
+	//									   body past the 10% tolerance) for only ~12% frame time - the integral is
+	//									   WALK-bound, not sample-bound. 16 = the accuracy set (shipped).
 #endif
 
 
@@ -752,10 +754,18 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
 			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
 			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
-			// NOTE: do NOT jump `se += e1.y` over a culled caster here. It looks like a free win over
+			// NOTE: do NOT jump `se += e1.y` PER LANE on a culled caster. It looks like a free win over
 			// per-record skipping, but it MEASURED SLOWER (24 -> 30 ms worst-scene): the data-dependent
 			// jump diverges the wave's loop trip counts, and the whole wave then serialises on its
 			// slowest lane, costing more than the uniform cheap skip iterations it saves.
+			// The WAVE-UNIFORM jump below is the fix: only when EVERY lane culls the caster (the common
+			// case - a wave covers ~8x8 px, a tiny world footprint, and most casters are far from it)
+			// does the whole wave take one scalar branch over the span. No lane loses records it would
+			// have walked, so it is bit-exact; lanes that disagree fall back to the per-record skip.
+			if( WaveActiveAllTrue( swSkip ) )
+			{
+				se += ( int )e1.y;
+			}
 			continue;
 		}
 		if( se + 1 >= swN ) { break; }		// malformed tail (needs the triangle's second record)

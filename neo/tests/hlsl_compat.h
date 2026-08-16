@@ -60,6 +60,11 @@ inline float abs( float x ) { return x < 0.0f ? -x : x; }
 inline float sqrt( float x ) { return std::sqrt( x ); }
 inline float atan2( float y, float x ) { return std::atan2( y, x ); }
 
+// wave intrinsics: the C++ test build is a single-lane wave, so the collective reductions are the
+// identity - semantically exact for lane count 1 (the shader's wave-uniform jumps degrade to the
+// per-lane skip, which walks the same records).
+inline bool WaveActiveAllTrue( bool b ) { return b; }
+
 // StructuredBuffer<float4> stand-in. The shared coverage function takes this as a trailing parameter
 // (SW_EDGEBUF_PARAM) in C++; in HLSL the parameter is absent and t_SoftEdges is the global resource.
 struct SoftEdgeBuffer

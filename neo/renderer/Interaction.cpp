@@ -713,6 +713,13 @@ the front set only when it grazes, where its area is 0). The light-silhouette pa
 Reuses the softShadowEdge_t stream: each triangle is TWO records - recA = ( v0, v1 ), recB = ( v1, v2 ) -
 so SoftShadow_FaceCoverage reads v0,v1 from recA and v2 from recB.e1. No light facing/selection is applied;
 the per-fragment receiver facing does that. World space, e0.w = 0 (>= 0 so it is never mistaken for a header).
+
+Do NOT midpoint-subdivide oversized triangles into a finer stream (with or without bounding-sphere
+node records for subtree jumps): measured 2026-08-16, every honest configuration regressed 1.5-2x -
+the per-fragment walk touches every record at least once, so the 4-20x stream inflation costs more
+VMEM than the tighter cone culls save, and the data-dependent subtree jumps serialise the wave64
+loop (same failure as the caster-header jump-skip). The "wins" in early runs were frames silently
+DROPPING most soft records over the frame budget.
 =====================
 */
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
