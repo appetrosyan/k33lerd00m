@@ -1604,6 +1604,11 @@ int R_SoftShadowGate( const char* arg )
 	const int launchStencil = cvarSystem->GetCVarInteger( "r_useStencilShadows" );
 	const int launchMapping = cvarSystem->GetCVarInteger( "r_useShadowMapping" );
 	const int launchContact = cvarSystem->GetCVarInteger( "r_shadowMapPCSSAnalyticContact" );
+	// The probes set r_shadowPenumbraSize to EACH capture light's stored radius (GateSetup) and never
+	// restore it, so the bench inherited whichever light was probed LAST - a different, arbitrary disk
+	// radius per capture. That taints every A/B: the coverage cost scales with the disk, and the
+	// subdivision threshold is a multiple of it. Bench with the LAUNCH radius, like the shipped game.
+	const float launchPenumbra = cvarSystem->GetCVarFloat( "r_shadowPenumbraSize" );
 
 	// map world cache: consecutive captures share the map, load it once
 	idStr loadedMap;
@@ -1707,6 +1712,11 @@ int R_SoftShadowGate( const char* arg )
 		// this camera are skipped silently (a matched light can sit behind a closed door); only if
 		// NONE draws is it a SETUP defect.
 		std::vector<int> probeLights;
+		// bench-only mode: skip every per-light probe (they cost ~40-60 s per capture) and go straight
+		// to the timed full frames - the fast loop for perf-config sweeps. NOT a correctness verdict:
+		// defect counting needs the probes, so PASS from a bench-only run means nothing.
+		extern idCVar com_softShadowGateBenchOnly;
+		if( !com_softShadowGateBenchOnly.GetBool() )
 		for( int li = 0; li < ( int )cap.lights.size(); li++ )
 		{
 			if( cap.lights[li].edgeCount > 0 )
@@ -1718,7 +1728,7 @@ int R_SoftShadowGate( const char* arg )
 		{
 			return cap.lights[a].edgeCount > cap.lights[b].edgeCount;
 		} );
-		if( probeLights.empty() )
+		if( probeLights.empty() && !com_softShadowGateBenchOnly.GetBool() )
 		{
 			common->Printf( "[softgate] %s: no light with soft edges -> SETUP defect (degenerate capture)\n", cap.name.c_str() );
 			GateDefect d;
@@ -2126,22 +2136,32 @@ int R_SoftShadowGate( const char* arg )
 			cvarSystem->SetCVarInteger( "r_useStencilShadows", launchStencil );
 			cvarSystem->SetCVarInteger( "r_useShadowMapping", launchMapping );
 			cvarSystem->SetCVarInteger( "r_shadowMapPCSSAnalyticContact", launchContact );
+			cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", launchPenumbra );
 			for( int wu = 0; wu < 3; wu++ )		// warm-up: caches, atlas, pipelines
 			{
 				GateRenderFrame( rw, &rv );
 			}
 			const int t0 = Sys_Microseconds();
+			int benchRecords = 0, benchDropped = 0;
 			for( int f = 0; f < benchFrames; f++ )
 			{
 				// pipelined like the game loop: frontend builds frame f while the GPU draws f-1
 				rw->RenderScene( &rv );
+				// sample the stream counters BEFORE SwapCommandBuffers resets tr.pc for the next frame
+				benchRecords = Max( benchRecords, tr.pc.c_softShadowEdges );
+				benchDropped = Max( benchDropped, tr.pc.c_softShadowDroppedEdges );
 				const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
 				tr.RenderCommandBuffers( cmd );
 			}
 			tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );	// drain the last frame
 			const double ms = ( Sys_Microseconds() - t0 ) / 1000.0 / benchFrames;
-			common->Printf( "[softgate] BENCH %-14s %6.2f ms/frame (%4.0f FPS) over %d frames, %d map lights\n",
-							cap.name.c_str(), ms, 1000.0 / ms, benchFrames, ( int )mapLights.size() );
+			// stream accounting from the LAST bench frame: dropped>0 means the frame BUDGET silently
+			// erased whole lights' soft shadows - such a bench time is a lie (faster because shadows
+			// are missing), so the drop count must be printed next to the ms it taints.
+			common->Printf( "[softgate] BENCH %-14s %6.2f ms/frame (%4.0f FPS) over %d frames, %d map lights, "
+							"%d soft records (%d dropped)\n",
+							cap.name.c_str(), ms, 1000.0 / ms, benchFrames, ( int )mapLights.size(),
+							benchRecords, benchDropped );
 			for( qhandle_t bh : benchLights )
 			{
 				rw->FreeLightDef( bh );

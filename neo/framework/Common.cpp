@@ -141,6 +141,7 @@ idCVar com_softShadowSelfTest( "com_softShadowSelfTest", "", CVAR_SYSTEM, "run t
 // Green iff ZERO defects. Empty = normal boot.
 idCVar com_softShadowGate( "com_softShadowGate", "", CVAR_SYSTEM, "run the minimal-init soft-shadow GPU defect gate on this .softcap directory (or 'corpus'), then quit" );
 idCVar com_softShadowGateBench( "com_softShadowGateBench", "0", CVAR_SYSTEM | CVAR_INTEGER, "softgate: additionally time N pipelined FULL frames (all map lights, real shading) per capture and print ms/FPS - the 60-FPS optimisation instrument. 0 = off" );
+idCVar com_softShadowGateBenchOnly( "com_softShadowGateBenchOnly", "0", CVAR_SYSTEM | CVAR_BOOL, "softgate: skip all per-light defect probes and run ONLY the bench frames - fast perf-config sweeps (~seconds per capture instead of a minute). PASS from a bench-only run is NOT a correctness verdict." );
 
 // For doom classic
 struct Globals;
