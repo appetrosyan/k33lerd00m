@@ -60,6 +60,16 @@ the Free Software Foundation, either version 3 of the License, or
 	#define SW_FACE_LEGACY 0
 #endif
 
+// SW_FACE_HOIST_DIRS: 1 = precompute all K sample ray directions into a per-fragment swDir[] array;
+// 0 = recompute each direction in-loop from the (unrolled-immediate) disk table + the hoisted rotation
+// and basis vectors. Bit-exact either way - same expression, same order. The array costs K*3 VGPRs live
+// across the whole triangle loop (48 at K=16), which capped the shipped interaction shader at 96 VGPRs
+// = 16 waves/SIMD (RADV shaderstats); recomputing costs ~10 VALU per sample-test but frees the
+// registers for occupancy. Distinct from SW_FACE_LEGACY: the triangle-constant qq/e2qq hoists STAY.
+#ifndef SW_FACE_HOIST_DIRS
+	#define SW_FACE_HOIST_DIRS 0
+#endif
+
 // --------------------------------------------------------------------------- decomposed primitives
 // Every intermediate step is a named pure function so each behaviour is unit-testable in isolation
 // (neo/tests/SoftShadowPrimitives_test.cpp). Same source compiles as HLSL and C++.
@@ -721,7 +731,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 	// once per fragment instead of recomputing the rotate + disk placement inside the triangle loop for every
 	// triangle. Bit-exact (identical values). Trades a per-fragment swDir[] (register pressure) for removing that
 	// redundant per-triangle work; the sample loop below just reads swDir[i].
-#if !SW_FACE_LEGACY
+#if !SW_FACE_LEGACY && SW_FACE_HOIST_DIRS
 	float3 swDir[SW_FACE_SAMPLES];
 	for( int di = 0; di < SW_FACE_SAMPLES; di++ )
 	{
@@ -792,7 +802,9 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
 		{
 			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }		// sample already blocked: skip
-#if SW_FACE_LEGACY
+#if SW_FACE_LEGACY || !SW_FACE_HOIST_DIRS
+			// in-loop direction from unrolled immediates: identical expression to the hoisted array,
+			// ~10 VALU per test, zero registers held across the triangle loop (occupancy win)
 			float2 s0  = swDisk[i];
 			float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
 			float3 dir = swBase + swSu * sc.x + swSv * sc.y;
