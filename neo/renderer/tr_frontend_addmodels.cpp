@@ -53,7 +53,13 @@ srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent,
 void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
 							 float penumbraSize, const float* modelToWorld,
 							 softShadowEdge_t** outEdges, int* outNumEdges );
+// analytic soft shadows: FRONT-FACE coverage stream (caster triangles as edge-pairs) - accurate receiver-disk
+// coverage, temporally stable; the light-silhouette path above undershoots off-axis (Interaction.cpp).
+void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
+							 float penumbraSize, const float* modelToWorld,
+							 softShadowEdge_t** outEdges, int* outNumEdges );
 extern idCVar r_shadowPenumbraSize;	// soft shadow volumes: light source radius (RenderSystem_init.cpp)
+extern idCVar r_softShadowFaceCoverage;	// 1 = stream caster faces + front-face coverage instead of light silhouette
 
 idCVar r_skipStaticShadows( "r_skipStaticShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip static shadows" );
 idCVar r_skipDynamicShadows( "r_skipDynamicShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip dynamic shadows" );
@@ -1321,8 +1327,18 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					const int swCollectStart = Sys_Microseconds();
 					softShadowEdge_t* sedges = NULL;
 					int nedges = 0;
-					R_CollectPenumbraEdges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
-											vEntity->modelMatrix, &sedges, &nedges );
+					// FRONT-FACE coverage streams the caster's triangles (accurate + stable); the default streams
+					// the light silhouette (undershoots off-axis). Both fill the same softShadowEdge_t records.
+					if( r_softShadowFaceCoverage.GetBool() )
+					{
+						R_CollectPenumbraFaces( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
+												vEntity->modelMatrix, &sedges, &nedges );
+					}
+					else
+					{
+						R_CollectPenumbraEdges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
+												vEntity->modelMatrix, &sedges, &nedges );
+					}
 					tr.pc.softShadowMicroSec += Sys_Microseconds() - swCollectStart;
 					extern int fe_softEdgesCollected;
 					fe_softEdgesCollected += nedges;

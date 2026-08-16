@@ -1706,7 +1706,7 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 						currentSoftEdgeCount = din->vLight->softEdgeCount;
 
 						float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), ( float )currentSoftEdgeCount, 0.0f };
-						SetVertexParm( RENDERPARM_JITTERTEXSCALE, swParm );
+						SetVertexParm( RENDERPARM_JITTERTEXSCALE, swParm );	// vertex bank; the PS reads the fragment bank (sign-select is applied there)
 
 						if( din->vLight->parallel )
 						{
@@ -1897,7 +1897,11 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			currentSoftEdgeBuffer = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
 			currentSoftEdgeCount = din->vLight->softEdgeCount;
 
-			float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), ( float )currentSoftEdgeCount, ( float )r_softShadowDebugShader.GetInteger() };
+			// SIGN of the record count selects the coverage path in the pixel shader: negative = FRONT-FACE
+			// stream (r_softShadowFaceCoverage, accurate + stable), positive = light-silhouette edge stream.
+			extern idCVar r_softShadowFaceCoverage;
+			const float swCountSigned = r_softShadowFaceCoverage.GetBool() ? -( float )currentSoftEdgeCount : ( float )currentSoftEdgeCount;
+			float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), swCountSigned, ( float )r_softShadowDebugShader.GetInteger() };
 			SetFragmentParm( RENDERPARM_JITTERTEXSCALE, swParm );	// the pixel shader reads rpJitterTexScale from the FRAGMENT bank
 
 			// first edge element in the joint buffer (structStride 16 bytes) - the shader indexes from here
@@ -4875,7 +4879,14 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			// and the cheap unshadowed variant on the provably-lit remainder (stencil == 0). Bit-identical.
 			extern idCVar r_softShadowBandMask;
 			extern idCVar r_softShadowAAM;
-				const bool bandMask = lightIsSoft && ( r_softShadowBandMask.GetBool() || r_softShadowAAM.GetBool() ) && vLight->softEdgeCache != 0;
+			extern idCVar r_softShadowFaceCoverage;
+				// FACE-COVERAGE mode owns the WHOLE shadow: front-face disk-sample coverage saturates to 1 in the
+				// umbra on its own (union sampling, no drain), so the band prepass is not merely redundant but
+				// HARMFUL - it inflates the triangle-edge FACE stream into phantom penumbra wedges (the stream is
+				// edge-pairs, not a silhouette) and stamps an over-sharp CORE umbra. So skip the band entirely and
+				// let the coverage shader run on every lit pixel; umbra/penumbra/lit all emerge from coverage.
+				const bool bandMask = lightIsSoft && ( r_softShadowBandMask.GetBool() || r_softShadowAAM.GetBool() )
+									  && !r_softShadowFaceCoverage.GetBool() && vLight->softEdgeCache != 0;
 			if( bandMask )
 			{
 				extern idCVar r_shadowPenumbraSize;
@@ -7038,6 +7049,20 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	// render all light <-> geometry interactions to a depth buffer atlas
 	//-------------------------------------------------
 	ShadowAtlasPass( _viewDef );
+
+	//-------------------------------------------------
+	// image-driven VRS (r_softShadowVRS 3): fill the per-tile shading-rate image before the soft-wedge draws.
+	// Milestone 1 = a uniform 2x2 fill (rate code (log2(w)<<2)|log2(h) = (1<<2)|1 = 5) to prove the image path
+	// reaches the draw (should reproduce the constant-2x2 frame time). Milestone 2 replaces this with the
+	// coverage-spread compute pre-pass. keepInitialState(ShadingRateSurface) => nvrhi restores the layout after.
+	{
+		extern idCVar r_softShadowVRS;
+		if( r_softShadowVRS.GetInteger() >= 3 && globalFramebuffers.softShadowRateImage != nullptr )
+		{
+			const uint32_t RATE_2x2 = ( 1u << 2 ) | 1u;		// KHR fragment-shading-rate attachment encoding
+			commandList->clearTextureUInt( globalFramebuffers.softShadowRateImage, nvrhi::AllSubresources, RATE_2x2 );
+		}
+	}
 
 	//-------------------------------------------------
 	// main light renderer

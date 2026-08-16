@@ -163,6 +163,12 @@ struct globalFramebuffers_t
 	Framebuffer*				smaaBlendFBO;
 	Framebuffer*				guiRenderTargetFBO;
 	Framebuffer*				accumFBO;
+
+	// Image-driven VRS for the analytic soft-shadow interaction draw (r_softShadowVRS 3): a per-tile
+	// shading-rate image attached to hdrFBO. R8_UINT, sized to the tile grid (renderRes / softShadowRateTile);
+	// a compute pre-pass writes 1x1 (fine: contact/kinks) vs 2x2 (coarse: smooth penumbra) per tile.
+	nvrhi::TextureHandle		softShadowRateImage;
+	uint32_t					softShadowRateTile;		// device shading-rate-image texel size (px), 0 = VRS unsupported
 };
 
 extern globalFramebuffers_t globalFramebuffers;

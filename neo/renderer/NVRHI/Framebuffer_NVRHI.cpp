@@ -142,10 +142,43 @@ void Framebuffer::ResizeFramebuffers( bool reloadImages )
 			.addColorAttachment( globalImages->ldrImage->texture )
 			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
 
-	globalFramebuffers.hdrFBO = new Framebuffer( "_hdr",
-			nvrhi::FramebufferDesc()
+	// Image-driven VRS rate image for the soft-shadow interaction draw (Milestone 1 plumbing). R8_UINT sized to
+	// the device tile grid; UAV (a compute pre-pass writes it) + ShadingRateSurface (the draw reads it). Created
+	// unconditionally (small); only ATTACHED to hdrFBO when r_softShadowVRS>=3 so the default keeps the hdr render
+	// pass VRS-free (byte-identical). Toggling the cvar needs a framebuffer rebuild (vid_restart / set at launch).
+	extern idCVar r_softShadowVRS;
+	nvrhi::IDevice* vrsDev = deviceManager->GetDevice();
+	globalFramebuffers.softShadowRateImage = nullptr;
+	globalFramebuffers.softShadowRateTile = 0;
+	if( vrsDev != NULL && vrsDev->queryFeatureSupport( nvrhi::Feature::VariableRateShading ) )
+	{
+		nvrhi::VariableRateShadingFeatureInfo vinfo = {};
+		vrsDev->queryFeatureSupport( nvrhi::Feature::VariableRateShading, &vinfo, sizeof( vinfo ) );
+		uint32_t tile = vinfo.shadingRateImageTileSize > 0 ? vinfo.shadingRateImageTileSize : 16;
+		globalFramebuffers.softShadowRateTile = tile;
+		const uint32_t rw = globalImages->currentRenderHDRImage->texture->getDesc().width;
+		const uint32_t rh = globalImages->currentRenderHDRImage->texture->getDesc().height;
+		nvrhi::TextureDesc rd;
+		rd.width = ( rw + tile - 1 ) / tile;
+		rd.height = ( rh + tile - 1 ) / tile;
+		rd.format = nvrhi::Format::R8_UINT;
+		rd.dimension = nvrhi::TextureDimension::Texture2D;
+		rd.isUAV = true;
+		rd.isShadingRateSurface = true;
+		rd.initialState = nvrhi::ResourceStates::ShadingRateSurface;
+		rd.keepInitialState = true;
+		rd.debugName = "_softShadowRate";
+		globalFramebuffers.softShadowRateImage = vrsDev->createTexture( rd );
+	}
+
+	nvrhi::FramebufferDesc hdrDesc = nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->currentRenderHDRImage->texture )
-			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
+			.setDepthAttachment( globalImages->currentDepthImage->texture );
+	if( globalFramebuffers.softShadowRateImage && r_softShadowVRS.GetInteger() >= 3 )
+	{
+		hdrDesc.setShadingRateAttachment( globalFramebuffers.softShadowRateImage );
+	}
+	globalFramebuffers.hdrFBO = new Framebuffer( "_hdr", hdrDesc );
 
 	// HDR output: isolated 2D UI layer (shares the depth/stencil with ldrFBO so GUI
 	// masking still works), composited into ldrImage in linear light before present.

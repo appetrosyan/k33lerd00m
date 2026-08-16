@@ -578,8 +578,18 @@ void idRenderBackend::DrawElementsWithCounters( const drawSurf_t* surf, bool sha
 					  program == BUILTIN_INTERACTION_SOFT_WEDGE_POINT || program == BUILTIN_INTERACTION_SOFT_WEDGE_POINT_SKINNED ||
 					  program == BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL || program == BUILTIN_INTERACTION_SOFT_WEDGE_PARALLEL_SKINNED ) )
 			{
-				state.shadingRateState.setEnabled( true )
-				.setShadingRate( vrs >= 2 ? nvrhi::VariableShadingRate::e4x4 : nvrhi::VariableShadingRate::e2x2 );
+				if( vrs >= 3 && globalFramebuffers.softShadowRateImage != nullptr )
+				{
+					// IMAGE-DRIVEN: the per-tile rate image (written by the pre-pass, attached to hdrFBO) drives the
+					// rate. Override replaces the pipeline's 1x1 primitive rate with the image's per-tile rate.
+					state.shadingRateState.setEnabled( true ).setImageCombiner( nvrhi::ShadingRateCombiner::Override );
+				}
+				else
+				{
+					// CONSTANT bring-up rate (uniform coarsening). 4x4 clamps to maxFragmentSize (2x2 on RDNA).
+					state.shadingRateState.setEnabled( true )
+					.setShadingRate( vrs >= 2 ? nvrhi::VariableShadingRate::e4x4 : nvrhi::VariableShadingRate::e2x2 );
+				}
 			}
 		}
 

@@ -29,6 +29,8 @@ the Free Software Foundation, either version 3 of the License, or
 #include <array>
 #include <map>
 #include <cmath>
+#include <cstdint>
+#include <utility>
 
 namespace swtest
 {
@@ -208,6 +210,94 @@ inline float LiveShadow( const std::vector<float4>& rec, float3 P, float3 L, flo
 {
 	SoftEdgeBuffer buf{ rec.data(), ( int )rec.size() };
 	return 1.0f - saturate( SoftShadow_WedgeOcclusion( P, L, r, 0, ( int )( rec.size() / 2 ), 0.0f, buf ) );
+}
+
+// per-triangle bounding radius (max |vertex - centroid|), a hair inflated so the shader's cone cull stays
+// CONSERVATIVE (never drops a real occluder) even against GPU float rounding. Precomputed here and carried in
+// recA.e0.w, so SoftShadow_FaceCoverage reads it instead of recomputing it every fragment. Must match the
+// engine's R_CollectPenumbraFaces so the C++-compiled shader in the tests sees the same value the GPU would.
+inline float SoftTriRad( float3 v0, float3 v1, float3 v2 )
+{
+	float3 cen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+	float r = std::fmax( len3( v0 - cen ), std::fmax( len3( v1 - cen ), len3( v2 - cen ) ) );
+	return r * 1.00001f;
+}
+
+// Pack a box into the FRONT-FACE stream SoftShadow_FaceCoverage consumes (the r_softShadowFaceCoverage
+// path): header ( centre, radius, recordCount ) then each triangle as TWO softShadowEdge_t records
+// recA = ( v0, v1 ), recB = ( v1, v2 ) - so v0,v1 come from recA and v2 from recB.e1. Two tris per box
+// quad, outward-wound (MakeBox orients the faces). This is EXACTLY what R_CollectPenumbraFaces streams,
+// so tests that read it exercise the shipped buffer format, not a bespoke one.
+inline std::vector<float4> BuildFaceCaster( const Box& b )
+{
+	float3 c( 0, 0, 0 );
+	for( int i = 0; i < 8; i++ ) { c = c + b.c[i]; }
+	c = c * ( 1.0f / 8.0f );
+	float rad = 0;
+	for( int i = 0; i < 8; i++ ) { float3 d = b.c[i] - c; rad = std::fmax( rad, len3( d ) ); }
+	std::vector<float4> recs;
+	for( int f = 0; f < 6; f++ )
+	{
+		int idx[6] = { b.f[f][0], b.f[f][1], b.f[f][2], b.f[f][0], b.f[f][2], b.f[f][3] };	// two outward tris
+		for( int t = 0; t < 2; t++ )
+		{
+			float3 v0 = b.c[idx[t * 3 + 0]], v1 = b.c[idx[t * 3 + 1]], v2 = b.c[idx[t * 3 + 2]];
+			recs.push_back( float4( v0.x, v0.y, v0.z, SoftTriRad( v0, v1, v2 ) ) ); recs.push_back( float4( v1.x, v1.y, v1.z, 0 ) );	// recA (e0.w = triRad)
+			recs.push_back( float4( v1.x, v1.y, v1.z, 0 ) ); recs.push_back( float4( v2.x, v2.y, v2.z, 0 ) );	// recB
+		}
+	}
+	std::vector<float4> buf;
+	buf.push_back( float4( c.x, c.y, c.z, -1.0f ) );				// header e0 = ( centre, -1 )
+	buf.push_back( float4( rad, ( float )( recs.size() / 2 ), 0, 0 ) );	// header e1 = ( radius, recordCount )
+	buf.insert( buf.end(), recs.begin(), recs.end() );
+	return buf;
+}
+
+// front-face coverage (r_softShadowFaceCoverage path) as an occlusion in [0,1] from the box's face stream.
+inline float FaceOcclusion( const std::vector<float4>& frec, float3 P, float3 L, float r )
+{
+	SoftEdgeBuffer buf{ frec.data(), ( int )frec.size() };
+	return saturate( SoftShadow_FaceCoverage( P, L, r, 0, ( int )( frec.size() / 2 ), buf ) );
+}
+
+// Build the SoftShadow_FaceCoverage stream from a CASTER's mesh triangles (real capture geometry, as opposed
+// to BuildFaceCaster's single box): a header ( centre, radius, recordCount ) then each triangle as recA=(v0,v1)
+// recB=(v1,v2). shellEdges carries the same records as edges (legacy diagnostic for the retired band prepass).
+// Shared by every pipeline test so they all feed the shipped stream, not a bespoke one.
+struct FaceCasterCPU
+{
+	std::vector<float4> faceRecs;
+	std::vector<std::pair<float3, float3>> shellEdges;
+	float3 centre;
+};
+inline FaceCasterCPU BuildFaceCasterFromMesh( const float* verts, const uint32_t* idx, uint32_t first, uint32_t num )
+{
+	FaceCasterCPU fc;
+	float3 lo( 1e30f, 1e30f, 1e30f ), hi( -1e30f, -1e30f, -1e30f );
+	for( uint32_t k = first; k < first + num; k++ )
+	{
+		const float* v = &verts[idx[k] * 3];
+		lo = float3( std::fmin( lo.x, v[0] ), std::fmin( lo.y, v[1] ), std::fmin( lo.z, v[2] ) );
+		hi = float3( std::fmax( hi.x, v[0] ), std::fmax( hi.y, v[1] ), std::fmax( hi.z, v[2] ) );
+	}
+	fc.centre = ( lo + hi ) * 0.5f;
+	float rad = 0.5f * std::sqrt( dot( hi - lo, hi - lo ) );
+	std::vector<float4> recs;
+	for( uint32_t t = first; t + 2 < first + num; t += 3 )
+	{
+		const float* p0 = &verts[idx[t + 0] * 3];
+		const float* p1 = &verts[idx[t + 1] * 3];
+		const float* p2 = &verts[idx[t + 2] * 3];
+		float3 v0( p0[0], p0[1], p0[2] ), v1( p1[0], p1[1], p1[2] ), v2( p2[0], p2[1], p2[2] );
+		recs.push_back( float4( v0.x, v0.y, v0.z, SoftTriRad( v0, v1, v2 ) ) ); recs.push_back( float4( v1.x, v1.y, v1.z, 0 ) );	// recA (e0.w = triRad)
+		recs.push_back( float4( v1.x, v1.y, v1.z, 0 ) ); recs.push_back( float4( v2.x, v2.y, v2.z, 0 ) );	// recB
+		fc.shellEdges.push_back( { v0, v1 } );
+		fc.shellEdges.push_back( { v1, v2 } );
+	}
+	fc.faceRecs.push_back( float4( fc.centre.x, fc.centre.y, fc.centre.z, -1.0f ) );
+	fc.faceRecs.push_back( float4( rad, ( float )( recs.size() / 2 ), 0, 0 ) );
+	fc.faceRecs.insert( fc.faceRecs.end(), recs.begin(), recs.end() );
+	return fc;
 }
 
 // deterministic LCG so fuzz is reproducible across platforms (no <random> variance)

@@ -59,7 +59,10 @@ struct idUnitTestCase
 	const char* suite;
 	const char* name;
 	idTestFn    fn;
-	idUnitTestCase( const char* s, const char* n, idTestFn f );
+	bool        pipeline;	// true = drives the full shipped stream->band->coverage->ray-truth path (a real
+	//                          correctness gate); false = ISOLATED unit/sanity (a passing one proves NOTHING
+	//                          about the rendered image - it can be green while the frame is unusable).
+	idUnitTestCase( const char* s, const char* n, idTestFn f, bool pipe = false );
 };
 
 // registry is a function-local static so registration order never depends on TU init order.
@@ -69,9 +72,20 @@ std::vector<idUnitTestCase*>& idUnitTestRegistry();
 // (0 = all passed), suitable as a process exit code.
 int RunAllUnitTests( const char* filter );
 
+// ISOLATED unit/sanity test. Exercises a function/primitive in isolation - USEFUL FOR DEVELOPMENT, but a
+// pass is NOT evidence the renderer produces a correct image (it stays green while the frame is unusable).
 #define TEST( suite, name )                                                              \
 	static void suite##_##name##_fn( idTestResult& );                                    \
-	static idUnitTestCase suite##_##name##_reg( #suite, #name, suite##_##name##_fn );     \
+	static idUnitTestCase suite##_##name##_reg( #suite, #name, suite##_##name##_fn, false ); \
+	static void suite##_##name##_fn( idTestResult& _tr )
+
+// FULL-PIPELINE test: drives the shipped stream -> band/shell classification -> coverage -> ray-truth
+// composition (on real captures where possible). THIS is the correctness gate. A pipeline test MUST run in
+// the actually-shipped path (e.g. face-coverage when r_softShadowFaceCoverage would be on), or it is only
+// testing a path the game no longer takes.
+#define PIPELINE_TEST( suite, name )                                                     \
+	static void suite##_##name##_fn( idTestResult& );                                    \
+	static idUnitTestCase suite##_##name##_reg( #suite, #name, suite##_##name##_fn, true ); \
 	static void suite##_##name##_fn( idTestResult& _tr )
 
 // _tr is the hidden idTestResult& each TEST body receives.

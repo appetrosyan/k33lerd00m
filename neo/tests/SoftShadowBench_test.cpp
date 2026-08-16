@@ -116,7 +116,7 @@ TEST( SoftShadowBench, wedge_throughput )
 	Workload w = MakeWorkload( 30, 64, 20260815u );	// ~hundreds of records; 4096 receiver calls
 	volatile double sink = RunOnce( w );			// warm caches / pull code in
 
-	const int REPS = 20;
+	const int REPS = 5;		// informational throughput bench (finite-check only); keep the unit tier fast
 	std::chrono::high_resolution_clock::time_point t0 = std::chrono::high_resolution_clock::now();
 	double acc = 0.0;
 	for( int r = 0; r < REPS; r++ )
@@ -133,6 +133,61 @@ TEST( SoftShadowBench, wedge_throughput )
 	std::printf( "    [bench] %.1f ns/call   %.3f ns/record(upper-bound)   %.2f Mcalls/s   (sink=%.4g)\n",
 				 ns / calls, ns / recUpper, calls / ( ns / 1e3 ), ( double )sink );
 	CHECK( acc == acc );	// a benchmark only needs to be finite/non-NaN; it is a measurement, not a pass/fail
+}
+
+// -------------------------------------------------------------------------- FACE vs WEDGE throughput
+// The face path (r_softShadowFaceCoverage) casts SW_FACE_SAMPLES disk rays per triangle (Moller-Trumbore) vs
+// the wedge path's O(1) circle-triangle area per edge. This measures the real cost multiplier on one workload:
+// many box casters in ONE combined stream (edge stream for wedge, face stream for face), swept over a floor grid
+// spanning lit/penumbra/umbra - the same lit/umbra mix the pixel shader sees, so the per-sample early-out
+// (a blocked sample is never retested; a fully-occluded fragment breaks) is exercised realistically.
+TEST( SoftShadowBench, face_vs_wedge_throughput )
+{
+	const int NBOX = 30, GRID = 64;
+	float3 L( 0, 0, 12 ); float r = 2.0f;
+	Rng rng( 20260815u );
+	std::vector<float4> edgeStream; std::vector<std::vector<float3>> loops;
+	std::vector<float4> faceStream;
+	for( int cbi = 0; cbi < NBOX; cbi++ )
+	{
+		float3 C( rng.f( -4, 4 ), rng.f( -4, 4 ), rng.f( 3.0f, 8.0f ) );
+		float3 h( rng.f( 0.3f, 1.5f ), rng.f( 0.3f, 1.5f ), rng.f( 0.2f, 1.5f ) );
+		Box b = MakeBox( C, h, rng.f( 0, 3.14f ), rng.f( -0.3f, 0.3f ) );
+		std::vector<float3> loop = Silhouette( b, L );
+		if( loop.size() >= 3 ) { loops.push_back( loop ); }
+		std::vector<float4> fs = BuildFaceCaster( b );
+		faceStream.insert( faceStream.end(), fs.begin(), fs.end() );		// concatenated: mask unions across casters
+	}
+	edgeStream = BuildCaster( loops );
+	int edgeRec = ( int )( edgeStream.size() / 2 );
+	int faceRec = ( int )( faceStream.size() / 2 );
+	std::vector<float3> P;
+	for( int i = 0; i < GRID; i++ )
+		for( int j = 0; j < GRID; j++ )
+			P.push_back( float3( -5.0f + 10.0f * i / ( GRID - 1 ), -5.0f + 10.0f * j / ( GRID - 1 ), 0.0f ) );
+
+	SoftEdgeBuffer eb{ edgeStream.data(), ( int )edgeStream.size() };
+	SoftEdgeBuffer fb{ faceStream.data(), ( int )faceStream.size() };
+	volatile double sink = 0;
+	const int REPS = 5;
+	std::chrono::high_resolution_clock::time_point t0 = std::chrono::high_resolution_clock::now();
+	double accW = 0;
+	for( int rep = 0; rep < REPS; rep++ )
+		for( size_t i = 0; i < P.size(); i++ ) { accW += SoftShadow_WedgeOcclusion( P[i], L, r, 0, edgeRec, 0.0f, eb ); }
+	std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+	double accF = 0;
+	for( int rep = 0; rep < REPS; rep++ )
+		for( size_t i = 0; i < P.size(); i++ ) { accF += SoftShadow_FaceCoverage( P[i], L, r, 0, faceRec, fb ); }
+	std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
+	sink = accW + accF;
+
+	long calls = ( long )P.size() * REPS;
+	double nsW = std::chrono::duration<double, std::nano>( t1 - t0 ).count() / calls;
+	double nsF = std::chrono::duration<double, std::nano>( t2 - t1 ).count() / calls;
+	std::printf( "    [face-bench] wedge: %d edge records, %.1f ns/eval\n", edgeRec, nsW );
+	std::printf( "    [face-bench] face : %d triangles,    %.1f ns/eval  (%.1fx the wedge cost)\n", faceRec, nsF, nsW > 1e-6 ? nsF / nsW : 0.0 );
+	std::printf( "    [face-bench] (sink=%.4g)\n", ( double )sink );
+	CHECK( accF == accF );	// measurement, not a pass/fail gate
 }
 
 // -------------------------------------------------------------------------- deviation-from-anchor gate

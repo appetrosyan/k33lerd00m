@@ -52,6 +52,14 @@ the Free Software Foundation, either version 3 of the License, or
 	#define SW_JUMP_SKIP 1
 #endif
 
+// SW_FACE_LEGACY: 0 = the four LOSSLESS face-coverage hoists (precompute triRad from the stream, hoist the
+// per-sample ray dirs and the triangle-constant qq/e2qq out of the loop, skip the crack-close on trivial masks);
+// 1 = recompute everything in-loop as before. Bit-EXACT either way (same values); the toggle exists only to A/B
+// the perf of the hoists (the shipped default is 0). See SoftShadowBench.face_vs_wedge_throughput.
+#ifndef SW_FACE_LEGACY
+	#define SW_FACE_LEGACY 0
+#endif
+
 // --------------------------------------------------------------------------- decomposed primitives
 // Every intermediate step is a named pure function so each behaviour is unit-testable in isolation
 // (neo/tests/SoftShadowPrimitives_test.cpp). Same source compiles as HLSL and C++.
@@ -571,6 +579,269 @@ SW_FUNC float SoftShadow_ProcCaster( float3 swP, float3 swL, float swR, bool raB
 		if( abs( raArea ) > 1.2f * ( PI * swR2 ) ) { raArea = 0.0f; }
 	}
 	return saturate( abs( raArea ) * swInv );
+}
+
+// ===================================================================================================
+// FRONT-FACE COVERAGE by DISK-SAMPLE UNION. Coverage = fraction of the area light's disk that is occluded
+// by the caster, as seen from the receiver: cast SW_FACE_SAMPLES equal-area rays from swP through fixed
+// sample points on the disk and count how many are blocked by ANY caster triangle. This is exactly a
+// low-sample area-light ray query (the same quantity the RT oracle integrates), so the umbra EMERGES where
+// every ray is blocked and the penumbra is the smooth fraction between - no stencil, no hard core stamp.
+//
+// WHY UNION SAMPLING, not the signed-area integral it replaces. The old body summed each front triangle's
+// disk-clipped projected SIGNED area; by Green's theorem that equals the area enclosed by the projected
+// front-face BOUNDARY, which is the true receiver silhouette ONLY for a closed, consistently-wound manifold.
+// Real Doom3 casters are single-sided walls and non-manifold brush junctions: the front-face boundary does
+// not enclose the disk and the signed contributions cancel, so coverage DRAINED to ~0 inside the umbra
+// (measured 11.5% lit holes on erebus, worst 0.000 where truth = 1). A per-sample ray hit is a UNION, not a
+// signed sum: any triangle covering a sample occludes it, so open/non-manifold/inconsistent-winding geometry
+// saturates correctly. Ray tests are double-sided (facing is irrelevant to occlusion), so the front-facing
+// select and the winding guard are both gone. Cost is O(samples * triangles) with a per-sample early-out
+// (a blocked sample is never retested and a fully-occluded fragment breaks early - the umbra is the CHEAPEST
+// case), and the whole fragment stops once every sample is blocked.
+//
+// ponytail: fixed SW_FACE_SAMPLES gives coverage in 1/N steps -> mild temporal shimmer as a caster crosses a
+// sample; raise N or add a per-fragment blue-noise rotation of swDisk if it is visible. N=32 packs into one
+// uint mask.
+//
+// Stream layout reuses the edge records (softShadowEdge_t, 2 float4) so the whole flatten/cache/bind path
+// is shared: a header (e0.w < 0) carries the caster centre in e0.xyz and (bounding radius, recordCount) in
+// e1.xy; each triangle is TWO consecutive records - record A = ( v0.xyz, - )( v1.xyz, hdr ), record B =
+// ( v1.xyz, - )( v2.xyz, hdr ) - so v0,v1 come from A and v2 from B.e1. Casters are cull-tested (shared with
+// the edge path); the sample mask is global so casters union for free.
+
+// portable 32-bit popcount (HLSL has countbits, but the C++ test build via hlsl_compat.h does not)
+SW_FUNC int SoftPopcount32( uint x )
+{
+	x = x - ( ( x >> 1 ) & 0x55555555u );
+	x = ( x & 0x33333333u ) + ( ( x >> 2 ) & 0x33333333u );
+	x = ( x + ( x >> 4 ) ) & 0x0f0f0f0fu;
+	return ( int )( ( x * 0x01010101u ) >> 24 );
+}
+
+#ifndef SW_FACE_SAMPLES
+	#define SW_FACE_SAMPLES 16			// equal-area disk samples (16 or 32); <=32 to pack the occlusion mask in one uint
+#endif
+
+
+SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN SW_EDGEBUF_PARAM )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float  swDistPL = swF.distPL;
+	float  swSinA = saturate( swR / swDistPL );
+	float  swCosA = sqrt( 1.0f - swSinA * swSinA );
+	const float swEps = SW_NEAR_EPS;
+
+	// unit-disk sample coords (golden-angle sunflower: equal area => coverage = occluded/N is unbiased) and the
+	// 6 nearest disk-neighbours of each, packed 5 bits each (for the morphological crack-close below).
+#if SW_FACE_SAMPLES == 16
+	const float2 swDisk[16] =
+	{
+		float2( 0.176777f, 0.000000f), float2(-0.225772f, 0.206826f),
+		float2( 0.034558f,-0.393771f), float2( 0.284571f, 0.371173f),
+		float2(-0.522223f,-0.092374f), float2( 0.494695f,-0.314685f),
+		float2(-0.165466f, 0.615525f), float2(-0.315561f,-0.607594f),
+		float2( 0.684642f, 0.250030f), float2(-0.712256f, 0.294009f),
+		float2( 0.343354f,-0.733729f), float2( 0.253730f, 0.808932f),
+		float2(-0.764746f,-0.443186f), float2( 0.897134f,-0.197232f),
+		float2(-0.547507f, 0.778772f), float2(-0.126487f,-0.976090f),
+	};
+	const uint swNbr[16] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x0a132d00u,
+		0x0023a581u, 0x0681014du, 0x0091adc1u, 0x00a231e2u,
+		0x02b281a3u, 0x00c33824u, 0x1a03bc45u, 0x00e0a0c3u,
+		0x02f124e4u, 0x04350105u, 0x06458526u, 0x08560947u,
+	};
+#else
+	const float2 swDisk[32] =
+	{
+		float2( 0.125000f, 0.000000f), float2(-0.159645f, 0.146248f),
+		float2( 0.024436f,-0.278438f), float2( 0.201222f, 0.262459f),
+		float2(-0.369268f,-0.065318f), float2( 0.349802f,-0.222516f),
+		float2(-0.117002f, 0.435242f), float2(-0.223136f,-0.429634f),
+		float2( 0.484115f, 0.176798f), float2(-0.503641f, 0.207896f),
+		float2( 0.242788f,-0.518824f), float2( 0.179414f, 0.572001f),
+		float2(-0.540757f,-0.313380f), float2( 0.634370f,-0.139464f),
+		float2(-0.387146f, 0.550675f), float2(-0.089440f,-0.690200f),
+		float2( 0.549072f, 0.462758f), float2(-0.738878f, 0.030555f),
+		float2( 0.538955f,-0.536332f), float2(-0.036058f, 0.779792f),
+		float2(-0.512818f,-0.614527f), float2( 0.812360f, 0.109302f),
+		float2(-0.688311f, 0.478909f), float2( 0.188086f,-0.836061f),
+		float2( 0.435033f, 0.759191f), float2(-0.850448f,-0.271316f),
+		float2( 0.826102f,-0.381680f), float2(-0.357888f, 0.855156f),
+		float2(-0.319407f,-0.888034f), float2( 0.849909f, 0.446688f),
+		float2(-0.944035f, 0.248845f), float2( 0.536596f,-0.834530f),
+	};
+	const uint swNbr[32] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x20132d00u,
+		0x0478a581u, 0x1121014du, 0x1239adc1u, 0x384a31e2u,
+		0x0a06d470u, 0x3ce0d891u, 0x3ef15cb2u, 0x11036073u,
+		0x1313e684u, 0x01246aa5u, 0x0334db66u, 0x28255f87u,
+		0x2a35e3a8u, 0x2cc267c9u, 0x2ed2ebeau, 0x07871b6bu,
+		0x09979f8cu, 0x0ba8750du, 0x0db8f92eu, 0x0fc97d4fu,
+		0x103ece0bu, 0x13e2522cu, 0x15f2d64du, 0x12bb1a6eu,
+		0x14cb9e8fu, 0x06dc22b0u, 0x08eca6d1u, 0x1e5d2af2u,
+	};
+#endif
+	// ray to disk sample i = swBase + swSu*rot(swDisk[i]) (t=1 lands on the light plane)
+	float3 swBase = swL - swP;
+	float3 swSu = swF.u * swR;
+	float3 swSv = swF.v * swR;
+	// per-fragment rotation of the fixed sample set: a shared pattern correlates the sampling error across
+	// neighbouring pixels into a visible fixed-pattern bias (measured worst meanAbs 0.099 on erebus5/6);
+	// rotating by a hash of swP decorrelates neighbours so it averages out spatially - the CPU analogue of
+	// the jittered rays the RT reference (and the shipped TAA path) already use. Stable in swP => no flicker.
+	float  swHash = dot( swP, float3( 12.9898f, 78.233f, 37.719f ) );
+	float  swAng  = ( swHash - floor( swHash ) ) * ( 2.0f * PI );
+	float  swCa = cos( swAng );
+	float  swSa = sin( swAng );
+
+	// Each sample ray direction depends only on (fragment, sample) - NOT on the triangle - so precompute all K
+	// once per fragment instead of recomputing the rotate + disk placement inside the triangle loop for every
+	// triangle. Bit-exact (identical values). Trades a per-fragment swDir[] (register pressure) for removing that
+	// redundant per-triangle work; the sample loop below just reads swDir[i].
+#if !SW_FACE_LEGACY
+	float3 swDir[SW_FACE_SAMPLES];
+	for( int di = 0; di < SW_FACE_SAMPLES; di++ )
+	{
+		float2 s0 = swDisk[di];
+		float2 sc = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+		swDir[di] = swBase + swSu * sc.x + swSv * sc.y;
+	}
+#endif
+
+	uint swMask = 0u;						// bit i set once sample i's ray is blocked by any triangle (union)
+	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+	bool  swSkip = false;
+	for( int se = 0; se < swN; se++ )
+	{
+		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
+		if( e0.w < 0.0f )					// header: cull the next caster (mask persists => casters union)
+		{
+			float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
+			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
+			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
+			continue;
+		}
+		if( se + 1 >= swN ) { break; }		// malformed tail (needs the triangle's second record)
+		if( swSkip ) { se++; continue; }	// culled: consume both records of this triangle
+
+		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
+		float4 g1 = t_SoftEdges[ swFirstElem + ( se + 1 ) * 2 + 1 ];	// record B's e1 carries v2
+		se++;								// consumed the triangle's second record
+		float3 v0 = float3( e0.x, e0.y, e0.z );
+		float3 v1 = float3( e1.x, e1.y, e1.z );
+		float3 v2 = float3( g1.x, g1.y, g1.z );
+		// PER-TRIANGLE CONE/SLAB REJECT (the big perf lever). The 32 sample rays form a cone: apex swP, axis
+		// swF.nrm, cross-section radius swR at depth swDistPL. A triangle that cannot reach that cone can hit NO
+		// sample, so skip its 32 ray tests entirely. Conservative (over-keeps) => bit-exact: never drops a real
+		// occluder. Because the FACE stream carries ALL of a caster's triangles, not just its silhouette, this is
+		// what keeps a big in-cone caster from costing O(all faces * 32) per fragment.
+		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+		float3 rc   = tcen - swP;
+		float  cd   = dot( rc, swF.nrm );							// centroid depth along the cone axis
+		// triRad (max |vertex - centroid|) is pure triangle geometry - precomputed at stream-build time (a hair
+		// inflated, so the cull stays conservative) and carried in recA.e0.w (already loaded as e0, and >= 0 so it
+		// never trips the header test). Saves the 3 sub / 3 dot / 2 max / sqrt recompute every fragment × triangle.
+#if SW_FACE_LEGACY
+		float  triRad = sqrt( max( dot( v0 - tcen, v0 - tcen ), max( dot( v1 - tcen, v1 - tcen ), dot( v2 - tcen, v2 - tcen ) ) ) );
+#else
+		float  triRad = e0.w;
+#endif
+		if( cd + triRad < swEps ) { continue; }						// wholly behind the receiver
+		if( cd - triRad > swDistPL ) { continue; }					// wholly beyond the light
+		float3 perp = rc - cd * swF.nrm;
+		float  coneR = swR * ( cd + triRad ) / swDistPL;			// max cone radius over the triangle's depth span
+		if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }	// outside the sample cone: cannot occlude
+		float3 edge1 = v1 - v0;
+		float3 edge2 = v2 - v0;
+		float3 sp = swP - v0;
+		// Moller-Trumbore, double-sided (occlusion is facing-independent): a hit with t in (0,1] means the
+		// triangle lies between the receiver and the light plane along this sample ray. All K rays share the
+		// receiver origin, so qq = cross(sp,edge1) and e2qq = dot(edge2,qq) are triangle-constant - hoisted out of
+		// the K-sample loop (they were recomputed identically every sample). Bit-exact; saves a cross + a dot per sample.
+#if !SW_FACE_LEGACY
+		float3 qq   = cross( sp, edge1 );
+		float  e2qq = dot( edge2, qq );
+#endif
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }		// sample already blocked: skip
+#if SW_FACE_LEGACY
+			float2 s0  = swDisk[i];
+			float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+			float3 dir = swBase + swSu * sc.x + swSv * sc.y;
+#else
+			float3 dir = swDir[i];									// precomputed once per fragment (hoisted)
+#endif
+			float3 h   = cross( dir, edge2 );
+			float  aa  = dot( edge1, h );
+			if( abs( aa ) < 1e-12f ) { continue; }					// ray parallel to triangle
+			float  inv = 1.0f / aa;
+			float  u   = inv * dot( sp, h );
+			if( u < 0.0f || u > 1.0f ) { continue; }
+#if SW_FACE_LEGACY
+			float3 qq  = cross( sp, edge1 );
+			float  vv  = inv * dot( dir, qq );
+			if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+			float  tt  = inv * dot( edge2, qq );
+#else
+			float  vv  = inv * dot( dir, qq );
+			if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+			float  tt  = inv * e2qq;
+#endif
+			if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+		}
+		if( swMask == swAll ) { break; }	// every sample blocked: fully in umbra, no need to read on
+	}
+	// Morphological CLOSE: seal INTERIOR tessellation cracks without touching the penumbra. A sample ray that
+	// threads a T-junction / brush-seam gap is reported lit even deep in the umbra. Uniform barycentric dilation
+	// would seal them but also expands the OUTER silhouette, over-darkening the penumbra toe (measured +0.35 bias).
+	// Instead: fill an unblocked sample only when >=5 of its 6 disk NEIGHBOURS are blocked - true for an interior
+	// crack (nearly surrounded by umbra) but not for the penumbra boundary (there the unblocked region connects to
+	// the lit outside, so a toe sample keeps >=2 lit neighbours). Streaming ALL casters into one call so the sample
+	// mask unions across them removes the bulk of holes; this close mops up the last single-caster interior cracks.
+	// Rotation-invariant: the neighbour topology survives the per-fragment disk rotation. The close only ever SETS
+	// bits, so it is a no-op when no sample is blocked (fully lit) or all are (fully umbra) - guard it out there,
+	// which skips it on the lit majority of the frame. Bit-exact: the guarded cases change nothing.
+#if !SW_FACE_LEGACY
+	if( swMask != 0u && swMask != swAll )
+#endif
+	{
+		uint filled = swMask;
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+			uint nb = swNbr[i];
+			int blocked = 0;
+			for( int k = 0; k < 6; k++ )
+			{
+				int j = ( int )( ( nb >> ( 5 * k ) ) & 31u );
+				if( ( swMask & ( 1u << j ) ) != 0u ) { blocked++; }
+			}
+			if( blocked >= 5 ) { filled |= ( 1u << i ); }
+		}
+		swMask = filled;
+	}
+	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
+}
+
+// Dispatcher: the pixel shader picks the coverage path by the SIGN of the record count (rpJitterTexScale.z):
+// negative = FRONT-FACE stream (r_softShadowFaceCoverage), positive = light-silhouette edge stream. The face
+// path needs no centre-lit winding guard (front-face area is bounded by construction), so swCentreLit is
+// ignored there. Callers pass abs(swN).
+SW_FUNC float SoftShadow_Coverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit, bool swFace SW_EDGEBUF_PARAM )
+{
+#ifdef __cplusplus
+	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN, t_SoftEdges )
+		   : SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit, t_SoftEdges );
+#else
+	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN )
+		   : SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit );
+#endif
 }
 
 #endif // __SOFTWEDGE_COVERAGE_INC__

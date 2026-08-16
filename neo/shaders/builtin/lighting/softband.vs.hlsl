@@ -113,8 +113,18 @@ VS_OUT main( uint vertexId : SV_VertexID )
 	// centre is the header record (e0.xyz) whose index this edge stashes in e1.w.
 	const uint hdr = uint( e1.w );
 	const float3 ctr = t_SoftEdges[ first + hdr * 2u + 0u ].xyz;
-	const float3 dA = A - ctr;
-	const float3 dB = B - ctr;
+	// Inflate in the plane PERPENDICULAR to the light ray (through the caster centre), NOT 3D-radially. A
+	// 3D-radial push has a component ALONG the ray; that component slides the vertex along its own
+	// projection line (extruding from L maps it to the same shadow point) and buys no floor-outward reach,
+	// while stealing magnitude from the perpendicular part that actually widens the penumbra. For an
+	// elevated/off-axis caster that shortfall left the outer penumbra fringe outside the confine, so the
+	// classifier forced those pixels lit (SoftShadowDivergence shell-miss). Removing the parallel component
+	// makes the inflated silhouette's point-shadow contain the whole penumbra on any receiver.
+	const float3 lh = normalize( L - ctr );
+	float3 dA = A - ctr;
+	float3 dB = B - ctr;
+	dA -= dot( dA, lh ) * lh;
+	dB -= dot( dB, lh ) * lh;
 	A += ( -apexSign * rp ) * ( length( dA ) > 1e-4 ? normalize( dA ) : float3( 0.0, 0.0, 0.0 ) );
 	B += ( -apexSign * rp ) * ( length( dB ) > 1e-4 ? normalize( dB ) : float3( 0.0, 0.0, 0.0 ) );
 

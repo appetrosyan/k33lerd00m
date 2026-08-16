@@ -138,6 +138,10 @@ void main( PS_IN fragment, out PS_OUT result )
 	float3 swL    = pc.rpGlobalLightOrigin.xyz;
 	float  swR    = max( pc.rpJitterTexScale.x, 1e-2 );	// light disk radius (penumbra); floored so pi*r^2 != 0
 	int    swN    = int( pc.rpJitterTexScale.z );
+	// SIGN of the record count selects the coverage path: negative = FRONT-FACE stream (r_softShadowFaceCoverage,
+	// the accurate receiver-disk coverage), positive = light-silhouette edge stream. abs() gives the real count.
+	bool   swFace = swN < 0;
+	swN = abs( swN );
 
 	// nvrhi doesn't apply the structured-buffer range byteOffset to the shader index, so index from an
 	// explicit first element (this light's edges start here), passed in rpJitterTexOffset.x.
@@ -178,7 +182,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	}
 	else if( pcssScale == 0.0 )
 	{
-		float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
+		float swOcc = SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
 		shadow = 1.0 - saturate( swOcc );
 	}
 	else
@@ -338,7 +342,7 @@ void main( PS_IN fragment, out PS_OUT result )
 			bool swDeepUmbra = ( swBlkCnt > 15.5 ) && ( swCentreLit < 0.5 ) && ( pcssLit < 0.002 );
 			if( pc.rpJitterTexOffset.w > 0.5 && !swDeepUmbra )
 			{
-				float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit );
+				float swOcc = SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, swCentreLit, swFace );
 				// Use the EXACT analytic wherever it sees ANY occlusion (edge-having casters); fall back to the PCSS
 				// PCF only where the analytic is fully lit - i.e. edge-less dynamic casters it can't see. max() over-
 				// darkened: it double-counted the same caster where PCSS's over-soft tail read darker than the exact value.
@@ -351,7 +355,7 @@ void main( PS_IN fragment, out PS_OUT result )
 		}
 	}
 #else
-	float swOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y );
+	float swOcc = SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
 	shadow = 1.0 - saturate( swOcc );
 #endif
 #elif USE_RT_SHADOW
@@ -875,7 +879,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	//   0 = real shadows.
 	if( swDbg == 7 )      { result.color = float4( 1.0, 0.0, 0.0, 1.0 ); }				// solid red for any soft-lit fragment (does the soft path run?)
 	else if( swDbg == 2 ) { result.color = float4( frac( swP / 64.0 ), 1.0 ); }			// receiver world pos (smooth gradient => swP valid)
-	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
+	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_Coverage( swP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
 	else if( swDbg == 9 ) { result.color = float4( frac( float( swFirstElem ) / 256.0 ), frac( float( swN ) / 64.0 ), 0.0, 1.0 ); }	// R = first-element param, G = edge count param
 		else if( swDbg == 8 ) { result.color = float4( shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
 		else if( swDbg == 10 ) { result.color = ( swLocFr < 0.0 ) ? float4( 0.0, 0.0, 0.4, 1.0 ) : float4( swLocFr, 1.0 - swLocFr, 0.0, 1.0 ); }	// LOCATOR: green = lit (frac 0), red = umbra (frac 1), blue = pcss off / outside face
