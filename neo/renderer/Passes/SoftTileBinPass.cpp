@@ -28,7 +28,17 @@ struct SoftTileBinCB
 	int		tileRect[4];
 	int		range[4];
 	float	screen[4];
+	int		minmax[4];
 };
+
+// mirrors c_MinMax in softtile_minmax.cs.hlsl
+struct SoftTileMinMaxCB
+{
+	int		dims[4];
+};
+
+// per-screen-tile min/max pairs: 4K-class screens are 256x160 tiles
+static const int SW_MINMAX_MAX_TILES = 256 * 160;
 
 // 16M uints = 64 MB: ~65k tile slots at K=256. Measured on erebus1_09: a heavy frame's soft
 // lights sum to ~54k tile slots, so this holds every light with headroom; lights past the cap
@@ -40,9 +50,50 @@ SoftTileBinPass::SoftTileBinPass( nvrhi::IDevice* device )
 {
 }
 
-void SoftTileBinPass::BeginView()
+void SoftTileBinPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* depthTexture )
 {
 	m_Cursor = 0;
+	m_MinMaxValid = false;
+	EnsurePipeline();
+	if( m_MinMaxPipeline == nullptr || depthTexture == nullptr )
+	{
+		return;
+	}
+
+	// screen-tile grid covers the whole render target (absolute tile coords, like SV_Position >> 4)
+	const int screenW = viewDef->viewport.x2 + 1;
+	const int screenH = viewDef->viewport.y2 + 1;
+	const int tilesX = ( screenW + TILE_SIZE - 1 ) / TILE_SIZE;
+	const int tilesY = ( screenH + TILE_SIZE - 1 ) / TILE_SIZE;
+	if( tilesX * tilesY > SW_MINMAX_MAX_TILES )
+	{
+		return;
+	}
+
+	SoftTileMinMaxCB cb;
+	cb.dims[0] = tilesX;
+	cb.dims[1] = screenW;
+	cb.dims[2] = screenH;
+	cb.dims[3] = 0;
+
+	nvrhi::BindingSetDesc sd;
+	sd.bindings =
+	{
+		nvrhi::BindingSetItem::ConstantBuffer( 0, m_MinMaxCB ),
+		nvrhi::BindingSetItem::Texture_SRV( 0, depthTexture ),
+		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_MinMaxBuffer ),
+	};
+	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_MinMaxLayout );
+
+	commandList->writeBuffer( m_MinMaxCB, &cb, sizeof( cb ) );
+	nvrhi::ComputeState cs;
+	cs.pipeline = m_MinMaxPipeline;
+	cs.bindings = { set };
+	commandList->setComputeState( cs );
+	commandList->dispatch( tilesX, tilesY, 1 );
+
+	m_MinMaxTilesX = tilesX;
+	m_MinMaxValid = true;
 }
 
 void SoftTileBinPass::EnsurePipeline()
@@ -68,7 +119,7 @@ void SoftTileBinPass::EnsurePipeline()
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 0 ),	// b0 : bin constants
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 0 ),	// t0 : edge records
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 1 ),	// t1 : pair-start indices
-		nvrhi::BindingLayoutItem::Texture_SRV( 2 ),				// t2 : depth
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 2 ),	// t2 : shared per-tile depth min/max
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : tile lists
 	};
 	m_Layout = m_Device->createBindingLayout( ld );
@@ -94,16 +145,56 @@ void SoftTileBinPass::EnsurePipeline()
 	td.keepInitialState = true;
 	td.debugName = "SoftTileBin/Tiles";
 	m_TileBuffer = m_Device->createBuffer( td );
+
+	// --- shared depth min/max reduce (once per view; every light's bin pass reads it) ---
+	m_MinMaxShader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softtile_minmax", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT ) );
+	if( m_MinMaxShader == nullptr )
+	{
+		common->Warning( "SoftTileBinPass: minmax shader failed to load - tile binning disabled." );
+		m_Pipeline = nullptr;
+		return;
+	}
+
+	nvrhi::BindingLayoutDesc mld;
+	mld.visibility = nvrhi::ShaderType::Compute;
+	mld.bindings =
+	{
+		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 0 ),	// b0 : dims
+		nvrhi::BindingLayoutItem::Texture_SRV( 0 ),				// t0 : depth
+		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : min/max pairs
+	};
+	m_MinMaxLayout = m_Device->createBindingLayout( mld );
+
+	nvrhi::ComputePipelineDesc mpd;
+	mpd.bindingLayouts = { m_MinMaxLayout };
+	mpd.CS = m_MinMaxShader;
+	m_MinMaxPipeline = m_Device->createComputePipeline( mpd );
+
+	nvrhi::BufferDesc mcb;
+	mcb.byteSize = sizeof( SoftTileMinMaxCB );
+	mcb.isConstantBuffer = true;
+	mcb.isVolatile = true;
+	mcb.maxVersions = 256;
+	mcb.debugName = "SoftTileBin/MinMaxCB";
+	m_MinMaxCB = m_Device->createBuffer( mcb );
+
+	nvrhi::BufferDesc mmd;
+	mmd.byteSize = ( uint64_t )SW_MINMAX_MAX_TILES * 2 * sizeof( uint32_t );
+	mmd.structStride = sizeof( uint32_t );
+	mmd.canHaveUAVs = true;
+	mmd.initialState = nvrhi::ResourceStates::UnorderedAccess;
+	mmd.keepInitialState = true;
+	mmd.debugName = "SoftTileBin/MinMax";
+	m_MinMaxBuffer = m_Device->createBuffer( mmd );
 }
 
 int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
 							   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem,
 							   nvrhi::IBuffer* pairBuffer, uint32_t pairFirstElem, int numPairs,
-							   float penumbraRadius, nvrhi::ITexture* depthTexture,
+							   float penumbraRadius,
 							   int& outTileOx, int& outTileOy, int& outTilesX )
 {
-	EnsurePipeline();
-	if( m_Pipeline == nullptr || numPairs <= 0 || depthTexture == nullptr )
+	if( m_Pipeline == nullptr || numPairs <= 0 || !m_MinMaxValid )
 	{
 		return -1;
 	}
@@ -165,6 +256,8 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	cb.screen[1] = ( float )( viewDef->viewport.y2 - viewDef->viewport.y1 + 1 );
 	cb.screen[2] = ( float )viewDef->viewport.x1;
 	cb.screen[3] = ( float )viewDef->viewport.y1;
+	cb.minmax[0] = m_MinMaxTilesX;
+	cb.minmax[1] = cb.minmax[2] = cb.minmax[3] = 0;
 
 	nvrhi::BindingSetDesc sd;
 	sd.bindings =
@@ -172,7 +265,7 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 		nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, edgeBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, pairBuffer ),
-		nvrhi::BindingSetItem::Texture_SRV( 2, depthTexture ),
+		nvrhi::BindingSetItem::StructuredBuffer_SRV( 2, m_MinMaxBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_TileBuffer ),
 	};
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );

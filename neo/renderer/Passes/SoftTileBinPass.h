@@ -33,8 +33,10 @@ class SoftTileBinPass
 public:
 	explicit SoftTileBinPass( nvrhi::IDevice* device );
 
-	// call once per view before the interaction loop: resets the tile-buffer allocation cursor
-	void BeginView();
+	// Once per view, BEFORE any BinLight: resets the tile-buffer cursor and dispatches the SHARED
+	// per-screen-tile depth min/max reduce every light's bin pass reads (one reduce instead of one
+	// per light x tile). Requires the depth prepass to be complete.
+	void BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* depthTexture );
 
 	// Dispatch binning for one soft light. Returns the tile-list base (uint element index into the
 	// tile buffer) and fills the tile rect the pixel shader needs, or -1 when binning is
@@ -42,7 +44,7 @@ public:
 	int BinLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
 				  nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem,
 				  nvrhi::IBuffer* pairBuffer, uint32_t pairFirstElem, int numPairs,
-				  float penumbraRadius, nvrhi::ITexture* depthTexture,
+				  float penumbraRadius,
 				  int& outTileOx, int& outTileOy, int& outTilesX );
 
 	nvrhi::IBuffer* GetTileBuffer() const
@@ -55,6 +57,9 @@ public:
 	// Measured (erebus1_05/07/09): K=64 overflowed the DENSE tiles - exactly the expensive ones -
 	// back to the full walk, erasing the win on heavy scenes; K=256 resolves every overflow there
 	// and K=512 changes nothing further (the residual cost is real per-tile sample work).
+	// 8x8 tiles MEASURED WORSE (17.9/22.1/23.8 vs 16.7/19.6/20.1 ms on erebus1_05/07/09): 4x the
+	// prepass and per-tile list overhead, while the dense tiles' relevant sets barely shrink - a
+	// triangle near one tile is near its neighbours too. Do not retry without a new idea.
 
 private:
 	void EnsurePipeline();
@@ -66,6 +71,13 @@ private:
 	nvrhi::ComputePipelineHandle	m_Pipeline;
 	nvrhi::BufferHandle				m_ConstantBuffer;
 	nvrhi::BufferHandle				m_TileBuffer;
+	nvrhi::ShaderHandle				m_MinMaxShader;
+	nvrhi::BindingLayoutHandle		m_MinMaxLayout;
+	nvrhi::ComputePipelineHandle	m_MinMaxPipeline;
+	nvrhi::BufferHandle				m_MinMaxCB;
+	nvrhi::BufferHandle				m_MinMaxBuffer;
+	int								m_MinMaxTilesX = 0;	// screen-tile row stride of the last reduce
+	bool							m_MinMaxValid = false;
 	int								m_Cursor = 0;	// uint elements allocated this view
 };
 

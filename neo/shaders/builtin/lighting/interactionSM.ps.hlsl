@@ -63,6 +63,7 @@ StructuredBuffer<float4> t_SoftEdges : register( t12 VK_DESCRIPTOR_SET( 0 ) );
 // Tile binning (r_softShadowTileBin): per-tile triangle lists written by softtile_bin.cs.hlsl,
 // [count | SW_TILE_K indices] per 16x16 tile. rpUser7 = ( base | -1, tilesX, tileOx, tileOy ).
 #define SW_TILE_K 256
+#define SW_TILE_SIZE 16
 StructuredBuffer<uint> t_SoftTiles : register( t13 VK_DESCRIPTOR_SET( 0 ) );
 // Included AFTER t_SoftEdges: SoftShadow_WedgeOcclusion reads that global directly (HLSL), so the
 // declaration must be in scope at include time.
@@ -203,8 +204,8 @@ void main( PS_IN fragment, out PS_OUT result )
 		// re-culled per fragment; a triangle outside it can hit no sample ray of this fragment).
 		float swOcc;
 		int swTileBase = int( pc.rpUser7.x );
-		int swTx = int( fragment.position.x ) / 16 - int( pc.rpUser7.z );
-		int swTy = int( fragment.position.y ) / 16 - int( pc.rpUser7.w );
+		int swTx = int( fragment.position.x ) / SW_TILE_SIZE - int( pc.rpUser7.z );
+		int swTy = int( fragment.position.y ) / SW_TILE_SIZE - int( pc.rpUser7.w );
 		if( swTileBase >= 0 && swTx >= 0 && swTy >= 0 )
 		{
 			int  swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( SW_TILE_K + 1 );

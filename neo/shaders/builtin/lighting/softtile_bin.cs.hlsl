@@ -39,7 +39,7 @@ version. See <http://www.gnu.org/licenses/>.
 // *INDENT-OFF*
 StructuredBuffer<float4>	t_Edges		: register( t0 );	// softShadowEdge_t stream (float4 pairs), whole joint buffer
 StructuredBuffer<uint>		t_PairIdx	: register( t1 );	// pair-start record indices, one per triangle
-Texture2D<float>			t_Depth		: register( t2 );	// scene depth (prepass complete before interactions)
+StructuredBuffer<uint>		t_MinMax	: register( t2 );	// per-SCREEN-tile depth min/max bits (softtile_minmax.cs.hlsl)
 RWStructuredBuffer<uint>	u_Tiles		: register( u0 );	// [count | K indices] per tile
 
 cbuffer c_TileBin : register( b0 )
@@ -52,13 +52,12 @@ cbuffer c_TileBin : register( b0 )
 	int4	g_tileRect;		// tile origin x, y (in tiles), tilesX, tilesY
 	int4	g_range;		// firstElem (edge float4 base), numPairs, outBase (uint elements), pairBase (uint elements)
 	float4	g_screen;		// viewport W, H, viewport origin x, y
+	int4	g_minmax;		// screen tiles X (t_MinMax row stride), unused x3
 };
 
 #define SW_NEAR_EPS 1e-3f
 // *INDENT-ON*
 
-groupshared uint gsZMin;
-groupshared uint gsZMax;
 groupshared uint gsCount;
 groupshared float3 gsCentre;
 groupshared float  gsRad;
@@ -88,32 +87,13 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 
 	if( tid == 0 )
 	{
-		gsZMin = 0xFFFFFFFFu;
-		gsZMax = 0u;
 		gsCount = 0u;
 	}
-	GroupMemoryBarrierWithGroupSync();
 
-	// ---- tile depth min/max (256 texels, 4 per thread). Depth >= 1 = sky/far: no receiver there. ----
-	for( int s = 0; s < 4; s++ )
-	{
-		int t = ( int )tid + s * 64;
-		int px = tileX * SW_TILE_SIZE + ( t & 15 );
-		int py = tileY * SW_TILE_SIZE + ( t >> 4 );
-		if( px < ( int )( g_screen.z + g_screen.x ) && py < ( int )( g_screen.w + g_screen.y ) )
-		{
-			float z = t_Depth.Load( int3( px, py, 0 ) );
-			if( z > 0.0f && z < 1.0f )
-			{
-				// depth in [0,1): asuint preserves float ordering for non-negative values
-				InterlockedMin( gsZMin, asuint( z ) );
-				InterlockedMax( gsZMax, asuint( z ) );
-			}
-		}
-	}
-	GroupMemoryBarrierWithGroupSync();
-
-	if( gsZMin > gsZMax )		// no valid depth in the tile: nothing will shade here
+	// ---- tile depth min/max from the SHARED once-per-view reduce (softtile_minmax.cs.hlsl) ----
+	const uint zMinBits = t_MinMax[ ( tileY * g_minmax.x + tileX ) * 2 + 0 ];
+	const uint zMaxBits = t_MinMax[ ( tileY * g_minmax.x + tileX ) * 2 + 1 ];
+	if( zMinBits > zMaxBits )	// no valid depth in the tile: nothing will shade here
 	{
 		if( tid == 0 )
 		{
@@ -121,12 +101,13 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 		}
 		return;
 	}
+	GroupMemoryBarrierWithGroupSync();
 
 	// ---- receiver AABB from the tile's 8 unprojected corners ----
 	if( tid == 0 )
 	{
-		float zmn = asfloat( gsZMin );
-		float zmx = asfloat( gsZMax );
+		float zmn = asfloat( zMinBits );
+		float zmx = asfloat( zMaxBits );
 		float x0 = ( float )( tileX * SW_TILE_SIZE );
 		float y0 = ( float )( tileY * SW_TILE_SIZE );
 		float x1 = min( x0 + ( float )SW_TILE_SIZE, g_screen.z + g_screen.x );
