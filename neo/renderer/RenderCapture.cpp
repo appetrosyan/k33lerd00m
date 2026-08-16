@@ -1701,11 +1701,11 @@ int R_SoftShadowGate( const char* arg )
 
 		capsRun++;
 
-		// ---- rank the captured lights by soft-edge count (most edge records = the light the
-		// soft-shadow work in this capture was about). ponytail: probe ONE light per capture (the
-		// first candidate that actually draws at this camera - a matched light can sit behind a
-		// closed door) to keep the whole corpus run in seconds; probe all lights if a defect ever
-		// hides on a secondary light.
+		// ---- rank the captured lights by soft-edge count and probe EVERY one that draws. The
+		// single-dominant-light shortcut was a measured blind spot: the erebus1_14 halo the user saw
+		// in-game lived under a secondary light and the gate passed. Lights that draw <1000 px at
+		// this camera are skipped silently (a matched light can sit behind a closed door); only if
+		// NONE draws is it a SETUP defect.
 		std::vector<int> probeLights;
 		for( int li = 0; li < ( int )cap.lights.size(); li++ )
 		{
@@ -1727,8 +1727,8 @@ int R_SoftShadowGate( const char* arg )
 		}
 		bool capProbed = false;
 
-		// ---- per candidate light (first one that draws wins) -----------------------------------
-		for( int pi = 0; pi < ( int )probeLights.size() && !capProbed; pi++ )
+		// ---- per light (every drawing light is probed) -----------------------------------------
+		for( int pi = 0; pi < ( int )probeLights.size(); pi++ )
 		{
 			const int li = probeLights[pi];
 			const softcapLight_t& cl = cap.lights[li];
@@ -1883,25 +1883,23 @@ int R_SoftShadowGate( const char* arg )
 					validN++;
 				}
 			}
-			if( validN < 1000 && pi + 1 < ( int )probeLights.size() )
+			if( validN < 1000 )
 			{
 				// the matched map light doesn't reach this camera (closed door, tiny scissor) -
-				// not a defect, just the wrong candidate; fall through to the next-ranked light
-				common->Printf( "[softgate] %s L%d: light drew only %ld px - trying next candidate light\n",
+				// not a defect on its own; only if NO light draws does the capture flag SETUP below
+				common->Printf( "[softgate] %s L%d: light drew only %ld px - skipped\n",
 								cap.name.c_str(), li, validN );
 				rw->FreeLightDef( lh );
+				if( pi + 1 >= ( int )probeLights.size() && !capProbed )
+				{
+					common->Printf( "[softgate] %s: NO candidate light draws at this camera -> SETUP defect\n", cap.name.c_str() );
+					GateDefect d;
+					d.kind = GATE_SETUP;
+					all.push_back( d );
+				}
 				continue;
 			}
 			capProbed = true;
-			if( validN < 1000 )
-			{
-				common->Printf( "[softgate] %s L%d: interaction mask covers only %ld px -> SETUP defect (no candidate light draws)\n",
-								cap.name.c_str(), li, validN );
-				GateDefect d;
-				d.kind = GATE_SETUP;
-				defects.push_back( d );
-			}
-			else
 			{
 				// a starved RT reference (empty TLAS -> fully-lit mask) must never silently pass the gate
 				long anaSh = 0, rtSh = 0;

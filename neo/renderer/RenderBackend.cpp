@@ -77,28 +77,11 @@ extern idCVar r_hdrOutput;			// HDR display output toggle (RenderSystem_init.cpp
 // SRS - flag indicating whether we are drawing a 3d view vs. a 2d-only view (e.g. menu or pda)
 bool drawView3D;
 
-// ANALYTIC LIGHT BUDGET: the top-N soft lights (by screen coverage) granted the exact analytic-contact
-// tier this view; every other soft light runs standalone PCSS. Filled by the DrawInteractions prescan.
-static const int MAX_ANALYTIC_SOFT_LIGHTS = 8;
-static const viewLight_t* s_analyticSoftLights[MAX_ANALYTIC_SOFT_LIGHTS];
-static int s_numAnalyticSoftLights = 0;
-
-static ID_INLINE bool R_SoftLightGetsAnalytic( const viewLight_t* vLight )
-{
-	extern idCVar r_softShadowAnalyticBudget;
-	if( r_softShadowAnalyticBudget.GetInteger() <= 0 )
-	{
-		return true;    // 0 = no budget: every soft light gets the analytic tier
-	}
-	for( int i = 0; i < s_numAnalyticSoftLights; i++ )
-	{
-		if( s_analyticSoftLights[i] == vLight )
-		{
-			return true;
-		}
-	}
-	return false;
-}
+// REMOVED: the "analytic light budget" (top-N soft lights by screen coverage got the analytic tier,
+// the rest PCSS). Play-testing showed the tier boundary is VIEW-DEPENDENT - turning the camera
+// visibly transformed a PCSS shadow into an analytic one - and PCSS is temporally unstable here.
+// Explicit directive: the nature of a shadow must never change with view direction; every soft
+// light is analytic, and perf is recovered by view-stable levers instead.
 
 // Ray-traced shadows: a light uses the RT visibility mask (instead of the shadow map)
 // when RT shadows built a TLAS this view AND the light is a shadow-casting point/spot
@@ -1945,8 +1928,7 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			const float swCentreLit = ( r_softShadowContinuous.GetBool() || ( r_softShadowAAM.GetBool() && softBandStencilRef == 1 ) ) ? 1.0f : 0.0f;
 			extern idCVar r_shadowMapPCSSBias;			// .z = PCSS normal-offset (texels)
 			extern idCVar r_shadowMapPCSSAnalyticContact;	// .w = PCSS->analytic contact hybrid gate
-			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, r_shadowMapPCSSBias.GetFloat(),
-							   ( r_shadowMapPCSSAnalyticContact.GetBool() && R_SoftLightGetsAnalytic( din->vLight ) ) ? 1.0f : 0.0f };
+			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, r_shadowMapPCSSBias.GetFloat(), r_shadowMapPCSSAnalyticContact.GetBool() ? 1.0f : 0.0f };
 			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
 		}
 
@@ -4599,60 +4581,6 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 	// visibility mask below, just before its interactions draw; the interaction shader Loads
 	// that mask instead of sampling the (now-skipped) shadow map. Sun/parallel + subviews
 	// stayed shadow-mapped and are excluded by R_LightUsesRTShadows.
-
-	// ANALYTIC LIGHT BUDGET (60-FPS directive): the exact analytic-contact integral is the frame's
-	// dominant cost and every soft light in view pays it. Rank the soft lights by screen coverage
-	// and grant the analytic tier only to the top r_softShadowAnalyticBudget of them; the rest fall
-	// back to standalone PCSS (measured ~free, slope-scaled offset keeps it acne-clean). The corpus
-	// gate probes single dominant lights, so its verdict is unaffected; in mixed frames the budget
-	// trades far/small-light edge exactness for frame time - the ordered, visible-first spend.
-	{
-		extern idCVar r_softShadowAnalyticBudget;
-		s_numAnalyticSoftLights = 0;
-		const int budget = r_softShadowAnalyticBudget.GetInteger();
-		if( budget > 0 )
-		{
-			struct softRank_t
-			{
-				const viewLight_t* l;
-				int area;
-			};
-			softRank_t ranked[MAX_ANALYTIC_SOFT_LIGHTS * 4];
-			int n = 0;
-			for( const viewLight_t* vl = viewDef->viewLights; vl != NULL; vl = vl->next )
-			{
-				if( vl->softEdgeCount <= 0 )
-				{
-					continue;
-				}
-				int area = ( vl->scissorRect.x2 - vl->scissorRect.x1 + 1 ) * ( vl->scissorRect.y2 - vl->scissorRect.y1 + 1 );
-				if( n < ( int )( sizeof( ranked ) / sizeof( ranked[0] ) ) )
-				{
-					ranked[n].l = vl;
-					ranked[n].area = area;
-					n++;
-				}
-			}
-			for( int a = 0; a < n && s_numAnalyticSoftLights < Min( budget, ( int )MAX_ANALYTIC_SOFT_LIGHTS ); a++ )
-			{
-				int best = -1, bestArea = -1;
-				for( int b = 0; b < n; b++ )
-				{
-					if( ranked[b].l != NULL && ranked[b].area > bestArea )
-					{
-						bestArea = ranked[b].area;
-						best = b;
-					}
-				}
-				if( best < 0 )
-				{
-					break;
-				}
-				s_analyticSoftLights[s_numAnalyticSoftLights++] = ranked[best].l;
-				ranked[best].l = NULL;
-			}
-		}
-	}
 
 	//
 	// for each light, perform shadowing and adding

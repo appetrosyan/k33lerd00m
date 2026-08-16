@@ -184,7 +184,18 @@ void main( PS_IN fragment, out PS_OUT result )
 	//        unreachable; the branch exists only so an atlas overflow can never resurrect the wedge under PCSS.
 	//   == 0 ANALYTIC mode (r_shadowMapPCSS off): the pure wedge, as explicitly chosen.
 	float pcssScale = pc.rpShadowAtlasOffsets[ 0 ].z;
-	if( pcssScale < 0.0 )
+	// FACE mode NEVER touches PCSS (explicit directive): the term is the exact analytic integral,
+	// full stop. PCSS is temporally unstable here - its shading, its atlas-resolution limits, AND
+	// its locator fast-outs (a low-res blocker search deciding "fully lit, skip the analytic" can
+	// erase a real thin shadow) must not be able to change a face-mode pixel. The nature of a
+	// shadow must not depend on where the camera looks; one code path, one look. PCSS survives
+	// only for the legacy L-sil wedge stream below.
+	if( swFace )
+	{
+		float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+		shadow = 1.0 - saturate( swOcc );
+	}
+	else if( pcssScale < 0.0 )
 	{
 		shadow = 1.0;
 	}
@@ -331,25 +342,15 @@ void main( PS_IN fragment, out PS_OUT result )
 			// texels used to FIND its blocker, but the clamp pinned it there. Allow up to 6x the search footprint
 			// (still bounded so 24 taps stay adequately dense); contact (swPen~0) still clamps to 1 texel = crisp.
 			float swFilter = clamp( swPen * pc.rpScreenCorrectionFactor.z, pc.rpScreenCorrectionFactor.z, 6.0 * swSearch );
-			// PCF ONLY WHERE ITS RESULT IS CONSUMED (perf). In face+analytic-contact mode the term is purely
-			// analytic, so the 24-tap PCF's ONLY consumer is the deep-umbra fast-out confirmation - and that
-			// is only reachable when all 16 search taps AND the centre are blocked. Everywhere else in face
-			// mode the 24 atlas taps were computed and discarded, on every soft fragment. The wedge path and
-			// plain-PCSS mode still consume pcssLit as the term, so they keep the unconditional PCF.
-			bool swFaceAnalytic = swFace && ( pc.rpJitterTexOffset.w > 0.5 );
-			bool swWantPCF = !swFaceAnalytic || ( ( swBlkCnt > 15.5 ) && ( swCentreLit < 0.5 ) );
-			float pcssLit = 0.0;				// only read when swWantPCF computed it (deep-umbra gate / non-face term)
-			if( swWantPCF )
+			// (face mode never reaches this branch - it is purely analytic with no PCSS/atlas reads at all)
+			float swLitSum = 0.0;
+			for( float fi = 0.0; fi < 24.0; fi += 1.0 )
 			{
-				float swLitSum = 0.0;
-				for( float fi = 0.0; fi < 24.0; fi += 1.0 )
-				{
-					float2 fOff = VogelDiskSample( fi, 24.0, swPhi ) * swFilter;
-					// swRecvAt hoisted above; COMPARISON sampler returns the LIT fraction (stored passes vs swRecvAt).
-					swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, clamp( swBase + fOff, swTileLo, swTileHi ), swRecvAt );
-				}
-				pcssLit = swLitSum / 24.0;		// soft penumbra gradient, contact-hardened
+				float2 fOff = VogelDiskSample( fi, 24.0, swPhi ) * swFilter;
+				// swRecvAt hoisted above; COMPARISON sampler returns the LIT fraction (stored passes vs swRecvAt).
+				swLitSum += t_ShadowAtlas.SampleCmpLevelZero( s_Shadow, clamp( swBase + fOff, swTileLo, swTileHi ), swRecvAt );
 			}
+			float pcssLit = swLitSum / 24.0;	// soft penumbra gradient, contact-hardened
 
 			// HYBRID (r_shadowMapPCSSAnalyticContact, plumbed in rpJitterTexOffset.w): in the conservative PENUMBRA
 			// band (partial occlusion), run the EXACT analytic silhouette-edge integral for physically correct contact
@@ -370,14 +371,9 @@ void main( PS_IN fragment, out PS_OUT result )
 			if( pc.rpJitterTexOffset.w > 0.5 && !swDeepUmbra )
 			{
 				float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, swCentreLit, swFace );
-				// FACE mode: the analytic IS the complete answer. The front-face stream carries EVERY caster's
-				// triangles (world geometry and posed dynamic meshes alike - R_CollectPenumbraFaces reads
-				// posedShadowVerts), so "analytic sees nothing" MEANS lit, and falling back to the PCSS PCF
-				// there only re-imports PCSS's grazing-floor acne into analytically-lit pixels (softgate: the
-				// erebus1_05 stripe turds survived the analytic-contact default precisely through this fallback).
-				// The legacy L-sil wedge stream (swFace==false) still undershoots off-axis, so IT keeps the
-				// PCSS fallback for the occlusion it cannot see.
-				shadow = ( swFace || swOcc > 0.003 ) ? ( 1.0 - saturate( swOcc ) ) : pcssLit;
+				// legacy L-sil wedge only (face mode exits above): the wedge undershoots off-axis, so it
+				// keeps the PCSS fallback for occlusion its silhouette stream cannot see.
+				shadow = ( swOcc > 0.003 ) ? ( 1.0 - saturate( swOcc ) ) : pcssLit;
 			}
 			else
 			{

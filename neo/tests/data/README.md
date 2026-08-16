@@ -26,6 +26,7 @@ Provenance of the rename (2026-08-16), for archaeology against old logs/branches
 | erebus1_12   | softcap0012  | 2560x1440  | tripod thin legs                       |
 | erebus1_13   | softcap0013  | 2560x1440  | tripod thin legs                       |
 | (attic)      | erebusART3   | 2560x1440  | degenerate: zero lights/casters        |
+| erebus1_14   | softcap0039  | 2560x1440  | play-test halo report (3 lights)       |
 
 Native res is the resolution the capture was TAKEN at (affects only the stored depth block used
 by the CPU `@study` instruments); the gate re-renders every capture live at >= 1920x1080.
