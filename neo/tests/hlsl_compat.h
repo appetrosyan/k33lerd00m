@@ -74,4 +74,13 @@ struct SoftEdgeBuffer
 	float4 operator[]( int i ) const { return p[i]; }
 };
 
+// StructuredBuffer<uint> stand-in for the per-tile record-index lists (SW_TILEBUF_PARAM).
+struct SoftTileBuffer
+{
+	const unsigned int* p;
+	int                 n;
+	unsigned int operator[]( int i ) const { return p[i]; }
+};
+typedef unsigned int uint;
+
 #endif // __HLSL_COMPAT_H__

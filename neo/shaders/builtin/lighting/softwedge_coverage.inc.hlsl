@@ -342,8 +342,10 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 
 #ifdef __cplusplus
 	#define SW_EDGEBUF_PARAM , SoftEdgeBuffer t_SoftEdges
+	#define SW_TILEBUF_PARAM , SoftTileBuffer t_SoftTiles
 #else
 	#define SW_EDGEBUF_PARAM
+	#define SW_TILEBUF_PARAM
 #endif
 
 // swCentreLit > 0.5: the caller GUARANTEES the light-disk centre is visible from swP (AAM penumbra-ring
@@ -892,6 +894,133 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 #if SW_FACE_PROFILE
 	if( swProbe > 1e30f ) { swMask = swAll; }	// never true; makes the probe accumulator observable
 #endif
+	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// TILE-BINNED face coverage (r_softShadowTileBin). A per-light compute prepass (softtile_bin.cs.hlsl)
+// tests every triangle record against each 16x16 screen tile's depth-bounded receiver volume with the
+// SAME cone/slab cull the full walk runs per fragment - conservatively inflated by the tile's world
+// radius - and writes the surviving PAIR-START indices per tile. This walk then touches only those:
+// the measured decomposition (SW_FACE_PROFILE, erebus1_09) put the per-fragment record walk at 51%
+// and the per-triangle culls at 18% of the soft cost, all of it recomputing a result that is nearly
+// identical across a tile's fragments. Headers never reach the list (face coverage unions ALL
+// triangles; caster identity only ever mattered for culling), so there is no header/caster logic here.
+// The tri test + close are duplicated from SoftShadow_FaceCoverage in its SHIPPED config (hoists on,
+// in-loop dirs); SoftShadowTileBin_test.cpp holds the two walks bit-identical so they cannot drift.
+SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, int swFirstElem,
+		int swListBase, int swListCount SW_TILEBUF_PARAM SW_EDGEBUF_PARAM )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float  swDistPL = swF.distPL;
+	const float swEps = SW_NEAR_EPS;
+#if SW_FACE_SAMPLES == 8
+	const float2 swDisk[8] =
+	{
+		float2( 0.250000f, 0.000000f), float2(-0.319290f, 0.292496f),
+		float2( 0.048872f,-0.556877f), float2( 0.402444f, 0.524918f),
+		float2(-0.738535f,-0.130636f), float2( 0.699605f,-0.445031f),
+		float2(-0.234004f, 0.870484f), float2(-0.446271f,-0.859268f),
+	};
+	const uint swNbr[8] =
+	{
+		0x08609443u, 0x0e218086u, 0x06121407u, 0x082284c0u,
+		0x066008e1u, 0x08138c40u, 0x0a220061u, 0x06508082u,
+	};
+#elif SW_FACE_SAMPLES == 16
+	const float2 swDisk[16] =
+	{
+		float2( 0.176777f, 0.000000f), float2(-0.225772f, 0.206826f),
+		float2( 0.034558f,-0.393771f), float2( 0.284571f, 0.371173f),
+		float2(-0.522223f,-0.092374f), float2( 0.494695f,-0.314685f),
+		float2(-0.165466f, 0.615525f), float2(-0.315561f,-0.607594f),
+		float2( 0.684642f, 0.250030f), float2(-0.712256f, 0.294009f),
+		float2( 0.343354f,-0.733729f), float2( 0.253730f, 0.808932f),
+		float2(-0.764746f,-0.443186f), float2( 0.897134f,-0.197232f),
+		float2(-0.547507f, 0.778772f), float2(-0.126487f,-0.976090f),
+	};
+	const uint swNbr[16] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x0a132d00u,
+		0x0023a581u, 0x0681014du, 0x0091adc1u, 0x00a231e2u,
+		0x02b281a3u, 0x00c33824u, 0x1a03bc45u, 0x00e0a0c3u,
+		0x02f124e4u, 0x04350105u, 0x06458526u, 0x08560947u,
+	};
+#else
+	#error SoftShadow_FaceCoverageList supports SW_FACE_SAMPLES 8 or 16
+#endif
+	float3 swBase = swL - swP;
+	float3 swSu = swF.u * swR;
+	float3 swSv = swF.v * swR;
+	float  swHash = dot( swP, float3( 12.9898f, 78.233f, 37.719f ) );
+	float  swAng  = ( swHash - floor( swHash ) ) * ( 2.0f * PI );
+	float  swCa = cos( swAng );
+	float  swSa = sin( swAng );
+
+	uint swMask = 0u;
+	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+	for( int li = 0; li < swListCount; li++ )
+	{
+		int se = ( int )t_SoftTiles[ swListBase + li ];				// pair-start index of record A
+		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
+		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
+		float4 g1 = t_SoftEdges[ swFirstElem + ( se + 1 ) * 2 + 1 ];
+		float3 v0 = float3( e0.x, e0.y, e0.z );
+		float3 v1 = float3( e1.x, e1.y, e1.z );
+		float3 v2 = float3( g1.x, g1.y, g1.z );
+		// per-FRAGMENT cone/slab reject still runs: the tile cull is the same test at tile grain, so
+		// this prunes the tile list down to this fragment's true cone. Identical math to the full walk.
+		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+		float3 rc   = tcen - swP;
+		float  cd   = dot( rc, swF.nrm );
+		float  triRad = e0.w;
+		if( cd + triRad < swEps ) { continue; }
+		if( cd - triRad > swDistPL ) { continue; }
+		float3 perp = rc - cd * swF.nrm;
+		float  coneR = swR * ( cd + triRad ) / swDistPL;
+		if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }
+		float3 edge1 = v1 - v0;
+		float3 edge2 = v2 - v0;
+		float3 sp = swP - v0;
+		float3 qq   = cross( sp, edge1 );
+		float  e2qq = dot( edge2, qq );
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+			float2 s0  = swDisk[i];
+			float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+			float3 dir = swBase + swSu * sc.x + swSv * sc.y;
+			float3 h   = cross( dir, edge2 );
+			float  aa  = dot( edge1, h );
+			if( abs( aa ) < 1e-12f ) { continue; }
+			float  inv = 1.0f / aa;
+			float  u   = inv * dot( sp, h );
+			if( u < 0.0f || u > 1.0f ) { continue; }
+			float  vv  = inv * dot( dir, qq );
+			if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+			float  tt  = inv * e2qq;
+			if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+		}
+		if( swMask == swAll ) { break; }
+	}
+	if( swMask != 0u && swMask != swAll )
+	{
+		uint filled = swMask;
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+			uint nb = swNbr[i];
+			int blocked = 0;
+			for( int k = 0; k < 6; k++ )
+			{
+				int j = ( int )( ( nb >> ( 5 * k ) ) & 31u );
+				if( ( swMask & ( 1u << j ) ) != 0u ) { blocked++; }
+			}
+			if( blocked >= 5 ) { filled |= ( 1u << i ); }
+		}
+		swMask = filled;
+	}
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
 

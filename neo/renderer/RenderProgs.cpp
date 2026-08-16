@@ -103,6 +103,7 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 		if( soft )
 		{
 			skinningLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 12 ) ); // soft-shadow edges
+			skinningLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 13 ) ); // per-tile triangle lists (r_softShadowTileBin)
 		}
 
 		return device->createBindingLayout( skinningLayoutDesc );
@@ -115,6 +116,7 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 		if( soft )
 		{
 			uniformsLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 12 ) ); // soft-shadow edges
+			uniformsLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 13 ) ); // per-tile triangle lists (r_softShadowTileBin)
 		}
 
 		return device->createBindingLayout( uniformsLayoutDesc );

@@ -204,6 +204,8 @@ void idRenderBackend::Init()
 	reflectionsPass = nullptr;
 	rtShadowsPass = nullptr;
 	emberPass = nullptr;
+	softTileBinPass = nullptr;
+	currentSoftTileBase = -1;
 	hdrGuiCompositePass = nullptr;
 
 	// Maximum resolution of one tile within tiled shadow map. Resolution must be power of two and
@@ -1727,6 +1729,11 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 		// passed via rpJitterTexOffset.x instead. Range must still reach past the edges.
 		const nvrhi::BufferRange sw_range( 0, ( size_t )currentSoftEdgeOffset + ( size_t )sizeof( idVec4 ) * 2 * currentSoftEdgeCount );
 
+		// t13 = the tile-bin lists (r_softShadowTileBin). Always bound (the layout demands a resource);
+		// when binning is off for this light rpUser7.x < 0 keeps the shader from reading it.
+		nvrhi::IBuffer* sw_tiles = ( softTileBinPass != NULL && softTileBinPass->GetTileBuffer() != nullptr )
+								   ? softTileBinPass->GetTileBuffer() : currentSoftEdgeBuffer;
+
 		// renderparms + edge buffer (+ joints): 0
 		if( sw_skinned )
 		{
@@ -1734,7 +1741,8 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 			{
 				uniformsBindingSetItem,
 				nvrhi::BindingSetItem::StructuredBuffer_SRV( 11, currentJointBuffer, nvrhi::Format::UNKNOWN, nvrhi::BufferRange( currentJointOffset, sizeof( idVec4 ) * numBoneMatrices ) ),
-				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range )
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range ),
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles )
 			};
 		}
 		else
@@ -1742,7 +1750,8 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 			desc[0].bindings =
 			{
 				uniformsBindingSetItem,
-				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range )
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range ),
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles )
 			};
 		}
 
@@ -1778,10 +1787,15 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 		// silhouette-edge StructuredBuffer at t12 (the band VS reads it to build wedge volumes). No
 		// materials/samplers - stencil-only. Range mirrors the SM_SOFT case (index from element 0).
 		const nvrhi::BufferRange sw_range( 0, ( size_t )currentSoftEdgeOffset + ( size_t )sizeof( idVec4 ) * 2 * currentSoftEdgeCount );
+		// t13 mirrors the SM_SOFT case: the shared 'soft' uniforms layout declares it, so the set must
+		// bind SOMETHING there even though the band VS never reads tile lists.
+		nvrhi::IBuffer* sw_tiles2 = ( softTileBinPass != NULL && softTileBinPass->GetTileBuffer() != nullptr )
+									? softTileBinPass->GetTileBuffer() : currentSoftEdgeBuffer;
 		desc[0].bindings =
 		{
 			uniformsBindingSetItem,
-			nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range )
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles2 )
 		};
 	}
 	else if( type == BINDING_LAYOUT_FOG )
@@ -2550,6 +2564,11 @@ void idRenderBackend::GL_StartFrame()
 		emberPass = new EmberPass( deviceManager->GetDevice() );
 	}
 
+	if( !softTileBinPass )
+	{
+		softTileBinPass = new SoftTileBinPass( deviceManager->GetDevice() );
+	}
+
 	if( !hdrGuiCompositePass )
 	{
 		hdrGuiCompositePass = new HdrGuiCompositePass( deviceManager->GetDevice() );
@@ -2934,6 +2953,12 @@ void idRenderBackend::ClearCaches()
 	{
 		delete emberPass;
 		emberPass = nullptr;
+	}
+
+	if( softTileBinPass )
+	{
+		delete softTileBinPass;
+		softTileBinPass = nullptr;
 	}
 
 	if( hdrGuiCompositePass )

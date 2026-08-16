@@ -41,6 +41,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Passes/ReflectionsPass.h"
 #include "Passes/RtShadowsPass.h"
 #include "Passes/EmberPass.h"
+#include "Passes/SoftTileBinPass.h"
 #include "Passes/HdrGuiCompositePass.h"
 #include "Passes/TonemapPass.h"
 #include "Passes/TemporalAntiAliasingPass.h"
@@ -415,6 +416,13 @@ private:
 	int								lastRenderWidth;			// scene render resolution the targets were last (re)allocated at; a change (e.g. live SSAA toggle) forces a realloc
 	int								lastRenderHeight;
 	EmberPass*						emberPass;
+	SoftTileBinPass*				softTileBinPass;
+	// per-light tile-binning result, set by DrawInteractions before the light's draws and consumed
+	// where the soft-wedge uniforms are written (rpUser7): base < 0 = binning off => full walk
+	int								currentSoftTileBase;
+	int								currentSoftTileOx;
+	int								currentSoftTileOy;
+	int								currentSoftTileTilesX;
 	HdrGuiCompositePass*			hdrGuiCompositePass;
 	MipMapGenPass*					hiZGenPass;
 	TonemapPass*					toneMapPass;

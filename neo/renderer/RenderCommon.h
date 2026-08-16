@@ -402,6 +402,8 @@ struct viewLight_t
 	drawSurf_t* 			softShadowWedges;			// analytic soft shadows: per-caster surfs carrying this light's silhouette edges (softEdges)
 	vertCacheHandle_t		softEdgeCache;				// analytic soft shadows: this light's silhouette edges flattened into the vertex cache (softShadowEdge_t)
 	int						softEdgeCount;				// analytic soft shadows: number of edges in softEdgeCache
+	vertCacheHandle_t		softPairCache;				// tile binning: pair-start record indices (one uint per triangle) of the FACE stream
+	int						softPairCount;				// tile binning: number of pair-start indices (triangles)
 
 	bool					ImageAtlasPlaced() const
 	{

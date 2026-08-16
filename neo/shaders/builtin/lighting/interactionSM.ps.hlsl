@@ -60,6 +60,10 @@ SamplerState 			s_Jitter   : register( s3 VK_DESCRIPTOR_SET( 3 ) ); // for sampl
 // float4 elements: each edge is TWO consecutive float4 (e0 = xyz world endpoint 0 + w silWeight; e1 =
 // xyz endpoint 1). Edge se lives at elements [se*2], [se*2+1].
 StructuredBuffer<float4> t_SoftEdges : register( t12 VK_DESCRIPTOR_SET( 0 ) );
+// Tile binning (r_softShadowTileBin): per-tile triangle lists written by softtile_bin.cs.hlsl,
+// [count | SW_TILE_K indices] per 16x16 tile. rpUser7 = ( base | -1, tilesX, tileOx, tileOy ).
+#define SW_TILE_K 256
+StructuredBuffer<uint> t_SoftTiles : register( t13 VK_DESCRIPTOR_SET( 0 ) );
 // Included AFTER t_SoftEdges: SoftShadow_WedgeOcclusion reads that global directly (HLSL), so the
 // declaration must be in scope at include time.
 #include "softwedge_coverage.inc.hlsl"
@@ -192,7 +196,32 @@ void main( PS_IN fragment, out PS_OUT result )
 	// only for the legacy L-sil wedge stream below.
 	if( swFace )
 	{
-		float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+		// TILE-BINNED walk when the prepass ran (rpUser7.x >= 0): this fragment's 16x16 tile carries
+		// the conservative list of triangles that can occlude any receiver in the tile, so the walk
+		// touches only those. Overflowed tiles (count sentinel) and out-of-rect fragments fall back
+		// to the full walk - the result is bit-exact either way (the list is a conservative superset
+		// re-culled per fragment; a triangle outside it can hit no sample ray of this fragment).
+		float swOcc;
+		int swTileBase = int( pc.rpUser7.x );
+		int swTx = int( fragment.position.x ) / 16 - int( pc.rpUser7.z );
+		int swTy = int( fragment.position.y ) / 16 - int( pc.rpUser7.w );
+		if( swTileBase >= 0 && swTx >= 0 && swTy >= 0 )
+		{
+			int  swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( SW_TILE_K + 1 );
+			uint swCnt  = t_SoftTiles[ swSlot ];
+			if( swCnt != 0xFFFFFFFFu )
+			{
+				swOcc = SoftShadow_FaceCoverageList( swCovP, swL, swR, swFirstElem, swSlot + 1, int( swCnt ) );
+			}
+			else
+			{
+				swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+			}
+		}
+		else
+		{
+			swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+		}
 		shadow = 1.0 - saturate( swOcc );
 	}
 	else if( pcssScale < 0.0 )

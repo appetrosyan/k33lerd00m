@@ -1930,6 +1930,12 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			extern idCVar r_shadowMapPCSSAnalyticContact;	// .w = PCSS->analytic contact hybrid gate
 			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, r_shadowMapPCSSBias.GetFloat(), r_shadowMapPCSSAnalyticContact.GetBool() ? 1.0f : 0.0f };
 			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
+
+			// tile binning result for this light (DrawInteractions ran the prepass): rpUser7 =
+			// ( tile-list base | -1, tilesX, tile origin x, tile origin y ). All exact in float.
+			float swTile[4] = { ( float )currentSoftTileBase, ( float )currentSoftTileTilesX,
+								( float )currentSoftTileOx, ( float )currentSoftTileOy };
+			SetFragmentParm( RENDERPARM_USER7, swTile );
 		}
 
 		// Depth-hacked surfaces (the view weapon, some particle models) write a squashed,
@@ -4575,6 +4581,11 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 
 	Framebuffer* previousFramebuffer = Framebuffer::GetActiveFramebuffer();
 
+	if( softTileBinPass != NULL )
+	{
+		softTileBinPass->BeginView();	// reset the per-view tile-buffer allocation cursor
+	}
+
 	// Ray-traced shadows: the world TLAS was built and rtShadowsActiveThisView set in
 	// DrawViewInternal, BEFORE the shadow-map atlas pass, so the atlas could skip the
 	// RT-shadowed lights. Each shadow-casting point/spot light traces its own screen-space
@@ -4639,6 +4650,43 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			// and drawIndexed hits dead state ("Graphics state is not set before a
 			// drawIndexed call"). Force the cache dirty so the next draw fully re-sets.
 			currentPipeline = nullptr;
+		}
+
+		// Analytic soft shadows: TILE BINNING prepass (r_softShadowTileBin). Bin this light's face
+		// stream against its scissor's 16x16 tiles once, so every interaction fragment walks only its
+		// tile's triangle list instead of the whole stream (measured 69% of the soft cost). The
+		// resulting tile-rect/base go to the pixel shader via rpUser7 in the soft-wedge uniform block;
+		// base -1 = no binning => full walk (bit-exact fallback at every level).
+		currentSoftTileBase = -1;
+		{
+			extern idCVar r_softShadowTileBin;
+			extern idCVar r_softShadowFaceCoverage;
+			if( r_softShadowTileBin.GetBool() && r_softShadowFaceCoverage.GetBool()
+					&& r_useSoftShadowVolumes.GetBool() && softTileBinPass != NULL
+					&& vLight->softEdgeCount > 0 && vLight->softPairCount > 0 )
+			{
+				extern idCVar r_shadowPenumbraSize;
+				const vertCacheHandle_t eh = vLight->softEdgeCache;
+				const vertCacheHandle_t ph = vLight->softPairCache;
+				const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				const uint pairOfs = ( uint )( ( ph >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+				int tox = 0, toy = 0, tsx = 0;
+				currentSoftTileBase = softTileBinPass->BinLight(
+										  commandList, viewDef, vLight,
+										  joint, edgeOfs / 16u,			// edge base in float4 elements
+										  joint, pairOfs / 4u,			// pair base in uint elements
+										  vLight->softPairCount,
+										  r_shadowPenumbraSize.GetFloat(),
+										  ( nvrhi::ITexture* )globalImages->currentDepthImage->GetTextureID(),
+										  tox, toy, tsx );
+				currentSoftTileOx = tox;
+				currentSoftTileOy = toy;
+				currentSoftTileTilesX = tsx;
+				// compute dispatch invalidates nvrhi's graphics state (same caveat as the RT mask
+				// dispatch above): force the pipeline cache dirty so the next draw fully re-sets.
+				currentPipeline = nullptr;
+			}
 		}
 
 		// Analytic soft shadow volumes. Three passes into the R32F coverage buffer:

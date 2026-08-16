@@ -1709,6 +1709,8 @@ void R_AddModels()
 		{
 			vLight->softEdgeCache = 0;
 			vLight->softEdgeCount = 0;
+			vLight->softPairCache = 0;
+			vLight->softPairCount = 0;
 
 			// Perf: prepend each caster's edge block with a HEADER record carrying the caster's
 			// world-space bounding sphere, so the pixel shader can cheaply reject a whole caster that
@@ -1751,6 +1753,13 @@ void R_AddModels()
 			edgesUsed += records;
 
 			softShadowEdge_t* flat = ( softShadowEdge_t* )R_FrameAlloc( records * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
+			// tile binning (r_softShadowTileBin): pair-start record indices of the FACE stream, one uint
+			// per triangle, so the bin compute pass gets random access to triangles without decoding the
+			// header/pair structure (recB.e0.w == 0 is not distinguishable from a degenerate recA).
+			extern idCVar r_softShadowFaceCoverage;
+			const bool facePairs = r_softShadowFaceCoverage.GetBool();
+			uint32_t* pairIdx = facePairs ? ( uint32_t* )R_FrameAlloc( ( total / 2 + 1 ) * sizeof( uint32_t ), FRAME_ALLOC_UNKNOWN ) : NULL;
+			int nPairs = 0;
 			int n = 0;
 			float casterId = 0.0f;	// tag each caster's edges so the shader can group + combine per caster
 			const void* curSpace = NULL;
@@ -1780,6 +1789,10 @@ void R_AddModels()
 				{
 					const idVec4& e0 = s->softEdges[i].e0;
 					const idVec4& e1 = s->softEdges[i].e1;
+					if( pairIdx != NULL && ( i & 1 ) == 0 )
+					{
+						pairIdx[nPairs++] = ( uint32_t )n;	// face records are strict (recA, recB) pairs per surf
+					}
 					gmn.x = Min( gmn.x, Min( e0.x, e1.x ) );	gmx.x = Max( gmx.x, Max( e0.x, e1.x ) );
 					gmn.y = Min( gmn.y, Min( e0.y, e1.y ) );	gmx.y = Max( gmx.y, Max( e0.y, e1.y ) );
 					gmn.z = Min( gmn.z, Min( e0.z, e1.z ) );	gmx.z = Max( gmx.z, Max( e0.z, e1.z ) );
@@ -1804,6 +1817,11 @@ void R_AddModels()
 			// interaction pixel shader can read; the vertex buffer is not bound as an SRV.
 			vLight->softEdgeCache = vertexCache.AllocJoint( flat, records, sizeof( softShadowEdge_t ) );
 			vLight->softEdgeCount = records;
+			if( pairIdx != NULL && nPairs > 0 )
+			{
+				vLight->softPairCache = vertexCache.AllocJoint( pairIdx, nPairs, sizeof( uint32_t ) );
+				vLight->softPairCount = nPairs;
+			}
 
 			if( R_SoftShadowCaptureArmed() )
 			{
