@@ -257,6 +257,12 @@ void main( PS_IN fragment, out PS_OUT result )
 		{
 			swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( SW_TILE_K + 1 );
 			swCnt  = t_SoftTiles[ swSlot ];
+			// HANG-PROOFING (see softterm.cs): non-sentinel counts above K are corrupt tile data -
+			// degrade to the bounded full walk instead of looping the GPU into a device reset
+			if( swCnt > uint( SW_TILE_K ) && swCnt < SW_TILE_SPILL )
+			{
+				swCnt = 0xFFFFFFFFu;
+			}
 		}
 		const bool swBinned = ( swSlot >= 0 ) && ( swCnt != 0xFFFFFFFFu ) && ( swCnt != SW_TILE_UMBRA ) && ( swCnt != SW_TILE_SPILL );
 		if( ( swSlot >= 0 ) && ( swCnt == SW_TILE_UMBRA ) )
@@ -268,7 +274,9 @@ void main( PS_IN fragment, out PS_OUT result )
 			// overflowed tile: the span holds this tile's surviving CLUSTER records (stream v3) -
 			// the two-level walk amortizes the cone cull ~3.6x exactly where lists are huge
 			const uint swOfs = t_SoftTiles[ swSlot + 1 ];
-			const uint swSpN = t_SoftTiles[ swSlot + 2 ];
+			// span length hard-capped (worst measured tile is ~334 clusters): a corrupt descriptor
+			// must degrade to a truncated walk, never a device reset
+			const uint swSpN = min( t_SoftTiles[ swSlot + 2 ], 65536u );
 			swOcc = SoftShadow_FaceCoverageClusterList( swCovP, swL, swR, swFirstElem, int( swOfs ), int( swSpN ), swRotAng );
 		}
 		else if( swBinned )

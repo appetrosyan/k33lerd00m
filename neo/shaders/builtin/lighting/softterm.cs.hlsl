@@ -150,7 +150,14 @@ void main( uint3 tid : SV_DispatchThreadID )
 	if( g_range.z >= 0 && swTx >= 0 && swTy >= 0 )
 	{
 		const int  swSlot = g_range.z + ( swTy * g_range.w + swTx ) * ( SW_TILE_K + 1 );
-		const uint swCnt  = t_SoftTiles[ swSlot ];
+		uint swCnt  = t_SoftTiles[ swSlot ];
+		// HANG-PROOFING: a count word must be a sane count (<= K) or a known sentinel. Anything else
+		// is corrupt tile data (a stale/aliased slot) - walking it would loop the GPU into a device
+		// reset (observed live: gfx-ring timeout, 10s watchdog). Degrade to the bounded full walk.
+		if( swCnt > ( uint )SW_TILE_K && swCnt < SW_TILE_SPILL )
+		{
+			swCnt = 0xFFFFFFFFu;
+		}
 		if( swCnt == SW_TILE_UMBRA )
 		{
 			// whole tile provably in umbra: the integral saturates to 1 for every receiver here
@@ -162,7 +169,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 			// overflowed tile: the span holds this tile's surviving CLUSTER records (stream v3) -
 			// the two-level walk amortizes the cone cull ~3.6x exactly where lists are huge
 			const uint swOfs = t_SoftTiles[ swSlot + 1 ];
-			const uint swSpN = t_SoftTiles[ swSlot + 2 ];
+			// span length hard-capped (worst measured tile is ~334 clusters; 64k = deep margin):
+			// a corrupt descriptor must degrade to a truncated walk, never a device reset
+			const uint swSpN = min( t_SoftTiles[ swSlot + 2 ], 65536u );
 			swOcc = SoftShadow_FaceCoverageClusterList( swP, swL, swR, g_range.x, ( int )swOfs, ( int )swSpN, swRotAng );
 		}
 		else if( swCnt != 0xFFFFFFFFu )
