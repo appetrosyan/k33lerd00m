@@ -121,9 +121,8 @@ STUDY_TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 		std::vector<float4> rec = BuildCaster( loops );
 		int numRec = ( int )( rec.size() / 2 );
 		SoftEdgeBuffer buf{ rec.data(), ( int )rec.size() };
-		std::vector<float4> frec = BuildFaceCaster( b );			// the SHIPPED front-face stream (the fix)
-		int numFRec = ( int )( frec.size() / 2 );
-		SoftEdgeBuffer fbuf{ frec.data(), ( int )frec.size() };
+		FaceStreamCPU frec = BuildFaceCaster( b );				// the SHIPPED front-face stream (the fix)
+		SoftEdgeBuffer fbuf{ frec.buf.data(), ( int )frec.buf.size() };
 		std::vector<float2> shell = ShellFloorPoly( loop, cf.boxC, L, cf.R * 1.1f );	// the actual GPU shell region
 
 		long fl = 0, fs = 0, pen = 0, lit = 0;
@@ -141,7 +140,7 @@ STUDY_TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 				// The FIX: front-face coverage (the shipped SoftShadow_FaceCoverage). The old L-silhouette path
 				// undershot the outer penumbra (false-lit ~0.14) because it is selected against the light but
 				// projected from the receiver; front-face coverage IS the exact receiver-disk coverage.
-				float anaOcc = SoftShadow_FaceCoverage( P, L, cf.R, 0, numFRec, SoftRotAngle( P ), fbuf );
+				float anaOcc = SoftShadow_FaceCoverage( P, L, cf.R, frec.triBase(), 0, frec.nCasters, SoftRotAngle( P ), fbuf );
 				( void )lsilOcc;
 
 				// COVERAGE ACCURACY (folded in from the old box_corpus test): in the penumbra ring, face

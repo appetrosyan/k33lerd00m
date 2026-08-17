@@ -1120,7 +1120,7 @@ TEST( SoftFinding, F6_caster_piercing_light_plane )
 	// contour at all: it casts disk-sample rays that hit the box's lower half directly, so the plane-piercing
 	// occlusion is captured without any clipped-cross-section reconstruction.
 	float liveWedge = LiveShadow( BuildCaster( { Silhouette( pierce, L ) } ), P, L, r );		// old path: diagnostic (undershoots)
-	std::vector<float4> fc = BuildFaceCaster( pierce );
+	FaceStreamCPU fc = BuildFaceCaster( pierce );
 	float shadeFace = 1.0f - FaceOcclusion( fc, P, L, r );
 	std::printf( "    [F6] pierce-light-plane: truth=%.4f  wedge(old)=%.4f  FACE(shipped)=%.4f\n", truth, liveWedge, shadeFace );
 	CHECK_NEAR( shadeFace, truth, 0.05f );
@@ -1257,7 +1257,7 @@ TEST( SoftFinding, F9_light_inside_caster_is_umbra )
 	// an enclosed light and BuildCaster emits a garbage header the cull skips -> falsely LIT (printed below).
 	auto loop = Silhouette( shell, L );
 	float liveWedge = LiveShadow( BuildCaster( { loop } ), P, L, r );		// old path: diagnostic only (wrong)
-	std::vector<float4> fc = BuildFaceCaster( shell );
+	FaceStreamCPU fc = BuildFaceCaster( shell );
 	float liveFace = 1.0f - FaceOcclusion( fc, P, L, r );					// shipped path: 0 = fully shadowed
 	std::printf( "    [F9] light-inside-caster: wedge(old)=%.4f  FACE(shipped)=%.4f (must be 0)\n", liveWedge, liveFace );
 	CHECK_NEAR( liveFace, 0.0f, 1e-3f );
@@ -2160,7 +2160,7 @@ STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 			float rp = 0, bandRp = 0;
 			int   firstElem = 0, nRec = 0;
 			std::vector<CasterRange> casters;
-			std::vector<float4> allRecs;					// SHIPPED front-face stream, all casters combined
+			FaceStreamCPU allRecs;							// SHIPPED front-face stream, all casters combined
 			std::vector<std::pair<float3, std::vector<std::pair<float3, float3>>>> shells;	// centre + edges (legacy diag)
 			std::vector<std::pair<int, int>> shellRec;		// per shell: (firstRec, numRec) into the edge stream
 		};
@@ -2192,7 +2192,7 @@ STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 				}
 				lc.casters.push_back( cr );
 				FaceCasterCPU fcc = BuildFaceCasterFromMesh( c.meshVerts.data(), c.meshIdx.data(), cs.firstIndex, cs.numIndex );
-				lc.allRecs.insert( lc.allRecs.end(), fcc.faceRecs.begin(), fcc.faceRecs.end() );	// one combined face stream
+				lc.allRecs.Append( fcc );	// one combined face stream
 			}
 			for( uint32_t rIdx = Lt.firstEdge; rIdx < Lt.firstEdge + Lt.edgeCount && rIdx < c.edges.size(); rIdx++ )
 			{
@@ -2476,7 +2476,7 @@ STUDY_TEST( SoftShadowFaceSum, erebus_analytic_matches_truth_over_whole_shadow )
 				float3 C( c.recvVerts[ic * 3], c.recvVerts[ic * 3 + 1], c.recvVerts[ic * 3 + 2] );
 				SwRasterTri( g, c.hdr.worldMVP, A, B, C, ( int )R.lightIndex );
 			}
-		struct LC { bool soft = false; float3 Lo; float rp = 0; int firstElem = 0, nRec = 0; std::vector<CasterRange> casters; std::vector<FaceCasterCPU> faces; std::vector<float4> allRecs; };
+		struct LC { bool soft = false; float3 Lo; float rp = 0; int firstElem = 0, nRec = 0; std::vector<CasterRange> casters; std::vector<FaceCasterCPU> faces; FaceStreamCPU allRecs; };
 		std::vector<LC> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
@@ -2499,7 +2499,7 @@ STUDY_TEST( SoftShadowFaceSum, erebus_analytic_matches_truth_over_whole_shadow )
 				lc.casters.push_back( cr );
 				lc.faces.push_back( BuildFaceCasterFromMesh( c.meshVerts.data(), c.meshIdx.data(), cs.firstIndex, cs.numIndex ) );
 			}
-			for( const FaceCasterCPU& f : lc.faces ) { lc.allRecs.insert( lc.allRecs.end(), f.faceRecs.begin(), f.faceRecs.end() ); }
+			for( const FaceCasterCPU& f : lc.faces ) { lc.allRecs.Append( f ); }
 		}
 		SoftEdgeBuffer buf{ reinterpret_cast<const float4*>( c.edges.data() ), ( int )( c.edges.size() * 2 ) };
 		// Two DISTINCT correctness properties, asserted separately instead of blurred into one number:
@@ -2579,7 +2579,7 @@ STUDY_TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 		for( const Cfg& cf : cfgs )
 		{
 			Box b = MakeBox( cf.c, cf.h, 0.4f, 0.1f );
-			std::vector<float4> fc = BuildFaceCaster( b );
+			FaceStreamCPU fc = BuildFaceCaster( b );
 			for( int j = 0; j < N; j++ )
 				for( int i = 0; i < N; i++ )
 				{
@@ -2641,8 +2641,8 @@ STUDY_TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 				// into a single SoftShadow_FaceCoverage call where the disk-sample mask unions across casters.
 				// max() over per-caster calls is NOT a union (two casters each covering half the disk => 0.5, not
 				// umbra) and would fake open-geometry drain the shader never has.
-				std::vector<float4> allRecs;
-				for( const FaceCasterCPU& f : faces ) { allRecs.insert( allRecs.end(), f.faceRecs.begin(), f.faceRecs.end() ); }
+				FaceStreamCPU allRecs;
+				for( const FaceCasterCPU& f : faces ) { allRecs.Append( f ); }
 				for( int i = 0; i < W * H; i++ )
 				{
 					if( g.light[i] != ( int )li ) { continue; }
@@ -2699,7 +2699,7 @@ STUDY_TEST( SoftShadowFacePipeline, face_mode_band_and_coverage_vs_truth )
 				SwRasterTri( g, c.hdr.worldMVP, A, B, C, ( int )R.lightIndex );
 			}
 		// per soft light: caster ranges (+AABB) and the FACE-mode feed (face stream + shell edges) per caster
-		struct LC { bool soft = false; float3 Lo; float rp = 0, bandRp = 0; std::vector<CasterRange> casters; std::vector<FaceCasterCPU> faces; std::vector<float4> allRecs; };
+		struct LC { bool soft = false; float3 Lo; float rp = 0, bandRp = 0; std::vector<CasterRange> casters; std::vector<FaceCasterCPU> faces; FaceStreamCPU allRecs; };
 		std::vector<LC> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
@@ -2722,7 +2722,7 @@ STUDY_TEST( SoftShadowFacePipeline, face_mode_band_and_coverage_vs_truth )
 				lc.casters.push_back( cr );
 				lc.faces.push_back( BuildFaceCasterFromMesh( c.meshVerts.data(), c.meshIdx.data(), cs.firstIndex, cs.numIndex ) );
 			}
-			for( const FaceCasterCPU& f : lc.faces ) { lc.allRecs.insert( lc.allRecs.end(), f.faceRecs.begin(), f.faceRecs.end() ); }
+			for( const FaceCasterCPU& f : lc.faces ) { lc.allRecs.Append( f ); }
 		}
 		float3 cam0( c.hdr.vieworg[0], c.hdr.vieworg[1], c.hdr.vieworg[2] );
 		long phantom = 0, disagree = 0, penum = 0, oversharp = 0;			// SHIPPED (emergent, no band)
@@ -3207,7 +3207,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 			float rp = 0, bandRp = 0;
 			int firstElem = 0, nRec = 0;
 			std::vector<CasterRange> casters;
-			std::vector<float4> allRecs;			// SHIPPED front-face stream (all casters combined)
+			FaceStreamCPU allRecs;					// SHIPPED front-face stream (all casters combined)
 			std::vector<std::pair<float3, std::vector<std::pair<float3, float3>>>> shells;
 		};
 		std::vector<RefLight> lights( c.hdr.numLights );
@@ -3238,7 +3238,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 				}
 				lc.casters.push_back( cr );
 				FaceCasterCPU fcc = BuildFaceCasterFromMesh( c.meshVerts.data(), c.meshIdx.data(), cs.firstIndex, cs.numIndex );
-				lc.allRecs.insert( lc.allRecs.end(), fcc.faceRecs.begin(), fcc.faceRecs.end() );	// one combined face stream
+				lc.allRecs.Append( fcc );	// one combined face stream
 			}
 			for( uint32_t rIdx = Lt.firstEdge; rIdx < Lt.firstEdge + Lt.edgeCount && rIdx < c.edges.size(); rIdx++ )
 			{
@@ -4377,7 +4377,7 @@ STUDY_TEST( SoftShadowSoftness, penumbra_width_tracks_truth_contact_hardening )
 		Box slab = MakeBox( float3( -30.0f, 0, slabZ[s] ), float3( 30.0f, 30.0f, 0.25f ) );
 		auto loop = Silhouette( slab, L );
 		CHECK( loop.size() >= 3 );
-		std::vector<float4> frec = BuildFaceCaster( slab );		// SHIPPED front-face stream
+		FaceStreamCPU frec = BuildFaceCaster( slab );			// SHIPPED front-face stream
 		// sweep the profile: shadow term and ray truth as functions of x on the floor. The SHIPPED path is
 		// front-face coverage - it computes the full shadow (lit/penumbra/umbra) directly, no band/shell gating,
 		// and its penumbra width tracks the ray truth because it is the exact receiver-disk coverage. The old

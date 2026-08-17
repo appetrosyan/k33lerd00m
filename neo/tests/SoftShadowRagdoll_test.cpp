@@ -90,9 +90,9 @@ STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
 		}
 		float3 lp( L.origin[0], L.origin[1], L.origin[2] );
 		float  swR = L.penumbraSize > 0 ? L.penumbraSize : 8.0f;
-		SoftEdgeBuffer buf{ allRecs, ( int )cap.edges.size() * 2 };
-		const int firstElem = ( int )L.firstEdge * 2;
-		const int numRec = ( int )L.edgeCount;
+		// pre-v5 capture blob = v1 records (inline headers + tri pairs); convert to the v2 stream
+		FaceStreamCPU fs = FaceStreamFromV1Records( allRecs, ( int )L.firstEdge * 2, ( int )L.edgeCount );
+		SoftEdgeBuffer buf{ fs.buf.data(), ( int )fs.buf.size() };
 
 		int totalV = 0, blackV = 0, litV = 0, penV = 0;
 		BlockStat firstBlockers;			// nearest blocking triangle per blocked sample of BLACK verts
@@ -111,7 +111,7 @@ STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
 				const float* pv = &cap.recvVerts[( rs.firstVert + v ) * 3];
 				float3 P( pv[0], pv[1], pv[2] );
 				totalV++;
-				float occ = saturate( SoftShadow_FaceCoverage( P, lp, swR, firstElem, numRec, SoftRotAngle( P ), buf ) );
+				float occ = saturate( SoftShadow_FaceCoverage( P, lp, swR, fs.triBase(), 0, fs.nCasters, SoftRotAngle( P ), buf ) );
 				if( occ <= 0.01f )
 				{
 					litV++;
@@ -149,21 +149,14 @@ STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
 					float2 sc( s0.x * ca - s0.y * sa, s0.x * sa + s0.y * ca );
 					float3 dir = base + su * sc.x + sv * sc.y;
 					float bestT = 1e30f;
-					for( int se = 0; se < numRec; se++ )
+					const int numTris = ( ( int )fs.buf.size() - fs.triBase() ) / 3;
+					for( int t = 0; t < numTris; t++ )
 					{
-						float4 e0 = buf[firstElem + se * 2];
-						if( e0.w < 0.0f )
-						{
-							continue;		// header
-						}
-						if( se + 1 >= numRec )
-						{
-							break;
-						}
-						float4 e1 = buf[firstElem + se * 2 + 1];
-						float4 g1 = buf[firstElem + ( se + 1 ) * 2 + 1];
-						se++;
-						float3 v0( e0.x, e0.y, e0.z ), v1( e1.x, e1.y, e1.z ), v2( g1.x, g1.y, g1.z );
+						const int b = fs.triBase() + t * 3;
+						float4 r0 = buf[b + 0];
+						float4 r1 = buf[b + 1];
+						float4 r2 = buf[b + 2];
+						float3 v0( r0.x, r0.y, r0.z ), v1( r1.x, r1.y, r1.z ), v2( r2.x, r2.y, r2.z );
 						float3 edge1 = v1 - v0, edge2 = v2 - v0, sp = P - v0;
 						float3 h = cross( dir, edge2 );
 						float aa = dot( edge1, h );

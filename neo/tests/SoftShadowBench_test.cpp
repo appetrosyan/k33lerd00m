@@ -147,7 +147,7 @@ STUDY_TEST( SoftShadowBench, face_vs_wedge_throughput )
 	float3 L( 0, 0, 12 ); float r = 2.0f;
 	Rng rng( 20260815u );
 	std::vector<float4> edgeStream; std::vector<std::vector<float3>> loops;
-	std::vector<float4> faceStream;
+	FaceStreamCPU faceStream;
 	for( int cbi = 0; cbi < NBOX; cbi++ )
 	{
 		float3 C( rng.f( -4, 4 ), rng.f( -4, 4 ), rng.f( 3.0f, 8.0f ) );
@@ -155,19 +155,18 @@ STUDY_TEST( SoftShadowBench, face_vs_wedge_throughput )
 		Box b = MakeBox( C, h, rng.f( 0, 3.14f ), rng.f( -0.3f, 0.3f ) );
 		std::vector<float3> loop = Silhouette( b, L );
 		if( loop.size() >= 3 ) { loops.push_back( loop ); }
-		std::vector<float4> fs = BuildFaceCaster( b );
-		faceStream.insert( faceStream.end(), fs.begin(), fs.end() );		// concatenated: mask unions across casters
+		faceStream.Append( BuildFaceCasterUnit( b ) );		// combined: mask unions across casters
 	}
 	edgeStream = BuildCaster( loops );
 	int edgeRec = ( int )( edgeStream.size() / 2 );
-	int faceRec = ( int )( faceStream.size() / 2 );
+	int faceRec = ( int )( ( faceStream.buf.size() - faceStream.triBase() ) / 3 );	// triangles (report only)
 	std::vector<float3> P;
 	for( int i = 0; i < GRID; i++ )
 		for( int j = 0; j < GRID; j++ )
 			P.push_back( float3( -5.0f + 10.0f * i / ( GRID - 1 ), -5.0f + 10.0f * j / ( GRID - 1 ), 0.0f ) );
 
 	SoftEdgeBuffer eb{ edgeStream.data(), ( int )edgeStream.size() };
-	SoftEdgeBuffer fb{ faceStream.data(), ( int )faceStream.size() };
+	SoftEdgeBuffer fb{ faceStream.buf.data(), ( int )faceStream.buf.size() };
 	volatile double sink = 0;
 	const int REPS = 5;
 	std::chrono::high_resolution_clock::time_point t0 = std::chrono::high_resolution_clock::now();
@@ -177,7 +176,7 @@ STUDY_TEST( SoftShadowBench, face_vs_wedge_throughput )
 	std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 	double accF = 0;
 	for( int rep = 0; rep < REPS; rep++ )
-		for( size_t i = 0; i < P.size(); i++ ) { accF += SoftShadow_FaceCoverage( P[i], L, r, 0, faceRec, SoftRotAngle( P[i] ), fb ); }
+		for( size_t i = 0; i < P.size(); i++ ) { accF += SoftShadow_FaceCoverage( P[i], L, r, faceStream.triBase(), 0, faceStream.nCasters, SoftRotAngle( P[i] ), fb ); }
 	std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
 	sink = accW + accF;
 

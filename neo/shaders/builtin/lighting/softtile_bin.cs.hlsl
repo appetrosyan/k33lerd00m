@@ -12,16 +12,17 @@ version. See <http://www.gnu.org/licenses/>.
 ===========================================================================
 */
 
-// Analytic soft shadows: PER-TILE TRIANGLE BINNING (r_softShadowTileBin). One threadgroup per 16x16
-// screen tile of one soft light's scissor. The group reduces the tile's depth min/max, unprojects the
-// tile's 8 corner points into a world-space receiver AABB, and then tests every caster TRIANGLE of the
-// light's face stream against the sample cone of that AABB - the SAME cone/slab cull the interaction
-// fragment shader runs per fragment, made conservative for the whole tile by inflating with the AABB
-// radius (translating the cone apex by d changes any point-cone distance by at most d, and the
-// receiver->light distance by at most d, so radius + 2d covers every receiver in the tile). Surviving
-// pair-start record indices are appended to this tile's list; the fragment shader then walks ONLY that
-// list (SoftShadow_FaceCoverageList). Measured motivation: the per-fragment record walk + triangle
-// culls are 69% of the soft-shadow cost and are near-identical across a tile's 256 fragments.
+// Analytic soft shadows: PER-TILE TRIANGLE BINNING (r_softShadowTileBin), STREAM V2. One threadgroup
+// per 16x16 screen tile of one soft light's scissor. The group reduces the tile's depth min/max,
+// unprojects the tile's 8 corner points into a world-space receiver AABB, then culls in two stages:
+// first every CASTER's bounding sphere against the sample cone of that AABB (a rejected sphere can
+// hide no triangle), then the surviving casters' TRIANGLES with the SAME cone/slab cull the
+// interaction fragment shader runs per fragment - made conservative for the whole tile by inflating
+// with the AABB radius (translating the cone apex by d changes any point-cone distance by at most d,
+// and the receiver->light distance by at most d, so radius + 2d covers every receiver in the tile).
+// Surviving TRIANGLE indices are appended to this tile's list; the fragment shader then walks ONLY
+// that list (SoftShadow_FaceCoverageList). Measured motivation: the per-fragment record walk +
+// triangle culls are 69% of the soft-shadow cost and are near-identical across a tile's 256 fragments.
 //
 // CONSERVATIVE by construction - a tile list can only OVER-include:
 //   - depth-degenerate tiles (huge z range) inflate the AABB, keeping more triangles;
@@ -34,11 +35,10 @@ version. See <http://www.gnu.org/licenses/>.
 #pragma pack_matrix( row_major )
 
 #define SW_TILE_SIZE	16
-#define SW_TILE_K		256		// indices per tile; must match interactionSM.ps.hlsl + SoftTileBinPass.h
+#define SW_TILE_K		512		// indices per tile; must match interactionSM.ps.hlsl + SoftTileBinPass.h
 
 // *INDENT-OFF*
-StructuredBuffer<float4>	t_Edges		: register( t0 );	// softShadowEdge_t stream (float4 pairs), whole joint buffer
-StructuredBuffer<uint>		t_PairIdx	: register( t1 );	// pair-start record indices, one per triangle
+StructuredBuffer<float4>	t_Edges		: register( t0 );	// STREAM V2: tri stream (3 float4/tri) + caster table (2 float4/caster), whole joint buffer
 StructuredBuffer<uint>		t_MinMax	: register( t2 );	// per-SCREEN-tile depth min/max bits (softtile_minmax.cs.hlsl)
 RWStructuredBuffer<uint>	u_Tiles		: register( u0 );	// [count | K indices] per tile
 
@@ -50,12 +50,18 @@ cbuffer c_TileBin : register( b0 )
 	float4	g_invMvp3;
 	float4	g_lightR;		// light origin xyz, disk radius w
 	int4	g_tileRect;		// tile origin x, y (in tiles), tilesX, tilesY
-	int4	g_range;		// firstElem (edge float4 base), numPairs, outBase (uint elements), pairBase (uint elements)
+	int4	g_range;		// firstElem (tri stream float4 base), numCasters, outBase (uint elements), casterBase (float4 elements)
 	float4	g_screen;		// viewport W, H, viewport origin x, y
 	int4	g_minmax;		// screen tiles X (t_MinMax row stride), unused x3
 };
 
 #define SW_NEAR_EPS 1e-3f
+// caster capacity of the groupshared survivor mask; casters past it are conservatively kept
+#define SW_BIN_MAX_CASTERS 2048
+// per-tile UMBRA sentinel (count slot value): one triangle provably blocks the WHOLE light disk for
+// EVERY receiver in the tile -> the coverage integral saturates to 1 everywhere in the tile, so the
+// consumers write term 0 without walking. Distinct from the overflow sentinel 0xFFFFFFFF.
+#define SW_TILE_UMBRA 0xFFFFFFFEu
 // *INDENT-ON*
 
 groupshared uint gsCount;
@@ -63,6 +69,8 @@ groupshared float3 gsCentre;
 groupshared float  gsRad;
 groupshared float3 gsNrm;
 groupshared float  gsDistPL;
+groupshared uint gsCasterKeep[SW_BIN_MAX_CASTERS / 32];
+groupshared uint gsUmbra;
 
 float3 TileUnproject( float px, float py, float depth )
 {
@@ -88,6 +96,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	if( tid == 0 )
 	{
 		gsCount = 0u;
+		gsUmbra = 0u;
 	}
 
 	// ---- tile depth min/max from the SHARED once-per-view reduce (softtile_minmax.cs.hlsl) ----
@@ -137,33 +146,146 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	const float  swR    = max( g_lightR.w, 1e-2f );
 	const float  eps    = SW_NEAR_EPS;
 
-	// ---- bin: same cone/slab cull as the fragment walk, inflated by the tile radius ----
-	for( int p = ( int )tid; p < g_range.y; p += 64 )
+	// ---- stage 1: CASTER pre-cull. The caster's bounding sphere gets the SAME cone/slab test the
+	// triangles get (a triangle is contained in its caster's sphere, so a rejected sphere can hide
+	// no triangle - conservative). This is the O(tiles x tris) -> O(tiles x casters + survivors)
+	// reduction: most casters are far from any given tile's cone. Survivor bits live in groupshared;
+	// casters beyond SW_BIN_MAX_CASTERS are conservatively kept.
+	for( int ci = ( int )tid; ci < ( SW_BIN_MAX_CASTERS / 32 ); ci += 64 )
 	{
-		int se = ( int )t_PairIdx[ g_range.w + p ];
-		float4 e0 = t_Edges[ g_range.x + se * 2 + 0 ];
-		float4 e1 = t_Edges[ g_range.x + se * 2 + 1 ];
-		float4 g1 = t_Edges[ g_range.x + ( se + 1 ) * 2 + 1 ];
-		float3 tcen = ( float3( e0.x, e0.y, e0.z ) + float3( e1.x, e1.y, e1.z ) + float3( g1.x, g1.y, g1.z ) ) * ( 1.0f / 3.0f );
-		float  triRad = e0.w + tR;								// apex may sit anywhere in the tile AABB
-		float3 rc = tcen - Pc;
+		gsCasterKeep[ci] = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	for( int c = ( int )tid; c < g_range.y && c < SW_BIN_MAX_CASTERS; c += 64 )
+	{
+		float4 c0 = t_Edges[ g_range.w + c * 2 + 0 ];			// ( centre.xyz, radius )
+		float  R  = c0.w + tR;									// apex may sit anywhere in the tile AABB
+		float3 rc = float3( c0.x, c0.y, c0.z ) - Pc;
 		float  cd = dot( rc, nrm );
-		if( cd + triRad < eps ) { continue; }					// wholly behind every receiver in the tile
-		if( cd - triRad > distPL + tR ) { continue; }			// wholly beyond the light for every receiver
+		if( cd + R < eps ) { continue; }						// wholly behind every receiver in the tile
+		if( cd - R > distPL + tR ) { continue; }				// wholly beyond the light for every receiver
 		float3 perp = rc - cd * nrm;
-		float  coneR = swR * ( cd + triRad ) / max( distPL - tR, 1e-4f );
-		if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }
-		uint slot;
-		InterlockedAdd( gsCount, 1u, slot );
-		if( slot < SW_TILE_K )
+		float  coneR = swR * ( cd + R ) / max( distPL - tR, 1e-4f );
+		if( sqrt( dot( perp, perp ) ) - R > coneR ) { continue; }
+		InterlockedOr( gsCasterKeep[c >> 5], 1u << ( c & 31 ) );
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// ---- stage 2: triangle cull over SURVIVING casters only. The caster loop is group-uniform (every
+	// thread sees the same survivor bit), so a culled caster's whole span is skipped by the group in
+	// one scalar branch; inside a surviving caster the threads stride its contiguous tri span.
+	//
+	// BIG-OCCLUDER-FIRST ORDERING was measured (cap61 2026-08-17) and REJECTED: a two-phase append
+	// (angularly-big survivors first, rest second) is bit-exact - the per-fragment walk unions a
+	// sample mask, which is order-independent - but the doubled per-tile bin cull cost (35.0 -> 36.3
+	// ms) was not recovered by faster per-fragment saturation, because the walk's swMask==swAll
+	// early-out already fires quickly in the umbra. Kept single-pass.
+	for( int cc = 0; cc < g_range.y; cc++ )
+	{
+		if( cc < SW_BIN_MAX_CASTERS && ( gsCasterKeep[cc >> 5] & ( 1u << ( cc & 31 ) ) ) == 0u )
 		{
-			u_Tiles[ outSlot + 1 + ( int )slot ] = ( uint )se;
+			continue;
+		}
+		float4 c1 = t_Edges[ g_range.w + cc * 2 + 1 ];			// ( firstTri, numTris, 0, 0 )
+		const int triFirst = ( int )c1.x;
+		const int triEnd   = triFirst + ( int )c1.y;
+		for( int t = triFirst + ( int )tid; t < triEnd; t += 64 )
+		{
+			const int b = g_range.x + t * 3;
+			float4 r0 = t_Edges[ b + 0 ];
+			float4 r1 = t_Edges[ b + 1 ];
+			float4 r2 = t_Edges[ b + 2 ];
+			float3 tcen = ( float3( r0.x, r0.y, r0.z ) + float3( r1.x, r1.y, r1.z ) + float3( r2.x, r2.y, r2.z ) ) * ( 1.0f / 3.0f );
+			float  triRad = r0.w + tR;							// apex may sit anywhere in the tile AABB
+			float3 rc = tcen - Pc;
+			float  cd = dot( rc, nrm );
+			if( cd + triRad < eps ) { continue; }				// wholly behind every receiver in the tile
+			if( cd - triRad > distPL + tR ) { continue; }		// wholly beyond the light for every receiver
+			float3 perp = rc - cd * nrm;
+			float  coneR = swR * ( cd + triRad ) / max( distPL - tR, 1e-4f );
+			if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }
+			uint slot;
+			InterlockedAdd( gsCount, 1u, slot );
+			if( slot < SW_TILE_K )
+			{
+				u_Tiles[ outSlot + 1 + ( int )slot ] = ( uint )t;	// TRIANGLE index (stream v2)
+			}
+
+			// ---- WHOLE-TILE UMBRA SENTINEL (g_minmax.y, r_softShadowUmbraTiles) ----------------
+			// Prove: this ONE triangle blocks the ENTIRE light disk for EVERY receiver in the tile
+			// ball (Pc, tR) - then every sample ray of every fragment in the tile hits it, the
+			// coverage mask saturates to all-16, and the integral's value is exactly 1: the
+			// consumers may write term 0 without walking. The proof is the classic per-edge
+			// inner-penumbra construction (Assarsson wedges): a receiver P is in the triangle's
+			// umbra w.r.t. the light SPHERE (centre L, radius swR >= the sample disk, so sphere
+			// occlusion implies disk occlusion) iff
+			//   (1) the triangle plane separates P from the whole sphere, and
+			//   (2) for each edge, P lies behind the plane through the edge tangent to the sphere
+			//       with the sphere on the lit side and the triangle interior on P's side
+			// - then any ray P->S (S in sphere) crosses the triangle plane on the interior side of
+			// all three edge lines, i.e. inside the triangle. Every test carries the tile radius tR
+			// so it holds for the whole ball, plus a slack for the ray test's t > 1e-4 floor.
+			// CONSERVATIVE: any failure to certify just skips the sentinel (no speedup, no error).
+			if( g_minmax.y != 0 && gsUmbra == 0u )
+			{
+				float3 Lp = float3( g_lightR.x, g_lightR.y, g_lightR.z );
+				float3 nt = cross( float3( r1.x, r1.y, r1.z ) - float3( r0.x, r0.y, r0.z ),
+								   float3( r2.x, r2.y, r2.z ) - float3( r0.x, r0.y, r0.z ) );
+				float ntl = sqrt( dot( nt, nt ) );
+				if( ntl > 1e-6f )
+				{
+					nt = nt * ( 1.0f / ntl );
+					float3 v0 = float3( r0.x, r0.y, r0.z );
+					float dL = dot( nt, Lp - v0 );
+					if( dL < 0.0f ) { nt = -nt; dL = -dL; }			// orient toward the light
+					float dP = dot( nt, Pc - v0 );
+					float slack = tR + 2e-4f * ( distPL + tR );		// covers the walk's t > 1e-4 floor
+					if( dL > swR + 1e-3f && dP < -slack )
+					{
+						bool ok = true;
+						float3 V[3];
+						V[0] = v0; V[1] = float3( r1.x, r1.y, r1.z ); V[2] = float3( r2.x, r2.y, r2.z );
+						[unroll]
+						for( int e = 0; e < 3; e++ )
+						{
+							float3 Va = V[e], Vb = V[( e + 1 ) % 3], Vc = V[( e + 2 ) % 3];
+							float3 ed = Vb - Va;
+							float el2 = dot( ed, ed );
+							if( el2 < 1e-12f ) { ok = false; break; }
+							float3 u2 = ed * rsqrt( el2 );
+							float3 w  = Lp - Va;
+							float3 wp = w - dot( w, u2 ) * u2;
+							float  W2 = dot( wp, wp );
+							if( W2 <= swR * swR + 1e-6f ) { ok = false; break; }	// sphere touches the edge line
+							float invW = rsqrt( W2 );
+							float3 n0 = wp * invW;
+							float3 m  = cross( u2, n0 );
+							float sinT = swR * invW;
+							float cosT = sqrt( max( 1.0f - sinT * sinT, 0.0f ) );
+							// of the two tangent planes through the edge, the INNER-PENUMBRA bound is
+							// the one whose tangent point lies AWAY from the triangle interior (the
+							// umbra-boundary sight line grazes the edge toward that far side of the
+							// sphere): sigma picks it by the interior direction Vc - Va. The bound
+							// leans OVER the shadow: light sphere and umbra receivers are on the SAME
+							// (positive) side, the penumbra on the other - so the ball must be fully
+							// on the + side (>= +tR), verified numerically by the 2D boundary case.
+							float sigma = ( dot( m, Vc - Va ) >= 0.0f ) ? 1.0f : -1.0f;
+							float3 ne = sinT * n0 + sigma * cosT * m;
+							if( dot( ne, Pc - Va ) < tR ) { ok = false; break; }	// tile ball not fully inside the umbra wedge
+						}
+						if( ok )
+						{
+							InterlockedOr( gsUmbra, 1u );
+						}
+					}
+				}
+			}
 		}
 	}
 	GroupMemoryBarrierWithGroupSync();
 
 	if( tid == 0 )
 	{
-		u_Tiles[outSlot] = ( gsCount > SW_TILE_K ) ? 0xFFFFFFFFu : gsCount;
+		u_Tiles[outSlot] = ( gsUmbra != 0u ) ? SW_TILE_UMBRA : ( ( gsCount > SW_TILE_K ) ? 0xFFFFFFFFu : gsCount );
 	}
 }

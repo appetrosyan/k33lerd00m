@@ -43,6 +43,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "RenderPass.h"
 #include <sys/DeviceManager.h>
 #include <nvrhi/utils.h>
+#include <algorithm>
 
 idCVar r_useNewSsaoPass( "r_useNewSSAOPass", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "use the new SSAO pass from Donut" );
 extern DeviceManager* deviceManager;
@@ -1903,10 +1904,12 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			currentSoftEdgeBuffer = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
 			currentSoftEdgeCount = din->vLight->softEdgeCount;
 
-			// SIGN of the record count selects the coverage path in the pixel shader: negative = FRONT-FACE
-			// stream (r_softShadowFaceCoverage, accurate + stable), positive = light-silhouette edge stream.
+			// SIGN of the count selects the coverage path in the pixel shader: negative = FRONT-FACE
+			// stream v2 (r_softShadowFaceCoverage; abs = CASTER count), positive = light-silhouette
+			// edge stream (abs = record count).
 			extern idCVar r_softShadowFaceCoverage;
-			const float swCountSigned = r_softShadowFaceCoverage.GetBool() ? -( float )currentSoftEdgeCount : ( float )currentSoftEdgeCount;
+			const bool swFaceMode = r_softShadowFaceCoverage.GetBool();
+			const float swCountSigned = swFaceMode ? -( float )din->vLight->softCasterCount : ( float )currentSoftEdgeCount;
 			float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), swCountSigned, ( float )r_softShadowDebugShader.GetInteger() };
 			SetFragmentParm( RENDERPARM_JITTERTEXSCALE, swParm );	// the pixel shader reads rpJitterTexScale from the FRAGMENT bank
 
@@ -1928,7 +1931,13 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			const float swCentreLit = ( r_softShadowContinuous.GetBool() || ( r_softShadowAAM.GetBool() && softBandStencilRef == 1 ) ) ? 1.0f : 0.0f;
 			extern idCVar r_shadowMapPCSSBias;			// .z = PCSS normal-offset (texels)
 			extern idCVar r_shadowMapPCSSAnalyticContact;	// .w = PCSS->analytic contact hybrid gate
-			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swCentreLit, r_shadowMapPCSSBias.GetFloat(), r_shadowMapPCSSAnalyticContact.GetBool() ? 1.0f : 0.0f };
+			// .y is mode-split: FACE mode (v2) carries the caster-table base (float4 elements; the face
+			// path never reads the centre-lit guard), the wedge path keeps the centre-lit flag.
+			const vertCacheHandle_t swCh = din->vLight->softCasterCache;
+			const float swOffY = swFaceMode
+								 ? ( float )( ( uint )( ( swCh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK ) / 16u )
+								 : swCentreLit;
+			float swOff[4] = { ( float )( currentSoftEdgeOffset / 16u ), swOffY, r_shadowMapPCSSBias.GetFloat(), r_shadowMapPCSSAnalyticContact.GetBool() ? 1.0f : 0.0f };
 			SetFragmentParm( RENDERPARM_JITTERTEXOFFSET, swOff );
 
 			// tile binning result for this light (DrawInteractions ran the prepass): rpUser7 =
@@ -3156,6 +3165,7 @@ void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurf
 	}
 
 	renderLog.OpenBlock( "Render_SoftShadowPos", colorBlue );
+	renderLog.BeginShadowGen( RLS_SOFT );		// attribute the pos fill to the soft GPU counter
 
 	Framebuffer* previousFramebuffer = Framebuffer::GetActiveFramebuffer();
 
@@ -3256,6 +3266,7 @@ void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurf
 		Framebuffer::Unbind();
 	}
 
+	renderLog.EndShadowGen();
 	renderLog.CloseBlock();
 }
 
@@ -4770,6 +4781,10 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 
 	nvrhi::ICommandList* target = commandList;
 	uint64 gInstance = 0;
+	if( !async )
+	{
+		renderLog.BeginShadowGen( RLS_SOFT );	// attribute bin+term dispatches to the soft GPU counter
+	}
 	if( async )
 	{
 		// submit the graphics work recorded so far (depth prepass + softpos fill) so the compute
@@ -4801,23 +4816,23 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 			{
 				continue;
 			}
-			if( vLight->softEdgeCount <= 0 || vLight->softPairCount <= 0 || softTileBins.Num() >= 256 )
+			if( vLight->softEdgeCount <= 0 || vLight->softCasterCount <= 0 || softTileBins.Num() >= 256 )
 			{
 				continue;
 			}
 			const vertCacheHandle_t eh = vLight->softEdgeCache;
-			const vertCacheHandle_t ph = vLight->softPairCache;
+			const vertCacheHandle_t ch = vLight->softCasterCache;
 			const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
-			const uint pairOfs = ( uint )( ( ph >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+			const uint casOfs = ( uint )( ( ch >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
 			nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
 			softTileBinResult_t r;
 			r.vLight = vLight;
 			r.ox = r.oy = r.tilesX = 0;
 			r.base = softTileBinPass->BinLight(
 						 target, viewDef, vLight,
-						 joint, edgeOfs / 16u,		// edge base in float4 elements
-						 joint, pairOfs / 4u,		// pair base in uint elements
-						 vLight->softPairCount,
+						 joint, edgeOfs / 16u,		// tri stream base in float4 elements
+						 casOfs / 16u,				// caster table base in float4 elements
+						 vLight->softCasterCount,
 						 r_shadowPenumbraSize.GetFloat(),
 						 r.ox, r.oy, r.tilesX );
 			if( r.base >= 0 )
@@ -4828,19 +4843,35 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 	}
 
 	// ---- coverage terms: per-light dispatches consuming the tile lists above ----
+	// The term atlas has a fixed slot budget (SLOT_COLS*SLOT_ROWS); lights past it fall back to the
+	// in-shader integral (wave64, the slow path). Hand out slots BIGGEST-SCISSOR-FIRST so an
+	// over-budget frame spills the SMALLEST lights - which cost the least on the fallback - instead
+	// of whichever light happened to be last in view order. Pure scheduling: bit-identical output,
+	// only which lights get the fast path changes.
 	if( wantTerms && softShadowTermPass->BeginView( target, viewDef,
 			( nvrhi::ITexture* )globalImages->softShadowPosImage->GetTextureID() ) )
 	{
+		idList<const viewLight_t*> swTermOrder;
 		for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
 		{
-			if( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() )
+			if( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() ) { continue; }
+			if( vLight->softEdgeCount <= 0 || vLight->softCasterCount <= 0 ) { continue; }
+			swTermOrder.Append( vLight );
+		}
+		// biggest scissor area first (descending): the fixed slot budget then spills the smallest lights
+		if( swTermOrder.Num() > 1 )
+		{
+			std::stable_sort( swTermOrder.Ptr(), swTermOrder.Ptr() + swTermOrder.Num(),
+							  []( const viewLight_t* a, const viewLight_t* b ) -> bool
 			{
-				continue;
-			}
-			if( vLight->softEdgeCount <= 0 )
-			{
-				continue;
-			}
+				const idScreenRect& ra = a->scissorRect;
+				const idScreenRect& rb = b->scissorRect;
+				return ( ra.x2 - ra.x1 + 1 ) * ( ra.y2 - ra.y1 + 1 ) > ( rb.x2 - rb.x1 + 1 ) * ( rb.y2 - rb.y1 + 1 );
+			} );
+		}
+		for( int swLi = 0; swLi < swTermOrder.Num(); swLi++ )
+		{
+			const viewLight_t* vLight = swTermOrder[swLi];
 			// this light's tile-binning result from the phase above; base -1 = full walk in-shader
 			int tileBase = -1, tileOx = 0, tileOy = 0, tileTilesX = 0;
 			for( int sb = 0; sb < softTileBins.Num(); sb++ )
@@ -4855,7 +4886,9 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 				}
 			}
 			const vertCacheHandle_t eh = vLight->softEdgeCache;
+			const vertCacheHandle_t ch = vLight->softCasterCache;
 			const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+			const uint casOfs = ( uint )( ( ch >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
 			nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
 
 			// coverage early-out eligibility: the CS can mirror the FS's falloff-first zero
@@ -4881,8 +4914,9 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 			t.ofsX = t.ofsY = -1;
 			if( softShadowTermPass->AddLight(
 						target, viewDef, vLight,
-						joint, edgeOfs / 16u,		// edge base in float4 elements
-						vLight->softEdgeCount,		// face-stream record count (FS swN)
+						joint, edgeOfs / 16u,		// tri stream base in float4 elements
+						casOfs / 16u,				// caster table base in float4 elements
+						vLight->softCasterCount,
 						r_shadowPenumbraSize.GetFloat(),
 						tileBase, tileOx, tileOy, tileTilesX,
 						( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
@@ -4923,6 +4957,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 		// compute dispatches on the graphics command list invalidate nvrhi's cached graphics
 		// state (same caveat as the RT mask dispatch): force the next draw to fully re-set.
 		currentPipeline = nullptr;
+		renderLog.EndShadowGen();
 	}
 }
 

@@ -99,8 +99,10 @@ struct softShadowEdge_t
 struct drawSurf_t
 {
 	const srfTriangles_t* 	frontEndGeo;		// don't use on the back end, it may be updated by the front end!
-	const softShadowEdge_t*	softEdges;			// analytic soft shadows: this caster's silhouette edges (frame mem), NULL otherwise
-	int						numSoftEdges;		// count for softEdges
+	const softShadowEdge_t*	softEdges;			// analytic soft shadows: this caster's stream (frame mem), NULL otherwise.
+												// WEDGE mode: silhouette edge records. FACE mode (v2): idVec4 triples per
+												// triangle, cast to this type; the two modes never mix in one frame.
+	int						numSoftEdges;		// WEDGE: record count. FACE v2: count in FLOAT4 ELEMENTS (3 per triangle)
 	int						numIndexes;
 	vertCacheHandle_t		indexCache;			// triIndex_t
 	vertCacheHandle_t		ambientCache;		// idDrawVert
@@ -402,8 +404,8 @@ struct viewLight_t
 	drawSurf_t* 			softShadowWedges;			// analytic soft shadows: per-caster surfs carrying this light's silhouette edges (softEdges)
 	vertCacheHandle_t		softEdgeCache;				// analytic soft shadows: this light's silhouette edges flattened into the vertex cache (softShadowEdge_t)
 	int						softEdgeCount;				// analytic soft shadows: number of edges in softEdgeCache
-	vertCacheHandle_t		softPairCache;				// tile binning: pair-start record indices (one uint per triangle) of the FACE stream
-	int						softPairCount;				// tile binning: number of pair-start indices (triangles)
+	vertCacheHandle_t		softCasterCache;			// FACE stream v2: per-caster table, 2 float4 each - ( centre.xyz, radius ) ( firstTri, numTris, 0, 0 )
+	int						softCasterCount;			// FACE stream v2: casters in the table
 
 	bool					ImageAtlasPlaced() const
 	{

@@ -38,12 +38,13 @@ public:
 	// per light x tile). Requires the depth prepass to be complete.
 	void BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* depthTexture );
 
-	// Dispatch binning for one soft light. Returns the tile-list base (uint element index into the
-	// tile buffer) and fills the tile rect the pixel shader needs, or -1 when binning is
+	// Dispatch binning for one soft light (stream v2: pure tri stream + caster table, both float4
+	// element offsets into the same joint buffer). Returns the tile-list base (uint element index
+	// into the tile buffer) and fills the tile rect the pixel shader needs, or -1 when binning is
 	// unavailable (no pipeline, buffer full, degenerate scissor) - callers then use the full walk.
 	int BinLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
 				  nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem,
-				  nvrhi::IBuffer* pairBuffer, uint32_t pairFirstElem, int numPairs,
+				  uint32_t casterFirstElem, int numCasters,
 				  float penumbraRadius,
 				  int& outTileOx, int& outTileOy, int& outTilesX );
 
@@ -53,10 +54,11 @@ public:
 	}
 
 	static const int TILE_SIZE = 16;
-	static const int TILE_K = 256;			// indices per tile; must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl.
+	static const int TILE_K = 512;			// indices per tile; must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl.
 	// Measured (erebus1_05/07/09): K=64 overflowed the DENSE tiles - exactly the expensive ones -
-	// back to the full walk, erasing the win on heavy scenes; K=256 resolves every overflow there
-	// and K=512 changes nothing further (the residual cost is real per-tile sample work).
+	// back to the full walk, erasing the win on heavy scenes; K=256 resolved every overflow at the
+	// OLD (entity-less) stream density, but at LIVE density (114k records, softcap0061 in-game
+	// 2026-08-17) K=256 overflowed again: K=512 measured soft 55 -> 48 ms. Revisit if density grows.
 	// 8x8 tiles MEASURED WORSE (17.9/22.1/23.8 vs 16.7/19.6/20.1 ms on erebus1_05/07/09): 4x the
 	// prepass and per-tile list overhead, while the dense tiles' relevant sets barely shrink - a
 	// triangle near one tile is near its neighbours too. Do not retry without a new idea.

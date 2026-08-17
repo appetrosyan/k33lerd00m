@@ -31,7 +31,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 // bump on any layout change; the reader rejects mismatches.
 #define SOFTCAP_MAGIC   0x50434653u			// 'SFCP' little-endian
-#define SOFTCAP_VERSION 4u					// v2: receiver meshes; v3: global mesh indices; v4: mapName + gameTime (self-identifying for reconstruction). reserved[0]=gameTimeMs, reserved[1]=mapName byte length (a trailing MAPNAME block follows recvIdx).
+#define SOFTCAP_VERSION 5u					// v2: receiver meshes; v3: global mesh indices; v4: mapName + gameTime (self-identifying for reconstruction). reserved[0]=gameTimeMs, reserved[1]=mapName byte length (a trailing MAPNAME block follows recvIdx). v5: FACE-mode edge sections hold the STREAM V2 pure-tri float4 triples (zero-padded to pair records), no inline caster headers; pre-v5 face sections are v1 header+pair records (tests convert via FaceStreamFromV1Records).
 
 // v5 TEXTURE TAIL: appended AFTER every v4 block, self-describing (magic + counts), so the header
 // layout never changes and old readers simply stop before it. Carries what the offline verification

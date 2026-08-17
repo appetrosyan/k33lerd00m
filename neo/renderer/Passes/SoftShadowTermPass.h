@@ -56,7 +56,8 @@ public:
 	// 1.8x scissor-overcoverage loss); coverageEarlyOut false (debug shaders active, multi-stage
 	// light shader, stage texture matrix) integrates the full rect - the bit-exact instrument mode.
 	bool AddLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
-				   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem, int faceCount,
+				   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem,
+				   uint32_t casterFirstElem, int casterCount,
 				   float penumbraRadius,
 				   int tileBase, int tileOx, int tileOy, int tilesX,
 				   nvrhi::IBuffer* tileBuffer,

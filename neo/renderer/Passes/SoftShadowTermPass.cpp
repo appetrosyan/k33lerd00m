@@ -24,7 +24,7 @@ the Free Software Foundation, either version 3 of the License, or
 struct SoftTermCB
 {
 	float	lightR[4];		// light origin xyz, disk radius w
-	int		range[4];		// firstElem, faceCount, tileBase | -1, tilesX
+	int		range[4];		// firstElem (tri stream float4 base), casterCount, tileBase | -1, tilesX
 	int		tile[4];		// tile origin x, y, atlas slot offset x, y
 	int		rect[4];		// scissor origin x, y (absolute pixels), width, height
 	float	falloffS[4];	// WORLD-space falloff plane (vLight->lightProject[3])
@@ -140,7 +140,8 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 }
 
 bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
-								   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem, int faceCount,
+								   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem,
+								   uint32_t casterFirstElem, int casterCount,
 								   float penumbraRadius,
 								   int tileBase, int tileOx, int tileOy, int tilesX,
 								   nvrhi::IBuffer* tileBuffer,
@@ -149,7 +150,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 								   bool coverageEarlyOut,
 								   int& outOfsX, int& outOfsY )
 {
-	if( !m_Valid || faceCount <= 0 )
+	if( !m_Valid || casterCount <= 0 )
 	{
 		return false;
 	}
@@ -187,7 +188,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.lightR[2] = vLight->globalLightOrigin.z;
 	cb.lightR[3] = penumbraRadius;
 	cb.range[0] = ( int )edgeFirstElem;
-	cb.range[1] = faceCount;
+	cb.range[1] = casterCount;
 	cb.range[2] = tileBase;
 	cb.range[3] = tilesX;
 	cb.tile[0] = tileOx;
@@ -208,7 +209,8 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		cb.falloffS[i] = vLight->lightProject[3][i];
 	}
 	cb.flags[0] = ( coverageEarlyOut && falloffTex != NULL && projTex != NULL ) ? 1 : 0;
-	cb.flags[1] = cb.flags[2] = cb.flags[3] = 0;
+	cb.flags[1] = ( int )casterFirstElem;	// caster table base (float4 elements) - stream v2
+	cb.flags[2] = cb.flags[3] = 0;
 
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.

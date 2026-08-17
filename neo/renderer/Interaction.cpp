@@ -710,9 +710,12 @@ face the RECEIVER - the exact receiver-disk coverage, and continuous under motio
 the front set only when it grazes, where its area is 0). The light-silhouette path undershoots off-axis
 (too-narrow, over-sharp penumbra) because it is selected against the light but projected from the receiver.
 
-Reuses the softShadowEdge_t stream: each triangle is TWO records - recA = ( v0, v1 ), recB = ( v1, v2 ) -
-so SoftShadow_FaceCoverage reads v0,v1 from recA and v2 from recB.e1. No light facing/selection is applied;
-the per-fragment receiver facing does that. World space, e0.w = 0 (>= 0 so it is never mistaken for a header).
+STREAM V2 (2026-08-17): each triangle is THREE contiguous float4 - ( v0.xyz, triRad ) ( v1.xyz, 0 )
+( v2.xyz, 0 ) - a PURE triangle stream with no inline headers; caster bounding spheres live in a separate
+per-caster table built by the flatten (tr_frontend_addmodels). vs the old two-record pair encoding this is
+25% less VMEM per triangle in the per-fragment walk, contiguous 48B loads, and no per-record header test.
+No light facing/selection is applied; the per-fragment receiver facing does that. World space. The out
+count is in FLOAT4 ELEMENTS (3 per triangle), not records.
 
 Do NOT midpoint-subdivide oversized triangles into a finer stream (with or without bounding-sphere
 node records for subtree jumps): measured 2026-08-16, every honest configuration regressed 1.5-2x -
@@ -724,10 +727,10 @@ DROPPING most soft records over the frame budget.
 */
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
 		const idRenderLightLocal* light, float penumbraSize, const float* modelToWorld,
-		softShadowEdge_t** outEdges, int* outNumEdges )
+		idVec4** outElems, int* outNumElems )
 {
-	*outEdges = NULL;
-	*outNumEdges = 0;
+	*outElems = NULL;
+	*outNumElems = 0;
 
 	if( tri->indexes == NULL || tri->numIndexes < 3 || penumbraSize <= 0.0f )
 	{
@@ -736,7 +739,7 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 
 	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
 	const int numTris = tri->numIndexes / 3;
-	softShadowEdge_t* recs = ( softShadowEdge_t* )R_FrameAlloc( ( size_t )numTris * 2 * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
+	idVec4* recs = ( idVec4* )R_FrameAlloc( ( size_t )numTris * 3 * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
 
 	int n = 0;
 	for( int t = 0; t < numTris; t++ )
@@ -748,22 +751,19 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 		R_LocalPointToGlobal( modelToWorld, verts[ia].xyz, v0 );
 		R_LocalPointToGlobal( modelToWorld, verts[ib].xyz, v1 );
 		R_LocalPointToGlobal( modelToWorld, verts[ic].xyz, v2 );
-		// Precompute the per-triangle bounding radius (max |vertex - centroid|) once here, carried in recA.e0.w,
+		// Precompute the per-triangle bounding radius (max |vertex - centroid|) once here, carried in r0.w,
 		// so SoftShadow_FaceCoverage reads it instead of recomputing it every fragment. A hair inflated so the
 		// shader's cone cull stays conservative under GPU float rounding (never drops a real occluder). Must match
-		// SoftTriRad in the tests' SoftShadowBox.h. e0.w >= 0 so it never trips the header ( e0.w < 0 ) test.
+		// SoftTriRad in the tests' SoftShadowBox.h.
 		idVec3 cen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
 		float triRad = Max( ( v0 - cen ).Length(), Max( ( v1 - cen ).Length(), ( v2 - cen ).Length() ) ) * 1.00001f;
-		recs[n].e0 = idVec4( v0.x, v0.y, v0.z, triRad );	// recA = ( v0, v1 ); e0.w = precomputed bounding radius
-		recs[n].e1 = idVec4( v1.x, v1.y, v1.z, 0.0f );
-		n++;
-		recs[n].e0 = idVec4( v1.x, v1.y, v1.z, 0.0f );	// recB = ( v1, v2 )  -> v2 read from e1
-		recs[n].e1 = idVec4( v2.x, v2.y, v2.z, 0.0f );
-		n++;
+		recs[n++] = idVec4( v0.x, v0.y, v0.z, triRad );
+		recs[n++] = idVec4( v1.x, v1.y, v1.z, 0.0f );
+		recs[n++] = idVec4( v2.x, v2.y, v2.z, 0.0f );
 	}
 
-	*outEdges = recs;
-	*outNumEdges = n;
+	*outElems = recs;
+	*outNumElems = n;
 }
 
 /*

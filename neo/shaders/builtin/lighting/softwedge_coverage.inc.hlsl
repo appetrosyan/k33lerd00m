@@ -59,13 +59,9 @@ the Free Software Foundation, either version 3 of the License, or
 	#define SW_FACE_PROFILE 0
 #endif
 
-// SW_FACE_LEGACY: 0 = the four LOSSLESS face-coverage hoists (precompute triRad from the stream, hoist the
-// per-sample ray dirs and the triangle-constant qq/e2qq out of the loop, skip the crack-close on trivial masks);
-// 1 = recompute everything in-loop as before. Bit-EXACT either way (same values); the toggle exists only to A/B
-// the perf of the hoists (the shipped default is 0). See SoftShadowBench.face_vs_wedge_throughput.
-#ifndef SW_FACE_LEGACY
-	#define SW_FACE_LEGACY 0
-#endif
+// SW_FACE_LEGACY: RETIRED with stream v2 (2026-08-17). The v1 in-loop recompute paths it toggled no
+// longer exist - the stream itself now carries triRad, and qq/e2qq/crack-close hoists are unconditional.
+#define SW_FACE_LEGACY 0
 
 // SW_FACE_SCALAR_LIST: 1 = route the tile-binned list walk's loads through readfirstlane'd addresses
 // so ACO can emit scalar s_ loads (the addresses ARE wave-uniform: 16x16 tiles align with the 8x8
@@ -103,7 +99,7 @@ the Free Software Foundation, either version 3 of the License, or
 #ifndef SW_FACE_FP16
 	#define SW_FACE_FP16 1
 #endif
-#if SW_FACE_FP16 && !defined(__cplusplus) && defined(__HLSL_ENABLE_16_BIT) && !SW_FACE_LEGACY
+#if SW_FACE_FP16 && !defined(__cplusplus) && defined(__HLSL_ENABLE_16_BIT)
 	#define SW_FP16_LOOP 1
 #else
 	#define SW_FP16_LOOP 0
@@ -664,11 +660,14 @@ SW_FUNC float SoftShadow_ProcCaster( float3 swP, float3 swL, float swR, bool raB
 // sample; raise N or add a per-fragment blue-noise rotation of swDisk if it is visible. N=32 packs into one
 // uint mask.
 //
-// Stream layout reuses the edge records (softShadowEdge_t, 2 float4) so the whole flatten/cache/bind path
-// is shared: a header (e0.w < 0) carries the caster centre in e0.xyz and (bounding radius, recordCount) in
-// e1.xy; each triangle is TWO consecutive records - record A = ( v0.xyz, - )( v1.xyz, hdr ), record B =
-// ( v1.xyz, - )( v2.xyz, hdr ) - so v0,v1 come from A and v2 from B.e1. Casters are cull-tested (shared with
-// the edge path); the sample mask is global so casters union for free.
+// STREAM V2 layout (2026-08-17): a PURE triangle stream - each triangle is THREE contiguous float4,
+// ( v0.xyz, triRad ) ( v1.xyz, 0 ) ( v2.xyz, 0 ), triangle t at element swTriBase + t*3 - plus a separate
+// per-caster table, 2 float4 per caster: ( centre.xyz, radius ) ( firstTri, numTris, 0, 0 ) at
+// swCasterBase. The walk loops casters (sphere cull, then the caster's contiguous tri span), so the hot
+// triangle loop has NO header branch and each triangle is one 48B contiguous load (v1's pair encoding was
+// 64B with a dead quarter). A culled caster skips its whole span structurally: when every lane culls, the
+// wave branches over it (the v1 wave-uniform jump, now for free); disagreeing lanes idle masked. The
+// sample mask is global so casters union for free.
 
 // portable 32-bit popcount (HLSL has countbits, but the C++ test build via hlsl_compat.h does not)
 SW_FUNC int SoftPopcount32( uint x )
@@ -757,7 +756,7 @@ uint SoftShadow_FaceTriHitsFP16( uint swMask, float3 edge1, float3 edge2, float3
 #endif
 
 
-SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swRotAng SW_EDGEBUF_PARAM )
+SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int swTriBase, int swCasterBase, int swCasterCount, float swRotAng SW_EDGEBUF_PARAM )
 {
 	swR = max( swR, 1e-2f );
 	softFrame_t swF = SoftShadow_Frame( swP, swL );
@@ -876,118 +875,94 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 
 	uint swMask = 0u;						// bit i set once sample i's ray is blocked by any triangle (union)
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
-	bool  swSkip = false;
 #if SW_FACE_PROFILE
 	// keeps the probed stages LIVE: the accumulator feeds an unprovable branch at the end, so the
 	// compiler cannot dead-code-eliminate the walk/culls the probe is supposed to time (it DID -
 	// the first probe benched BELOW the soft-off floor).
 	float swProbe = 0.0f;
 #endif
-	for( int se = 0; se < swN; se++ )
+	for( int sc = 0; sc < swCasterCount; sc++ )
 	{
-		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
-		if( e0.w < 0.0f )					// header: cull the next caster (mask persists => casters union)
+		float4 c0 = t_SoftEdges[ swCasterBase + sc * 2 + 0 ];		// ( centre.xyz, radius )
+		float4 c1 = t_SoftEdges[ swCasterBase + sc * 2 + 1 ];		// ( firstTri, numTris, 0, 0 )
+		float3 dCv = float3( c0.x, c0.y, c0.z ) - swP;
+		if( SoftShadow_CullCaster( dCv, c0.w, swF, swSinA, swCosA, swEps ) )
 		{
-			float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
-			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
-			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
-			// NOTE: do NOT jump `se += e1.y` PER LANE on a culled caster. It looks like a free win over
-			// per-record skipping, but it MEASURED SLOWER (24 -> 30 ms worst-scene): the data-dependent
-			// jump diverges the wave's loop trip counts, and the whole wave then serialises on its
-			// slowest lane, costing more than the uniform cheap skip iterations it saves.
-			// The WAVE-UNIFORM jump below is the fix: only when EVERY lane culls the caster (the common
-			// case - a wave covers ~8x8 px, a tiny world footprint, and most casters are far from it)
-			// does the whole wave take one scalar branch over the span. No lane loses records it would
-			// have walked, so it is bit-exact; lanes that disagree fall back to the per-record skip.
-			if( WaveActiveAllTrue( swSkip ) )
-			{
-				se += ( int )e1.y;
-			}
+			// structural span skip: when EVERY lane culls, the wave branches over the whole span (the
+			// v1 wave-uniform jump, now implicit); a disagreeing lane just idles masked - no lane ever
+			// pays per-record skip iterations. Bit-exact: the cull is conservative.
 			continue;
 		}
-		if( se + 1 >= swN ) { break; }		// malformed tail (needs the triangle's second record)
-		if( swSkip ) { se++; continue; }	// culled: consume both records of this triangle (safety)
+		const int swTriFirst = ( int )c1.x;
+		const int swTriEnd   = swTriFirst + ( int )c1.y;
 #if SW_FACE_PROFILE == 1
-		swProbe += e0.x; se++; continue;	// TIMING PROBE ONLY: walk + caster culls, no triangle work
+		swProbe += c0.x; continue;			// TIMING PROBE ONLY: caster walk + culls, no triangle work
 #endif
-
-		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
-		float4 g1 = t_SoftEdges[ swFirstElem + ( se + 1 ) * 2 + 1 ];	// record B's e1 carries v2
-		se++;								// consumed the triangle's second record
-		float3 v0 = float3( e0.x, e0.y, e0.z );
-		float3 v1 = float3( e1.x, e1.y, e1.z );
-		float3 v2 = float3( g1.x, g1.y, g1.z );
-		// PER-TRIANGLE CONE/SLAB REJECT (the big perf lever). The 32 sample rays form a cone: apex swP, axis
-		// swF.nrm, cross-section radius swR at depth swDistPL. A triangle that cannot reach that cone can hit NO
-		// sample, so skip its 32 ray tests entirely. Conservative (over-keeps) => bit-exact: never drops a real
-		// occluder. Because the FACE stream carries ALL of a caster's triangles, not just its silhouette, this is
-		// what keeps a big in-cone caster from costing O(all faces * 32) per fragment.
-		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
-		float3 rc   = tcen - swP;
-		float  cd   = dot( rc, swF.nrm );							// centroid depth along the cone axis
-		// triRad (max |vertex - centroid|) is pure triangle geometry - precomputed at stream-build time (a hair
-		// inflated, so the cull stays conservative) and carried in recA.e0.w (already loaded as e0, and >= 0 so it
-		// never trips the header test). Saves the 3 sub / 3 dot / 2 max / sqrt recompute every fragment × triangle.
-#if SW_FACE_LEGACY
-		float  triRad = sqrt( max( dot( v0 - tcen, v0 - tcen ), max( dot( v1 - tcen, v1 - tcen ), dot( v2 - tcen, v2 - tcen ) ) ) );
-#else
-		float  triRad = e0.w;
-#endif
-		if( cd + triRad < swEps ) { continue; }						// wholly behind the receiver
-		if( cd - triRad > swDistPL ) { continue; }					// wholly beyond the light
-		float3 perp = rc - cd * swF.nrm;
-		float  coneR = swR * ( cd + triRad ) / swDistPL;			// max cone radius over the triangle's depth span
-		if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }	// outside the sample cone: cannot occlude
-#if SW_FACE_PROFILE == 2
-		swProbe += cd; continue;			// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
-#endif
-		float3 edge1 = v1 - v0;
-		float3 edge2 = v2 - v0;
-		float3 sp = swP - v0;
-		// Moller-Trumbore, double-sided (occlusion is facing-independent): a hit with t in (0,1] means the
-		// triangle lies between the receiver and the light plane along this sample ray. All K rays share the
-		// receiver origin, so qq = cross(sp,edge1) and e2qq = dot(edge2,qq) are triangle-constant - hoisted out of
-		// the K-sample loop (they were recomputed identically every sample). Bit-exact; saves a cross + a dot per sample.
-#if !SW_FACE_LEGACY
-		float3 qq   = cross( sp, edge1 );
-		float  e2qq = dot( edge2, qq );
-#endif
-#if SW_FP16_LOOP
-		swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
-											 swBase, swU2, swV2, swMD, swKD, swDisk );
-#else
-		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		for( int t = swTriFirst; t < swTriEnd; t++ )
 		{
-			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }		// sample already blocked: skip
-#if SW_FACE_LEGACY || !SW_FACE_HOIST_DIRS
-			// in-loop direction from unrolled immediates: identical expression to the hoisted array,
-			// ~10 VALU per test, zero registers held across the triangle loop (occupancy win)
-			float2 s0  = swDisk[i];
-			float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
-			float3 dir = swBase + swSu * sc.x + swSv * sc.y;
-#else
-			float3 dir = swDir[i];									// precomputed once per fragment (hoisted)
+			const int b = swTriBase + t * 3;
+			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, triRad )
+			float4 r1 = t_SoftEdges[ b + 1 ];						// ( v1.xyz, 0 )
+			float4 r2 = t_SoftEdges[ b + 2 ];						// ( v2.xyz, 0 )
+			float3 v0 = float3( r0.x, r0.y, r0.z );
+			float3 v1 = float3( r1.x, r1.y, r1.z );
+			float3 v2 = float3( r2.x, r2.y, r2.z );
+			// PER-TRIANGLE CONE/SLAB REJECT (the big perf lever). The sample rays form a cone: apex swP, axis
+			// swF.nrm, cross-section radius swR at depth swDistPL. A triangle that cannot reach that cone can
+			// hit NO sample, so skip its ray tests entirely. Conservative (over-keeps) => bit-exact. triRad is
+			// precomputed at stream-build time (a hair inflated) and carried in r0.w.
+			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+			float3 rc   = tcen - swP;
+			float  cd   = dot( rc, swF.nrm );						// centroid depth along the cone axis
+			float  triRad = r0.w;
+			if( cd + triRad < swEps ) { continue; }					// wholly behind the receiver
+			if( cd - triRad > swDistPL ) { continue; }				// wholly beyond the light
+			float3 perp = rc - cd * swF.nrm;
+			float  coneR = swR * ( cd + triRad ) / swDistPL;		// max cone radius over the triangle's depth span
+			if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }	// outside the sample cone: cannot occlude
+#if SW_FACE_PROFILE == 2
+			swProbe += cd; continue;		// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
 #endif
-			float3 h   = cross( dir, edge2 );
-			float  aa  = dot( edge1, h );
-			if( abs( aa ) < 1e-12f ) { continue; }					// ray parallel to triangle
-			float  inv = 1.0f / aa;
-			float  u   = inv * dot( sp, h );
-			if( u < 0.0f || u > 1.0f ) { continue; }
-#if SW_FACE_LEGACY
-			float3 qq  = cross( sp, edge1 );
-			float  vv  = inv * dot( dir, qq );
-			if( vv < 0.0f || u + vv > 1.0f ) { continue; }
-			float  tt  = inv * dot( edge2, qq );
+			float3 edge1 = v1 - v0;
+			float3 edge2 = v2 - v0;
+			float3 sp = swP - v0;
+			// Moller-Trumbore, double-sided (occlusion is facing-independent): a hit with t in (0,1] means the
+			// triangle lies between the receiver and the light plane along this sample ray. All K rays share the
+			// receiver origin, so qq = cross(sp,edge1) and e2qq = dot(edge2,qq) are triangle-constant - hoisted
+			// out of the K-sample loop. Bit-exact; saves a cross + a dot per sample.
+			float3 qq   = cross( sp, edge1 );
+			float  e2qq = dot( edge2, qq );
+#if SW_FP16_LOOP
+			swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+												 swBase, swU2, swV2, swMD, swKD, swDisk );
 #else
-			float  vv  = inv * dot( dir, qq );
-			if( vv < 0.0f || u + vv > 1.0f ) { continue; }
-			float  tt  = inv * e2qq;
+			for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+			{
+				if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }	// sample already blocked: skip
+#if !SW_FACE_HOIST_DIRS
+				// in-loop direction from unrolled immediates: identical expression to the hoisted array,
+				// ~10 VALU per test, zero registers held across the triangle loop (occupancy win)
+				float2 s0  = swDisk[i];
+				float2 sc2 = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+				float3 dir = swBase + swSu * sc2.x + swSv * sc2.y;
+#else
+				float3 dir = swDir[i];								// precomputed once per fragment (hoisted)
 #endif
-			if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
-		}
+				float3 h   = cross( dir, edge2 );
+				float  aa  = dot( edge1, h );
+				if( abs( aa ) < 1e-12f ) { continue; }				// ray parallel to triangle
+				float  inv = 1.0f / aa;
+				float  u   = inv * dot( sp, h );
+				if( u < 0.0f || u > 1.0f ) { continue; }
+				float  vv  = inv * dot( dir, qq );
+				if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+				float  tt  = inv * e2qq;
+				if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+			}
 #endif	// SW_FP16_LOOP
-		if( swMask == swAll ) { break; }	// every sample blocked: fully in umbra, no need to read on
+			if( swMask == swAll ) { break; }	// every sample blocked: fully in umbra
+		}
+		if( swMask == swAll ) { break; }		// umbra: no caster can add anything
 	}
 	// Morphological CLOSE: seal INTERIOR tessellation cracks without touching the penumbra. A sample ray that
 	// threads a T-junction / brush-seam gap is reported lit even deep in the umbra. Uniform barycentric dilation
@@ -1113,25 +1088,26 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			se = ( int )t_SoftTiles[ swListBase + li ];
 		}
 #else
-		int seTmp = ( int )t_SoftTiles[ swListBase + li ];			// pair-start index of record A
+		int seTmp = ( int )t_SoftTiles[ swListBase + li ];			// TRIANGLE index (stream v2)
 		se = seTmp;
 #endif
-		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
+		const int b = swFirstElem + se * 3;
+		float4 r0 = t_SoftEdges[ b + 0 ];							// ( v0.xyz, triRad )
 #if SW_FACE_PROFILE == 1
-		swProbe += e0.x;
-		continue;													// TIMING PROBE: list walk + recA loads only
+		swProbe += r0.x;
+		continue;													// TIMING PROBE: list walk + r0 loads only
 #endif
-		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
-		float4 g1 = t_SoftEdges[ swFirstElem + ( se + 1 ) * 2 + 1 ];
-		float3 v0 = float3( e0.x, e0.y, e0.z );
-		float3 v1 = float3( e1.x, e1.y, e1.z );
-		float3 v2 = float3( g1.x, g1.y, g1.z );
+		float4 r1 = t_SoftEdges[ b + 1 ];
+		float4 r2 = t_SoftEdges[ b + 2 ];
+		float3 v0 = float3( r0.x, r0.y, r0.z );
+		float3 v1 = float3( r1.x, r1.y, r1.z );
+		float3 v2 = float3( r2.x, r2.y, r2.z );
 		// per-FRAGMENT cone/slab reject still runs: the tile cull is the same test at tile grain, so
 		// this prunes the tile list down to this fragment's true cone. Identical math to the full walk.
 		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
 		float3 rc   = tcen - swP;
 		float  cd   = dot( rc, swF.nrm );
-		float  triRad = e0.w;
+		float  triRad = r0.w;
 		if( cd + triRad < swEps ) { continue; }
 		if( cd - triRad > swDistPL ) { continue; }
 		float3 perp = rc - cd * swF.nrm;
@@ -1193,17 +1169,18 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
 
-// Dispatcher: the pixel shader picks the coverage path by the SIGN of the record count (rpJitterTexScale.z):
-// negative = FRONT-FACE stream (r_softShadowFaceCoverage), positive = light-silhouette edge stream. The face
-// path needs no centre-lit winding guard (front-face area is bounded by construction), so swCentreLit is
-// ignored there. Callers pass abs(swN).
-SW_FUNC float SoftShadow_Coverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit, bool swFace, float swRotAng SW_EDGEBUF_PARAM )
+// Dispatcher: the pixel shader picks the coverage path by the SIGN of the count (rpJitterTexScale.z):
+// negative = FRONT-FACE stream v2 (r_softShadowFaceCoverage; abs = CASTER count, swFirstElem = tri stream
+// base, swCasterBase = caster table base), positive = light-silhouette edge stream (abs = record count;
+// swCasterBase ignored). The face path needs no centre-lit winding guard (coverage is a bounded union),
+// so swCentreLit is ignored there. Callers pass abs(swN).
+SW_FUNC float SoftShadow_Coverage( float3 swP, float3 swL, float swR, int swFirstElem, int swCasterBase, int swN, float swCentreLit, bool swFace, float swRotAng SW_EDGEBUF_PARAM )
 {
 #ifdef __cplusplus
-	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN, swRotAng, t_SoftEdges )
+	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swCasterBase, swN, swRotAng, t_SoftEdges )
 		   : SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit, t_SoftEdges );
 #else
-	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN, swRotAng )
+	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swCasterBase, swN, swRotAng )
 		   : SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit );
 #endif
 }

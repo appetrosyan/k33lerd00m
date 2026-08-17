@@ -1491,23 +1491,30 @@ float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR )
 		double Pd[3] = { P.x, P.y, P.z };
 		double Dd[3] = { tgt.x - P.x, tgt.y - P.y, tgt.z - P.z };
 		bool hit = false;
-		for( size_t k = 0; k + 1 < s_edges.size() && !hit; k++ )
+		// STREAM V2 (softcap v5): each light's captured blob range is its pure-tri float4 stream
+		// (3 float4 per triangle, zero-padded to an even float4 count so it stores as pair records).
+		// The pad breaks 3-alignment ACROSS lights, so iterate per light range: triangle tri of a
+		// range starting at record 'first' lives at float4s first*2 + 3*tri .. +2.
+		auto F4 = []( size_t j ) -> const float*
 		{
-			const softcapEdge_t& A = s_edges[k];
-			if( A.e0[3] < 0.0f )
+			return ( j & 1 ) ? s_edges[j >> 1].e1 : s_edges[j >> 1].e0;
+		};
+		for( const auto& er : s_edgeRange )
+		{
+			if( hit )
 			{
-				continue;    // header
+				break;
 			}
-			const softcapEdge_t& B = s_edges[k + 1];
-			if( B.e0[3] < 0.0f )
-			{
-				continue;    // recB missing (chain end) - malformed, skip
-			}
-			// triangle = ( recA.e0, recA.e1, recB.e1 ); records come in pairs, advance one extra
-			double a[3] = { A.e0[0], A.e0[1], A.e0[2] };
-			double b[3] = { A.e1[0], A.e1[1], A.e1[2] };
-			double c[3] = { B.e1[0], B.e1[1], B.e1[2] };
-			k++;
+			const size_t base4 = ( size_t )er.second.first * 2;
+			const size_t nTris = ( ( size_t )er.second.second * 2 ) / 3;	// floor() drops the zero pad
+		for( size_t tri = 0; tri < nTris && !hit; tri++ )
+		{
+			const float* A0 = F4( base4 + tri * 3 + 0 );
+			const float* A1 = F4( base4 + tri * 3 + 1 );
+			const float* A2 = F4( base4 + tri * 3 + 2 );
+			double a[3] = { A0[0], A0[1], A0[2] };
+			double b[3] = { A1[0], A1[1], A1[2] };
+			double c[3] = { A2[0], A2[1], A2[2] };
 			double e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
 			double e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
 			double pv[3] = { Dd[1] * e2[2] - Dd[2] * e2[1], Dd[2] * e2[0] - Dd[0] * e2[2], Dd[0] * e2[1] - Dd[1] * e2[0] };
@@ -1534,6 +1541,7 @@ float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR )
 			{
 				hit = true;
 			}
+		}
 		}
 		if( hit )
 		{
@@ -1614,6 +1622,7 @@ int R_SoftShadowGate( const char* arg )
 	idStr loadedMap;
 	idRenderWorld* rw = NULL;
 	std::vector<renderLight_t> mapLights;
+	std::vector<renderEntity_t> mapModels;		// static model entities (func_static etc.) - the live game's casters
 
 	for( int fi = 0; fi < files.Num(); fi++ )
 	{
@@ -1646,6 +1655,7 @@ int R_SoftShadowGate( const char* arg )
 				rw = NULL;
 			}
 			mapLights.clear();
+			mapModels.clear();
 			// complete the world the way a REAL map load does (Common_load.cpp order):
 			//  - Begin/EndLevelLoad pins every loaded model into the STATIC vertex cache; the RT
 			//    shadow TLAS only accepts static-cache surfaces, so without this the reference is
@@ -1675,16 +1685,59 @@ int R_SoftShadowGate( const char* arg )
 				for( int e = 0; e < mapFile.GetNumEntities(); e++ )
 				{
 					idMapEntity* ent = mapFile.GetEntity( e );
-					if( idStr::Icmp( ent->epairs.GetString( "classname" ), "light" ) != 0 )
+					if( idStr::Icmp( ent->epairs.GetString( "classname" ), "light" ) == 0 )
+					{
+						renderLight_t rl;
+						SelfTestParseLight( &ent->epairs, &rl );
+						mapLights.push_back( rl );
+						continue;
+					}
+					// STATIC MODEL ENTITIES (func_static, mover machinery, ...) are the live game's
+					// casters and roughly DOUBLE the soft-record stream vs the bare worldspawn
+					// (measured erebus1 softcap0061: 114k records in-game vs 56k without them - the
+					// gate bench under-read the shipped soft cost ~3x). Add every entity whose
+					// spawnargs resolve to a loadable non-animated model; the bench places them so
+					// its frame carries the live caster density. Animated md5 meshes are skipped
+					// (their live pose is gameplay state the gate cannot know).
+					const char* mdl = ent->epairs.GetString( "model" );
+					if( mdl == NULL || mdl[0] == '\0' || idStr::Icmp( ent->epairs.GetString( "classname" ), "worldspawn" ) == 0 )
 					{
 						continue;
 					}
-					renderLight_t rl;
-					SelfTestParseLight( &ent->epairs, &rl );
-					mapLights.push_back( rl );
+					if( idStr( mdl ).Find( ".md5mesh", false ) >= 0 || ent->epairs.GetBool( "hide" ) || ent->epairs.GetBool( "noshadows" ) )
+					{
+						continue;
+					}
+					// minimal spawn-arg parse: gameEdit->ParseSpawnArgsToRenderEntity needs the
+					// GAME-registered modelDef decl type, which the gate's minimal init never
+					// registers (Sys_Error "bad type"). Static casters need only model + placement.
+					renderEntity_t re;
+					memset( &re, 0, sizeof( re ) );
+					re.hModel = renderModelManager->FindModel( mdl );
+					if( re.hModel == NULL || re.hModel->IsDefaultModel() )
+					{
+						continue;
+					}
+					re.bounds = re.hModel->Bounds( NULL );
+					ent->epairs.GetVector( "origin", "0 0 0", re.origin );
+					if( !ent->epairs.GetMatrix( "rotation", "1 0 0 0 1 0 0 0 1", re.axis ) )
+					{
+						float angle = ent->epairs.GetFloat( "angle" );
+						if( angle != 0.0f )
+						{
+							re.axis = idAngles( 0.0f, angle, 0.0f ).ToMat3();
+						}
+						else
+						{
+							re.axis.Identity();
+						}
+					}
+					re.shaderParms[0] = re.shaderParms[1] = re.shaderParms[2] = re.shaderParms[3] = 1.0f;
+					mapModels.push_back( re );
 				}
 			}
-			common->Printf( "[softgate] loaded %s (%d map lights)\n", cap.mapName.c_str(), ( int )mapLights.size() );
+			common->Printf( "[softgate] loaded %s (%d map lights, %d model entities)\n",
+							cap.mapName.c_str(), ( int )mapLights.size(), ( int )mapModels.size() );
 		}
 
 		// NOTE: the captured DYNAMIC casters (the scripted rock etc.) are deliberately NOT replayed here.
@@ -2151,6 +2204,14 @@ int R_SoftShadowGate( const char* arg )
 			{
 				benchLights.push_back( rw->AddLightDef( &ml ) );
 			}
+			// static model entities: without them the bench frame carries ~half the live soft-record
+			// stream and under-reads the shipped soft cost ~3x (see the map-parse comment above)
+			std::vector<qhandle_t> benchModels;
+			benchModels.reserve( mapModels.size() );
+			for( const renderEntity_t& me : mapModels )
+			{
+				benchModels.push_back( rw->AddEntityDef( &me ) );
+			}
 			R_SoftShadowPinTestConfig( false );
 			cvarSystem->SetCVarInteger( "r_skipAmbient", 0 );
 			cvarSystem->SetCVarInteger( "r_skipShadows", 0 );
@@ -2200,6 +2261,10 @@ int R_SoftShadowGate( const char* arg )
 			for( qhandle_t bh : benchLights )
 			{
 				rw->FreeLightDef( bh );
+			}
+			for( qhandle_t bh : benchModels )
+			{
+				rw->FreeEntityDef( bh );
 			}
 		}
 

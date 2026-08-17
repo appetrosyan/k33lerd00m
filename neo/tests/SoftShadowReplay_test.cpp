@@ -27,7 +27,7 @@ the Free Software Foundation, either version 3 of the License, or
 // (it would duplicate the non-inline definition already compiled into SoftShadowCoverage_test.cpp), and we
 // never call LiveShadow in this file, so the symbol is never odr-used - no link dependency.
 float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit, SoftEdgeBuffer t_SoftEdges );
-float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swRotAng, SoftEdgeBuffer t_SoftEdges );	// SoftShadowBox.h::FaceOcclusion parses (never odr-used here)
+float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int swTriBase, int swCasterBase, int swCasterCount, float swRotAng, SoftEdgeBuffer t_SoftEdges );	// SoftShadowBox.h::FaceOcclusion parses (never odr-used here)
 #include "SoftShadowBox.h"
 #include "SoftShadowMesh.h"
 #include "idUnitTest.h"

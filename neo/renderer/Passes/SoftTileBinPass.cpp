@@ -43,7 +43,7 @@ static const int SW_MINMAX_MAX_TILES = 256 * 160;
 // 16M uints = 64 MB: ~65k tile slots at K=256. Measured on erebus1_09: a heavy frame's soft
 // lights sum to ~54k tile slots, so this holds every light with headroom; lights past the cap
 // fall back to the full per-fragment walk for one frame.
-static const int SW_TILE_BUFFER_ELEMENTS = 16 << 20;
+static const int SW_TILE_BUFFER_ELEMENTS = 48 << 20;
 
 SoftTileBinPass::SoftTileBinPass( nvrhi::IDevice* device )
 	: m_Device( device )
@@ -125,8 +125,7 @@ void SoftTileBinPass::EnsurePipeline()
 	ld.bindings =
 	{
 		nvrhi::BindingLayoutItem::VolatileConstantBuffer( 0 ),	// b0 : bin constants
-		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 0 ),	// t0 : edge records
-		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 1 ),	// t1 : pair-start indices
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 0 ),	// t0 : tri stream + caster table (joint buffer, float4)
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 2 ),	// t2 : shared per-tile depth min/max
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : tile lists
 	};
@@ -198,11 +197,11 @@ void SoftTileBinPass::EnsurePipeline()
 
 int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
 							   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem,
-							   nvrhi::IBuffer* pairBuffer, uint32_t pairFirstElem, int numPairs,
+							   uint32_t casterFirstElem, int numCasters,
 							   float penumbraRadius,
 							   int& outTileOx, int& outTileOy, int& outTilesX )
 {
-	if( m_Pipeline == nullptr || numPairs <= 0 || !m_MinMaxValid )
+	if( m_Pipeline == nullptr || numCasters <= 0 || !m_MinMaxValid )
 	{
 		return -1;
 	}
@@ -238,8 +237,8 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	}
 	if( r_rtAccelDebug.GetBool() )
 	{
-		common->Printf( "SoftTileBin: light %d tiles (%dx%d), %d tris, cursor %d/%d\n",
-						tilesX * tilesY, tilesX, tilesY, numPairs, m_Cursor, SW_TILE_BUFFER_ELEMENTS );
+		common->Printf( "SoftTileBin: light %d tiles (%dx%d), %d casters, cursor %d/%d\n",
+						tilesX * tilesY, tilesX, tilesY, numCasters, m_Cursor, SW_TILE_BUFFER_ELEMENTS );
 	}
 	const int outBase = m_Cursor;
 	m_Cursor += slots;
@@ -261,23 +260,24 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	cb.tileRect[2] = tilesX;
 	cb.tileRect[3] = tilesY;
 	cb.range[0] = ( int )edgeFirstElem;
-	cb.range[1] = numPairs;
+	cb.range[1] = numCasters;
 	cb.range[2] = outBase;
-	cb.range[3] = ( int )pairFirstElem;
+	cb.range[3] = ( int )casterFirstElem;
 	// viewport extents, so the pixel->NDC mapping matches this view's MVP even for subviews
 	cb.screen[0] = ( float )( viewDef->viewport.x2 - viewDef->viewport.x1 + 1 );
 	cb.screen[1] = ( float )( viewDef->viewport.y2 - viewDef->viewport.y1 + 1 );
 	cb.screen[2] = ( float )viewDef->viewport.x1;
 	cb.screen[3] = ( float )viewDef->viewport.y1;
 	cb.minmax[0] = m_MinMaxTilesX;
-	cb.minmax[1] = cb.minmax[2] = cb.minmax[3] = 0;
+	extern idCVar r_softShadowUmbraTiles;
+	cb.minmax[1] = r_softShadowUmbraTiles.GetBool() ? 1 : 0;	// whole-tile umbra sentinel enable
+	cb.minmax[2] = cb.minmax[3] = 0;
 
 	nvrhi::BindingSetDesc sd;
 	sd.bindings =
 	{
 		nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, edgeBuffer ),
-		nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, pairBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 2, m_MinMaxBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_TileBuffer ),
 	};

@@ -32,7 +32,8 @@ version. See <http://www.gnu.org/licenses/>.
 //     has no VK_EXT_subgroup_size_control plumbing; the workgroup size only encourages it.)
 
 #define SW_TILE_SIZE	16
-#define SW_TILE_K		256		// must match softtile_bin.cs.hlsl + SoftTileBinPass.h
+#define SW_TILE_K		512		// must match softtile_bin.cs.hlsl + SoftTileBinPass.h
+#define SW_TILE_UMBRA	0xFFFFFFFEu	// whole-tile umbra sentinel (softtile_bin.cs.hlsl): term is exactly 0
 
 // *INDENT-OFF*
 // Declared BEFORE the include: the coverage functions read these globals directly (HLSL).
@@ -53,7 +54,7 @@ RWTexture2D<float>			u_Term		: register( u0 );	// R32F term atlas, one screen-si
 cbuffer c_Term : register( b0 )
 {
 	float4	g_lightR;	// light origin xyz, disk radius w
-	int4	g_range;	// firstElem (edge float4 base), faceCount (records), tileBase | -1, tilesX
+	int4	g_range;	// firstElem (tri stream float4 base), casterCount, tileBase | -1, tilesX
 	int4	g_tile;		// tile origin x, y (in tiles), atlas slot offset x, y (in pixels)
 	int4	g_rect;		// scissor origin x, y (absolute pixels), width, height
 	float4	g_falloffS;	// WORLD-space light falloff plane (vLight->lightProject[3])
@@ -64,6 +65,7 @@ cbuffer c_Term : register( b0 )
 						//    anaTerm-hash instrument stays full-field, and for lights the CPU
 						//    could not qualify: multi-stage light shaders / stage texture
 						//    matrices, where one static plane set cannot represent the stages)
+						// y: caster table base (float4 elements into t_SoftEdges) - stream v2
 };
 // *INDENT-ON*
 
@@ -133,18 +135,24 @@ void main( uint3 tid : SV_DispatchThreadID )
 	{
 		const int  swSlot = g_range.z + ( swTy * g_range.w + swTx ) * ( SW_TILE_K + 1 );
 		const uint swCnt  = t_SoftTiles[ swSlot ];
+		if( swCnt == SW_TILE_UMBRA )
+		{
+			// whole tile provably in umbra: the integral saturates to 1 for every receiver here
+			u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;
+			return;
+		}
 		if( swCnt != 0xFFFFFFFFu )
 		{
 			swOcc = SoftShadow_FaceCoverageList( swP, swL, swR, g_range.x, swSlot + 1, ( int )swCnt, swRotAng );
 		}
 		else
 		{
-			swOcc = SoftShadow_Coverage( swP, swL, swR, g_range.x, g_range.y, 0.0, true, swRotAng );
+			swOcc = SoftShadow_Coverage( swP, swL, swR, g_range.x, g_flags.y, g_range.y, 0.0, true, swRotAng );
 		}
 	}
 	else
 	{
-		swOcc = SoftShadow_Coverage( swP, swL, swR, g_range.x, g_range.y, 0.0, true, swRotAng );
+		swOcc = SoftShadow_Coverage( swP, swL, swR, g_range.x, g_flags.y, g_range.y, 0.0, true, swRotAng );
 	}
 
 	u_Term[ uint2( px + g_tile.zw ) ] = 1.0 - saturate( swOcc );

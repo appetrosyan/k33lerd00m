@@ -53,11 +53,11 @@ srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent,
 void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
 							 float penumbraSize, const float* modelToWorld,
 							 softShadowEdge_t** outEdges, int* outNumEdges );
-// analytic soft shadows: FRONT-FACE coverage stream (caster triangles as edge-pairs) - accurate receiver-disk
+// analytic soft shadows: FRONT-FACE coverage stream v2 (3 float4 per caster triangle) - accurate receiver-disk
 // coverage, temporally stable; the light-silhouette path above undershoots off-axis (Interaction.cpp).
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
 							 float penumbraSize, const float* modelToWorld,
-							 softShadowEdge_t** outEdges, int* outNumEdges );
+							 idVec4** outElems, int* outNumElems );
 extern idCVar r_shadowPenumbraSize;	// soft shadow volumes: light source radius (RenderSystem_init.cpp)
 extern idCVar r_softShadowFaceCoverage;	// 1 = stream caster faces + front-face coverage instead of light silhouette
 
@@ -1333,11 +1333,14 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					softShadowEdge_t* sedges = NULL;
 					int nedges = 0;
 					// FRONT-FACE coverage streams the caster's triangles (accurate + stable); the default streams
-					// the light silhouette (undershoots off-axis). Both fill the same softShadowEdge_t records.
+					// the light silhouette (undershoots off-axis). Face mode uses the v2 float4-triple layout,
+					// stored through the same drawSurf fields (count in FLOAT4 elements; see drawSurf_t).
 					if( r_softShadowFaceCoverage.GetBool() )
 					{
+						idVec4* faceElems = NULL;
 						R_CollectPenumbraFaces( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
-												vEntity->modelMatrix, &sedges, &nedges );
+												vEntity->modelMatrix, &faceElems, &nedges );
+						sedges = ( softShadowEdge_t* )faceElems;
 					}
 					else
 					{
@@ -1705,12 +1708,15 @@ void R_AddModels()
 		int edgesUsed = 0;
 		const int swFlattenStart = Sys_Microseconds();
 
+		extern idCVar r_softShadowFaceCoverage;
+		const bool swFaceMode = r_softShadowFaceCoverage.GetBool();
+
 		for( viewLight_t* vLight = tr.viewDef->viewLights; vLight != NULL; vLight = vLight->next )
 		{
 			vLight->softEdgeCache = 0;
 			vLight->softEdgeCount = 0;
-			vLight->softPairCache = 0;
-			vLight->softPairCount = 0;
+			vLight->softCasterCache = 0;
+			vLight->softCasterCount = 0;
 
 			// Perf: prepend each caster's edge block with a HEADER record carrying the caster's
 			// world-space bounding sphere, so the pixel shader can cheaply reject a whole caster that
@@ -1740,11 +1746,94 @@ void R_AddModels()
 									 && s->space->entityDef->parms.hModel->IsStaticWorldModel();
 				if( isWorld || s->space != prevSpace ) { numCasters++; prevSpace = s->space; }
 			}
-			const int records = total + numCasters;
 			if( total <= 0 )
 			{
 				continue;	// no edges for this light
 			}
+
+			if( swFaceMode )
+			{
+				// ---- FACE stream v2: pure triangle stream (3 float4/tri) + separate caster table ----
+				// No inline headers: the per-fragment walk loops the caster table (sphere cull, then the
+				// caster's contiguous tri span) so the hot triangle loop carries no header branch, the
+				// bin pass can pre-cull whole casters, and each triangle is one contiguous 48B load.
+				// 'total' is already in float4 elements (R_CollectPenumbraFaces v2). Budget is bytes-
+				// equivalent to the wedge path's: records are 32B, float4s are 16B.
+				const int casterElems = numCasters * 2;
+				if( edgesUsed + ( total + casterElems + 1 ) / 2 > SOFT_EDGE_FRAME_BUDGET )
+				{
+					tr.pc.c_softShadowDroppedEdges += total;	// over budget -> this light gets no soft shadow
+					continue;
+				}
+				edgesUsed += ( total + casterElems + 1 ) / 2;
+
+				idVec4* triFlat = ( idVec4* )R_FrameAlloc( ( total + 1 ) * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );	// +1: zero pad for the pair-based capture copy
+				idVec4* casFlat = ( idVec4* )R_FrameAlloc( casterElems * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
+				int nElems = 0;
+				int nCas = 0;
+				const void* curSpace = NULL;
+				int  openFirstTri = 0;
+				bool casterOpen = false;
+				idVec3 gmn( 1e30f, 1e30f, 1e30f ), gmx( -1e30f, -1e30f, -1e30f );
+				for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
+				{
+					const bool isWorld = s->space->entityDef != NULL && s->space->entityDef->parms.hModel != NULL
+										 && s->space->entityDef->parms.hModel->IsStaticWorldModel();
+					if( isWorld || s->space != curSpace )	// world surfaces never group (each is its own caster)
+					{
+						if( casterOpen )
+						{
+							const idVec3 c = ( gmn + gmx ) * 0.5f;
+							const float  rad = ( gmx - gmn ).Length() * 0.5f;
+							casFlat[nCas * 2 + 0] = idVec4( c.x, c.y, c.z, rad );
+							casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri, ( float )( nElems / 3 - openFirstTri ), 0.0f, 0.0f );
+							nCas++;
+						}
+						openFirstTri = nElems / 3;
+						casterOpen = true;
+						gmn.Set( 1e30f, 1e30f, 1e30f );
+						gmx.Set( -1e30f, -1e30f, -1e30f );
+						curSpace = s->space;
+					}
+					const idVec4* src = ( const idVec4* )s->softEdges;
+					for( int i = 0; i < s->numSoftEdges; i++ )
+					{
+						const idVec4& v = src[i];
+						gmn.x = Min( gmn.x, v.x );	gmx.x = Max( gmx.x, v.x );	// every float4's xyz is a vertex; w (triRad/0) ignored
+						gmn.y = Min( gmn.y, v.y );	gmx.y = Max( gmx.y, v.y );
+						gmn.z = Min( gmn.z, v.z );	gmx.z = Max( gmx.z, v.z );
+						triFlat[nElems++] = v;
+					}
+				}
+				if( casterOpen )
+				{
+					const idVec3 c = ( gmn + gmx ) * 0.5f;
+					const float  rad = ( gmx - gmn ).Length() * 0.5f;
+					casFlat[nCas * 2 + 0] = idVec4( c.x, c.y, c.z, rad );
+					casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri, ( float )( nElems / 3 - openFirstTri ), 0.0f, 0.0f );
+					nCas++;
+				}
+
+				vLight->softEdgeCache = vertexCache.AllocJoint( triFlat, total, sizeof( idVec4 ) );
+				vLight->softEdgeCount = total;					// FACE mode: count in FLOAT4 elements
+				vLight->softCasterCache = vertexCache.AllocJoint( casFlat, casterElems, sizeof( idVec4 ) );
+				vLight->softCasterCount = nCas;
+
+				if( R_SoftShadowCaptureArmed() )
+				{
+					triFlat[total].Zero();						// pad the odd tail for the pair-based copy
+					R_CaptureLightEdges( vLight, ( const softShadowEdge_t* )triFlat, ( total + 1 ) / 2 );
+				}
+
+				tr.pc.c_softShadowLights++;
+				tr.pc.c_softShadowCasters += nCas;
+				tr.pc.c_softShadowEdges += total;
+				tr.pc.c_softShadowMaxEdgesPerLight = Max( tr.pc.c_softShadowMaxEdgesPerLight, total );
+				continue;
+			}
+
+			// ---- legacy WEDGE stream: inline caster headers + silhouette edge records ----
+			const int records = total + numCasters;
 			if( edgesUsed + records > SOFT_EDGE_FRAME_BUDGET )
 			{
 				tr.pc.c_softShadowDroppedEdges += total;	// over budget -> this light gets no soft shadow
@@ -1753,13 +1842,6 @@ void R_AddModels()
 			edgesUsed += records;
 
 			softShadowEdge_t* flat = ( softShadowEdge_t* )R_FrameAlloc( records * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
-			// tile binning (r_softShadowTileBin): pair-start record indices of the FACE stream, one uint
-			// per triangle, so the bin compute pass gets random access to triangles without decoding the
-			// header/pair structure (recB.e0.w == 0 is not distinguishable from a degenerate recA).
-			extern idCVar r_softShadowFaceCoverage;
-			const bool facePairs = r_softShadowFaceCoverage.GetBool();
-			uint32_t* pairIdx = facePairs ? ( uint32_t* )R_FrameAlloc( ( total / 2 + 1 ) * sizeof( uint32_t ), FRAME_ALLOC_UNKNOWN ) : NULL;
-			int nPairs = 0;
 			int n = 0;
 			float casterId = 0.0f;	// tag each caster's edges so the shader can group + combine per caster
 			const void* curSpace = NULL;
@@ -1789,10 +1871,6 @@ void R_AddModels()
 				{
 					const idVec4& e0 = s->softEdges[i].e0;
 					const idVec4& e1 = s->softEdges[i].e1;
-					if( pairIdx != NULL && ( i & 1 ) == 0 )
-					{
-						pairIdx[nPairs++] = ( uint32_t )n;	// face records are strict (recA, recB) pairs per surf
-					}
 					gmn.x = Min( gmn.x, Min( e0.x, e1.x ) );	gmx.x = Max( gmx.x, Max( e0.x, e1.x ) );
 					gmn.y = Min( gmn.y, Min( e0.y, e1.y ) );	gmx.y = Max( gmx.y, Max( e0.y, e1.y ) );
 					gmn.z = Min( gmn.z, Min( e0.z, e1.z ) );	gmx.z = Max( gmx.z, Max( e0.z, e1.z ) );
@@ -1817,11 +1895,6 @@ void R_AddModels()
 			// interaction pixel shader can read; the vertex buffer is not bound as an SRV.
 			vLight->softEdgeCache = vertexCache.AllocJoint( flat, records, sizeof( softShadowEdge_t ) );
 			vLight->softEdgeCount = records;
-			if( pairIdx != NULL && nPairs > 0 )
-			{
-				vLight->softPairCache = vertexCache.AllocJoint( pairIdx, nPairs, sizeof( uint32_t ) );
-				vLight->softPairCount = nPairs;
-			}
 
 			if( R_SoftShadowCaptureArmed() )
 			{
