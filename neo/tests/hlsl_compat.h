@@ -64,6 +64,9 @@ inline float atan2( float y, float x ) { return std::atan2( y, x ); }
 // identity - semantically exact for lane count 1 (the shader's wave-uniform jumps degrade to the
 // per-lane skip, which walks the same records).
 inline bool WaveActiveAllTrue( bool b ) { return b; }
+inline int  WaveReadLaneFirst( int x ) { return x; }
+inline uint WaveReadLaneFirst( uint x ) { return x; }
+inline float WaveReadLaneFirst( float x ) { return x; }
 
 // StructuredBuffer<float4> stand-in. The shared coverage function takes this as a trailing parameter
 // (SW_EDGEBUF_PARAM) in C++; in HLSL the parameter is absent and t_SoftEdges is the global resource.

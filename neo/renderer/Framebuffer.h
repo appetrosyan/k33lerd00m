@@ -158,6 +158,7 @@ struct globalFramebuffers_t
 	Framebuffer*				softShadowMaskFBO;	// soft shadow volumes: LVB colour (rtShadowMaskImage) + shared depth-stencil
 	Framebuffer*				softShadowAccumFBO;	// analytic soft shadows: R32F coverage accum + scene depth-stencil (baseline hard-shadow pass)
 	Framebuffer*				softShadowWedgeFBO;	// analytic soft shadows: R32F coverage accum, colour-only (wedge pass reads depth as SRV)
+	Framebuffer*				softShadowPosFBO;	// r_softShadowCompute: RGBA32F exact world position + scene depth (softpos depth-EQUAL pass)
 	Framebuffer*				smaaInputFBO;
 	Framebuffer*				smaaEdgesFBO;
 	Framebuffer*				smaaBlendFBO;

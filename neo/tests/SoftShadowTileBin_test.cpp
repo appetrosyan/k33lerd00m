@@ -94,7 +94,7 @@ inline float ListOcclusion( const std::vector<float4>& buf, const std::vector<ui
 {
 	SoftEdgeBuffer eb{ buf.data(), ( int )buf.size() };
 	SoftTileBuffer tb{ list.data(), ( int )list.size() };
-	return SoftShadow_FaceCoverageList( P, L, r, 0, 0, ( int )list.size(), tb, eb );
+	return SoftShadow_FaceCoverageList( P, L, r, 0, 0, ( int )list.size(), SoftRotAngle( P ), tb, eb );
 }
 
 TEST( SoftShadowTileBin, list_walk_bit_identical_and_bin_cull_lossless )
@@ -122,7 +122,7 @@ TEST( SoftShadowTileBin, list_walk_bit_identical_and_bin_cull_lossless )
 		for( int p = 0; p < 40; p++ )
 		{
 			float3 P( Rnd( seed, -80, 80 ), Rnd( seed, -80, 80 ), Rnd( seed, -8, 6 ) );
-			float full = SoftShadow_FaceCoverage( P, L, swR, 0, nRec, eb );
+			float full = SoftShadow_FaceCoverage( P, L, swR, 0, nRec, SoftRotAngle( P ), eb );
 
 			// 1) complete list == full walk, bit-identical
 			float listAll = ListOcclusion( buf, all, P, L, swR );
@@ -143,7 +143,7 @@ TEST( SoftShadowTileBin, list_walk_bit_identical_and_bin_cull_lossless )
 
 			// 3) and for a DISPLACED receiver still inside the AABB the culled list must stay lossless
 			float3 Pd = P + float3( Rnd( seed, -1, 1 ), Rnd( seed, -1, 1 ), Rnd( seed, -1, 1 ) ) * ( tR * 0.57f );
-			float fullD = SoftShadow_FaceCoverage( Pd, L, swR, 0, nRec, eb );
+			float fullD = SoftShadow_FaceCoverage( Pd, L, swR, 0, nRec, SoftRotAngle( Pd ), eb );
 			std::vector<uint32_t> culledD;	// bin cull is evaluated at the AABB CENTRE P, receiver at Pd
 			for( uint32_t se : all )
 			{

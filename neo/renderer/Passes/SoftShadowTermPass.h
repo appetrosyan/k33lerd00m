@@ -1,0 +1,91 @@
+/*
+===========================================================================
+
+Doom 3 BFG Edition GPL Source Code
+Copyright (C) 2026 Aleksandr Petrosyan
+
+This file is part of the Doom 3 BFG Edition GPL Source Code ("Doom 3 BFG Edition Source Code").
+
+Doom 3 BFG Edition Source Code is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+===========================================================================
+*/
+
+#ifndef __SOFT_SHADOW_TERM_PASS_H__
+#define __SOFT_SHADOW_TERM_PASS_H__
+
+#include <nvrhi/nvrhi.h>
+
+struct viewDef_t;
+struct viewLight_t;
+
+// Analytic soft shadows: per-soft-light COMPUTE evaluation of the coverage integral
+// (r_softShadowCompute, softterm.cs.hlsl). One dispatch per light over its scissor rect, reading
+// the EXACT receiver world positions from the softShadowPos G-buffer (softpos.{vs,ps}.hlsl at
+// depth-EQUAL - never reconstructed from depth) and the SoftTileBinPass tile lists, writing the
+// visibility term into an R32F atlas of screen-size slots (one per light). The interaction pixel
+// shader then Loads its light's term texel (rpUser6 selects mode + slot offset) instead of running
+// the integral per fragment in wave64. 32-thread workgroups (8x4) so RDNA3 can pick wave32 (VOPD
+// dual-issue); this vendored nvrhi exposes no VK_EXT_subgroup_size_control, so the wave size is
+// ultimately the driver's choice.
+// Everything is conservative: no pipeline / atlas too large for the device / out of slots => the
+// caller leaves the light on the in-shader integral (bit-exact by design either way).
+class SoftShadowTermPass
+{
+public:
+	explicit SoftShadowTermPass( nvrhi::IDevice* device );
+
+	// Once per view, AFTER the softpos pass drew and AFTER SoftTileBinPass::BeginView/BinLight:
+	// resets the slot cursor, (re)creates the term atlas for the current render size and barriers
+	// the position G-buffer to ShaderResource (same explicit-transition precedent as the tile-bin
+	// depth read). Returns false when the pass cannot run this view (no pipeline / atlas exceeds
+	// the device texture limit).
+	bool BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* worldPosTexture );
+
+	// Dispatch the coverage integral for one soft light over its scissor rect into the next free
+	// atlas slot. tileBase/tileOx/tileOy/tilesX are this light's SoftTileBinPass result (base -1 =
+	// not binned => the shader runs the full walk - bit-exact fallback, same as the pixel shader).
+	// On success fills the slot's pixel offset (add to SV_Position to address the atlas) and
+	// returns true; false = out of slots (light stays on the in-shader integral).
+	bool AddLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
+				   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem, int faceCount,
+				   float penumbraRadius,
+				   int tileBase, int tileOx, int tileOy, int tilesX,
+				   nvrhi::IBuffer* tileBuffer,
+				   int& outOfsX, int& outOfsY );
+
+	nvrhi::ITexture* GetTermTexture() const
+	{
+		return m_TermTexture;
+	}
+
+	// Atlas slot grid: SLOT_COLS x SLOT_ROWS screen-size R32F slots (R32F so the term is BIT-EXACT
+	// against the fragment integral - the designed anaTerm-hash A/B property; drop to R16F only
+	// after that gate is green if the memory matters). 12 slots covers the measured "up to ~a
+	// dozen" soft lights per frame; lights beyond the budget keep the in-shader integral.
+	// ponytail: fixed grid of full-screen slots (4K = ~398 MB, allocated only once the cvar is on);
+	// pack scissor-sized rects instead if the memory ever matters.
+	static const int SLOT_COLS = 4;
+	static const int SLOT_ROWS = 3;
+
+private:
+	void EnsurePipeline();
+
+	nvrhi::DeviceHandle				m_Device;
+	bool							m_PipelineTried = false;
+	nvrhi::ShaderHandle				m_Shader;
+	nvrhi::BindingLayoutHandle		m_Layout;
+	nvrhi::ComputePipelineHandle	m_Pipeline;
+	nvrhi::BufferHandle				m_ConstantBuffer;
+	nvrhi::TextureHandle			m_TermTexture;
+	nvrhi::TextureHandle			m_WorldPos;		// this view's position G-buffer (set by BeginView)
+	int								m_SlotW = 0;	// screen-size slot extents the atlas was built for
+	int								m_SlotH = 0;
+	int								m_Cursor = 0;	// slots handed out this view
+	bool							m_Valid = false;
+};
+
+#endif // __SOFT_SHADOW_TERM_PASS_H__

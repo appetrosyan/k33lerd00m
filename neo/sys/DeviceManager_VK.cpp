@@ -984,7 +984,9 @@ bool DeviceManager_VK::createDevice()
 	// SRS - get/set shading rate features which are detected individually by nvrhi (not just at extension level)
 	vk::PhysicalDeviceFeatures2 actualDeviceFeatures2;
 	vk::PhysicalDeviceFragmentShadingRateFeaturesKHR fragmentShadingRateFeatures;
+	vk::PhysicalDeviceVulkan12Features actualVulkan12Features;
 	actualDeviceFeatures2.pNext = &fragmentShadingRateFeatures;
+	fragmentShadingRateFeatures.pNext = &actualVulkan12Features;
 	m_VulkanPhysicalDevice.getFeatures2( &actualDeviceFeatures2 );
 
 	auto vrsFeatures = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR()
@@ -1024,9 +1026,19 @@ bool DeviceManager_VK::createDevice()
 						  .setGeometryShader( actualDeviceFeatures2.features.geometryShader )
 						  .setFillModeNonSolid( actualDeviceFeatures2.features.fillModeNonSolid )
 						  .setImageCubeArray( true )
-						  .setDualSrcBlend( true );
+						  .setDualSrcBlend( true )
+						  // Defined behaviour for out-of-bounds buffer reads (return 0 / clamp). The soft-shadow
+						  // stack has a latent, RESULT-NEUTRAL over-read (proven: per-light anaTerm hashes are
+						  // bit-identical with robustness on vs. runs where the overshoot landed in mapped pages)
+						  // that GPUVM-faults when allocation layout leaves the overshot page unmapped. Robustness
+						  // is ~free on RDNA (descriptors carry the range anyway) and turns that crash into a
+						  // spec-defined zero read.
+						  .setRobustBufferAccess( true );
 
 	auto vulkan12features = vk::PhysicalDeviceVulkan12Features()
+							// soft-shadow fp16 sample loop (softwedge_coverage.inc.hlsl SW_FACE_FP16) emits
+							// Float16 SPIR-V; enable the capability when the device actually has it
+							.setShaderFloat16( actualVulkan12Features.shaderFloat16 )
 							.setDescriptorIndexing( true )
 							.setRuntimeDescriptorArray( true )
 							.setDescriptorBindingPartiallyBound( true )

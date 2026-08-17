@@ -65,6 +65,11 @@ StructuredBuffer<float4> t_SoftEdges : register( t12 VK_DESCRIPTOR_SET( 0 ) );
 #define SW_TILE_K 256
 #define SW_TILE_SIZE 16
 StructuredBuffer<uint> t_SoftTiles : register( t13 VK_DESCRIPTOR_SET( 0 ) );
+// Compute-decoupled term (r_softShadowCompute): softterm.cs.hlsl already evaluated this light's
+// coverage integral (same include, exact positions from the softpos G-buffer) into an R32F atlas of
+// screen-size slots. rpUser6 = ( mode 0|1, slot offset x, y, unused ); mode 1 replaces the whole
+// in-shader integral with one Load. Bound to a dummy (black) texture when the pass is off.
+Texture2D t_SoftTerm : register( t14 VK_DESCRIPTOR_SET( 0 ) );
 // Included AFTER t_SoftEdges: SoftShadow_WedgeOcclusion reads that global directly (HLSL), so the
 // declaration must be in scope at include time.
 #include "softwedge_coverage.inc.hlsl"
@@ -152,6 +157,14 @@ void main( PS_IN fragment, out PS_OUT result )
 	// explicit first element (this light's edges start here), passed in rpJitterTexOffset.x.
 	int swFirstElem = int( pc.rpJitterTexOffset.x );
 
+	// per-fragment sample-set rotation angle: WORLD-POSITION hash (the original scheme, bit-identical
+	// to when it lived inside the coverage function). A screen-anchored blue-noise rotation was tried
+	// against the contour banding and REJECTED by play-test (2026-08-17): no visible improvement - the
+	// banding/grain complaint traced mostly to VRS 2x2 coarseness, and world-anchored rotation keeps
+	// the pattern glued to surfaces under camera motion where screen-anchored noise swims.
+	float swRotHash = dot( swP, float3( 12.9898, 78.233, 37.719 ) );
+	float swRotAng = ( swRotHash - floor( swRotHash ) ) * 6.28318531;
+
 	// NO origin bias on the coverage rays: the analytic path traces the exact caster triangles from the
 	// exact interpolated receiver position, and the "phantom" shadows once blamed on self-intersection
 	// turned out to be REAL contact shadows in seams/cracks (gate finding: the blocking triangle exists
@@ -161,6 +174,18 @@ void main( PS_IN fragment, out PS_OUT result )
 	float3 swCovP = swP;
 
 	int swDbg = int( pc.rpJitterTexScale.w );	// diagnostic selector (r_softShadowDebugShader), visualised at end of main
+
+	// FALLOFF-FIRST EARLY-OUT: the light's scissor is a rectangle but its influence region is the
+	// projection x falloff support inside it; outside that support the interaction contributes
+	// EXACTLY zero regardless of the shadow term (lightColor multiplies everything), so the
+	// integral is provably skippable. Hoisted from below (single consumer, line ~915) - the
+	// samples live across the walk only on pixels that actually shade. Debug modes never skip:
+	// the gate's term instruments (dbg 6/8 readbacks, anaTerm hashes) must stay full-field.
+	float4 swLightFalloff = idtex2Dproj( s_Lighting, t_LightFalloff, fragment.texcoord2 );
+	float4 swLightProj    = idtex2Dproj( s_Lighting, t_LightProjection, fragment.texcoord3 );
+	const bool swZeroLight = ( swDbg == 0 ) &&
+							 ( max( max( swLightProj.x * swLightFalloff.x, swLightProj.y * swLightFalloff.y ),
+									swLightProj.z * swLightFalloff.z ) <= 0.0 );
 
 	// Light-disk coverage: sum each caster's silhouette against the area-light disk (see
 	// softwedge_coverage.inc.hlsl). This is the SAME function the unit tests compile as C++
@@ -195,7 +220,22 @@ void main( PS_IN fragment, out PS_OUT result )
 	// erase a real thin shadow) must not be able to change a face-mode pixel. The nature of a
 	// shadow must not depend on where the camera looks; one code path, one look. PCSS survives
 	// only for the legacy L-sil wedge stream below.
-	if( swFace )
+	if( swZeroLight )
+	{
+		// zero light contribution at this pixel: the term is multiplied by 0 downstream, any value
+		// is exact. 1.0 keeps the unshadowed invariants (and the branch is wave-coherent at the
+		// scissor corners / outside the projection support, where whole waves skip the walk).
+		shadow = 1.0;
+	}
+	else if( swFace && pc.rpUser6.x > 0.5 )
+	{
+		// COMPUTE-DECOUPLED term (r_softShadowCompute): the per-light softterm dispatch already ran
+		// this exact integral at this exact position (softpos G-buffer); just Load the term. R32F
+		// storage + shared include + identical inputs => bit-exact vs the else-branch below (the
+		// designed A/B property: anaTerm hashes must match with the cvar 0 vs 1).
+		shadow = t_SoftTerm.Load( int3( int2( fragment.position.xy ) + int2( int( pc.rpUser6.y ), int( pc.rpUser6.z ) ), 0 ) ).r;
+	}
+	else if( swFace )
 	{
 		// TILE-BINNED walk when the prepass ran (rpUser7.x >= 0): this fragment's 16x16 tile carries
 		// the conservative list of triangles that can occlude any receiver in the tile, so the walk
@@ -206,23 +246,28 @@ void main( PS_IN fragment, out PS_OUT result )
 		int swTileBase = int( pc.rpUser7.x );
 		int swTx = int( fragment.position.x ) / SW_TILE_SIZE - int( pc.rpUser7.z );
 		int swTy = int( fragment.position.y ) / SW_TILE_SIZE - int( pc.rpUser7.w );
+		int  swSlot = -1;
+		uint swCnt  = 0xFFFFFFFFu;
 		if( swTileBase >= 0 && swTx >= 0 && swTy >= 0 )
 		{
-			int  swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( SW_TILE_K + 1 );
-			uint swCnt  = t_SoftTiles[ swSlot ];
-			if( swCnt != 0xFFFFFFFFu )
-			{
-				swOcc = SoftShadow_FaceCoverageList( swCovP, swL, swR, swFirstElem, swSlot + 1, int( swCnt ) );
-			}
-			else
-			{
-				swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
-			}
+			swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( SW_TILE_K + 1 );
+			swCnt  = t_SoftTiles[ swSlot ];
+		}
+		const bool swBinned = ( swSlot >= 0 ) && ( swCnt != 0xFFFFFFFFu );
+		if( swBinned )
+		{
+			swOcc = SoftShadow_FaceCoverageList( swCovP, swL, swR, swFirstElem, swSlot + 1, int( swCnt ), swRotAng );
 		}
 		else
 		{
-			swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+			swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace, swRotAng );
 		}
+		// NO penumbra second-pass refinement: a 2x16-sample average (independent rotations, penumbra
+		// fragments only) was tried against the contour banding and REMOVED (play-test 2026-08-17) -
+		// the bands are insensitive to the rotation scheme entirely (hash vs blue noise: "no
+		// difference"), so doubling the effective sample count bought nothing visible for ~15-20% of
+		// the heavy-scene frame time. The bands are structural, not sampling noise; find the actual
+		// mechanism before spending samples on it.
 		shadow = 1.0 - saturate( swOcc );
 	}
 	else if( pcssScale < 0.0 )
@@ -231,7 +276,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	}
 	else if( pcssScale == 0.0 )
 	{
-		float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+		float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace, swRotAng );
 		shadow = 1.0 - saturate( swOcc );
 	}
 	else
@@ -400,7 +445,7 @@ void main( PS_IN fragment, out PS_OUT result )
 			bool swDeepUmbra = ( swBlkCnt > 15.5 ) && ( swCentreLit < 0.5 ) && ( pcssLit < 0.002 );
 			if( pc.rpJitterTexOffset.w > 0.5 && !swDeepUmbra )
 			{
-				float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, swCentreLit, swFace );
+				float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, swCentreLit, swFace, swRotAng );
 				// legacy L-sil wedge only (face mode exits above): the wedge undershoots off-axis, so it
 				// keeps the PCSS fallback for occlusion its silhouette stream cannot see.
 				shadow = ( swOcc > 0.003 ) ? ( 1.0 - saturate( swOcc ) ) : pcssLit;
@@ -412,7 +457,7 @@ void main( PS_IN fragment, out PS_OUT result )
 		}
 	}
 #else
-	float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace );
+	float swOcc = SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace, swRotAng );
 	shadow = 1.0 - saturate( swOcc );
 #endif
 #elif USE_RT_SHADOW
@@ -792,8 +837,14 @@ void main( PS_IN fragment, out PS_OUT result )
 	}
 
 	float4 bumpMap =		t_Normal.Sample( s_Material, bumpUV );
+#if USE_SOFT_WEDGE
+	// already sampled above for the falloff-first early-out; identical coordinates, single sample
+	float4 lightFalloff =	swLightFalloff;
+	float4 lightProj =		swLightProj;
+#else
 	float4 lightFalloff =	idtex2Dproj( s_Lighting, t_LightFalloff, fragment.texcoord2 );
 	float4 lightProj =		idtex2Dproj( s_Lighting, t_LightProjection, fragment.texcoord3 );
+#endif
 	float4 YCoCG =			t_BaseColor.Sample( s_Material, baseUV );
 	float4 specMapSRGB =	t_Specular.Sample( s_Material, specUV );
 	float4 specMap =		sRGBAToLinearRGBA( specMapSRGB );
@@ -936,7 +987,7 @@ void main( PS_IN fragment, out PS_OUT result )
 	//   0 = real shadows.
 	if( swDbg == 7 )      { result.color = float4( 1.0, 0.0, 0.0, 1.0 ); }				// solid red for any soft-lit fragment (does the soft path run?)
 	else if( swDbg == 2 ) { result.color = float4( frac( swP / 64.0 ), 1.0 ); }			// receiver world pos (smooth gradient => swP valid)
-	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
+	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swFace, swRotAng ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
 	else if( swDbg == 9 ) { result.color = float4( frac( float( swFirstElem ) / 256.0 ), frac( float( swN ) / 64.0 ), 0.0, 1.0 ); }	// R = first-element param, G = edge count param
 		else if( swDbg == 8 ) { result.color = float4( shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
 		else if( swDbg == 10 ) { result.color = ( swLocFr < 0.0 ) ? float4( 0.0, 0.0, 0.4, 1.0 ) : float4( swLocFr, 1.0 - swLocFr, 0.0, 1.0 ); }	// LOCATOR: green = lit (frac 0), red = umbra (frac 1), blue = pcss off / outside face

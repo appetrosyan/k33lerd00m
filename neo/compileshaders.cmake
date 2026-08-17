@@ -108,7 +108,11 @@ function(compile_shaders)
         endif()
 
         if (NOT params_CFLAGS)
-			set(CFLAGS $<IF:$<CONFIG:Debug>,--PDB,> --vulkanVersion=1.2 --shaderModel=6_0 -O3 --WX --matrixRowMajor --tRegShift=0 --sRegShift=128 --bRegShift=256 --uRegShift=384)
+			# SM 6.2 solely for -enable-16bit-types (ShaderMake adds it automatically at >= 6_2): the packed-fp16
+			# soft-shadow sample loop (SW_FACE_FP16, softwedge_coverage.inc.hlsl) needs explicit float16_t. The
+			# legacy 'half' types would silently become real fp16 and break -WX builds (global_inc.hlsl YCoCg) and
+			# change codegen everywhere, so they are pinned back to float - float16_t stays the only fp16 type.
+			set(CFLAGS $<IF:$<CONFIG:Debug>,--PDB,> --vulkanVersion=1.2 --shaderModel=6_2 -D half=float -D half2=float2 -D half3=float3 -D half4=float4 -O3 --WX --matrixRowMajor --tRegShift=0 --sRegShift=128 --bRegShift=256 --uRegShift=384)
         else()
             set(CFLAGS ${params_CFLAGS})
         endif()

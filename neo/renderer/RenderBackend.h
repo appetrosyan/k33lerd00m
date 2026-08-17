@@ -42,6 +42,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Passes/RtShadowsPass.h"
 #include "Passes/EmberPass.h"
 #include "Passes/SoftTileBinPass.h"
+#include "Passes/SoftShadowTermPass.h"
 #include "Passes/HdrGuiCompositePass.h"
 #include "Passes/TonemapPass.h"
 #include "Passes/TemporalAntiAliasingPass.h"
@@ -197,6 +198,7 @@ private:
 
 	// RB
 	void				AmbientPass( const drawSurf_t* const* drawSurfs, int numDrawSurfs, bool fillGbuffer );
+	void				FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurfs, int numDrawSurfs );	// r_softShadowCompute: exact-position G-buffer (depth-EQUAL)
 
 	void				SetupShadowMapMatrices( viewLight_t* vLight, int side, idRenderMatrix& lightProjectionRenderMatrix, idRenderMatrix& lightViewRenderMatrix );
 	void				ShadowMapPassFast( const drawSurf_t* drawSurfs, viewLight_t* vLight, int side, bool atlas );
@@ -423,6 +425,11 @@ private:
 	int								currentSoftTileOx;
 	int								currentSoftTileOy;
 	int								currentSoftTileTilesX;
+	SoftShadowTermPass*				softShadowTermPass;
+	// per-light compute-term result (r_softShadowCompute), set by DrawInteractions before the
+	// light's draws and consumed where rpUser6 is written: ofsX < 0 = no term => in-shader integral
+	int								currentSoftTermOfsX;
+	int								currentSoftTermOfsY;
 	HdrGuiCompositePass*			hdrGuiCompositePass;
 	MipMapGenPass*					hiZGenPass;
 	TonemapPass*					toneMapPass;

@@ -85,6 +85,14 @@ void SoftTileBinPass::BeginView( nvrhi::ICommandList* commandList, const viewDef
 	};
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_MinMaxLayout );
 
+	// EXPLICIT transition of the depth target out of its attachment state before the compute read:
+	// nvrhi's automatic barriers do not synchronise a render-target write with a later dispatch's SRV
+	// read (same hazard class the wedge-accum pass documents in RenderBackend.cpp) - without this the
+	// reduce can consume the PREVIOUS frame's depth, so every bin list is built for the previous
+	// camera and the shadows visibly flash one frame behind while rotating (play-test 2026-08-17).
+	commandList->setTextureState( depthTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+	commandList->commitBarriers();
+
 	commandList->writeBuffer( m_MinMaxCB, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;
 	cs.pipeline = m_MinMaxPipeline;

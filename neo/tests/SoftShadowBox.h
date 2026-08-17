@@ -253,11 +253,21 @@ inline std::vector<float4> BuildFaceCaster( const Box& b )
 	return buf;
 }
 
+// The LEGACY per-fragment rotation angle (position hash). The shipped pixel shader now samples blue
+// noise instead (screen-anchored decorrelation - the hash left the 1/16 coverage quanta visible as
+// contour bands); the tests keep the hash so every recorded expected value stays bit-exact, and
+// because they have no screen position to sample noise at.
+inline float SoftRotAngle( float3 P )
+{
+	float h = dot( P, float3( 12.9898f, 78.233f, 37.719f ) );
+	return ( h - std::floor( h ) ) * 6.2831853f;
+}
+
 // front-face coverage (r_softShadowFaceCoverage path) as an occlusion in [0,1] from the box's face stream.
 inline float FaceOcclusion( const std::vector<float4>& frec, float3 P, float3 L, float r )
 {
 	SoftEdgeBuffer buf{ frec.data(), ( int )frec.size() };
-	return saturate( SoftShadow_FaceCoverage( P, L, r, 0, ( int )( frec.size() / 2 ), buf ) );
+	return saturate( SoftShadow_FaceCoverage( P, L, r, 0, ( int )( frec.size() / 2 ), SoftRotAngle( P ), buf ) );
 }
 
 // Build the SoftShadow_FaceCoverage stream from a CASTER's mesh triangles (real capture geometry, as opposed

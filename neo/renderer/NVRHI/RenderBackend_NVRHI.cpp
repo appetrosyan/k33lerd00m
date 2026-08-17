@@ -206,6 +206,8 @@ void idRenderBackend::Init()
 	emberPass = nullptr;
 	softTileBinPass = nullptr;
 	currentSoftTileBase = -1;
+	softShadowTermPass = nullptr;
+	currentSoftTermOfsX = currentSoftTermOfsY = -1;
 	hdrGuiCompositePass = nullptr;
 
 	// Maximum resolution of one tile within tiled shadow map. Resolution must be power of two and
@@ -1734,6 +1736,12 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 		nvrhi::IBuffer* sw_tiles = ( softTileBinPass != NULL && softTileBinPass->GetTileBuffer() != nullptr )
 								   ? softTileBinPass->GetTileBuffer() : currentSoftEdgeBuffer;
 
+		// t14 = the compute-term atlas (r_softShadowCompute). Always bound (the layout demands a
+		// resource); black fallback until the term pass has created its atlas - rpUser6.x == 0
+		// keeps the shader from reading it then.
+		nvrhi::ITexture* sw_term = ( softShadowTermPass != NULL && softShadowTermPass->GetTermTexture() != nullptr )
+								   ? softShadowTermPass->GetTermTexture() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID();
+
 		// renderparms + edge buffer (+ joints): 0
 		if( sw_skinned )
 		{
@@ -1742,7 +1750,8 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 				uniformsBindingSetItem,
 				nvrhi::BindingSetItem::StructuredBuffer_SRV( 11, currentJointBuffer, nvrhi::Format::UNKNOWN, nvrhi::BufferRange( currentJointOffset, sizeof( idVec4 ) * numBoneMatrices ) ),
 				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range ),
-				nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles )
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles ),
+				nvrhi::BindingSetItem::Texture_SRV( 14, sw_term )
 			};
 		}
 		else
@@ -1751,7 +1760,8 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 			{
 				uniformsBindingSetItem,
 				nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range ),
-				nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles )
+				nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles ),
+				nvrhi::BindingSetItem::Texture_SRV( 14, sw_term )
 			};
 		}
 
@@ -1791,11 +1801,16 @@ void idRenderBackend::GetCurrentBindingLayout( int type )
 		// bind SOMETHING there even though the band VS never reads tile lists.
 		nvrhi::IBuffer* sw_tiles2 = ( softTileBinPass != NULL && softTileBinPass->GetTileBuffer() != nullptr )
 									? softTileBinPass->GetTileBuffer() : currentSoftEdgeBuffer;
+		// t14 mirrors the SM_SOFT case: the shared 'soft' uniforms layout declares the term atlas,
+		// so the set must bind SOMETHING there even though the band shaders never read it.
+		nvrhi::ITexture* sw_term2 = ( softShadowTermPass != NULL && softShadowTermPass->GetTermTexture() != nullptr )
+									? softShadowTermPass->GetTermTexture() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID();
 		desc[0].bindings =
 		{
 			uniformsBindingSetItem,
 			nvrhi::BindingSetItem::StructuredBuffer_SRV( 12, currentSoftEdgeBuffer, nvrhi::Format::UNKNOWN, sw_range ),
-			nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles2 )
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 13, sw_tiles2 ),
+			nvrhi::BindingSetItem::Texture_SRV( 14, sw_term2 )
 		};
 	}
 	else if( type == BINDING_LAYOUT_FOG )
@@ -2569,6 +2584,11 @@ void idRenderBackend::GL_StartFrame()
 		softTileBinPass = new SoftTileBinPass( deviceManager->GetDevice() );
 	}
 
+	if( !softShadowTermPass )
+	{
+		softShadowTermPass = new SoftShadowTermPass( deviceManager->GetDevice() );
+	}
+
 	if( !hdrGuiCompositePass )
 	{
 		hdrGuiCompositePass = new HdrGuiCompositePass( deviceManager->GetDevice() );
@@ -2961,6 +2981,12 @@ void idRenderBackend::ClearCaches()
 		softTileBinPass = nullptr;
 	}
 
+	if( softShadowTermPass )
+	{
+		delete softShadowTermPass;
+		softShadowTermPass = nullptr;
+	}
+
 	if( hdrGuiCompositePass )
 	{
 		delete hdrGuiCompositePass;
@@ -3100,6 +3126,8 @@ idRenderBackend::idRenderBackend()
 	// as a boot-order-dependent crash)
 	currentSoftTileBase = -1;
 	currentSoftTileOx = currentSoftTileOy = currentSoftTileTilesX = 0;
+	softShadowTermPass = nullptr;	// same ctor-vs-Init landmine as softTileBinPass above
+	currentSoftTermOfsX = currentSoftTermOfsY = -1;
 	hdrGuiCompositePass = nullptr;
 
 	memset( &glConfig, 0, sizeof( glConfig ) );

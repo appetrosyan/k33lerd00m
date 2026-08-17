@@ -104,6 +104,7 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 		{
 			skinningLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 12 ) ); // soft-shadow edges
 			skinningLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 13 ) ); // per-tile triangle lists (r_softShadowTileBin)
+			skinningLayoutDesc.addItem( nvrhi::BindingLayoutItem::Texture_SRV( 14 ) ); // precomputed term atlas (r_softShadowCompute)
 		}
 
 		return device->createBindingLayout( skinningLayoutDesc );
@@ -117,6 +118,7 @@ nvrhi::BindingLayoutHandle idRenderProgManager::uniformsLayout( bindingLayoutTyp
 		{
 			uniformsLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 12 ) ); // soft-shadow edges
 			uniformsLayoutDesc.addItem( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 13 ) ); // per-tile triangle lists (r_softShadowTileBin)
+			uniformsLayoutDesc.addItem( nvrhi::BindingLayoutItem::Texture_SRV( 14 ) ); // precomputed term atlas (r_softShadowCompute)
 		}
 
 		return device->createBindingLayout( uniformsLayoutDesc );
@@ -1036,6 +1038,15 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		// Analytic soft shadows: penumbra-band stencil prepass. Procedural (no vertex buffer -> LAYOUT_UNKNOWN,
 		// null input layout); the VS expands each t12 edge record into a wedge volume from SV_VertexID.
 		{ BUILTIN_SOFT_BAND, "builtin/lighting/softband", "", { { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_SOFT_BAND ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_UNKNOWN, BINDING_LAYOUT_SOFT_BAND },
+
+		// Analytic soft shadows, compute decoupling (r_softShadowCompute): the EXACT-POSITION G-buffer
+		// pass. Re-rasterises the depth-prepassed surfaces at depth-EQUAL and writes the interpolated
+		// world position (interactionSM texcoord7 x model matrix) to RGBA32F, so the softterm compute
+		// pass evaluates the coverage integral at the exact fragment positions. Reuses the gbuffer
+		// binding layout (renderParmSet3 + joints when skinned); the extra material/sampler layout
+		// items are simply unused by the shader.
+		{ BUILTIN_SOFT_SHADOW_POS, "builtin/lighting/softpos", "", { { "USE_GPU_SKINNING", "0" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_GBUFFER ) } }, false, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_GBUFFER },
+		{ BUILTIN_SOFT_SHADOW_POS_SKINNED, "builtin/lighting/softpos", "_skinned", { { "USE_GPU_SKINNING", "1" }, { "USE_PUSH_CONSTANTS", usePushConstants( BINDING_LAYOUT_GBUFFER_SKINNED ) } }, true, SHADER_STAGE_DEFAULT, LAYOUT_DRAW_VERT, BINDING_LAYOUT_GBUFFER_SKINNED },
 	};
 	int numBuiltins = sizeof( builtins ) / sizeof( builtins[0] );
 
@@ -1132,6 +1143,7 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		renderProgs[builtinShaders[BUILTIN_AMBIENT_LIGHTGRID_IBL_PBR_SKINNED]].usesJoints = true;
 
 		renderProgs[builtinShaders[BUILTIN_SMALL_GEOMETRY_BUFFER_SKINNED]].usesJoints = true;
+		renderProgs[builtinShaders[BUILTIN_SOFT_SHADOW_POS_SKINNED]].usesJoints = true;
 
 		renderProgs[builtinShaders[BUILTIN_PBR_INTERACTION_SKINNED]].usesJoints = true;
 		renderProgs[builtinShaders[BUILTIN_PBR_INTERACTION_AMBIENT_SKINNED]].usesJoints = true;

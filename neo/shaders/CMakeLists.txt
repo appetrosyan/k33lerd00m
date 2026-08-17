@@ -57,11 +57,13 @@ endif()
 
 # ---------------------------------------------------------------------------
 # DDGI ray tracing shaders (inline ray query) require shader model 6.6, so they
-# are compiled as a SEPARATE target. Bumping the global shader model would enable
-# -enable-16bit-types and change fp16 semantics across every shader (and break
-# global_inc.hlsl under -Werror). The DDGI shaders are self-contained (they do
-# not include global_inc.hlsl) so 6.6 is safe for them. Output goes to the same
-# renderprogs2/spirv directory the engine loads from.
+# are compiled as a SEPARATE target. The global SPIR-V build is now SM 6.2 (for
+# the packed-fp16 soft-shadow loop's explicit float16_t); the legacy 'half'
+# types are pinned back to float via -D half=float etc. in compileshaders.cmake
+# so their semantics (and global_inc.hlsl under -Werror) are unchanged. The DDGI
+# shaders are self-contained (they do not include global_inc.hlsl) so 6.6 is
+# safe for them. Output goes to the same renderprogs2/spirv directory the
+# engine loads from.
 # ---------------------------------------------------------------------------
 if(STANDALONE)
     set(DDGI_OUTPUT_BASE ${CMAKE_CURRENT_SOURCE_DIR}/../../content/renderprogs2)

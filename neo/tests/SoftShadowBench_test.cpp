@@ -177,7 +177,7 @@ STUDY_TEST( SoftShadowBench, face_vs_wedge_throughput )
 	std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
 	double accF = 0;
 	for( int rep = 0; rep < REPS; rep++ )
-		for( size_t i = 0; i < P.size(); i++ ) { accF += SoftShadow_FaceCoverage( P[i], L, r, 0, faceRec, fb ); }
+		for( size_t i = 0; i < P.size(); i++ ) { accF += SoftShadow_FaceCoverage( P[i], L, r, 0, faceRec, SoftRotAngle( P[i] ), fb ); }
 	std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
 	sink = accW + accF;
 

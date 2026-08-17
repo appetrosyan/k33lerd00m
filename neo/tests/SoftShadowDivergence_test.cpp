@@ -141,7 +141,7 @@ STUDY_TEST( SoftShadowDivergence, penalise_false_lit_and_false_shadow_vs_truth )
 				// The FIX: front-face coverage (the shipped SoftShadow_FaceCoverage). The old L-silhouette path
 				// undershot the outer penumbra (false-lit ~0.14) because it is selected against the light but
 				// projected from the receiver; front-face coverage IS the exact receiver-disk coverage.
-				float anaOcc = SoftShadow_FaceCoverage( P, L, cf.R, 0, numFRec, fbuf );
+				float anaOcc = SoftShadow_FaceCoverage( P, L, cf.R, 0, numFRec, SoftRotAngle( P ), fbuf );
 				( void )lsilOcc;
 
 				// COVERAGE ACCURACY (folded in from the old box_corpus test): in the penumbra ring, face

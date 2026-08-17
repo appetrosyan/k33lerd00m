@@ -95,6 +95,12 @@ void Framebuffer::CheckFramebuffers()
 void Framebuffer::Shutdown()
 {
 	framebuffers.DeleteContents( true );
+
+	// Release the ONE ref-counted nvrhi handle living in the static globalFramebuffers struct. Left
+	// alone, the static's destructor runs inside exit() AFTER the Vulkan device is gone and the
+	// texture release segfaults - the crash on every quit (backtrace: ~globalFramebuffers_t ->
+	// RefCounter<ITexture>::Release -> vulkan::Texture::~Texture, reproducible headless).
+	globalFramebuffers.softShadowRateImage = nullptr;
 }
 
 void Framebuffer::ResizeFramebuffers( bool reloadImages )
@@ -247,6 +253,14 @@ void Framebuffer::ResizeFramebuffers( bool reloadImages )
 			nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->softShadowAccumImage->texture ) );
 
+	// Analytic soft shadows, compute decoupling (r_softShadowCompute): the softpos pass re-draws
+	// the depth-prepassed surfaces at depth-EQUAL against the scene depth, writing the exact
+	// interpolated world position for the softterm compute integral.
+	globalFramebuffers.softShadowPosFBO = new Framebuffer( "_softShadowPos",
+			nvrhi::FramebufferDesc()
+			.addColorAttachment( globalImages->softShadowPosImage->texture )
+			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
+
 	globalFramebuffers.smaaInputFBO = new Framebuffer( "_smaaInput",
 			nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->smaaInputImage->texture ) );
@@ -294,6 +308,7 @@ void Framebuffer::ReloadImages()
 	globalImages->gbufferNormalsRoughnessImage->Reload( false, backEnd.commandList );
 	globalImages->rtShadowMaskImage->Reload( false, backEnd.commandList );
 	globalImages->rtShadowCoarseImage->Reload( false, backEnd.commandList );
+	globalImages->softShadowPosImage->Reload( false, backEnd.commandList );
 	globalImages->taaMotionVectorsImage->Reload( false, backEnd.commandList );
 	globalImages->taaFeedback1Image->Reload( false, backEnd.commandList );
 	globalImages->taaFeedback2Image->Reload( false, backEnd.commandList );

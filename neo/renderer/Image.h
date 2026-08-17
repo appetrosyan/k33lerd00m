@@ -629,6 +629,7 @@ public:
 	idImage*			smaaBlendImage;
 	idImage*			gbufferNormalsRoughnessImage;	// cheap G-Buffer replacement, holds normals and surface roughness
 	idImage*			softShadowAccumImage;			// soft shadow volumes: R32F signed analytic-coverage accumulation, resolved to rtShadowMaskImage
+	idImage*			softShadowPosImage;				// r_softShadowCompute: RGBA32F EXACT receiver world position (softpos depth-EQUAL pass), read by softterm.cs
 	idImage*			rtShadowMaskImage;				// screen-space ray-traced visibility mask (per light) written by RtShadowsPass
 	idImage*			rtShadowMaskRawImage;			// raw (pre-denoise) soft-shadow visibility; denoised into rtShadowMaskImage
 	idImage*			rtShadowCoarseImage;			// low-res coarse visibility mask (coarse+refine path); render-res image, top-left subregion used

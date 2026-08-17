@@ -1936,6 +1936,15 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			float swTile[4] = { ( float )currentSoftTileBase, ( float )currentSoftTileTilesX,
 								( float )currentSoftTileOx, ( float )currentSoftTileOy };
 			SetFragmentParm( RENDERPARM_USER7, swTile );
+
+			// compute-term result for this light (r_softShadowCompute): rpUser6 = ( mode, term
+			// atlas slot offset x, y, 0 ). Mode 1 only in FACE mode (the compute pass evaluates
+			// only the face integral) with a dispatched slot; translucent draws cleared the offset.
+			const bool swTermOn = ( currentSoftTermOfsX >= 0 ) && r_softShadowFaceCoverage.GetBool();
+			float swTermParm[4] = { swTermOn ? 1.0f : 0.0f,
+									( float )( swTermOn ? currentSoftTermOfsX : 0 ),
+									( float )( swTermOn ? currentSoftTermOfsY : 0 ), 0.0f };
+			SetFragmentParm( RENDERPARM_USER6, swTermParm );
 		}
 
 		// Depth-hacked surfaces (the view weapon, some particle models) write a squashed,
@@ -3102,6 +3111,152 @@ void idRenderBackend::AmbientPass( const drawSurf_t* const* drawSurfs, int numDr
 
 	renderLog.CloseBlock();
 	renderLog.CloseMainBlock();
+}
+
+/*
+==================
+idRenderBackend::FillSoftShadowPosBuffer
+
+Analytic soft shadows, compute decoupling (r_softShadowCompute): the EXACT-POSITION G-buffer.
+Re-rasterises the depth-prepassed opaque surfaces at depth-EQUAL into softShadowPosImage
+(RGBA32F), interpolating the model position and transforming it in the pixel shader with the
+same dot4s the interaction shader runs on texcoord7 - so the stored world position is
+bit-identical to the one the in-shader coverage integral would use. NO depth reconstruction
+(explicitly rejected: grazing instability). The softterm compute pass reads this to evaluate
+the coverage integral per soft light; surfaces skipped here (translucent, depth hacks) keep
+the in-shader integral or never take the soft path at all.
+==================
+*/
+void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurfs, int numDrawSurfs )
+{
+	extern idCVar r_softShadowCompute;
+	extern idCVar r_softShadowFaceCoverage;
+	if( !r_softShadowCompute.GetBool() || !r_useSoftShadowVolumes.GetBool() || !r_softShadowFaceCoverage.GetBool() )
+	{
+		return;
+	}
+	if( numDrawSurfs == 0 || drawSurfs == NULL || viewDef->viewEntitys == NULL )
+	{
+		return;
+	}
+
+	// only pay for the pass when a soft light will actually draw this view
+	bool anySoft = false;
+	for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
+	{
+		if( vLight->softEdgeCount > 0 && !vLight->lightShader->IsFogLight() && !vLight->lightShader->IsBlendLight() )
+		{
+			anySoft = true;
+			break;
+		}
+	}
+	if( !anySoft )
+	{
+		return;
+	}
+
+	renderLog.OpenBlock( "Render_SoftShadowPos", colorBlue );
+
+	Framebuffer* previousFramebuffer = Framebuffer::GetActiveFramebuffer();
+
+	// clear so never-rasterised pixels (sky) hold a recognisable origin instead of stale garbage
+	commandList->clearTextureFloat( globalImages->softShadowPosImage->GetTextureHandle(), nvrhi::AllSubresources, nvrhi::Color( 0.0f ) );
+
+	globalFramebuffers.softShadowPosFBO->Bind();
+
+	// full view scissor: the depth prepass may have left a per-surface scissor behind
+	GL_Scissor( viewDef->viewport.x1 + viewDef->scissor.x1,
+				viewDef->viewport.y2 - viewDef->scissor.y2,
+				viewDef->scissor.x2 + 1 - viewDef->scissor.x1,
+				viewDef->scissor.y2 + 1 - viewDef->scissor.y1 );
+	currentScissor = viewDef->scissor;
+
+	// depth-EQUAL, no depth writes: only the visible (prepassed) fragment of each pixel survives,
+	// which also makes alpha-tested prepass coverage carry over for free
+	GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO | GLS_DEPTHMASK | GLS_DEPTHFUNC_EQUAL );
+	GL_Color( colorWhite );
+
+	// the gbuffer binding layout carries material texture slots the softpos shader never reads;
+	// park a valid texture there so the binding set builds
+	GL_SelectTexture( 0 );
+	globalImages->blackImage->Bind();
+	GL_SelectTexture( 1 );
+	globalImages->blackImage->Bind();
+	GL_SelectTexture( 0 );
+
+	// force MVP change on first surface
+	currentSpace = NULL;
+
+	for( int i = 0; i < numDrawSurfs; i++ )
+	{
+		const drawSurf_t* drawSurf = drawSurfs[i];
+		const idMaterial* surfaceMaterial = drawSurf->material;
+
+		// same skip set as the gbuffer fill: translucent surfaces wrote no depth (they keep the
+		// in-shader integral), fully conditioned-off materials draw nothing anywhere
+		if( surfaceMaterial->Coverage() == MC_TRANSLUCENT )
+		{
+			continue;
+		}
+		const float* surfaceRegs = drawSurf->shaderRegisters;
+		int stage = 0;
+		for( ; stage < surfaceMaterial->GetNumStages(); stage++ )
+		{
+			const shaderStage_t* pStage = surfaceMaterial->GetStage( stage );
+			if( surfaceRegs[ pStage->conditionRegister ] != 0 )
+			{
+				break;
+			}
+		}
+		if( stage == surfaceMaterial->GetNumStages() )
+		{
+			continue;
+		}
+
+		// depth-hacked surfaces (view weapon) wrote squashed depth in the prepass, so EQUAL with
+		// the real MVP fails anyway - and they never take the soft interaction path. Skip the draw.
+		if( drawSurf->space->weaponDepthHack || drawSurf->space->modelDepthHack != 0.0f )
+		{
+			continue;
+		}
+
+		if( drawSurf->jointCache )
+		{
+			renderProgManager.BindShader_Builtin( BUILTIN_SOFT_SHADOW_POS_SKINNED );
+		}
+		else
+		{
+			renderProgManager.BindShader_Builtin( BUILTIN_SOFT_SHADOW_POS );
+		}
+
+		if( drawSurf->space != currentSpace )
+		{
+			currentSpace = drawSurf->space;
+
+			RB_SetMVP( drawSurf->space->mvp );
+
+			// model -> world rows for the pixel-shader transform (same parm the interaction FS uses)
+			idRenderMatrix modelMatrix;
+			idRenderMatrix::Transpose( *( idRenderMatrix* )drawSurf->space->modelMatrix, modelMatrix );
+			SetVertexParms( RENDERPARM_MODELMATRIX_X, modelMatrix[0], 4 );
+		}
+
+		DrawElementsWithCounters( drawSurf );
+	}
+
+	renderProgManager.Unbind();
+	GL_State( GLS_DEFAULT );
+
+	if( previousFramebuffer != NULL )
+	{
+		previousFramebuffer->Bind();
+	}
+	else
+	{
+		Framebuffer::Unbind();
+	}
+
+	renderLog.CloseBlock();
 }
 
 // RB end
@@ -4637,6 +4792,73 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 		}
 	}
 
+	// Analytic soft shadows, COMPUTE DECOUPLING (r_softShadowCompute): evaluate every soft light's
+	// coverage integral as one batched compute phase (after the tile binning above, whose lists the
+	// term shader consumes) into the R32F term atlas, so the interaction pixel shader just Loads
+	// its light's term texel via rpUser6 instead of integrating per fragment in wave64. Lights the
+	// pass rejects (out of atlas slots / pass unavailable) simply stay on the in-shader integral -
+	// bit-exact either way by design.
+	struct softTermResult_t
+	{
+		const viewLight_t* vLight;
+		int ofsX, ofsY;
+	};
+	idStaticList<softTermResult_t, SoftShadowTermPass::SLOT_COLS* SoftShadowTermPass::SLOT_ROWS> softTerms;
+	{
+		extern idCVar r_softShadowCompute;
+		extern idCVar r_softShadowFaceCoverage;
+		if( softShadowTermPass != NULL && r_softShadowCompute.GetBool() && r_softShadowFaceCoverage.GetBool()
+				&& r_useSoftShadowVolumes.GetBool()
+				&& softShadowTermPass->BeginView( commandList, viewDef,
+						( nvrhi::ITexture* )globalImages->softShadowPosImage->GetTextureID() ) )
+		{
+			extern idCVar r_shadowPenumbraSize;
+			for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
+			{
+				if( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() )
+				{
+					continue;
+				}
+				if( vLight->softEdgeCount <= 0 )
+				{
+					continue;
+				}
+				// this light's tile-binning result from the phase above; base -1 = full walk in-shader
+				int tileBase = -1, tileOx = 0, tileOy = 0, tileTilesX = 0;
+				for( int sb = 0; sb < softTileBins.Num(); sb++ )
+				{
+					if( softTileBins[sb].vLight == vLight )
+					{
+						tileBase   = softTileBins[sb].base;
+						tileOx     = softTileBins[sb].ox;
+						tileOy     = softTileBins[sb].oy;
+						tileTilesX = softTileBins[sb].tilesX;
+						break;
+					}
+				}
+				const vertCacheHandle_t eh = vLight->softEdgeCache;
+				const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+				softTermResult_t t;
+				t.vLight = vLight;
+				t.ofsX = t.ofsY = -1;
+				if( softShadowTermPass->AddLight(
+							commandList, viewDef, vLight,
+							joint, edgeOfs / 16u,		// edge base in float4 elements
+							vLight->softEdgeCount,		// face-stream record count (FS swN)
+							r_shadowPenumbraSize.GetFloat(),
+							tileBase, tileOx, tileOy, tileTilesX,
+							( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
+							t.ofsX, t.ofsY ) )
+				{
+					softTerms.Append( t );
+				}
+			}
+			// compute dispatches invalidate nvrhi's graphics state: force a full re-set on the next draw
+			currentPipeline = nullptr;
+		}
+	}
+
 	// Ray-traced shadows: the world TLAS was built and rtShadowsActiveThisView set in
 	// DrawViewInternal, BEFORE the shadow-map atlas pass, so the atlas could skip the
 	// RT-shadowed lights. Each shadow-casting point/spot light traces its own screen-space
@@ -4715,6 +4937,19 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				currentSoftTileOx     = softTileBins[sb].ox;
 				currentSoftTileOy     = softTileBins[sb].oy;
 				currentSoftTileTilesX = softTileBins[sb].tilesX;
+				break;
+			}
+		}
+
+		// r_softShadowCompute: this light's precomputed term slot (rpUser6); ofsX < 0 = none =>
+		// the pixel shader keeps the in-shader integral.
+		currentSoftTermOfsX = currentSoftTermOfsY = -1;
+		for( int st = 0; st < softTerms.Num(); st++ )
+		{
+			if( softTerms[st].vLight == vLight )
+			{
+				currentSoftTermOfsX = softTerms[st].ofsX;
+				currentSoftTermOfsY = softTerms[st].ofsY;
 				break;
 			}
 		}
@@ -5207,6 +5442,11 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 			// shadow buffer solution would work but stencil shadows do not because
 			// stencil shadows only affect surfaces that contribute to the view depth
 			// buffer and translucent surfaces do not contribute to the view depth buffer.
+
+			// r_softShadowCompute: translucent receivers are NOT in the position G-buffer (no depth
+			// write), so the precomputed term at their pixels belongs to the opaque surface behind -
+			// keep them on the in-shader integral (exact interpolated position, as before).
+			currentSoftTermOfsX = currentSoftTermOfsY = -1;
 
 			RenderInteractions( vLight->translucentInteractions, vLight, GLS_DEPTHFUNC_LESS, false, false );
 
@@ -7058,6 +7298,16 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	// fill the depth buffer and clear color buffer to black except on subviews
 	//-------------------------------------------------
 	FillDepthBufferFast( drawSurfs, numDrawSurfs );
+
+	//-------------------------------------------------
+	// r_softShadowCompute: exact-position G-buffer for the soft-shadow term compute pass
+	// (depth-EQUAL against the prepass just completed; no-op unless the cvar is on and a
+	// soft light will draw)
+	//-------------------------------------------------
+	if( is3D )
+	{
+		FillSoftShadowPosBuffer( drawSurfs, numDrawSurfs );
+	}
 
 	//-------------------------------------------------
 	// build hierarchical depth buffer

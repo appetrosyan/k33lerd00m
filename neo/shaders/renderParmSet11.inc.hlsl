@@ -81,6 +81,8 @@ struct renderParmSet11_t
 	float4 rpShadowMatrices[6 * 4];
 	float4 rpShadowAtlasOffsets[6];
 	float4 rpUser7;			// soft-shadow tile binning: ( list base | -1, tilesX, tile origin x, y )
+	float4 rpUser6;			// soft-shadow compute term (r_softShadowCompute): ( mode 0|1, term atlas offset x, y, unused ).
+	//						   Appended AFTER rpUser7: field order MUST match rpMaximalSet11 (sequential memcpy upload).
 };
 
 #if USE_PUSH_CONSTANTS

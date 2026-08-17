@@ -67,6 +67,16 @@ the Free Software Foundation, either version 3 of the License, or
 	#define SW_FACE_LEGACY 0
 #endif
 
+// SW_FACE_SCALAR_LIST: 1 = route the tile-binned list walk's loads through readfirstlane'd addresses
+// so ACO can emit scalar s_ loads (the addresses ARE wave-uniform: 16x16 tiles align with the 8x8
+// wave tiling). MEASURED NO GAIN (2026-08-17, VRS 0 heavy trio: 45.5/42.8/53.5 vs 46.5/44.1/51.6 -
+// noise): lanes loading one shared address already broadcast from L0, so the per-lane loads were
+// effectively free; the walk's ~10 ms is loop/latency overhead, not VMEM bandwidth. Default 0;
+// kept only as the recorded experiment - do not retry without a different theory of the walk cost.
+#ifndef SW_FACE_SCALAR_LIST
+	#define SW_FACE_SCALAR_LIST 0
+#endif
+
 // SW_FACE_HOIST_DIRS: 1 = precompute all K sample ray directions into a per-fragment swDir[] array;
 // 0 = recompute each direction in-loop from the (unrolled-immediate) disk table + the hoisted rotation
 // and basis vectors. Bit-exact either way - same expression, same order. The array costs K*3 VGPRs live
@@ -75,6 +85,37 @@ the Free Software Foundation, either version 3 of the License, or
 // registers for occupancy. Distinct from SW_FACE_LEGACY: the triangle-constant qq/e2qq hoists STAY.
 #ifndef SW_FACE_HOIST_DIRS
 	#define SW_FACE_HOIST_DIRS 0
+#endif
+
+// SW_FACE_FP16: 1 = run the Moller-Trumbore 16-sample test loop as PACKED fp16 (two samples per iteration,
+// one sample per half2 component) - on RDNA3 the v_pk_* packed ops retire two fp16 MADs per cycle even in
+// wave64 fragment shaders, roughly halving the VALU cost of the dominant loop. NOT bit-exact vs fp32:
+// world magnitudes overflow half, so every triangle's inputs are RESCALED into a normalized frame first -
+// a per-fragment scale kD = 1/max|dir| for the ray directions and a per-triangle scale kT =
+// 1/max(|edge1|,|edge2|,|sp|) for the triangle-local vectors. u and v are ratios of same-scaled dots, so
+// the [0,1] tests keep their exact form; only the t test needs the cross-scale ratio rr = kT/kD folded
+// into its bounds (t in (1e-4,1] becomes t_num in (1e-4*rr*|a|, rr*|a|]). The whole test is DIVISION-FREE
+// (sign-folded numerator comparisons instead of 1/aa - fp16 rcp is neither packed nor precise), and
+// aa == 0 (parallel ray) self-rejects through the empty sandwich, so the fp32 path's 1e-12 guard has no
+// fp16 counterpart. Error shows up only as edge-adjacent sample misclassification (one 1/16 coverage step
+// on boundary pixels); the corpus gate is the acceptance judge. Requires -enable-16bit-types (SPIR-V is
+// built at SM 6.2); C++ unit tests and any SM < 6.2 build compile the fp32 loop unchanged.
+#ifndef SW_FACE_FP16
+	#define SW_FACE_FP16 1
+#endif
+#if SW_FACE_FP16 && !defined(__cplusplus) && defined(__HLSL_ENABLE_16_BIT) && !SW_FACE_LEGACY
+	#define SW_FP16_LOOP 1
+#else
+	#define SW_FP16_LOOP 0
+#endif
+
+#if SW_FP16_LOOP
+// largest absolute component - the normalization denominator for the fp16 rescale
+float SoftMaxComp3( float3 v )
+{
+	float3 a = abs( v );
+	return max( a.x, max( a.y, a.z ) );
+}
 #endif
 
 // --------------------------------------------------------------------------- decomposed primitives
@@ -646,8 +687,77 @@ SW_FUNC int SoftPopcount32( uint x )
 	//									   WALK-bound, not sample-bound. 16 = the accuracy set (shipped).
 #endif
 
+#if SW_FP16_LOOP
+// PACKED fp16 Moller-Trumbore for ONE triangle: tests all still-unblocked samples two at a time (one per
+// half2 component) and returns the updated occlusion mask. Shared by both the full walk and the tile-binned
+// walk so the two cannot drift. Triangle inputs arrive fp32 (including the hoisted qq/e2qq, which keep
+// their fp32 cancellation accuracy); everything half-domain is rescaled by kT = 1/max(|edge1|,|edge2|,|sp|)
+// and kD = 1/swMD. u,v are ratios of same-scaled dots so their tests keep the exact fp32 form; t's bounds
+// absorb the cross-scale ratio rr = kT/kD. The test is division-free (sign-folded numerators, no fp16 rcp)
+// and aa == 0 self-rejects via the empty sandwich. See the SW_FACE_FP16 doc block for the full numerics.
+uint SoftShadow_FaceTriHitsFP16( uint swMask, float3 edge1, float3 edge2, float3 sp, float3 qq, float e2qq,
+		float3 swBase, float3 swU2, float3 swV2, float swMD, float swKD,
+		in float2 swDisk[SW_FACE_SAMPLES] )
+{
+	// KEY REDUCTION: dir = base + dx*U2 + dy*V2 (rotation pre-folded into U2/V2), and every MT numerator
+	// is linear in dir, so aa/un/vn are AFFINE in the disk coords: aa = A0 + dx*A1 + dy*A2 etc. The nine
+	// affine coefficients are triangle constants - computed here ONCE in fp32 (keeping the cancellation-
+	// prone crosses/dots in full precision) and rounded to half - so the per-pair packed work is just two
+	// v_pk_fma per numerator plus the folded interval tests.
+	float mT  = max( max( SoftMaxComp3( edge1 ), SoftMaxComp3( edge2 ) ), max( SoftMaxComp3( sp ), 1e-19f ) );
+	float kT  = 1.0f / mT;
+	float ss  = swKD * kT * kT;			// shared scale of aa/un/vn: every term is (dir-deg-1)*(tri-deg-2)
+	float3 c0 = cross( swBase, edge2 );
+	float3 c1 = cross( swU2, edge2 );
+	float3 c2 = cross( swV2, edge2 );
+	float16_t A0 = float16_t( dot( edge1, c0 ) * ss );
+	float16_t A1 = float16_t( dot( edge1, c1 ) * ss );
+	float16_t A2 = float16_t( dot( edge1, c2 ) * ss );
+	float16_t U0 = float16_t( dot( sp, c0 ) * ss );
+	float16_t U1 = float16_t( dot( sp, c1 ) * ss );
+	float16_t U2 = float16_t( dot( sp, c2 ) * ss );
+	float16_t V0 = float16_t( dot( swBase, qq ) * ss );
+	float16_t V1 = float16_t( dot( swU2, qq ) * ss );
+	float16_t V2 = float16_t( dot( swV2, qq ) * ss );
+	float16_t tnh = float16_t( e2qq * ( kT * kT * kT ) );
+	float rr = swMD * kT;								// = kT/kD: cross-scale ratio for the t bounds
+	float16_t tLo = float16_t( 1e-4f * rr );
+	float16_t tHi = float16_t( min( rr, 3.0e4f ) );		// keep tHi finite in half; |t_num| <= ~8 so a
+	//													   clamped bound only ever rejects degenerate sa
+	const float16_t2 zz = float16_t2( 0.0, 0.0 );
+	for( int i = 0; i < SW_FACE_SAMPLES; i += 2 )
+	{
+		if( ( ( swMask >> i ) & 3u ) == 3u ) { continue; }	// both samples of the pair already blocked
+		float16_t2 dx  = float16_t2( swDisk[i].x, swDisk[i + 1].x );	// compile-time packed literals
+		float16_t2 dy  = float16_t2( swDisk[i].y, swDisk[i + 1].y );
+		float16_t2 aa  = A0 + dx * A1 + dy * A2;
+		float16_t2 un  = U0 + dx * U1 + dy * U2;
+		float16_t2 ff  = select( aa < zz, float16_t2( -1.0, -1.0 ), float16_t2( 1.0, 1.0 ) );	// double-sided sign fold
+		float16_t2 sa  = ff * aa;
+		float16_t2 su  = ff * un;
+		// The interval tests run as packed min-arithmetic (a condition is one 'min partial >= 0' at the
+		// end) instead of per-component compare/mask chains - v_pk_min_f16 runs at the packed 2x rate,
+		// the scalar-cmp tail does not. Equality lands on the inclusive side (boundary hair, fp16 already
+		// owns the boundary). Staged reject on the u test (u in [0,1] <=> su in [0,sa]): sample rays are
+		// wave-coherent, so when this pair misses in u it usually misses across the whole wave and the
+		// s_cbranch_execz skips the v/t work - the early-out shape that makes the fp32 loop cheap on the
+		// all-miss majority.
+		float16_t2 mU  = min( su, sa - su );
+		if( !any( mU >= zz ) ) { continue; }
+		float16_t2 vn  = V0 + dx * V1 + dy * V2;
+		float16_t2 sv  = ff * vn;
+		float16_t2 st  = ff * tnh;
+		float16_t2 mV  = min( sv, sa - su - sv );
+		float16_t2 mT2 = min( st - tLo * sa, tHi * sa - st );
+		bool2 hit = min( mU, min( mV, mT2 ) ) >= zz;
+		swMask |= ( ( hit.x ? 1u : 0u ) | ( hit.y ? 2u : 0u ) ) << i;
+	}
+	return swMask;
+}
+#endif
 
-SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN SW_EDGEBUF_PARAM )
+
+SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swRotAng SW_EDGEBUF_PARAM )
 {
 	swR = max( swR, 1e-2f );
 	softFrame_t swF = SoftShadow_Frame( swP, swL );
@@ -730,13 +840,25 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 	float3 swSu = swF.u * swR;
 	float3 swSv = swF.v * swR;
 	// per-fragment rotation of the fixed sample set: a shared pattern correlates the sampling error across
-	// neighbouring pixels into a visible fixed-pattern bias (measured worst meanAbs 0.099 on erebus5/6);
-	// rotating by a hash of swP decorrelates neighbours so it averages out spatially - the CPU analogue of
-	// the jittered rays the RT reference (and the shipped TAA path) already use. Stable in swP => no flicker.
-	float  swHash = dot( swP, float3( 12.9898f, 78.233f, 37.719f ) );
-	float  swAng  = ( swHash - floor( swHash ) ) * ( 2.0f * PI );
-	float  swCa = cos( swAng );
-	float  swSa = sin( swAng );
+	// neighbouring pixels into a visible fixed-pattern bias (measured worst meanAbs 0.099 on erebus5/6),
+	// and a poorly-decorrelated rotation leaves the 1/N coverage quanta as MAP-CONTOUR BANDS across wide
+	// penumbras (2026-08-17 play-test). The angle now comes from the CALLER: the pixel shader samples the
+	// 512x512 blue-noise texture (screen-anchored, properly decorrelated neighbours); the C++ tests pass
+	// the legacy position-hash (SoftRotAngle in SoftShadowBox.h) so their expected values stay bit-exact.
+	float  swCa = cos( swRotAng );
+	float  swSa = sin( swRotAng );
+
+#if SW_FP16_LOOP
+	// per-fragment fp16 frame: swMD bounds every sample ray component (|dir| <= |swBase| + |swSu| + |swSv|
+	// componentwise, rotation-invariant bound). The per-fragment disk rotation is FOLDED INTO THE BASIS
+	// ( dir = base + dx*(Su ca + Sv sa) + dy*(Sv ca - Su sa) ), so the packed loop consumes raw compile-
+	// time disk constants - no per-sample rotate. These stay fp32: only the per-triangle affine
+	// coefficients cross into half, inside SoftShadow_FaceTriHitsFP16.
+	float  swMD = SoftMaxComp3( swBase ) + SoftMaxComp3( swSu ) + SoftMaxComp3( swSv );
+	float  swKD = 1.0f / max( swMD, 1e-19f );
+	float3 swU2 = swSu * swCa + swSv * swSa;
+	float3 swV2 = swSv * swCa - swSu * swSa;
+#endif
 
 	// Each sample ray direction depends only on (fragment, sample) - NOT on the triangle - so precompute all K
 	// once per fragment instead of recomputing the rotate + disk placement inside the triangle loop for every
@@ -830,6 +952,10 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		float3 qq   = cross( sp, edge1 );
 		float  e2qq = dot( edge2, qq );
 #endif
+#if SW_FP16_LOOP
+		swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+											 swBase, swU2, swV2, swMD, swKD, swDisk );
+#else
 		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
 		{
 			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }		// sample already blocked: skip
@@ -860,6 +986,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 #endif
 			if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
 		}
+#endif	// SW_FP16_LOOP
 		if( swMask == swAll ) { break; }	// every sample blocked: fully in umbra, no need to read on
 	}
 	// Morphological CLOSE: seal INTERIOR tessellation cracks without touching the penumbra. A sample ray that
@@ -909,7 +1036,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 // The tri test + close are duplicated from SoftShadow_FaceCoverage in its SHIPPED config (hoists on,
 // in-loop dirs); SoftShadowTileBin_test.cpp holds the two walks bit-identical so they cannot drift.
 SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, int swFirstElem,
-		int swListBase, int swListCount SW_TILEBUF_PARAM SW_EDGEBUF_PARAM )
+		int swListBase, int swListCount, float swRotAng SW_TILEBUF_PARAM SW_EDGEBUF_PARAM )
 {
 	swR = max( swR, 1e-2f );
 	softFrame_t swF = SoftShadow_Frame( swP, swL );
@@ -953,17 +1080,47 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 	float3 swBase = swL - swP;
 	float3 swSu = swF.u * swR;
 	float3 swSv = swF.v * swR;
-	float  swHash = dot( swP, float3( 12.9898f, 78.233f, 37.719f ) );
-	float  swAng  = ( swHash - floor( swHash ) ) * ( 2.0f * PI );
-	float  swCa = cos( swAng );
-	float  swSa = sin( swAng );
+	float  swCa = cos( swRotAng );		// rotation from the caller (blue noise in the PS, legacy hash in tests)
+	float  swSa = sin( swRotAng );
+
+#if SW_FP16_LOOP
+	// per-fragment fp16 frame - identical construction to SoftShadow_FaceCoverage (see doc there)
+	float  swMD = SoftMaxComp3( swBase ) + SoftMaxComp3( swSu ) + SoftMaxComp3( swSv );
+	float  swKD = 1.0f / max( swMD, 1e-19f );
+	float3 swU2 = swSu * swCa + swSv * swSa;
+	float3 swV2 = swSv * swCa - swSu * swSa;
+#endif
 
 	uint swMask = 0u;
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+#if SW_FACE_PROFILE
+	float swProbe = 0.0f;		// keeps probed stages live (see the SW_FACE_PROFILE doc at the top)
+#endif
+#if SW_FACE_SCALAR_LIST
+	const int  swBaseU    = WaveReadLaneFirst( swListBase );
+	const bool swScalarOK = WaveActiveAllTrue( swBaseU == swListBase );
+#endif
 	for( int li = 0; li < swListCount; li++ )
 	{
-		int se = ( int )t_SoftTiles[ swListBase + li ];				// pair-start index of record A
+		int se;
+#if SW_FACE_SCALAR_LIST
+		if( swScalarOK )
+		{
+			se = ( int )t_SoftTiles[ swBaseU + li ];				// uniform address => scalar load
+		}
+		else
+		{
+			se = ( int )t_SoftTiles[ swListBase + li ];
+		}
+#else
+		int seTmp = ( int )t_SoftTiles[ swListBase + li ];			// pair-start index of record A
+		se = seTmp;
+#endif
 		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
+#if SW_FACE_PROFILE == 1
+		swProbe += e0.x;
+		continue;													// TIMING PROBE: list walk + recA loads only
+#endif
 		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
 		float4 g1 = t_SoftEdges[ swFirstElem + ( se + 1 ) * 2 + 1 ];
 		float3 v0 = float3( e0.x, e0.y, e0.z );
@@ -980,11 +1137,19 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		float3 perp = rc - cd * swF.nrm;
 		float  coneR = swR * ( cd + triRad ) / swDistPL;
 		if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }
+#if SW_FACE_PROFILE == 2
+		swProbe += cd;
+		continue;													// TIMING PROBE: + per-triangle cone culls
+#endif
 		float3 edge1 = v1 - v0;
 		float3 edge2 = v2 - v0;
 		float3 sp = swP - v0;
 		float3 qq   = cross( sp, edge1 );
 		float  e2qq = dot( edge2, qq );
+#if SW_FP16_LOOP
+		swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+											 swBase, swU2, swV2, swMD, swKD, swDisk );
+#else
 		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
 		{
 			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
@@ -1002,6 +1167,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			float  tt  = inv * e2qq;
 			if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
 		}
+#endif	// SW_FP16_LOOP
 		if( swMask == swAll ) { break; }
 	}
 	if( swMask != 0u && swMask != swAll )
@@ -1021,6 +1187,9 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		}
 		swMask = filled;
 	}
+#if SW_FACE_PROFILE
+	if( swProbe > 1e30f ) { swMask = swAll; }	// never true; makes the probe accumulator observable
+#endif
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
 
@@ -1028,13 +1197,13 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 // negative = FRONT-FACE stream (r_softShadowFaceCoverage), positive = light-silhouette edge stream. The face
 // path needs no centre-lit winding guard (front-face area is bounded by construction), so swCentreLit is
 // ignored there. Callers pass abs(swN).
-SW_FUNC float SoftShadow_Coverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit, bool swFace SW_EDGEBUF_PARAM )
+SW_FUNC float SoftShadow_Coverage( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit, bool swFace, float swRotAng SW_EDGEBUF_PARAM )
 {
 #ifdef __cplusplus
-	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN, t_SoftEdges )
+	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN, swRotAng, t_SoftEdges )
 		   : SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit, t_SoftEdges );
 #else
-	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN )
+	return swFace ? SoftShadow_FaceCoverage( swP, swL, swR, swFirstElem, swN, swRotAng )
 		   : SoftShadow_WedgeOcclusion( swP, swL, swR, swFirstElem, swN, swCentreLit );
 #endif
 }

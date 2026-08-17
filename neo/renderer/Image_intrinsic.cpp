@@ -389,6 +389,15 @@ static void R_SoftShadowAccumImage_ResNative( idImage* image, nvrhi::ICommandLis
 	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_R32F, nullptr, true, true );
 }
 
+// Analytic soft shadows, compute decoupling (r_softShadowCompute): the EXACT-POSITION G-buffer.
+// World position must survive at full float32 (the compute term is designed bit-exact against the
+// fragment integral, and positions reach kilo-unit magnitudes where half floats lose contact-scale
+// bits), hence RGBA32F. Render target for the softpos depth-EQUAL pass; sampled by softterm.cs.
+static void R_SoftShadowPosImage_ResNative( idImage* image, nvrhi::ICommandList* commandList )
+{
+	image->GenerateImage( NULL, renderSystem->GetRenderWidth(), renderSystem->GetRenderHeight(), TF_NEAREST, TR_CLAMP, TD_RGBA32F, nullptr, true, false );
+}
+
 // coarse+refine RT shadows: allocated at full render res, but the pass only ever writes/reads its
 // top-left coarseW x coarseH subregion (coarseW = renderW / round(r_rtShadowCoarseDiv * SSAA)), so
 // the divisor stays a live runtime cvar with no realloc. Same R8F + render-target + UAV as the mask.
@@ -1174,6 +1183,7 @@ void idImageManager::CreateIntrinsicImages()
 	rtShadowMaskRawImage = ImageFromFunction( "_rtShadowMaskRaw", R_RTShadowMaskImage_ResNative );
 	rtShadowCoarseImage = ImageFromFunction( "_rtShadowCoarse", R_RTShadowCoarseImage_ResNative );
 	softShadowAccumImage = ImageFromFunction( "_softShadowAccum", R_SoftShadowAccumImage_ResNative );
+	softShadowPosImage = ImageFromFunction( "_softShadowPos", R_SoftShadowPosImage_ResNative );
 
 	ambientOcclusionImage[0] = ImageFromFunction( "_ao0", R_AmbientOcclusionImage_ResNative );
 	ambientOcclusionImage[1] = ImageFromFunction( "_ao1", R_AmbientOcclusionImage_ResNative );
