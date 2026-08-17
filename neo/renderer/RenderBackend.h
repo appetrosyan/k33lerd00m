@@ -476,6 +476,10 @@ public:
 	{
 		return commonPasses;
 	}
+	SoftTileBinPass*	GetSoftTileBinPass()	// bench/diagnostic access (spill stats readback)
+	{
+		return softTileBinPass;
+	}
 };
 
 #endif

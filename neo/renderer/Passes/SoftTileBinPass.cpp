@@ -40,9 +40,10 @@ struct SoftTileMinMaxCB
 // per-screen-tile min/max pairs: 4K-class screens are 256x160 tiles
 static const int SW_MINMAX_MAX_TILES = 256 * 160;
 
-// 16M uints = 64 MB: ~65k tile slots at K=256. Measured on erebus1_09: a heavy frame's soft
-// lights sum to ~54k tile slots, so this holds every light with headroom; lights past the cap
-// fall back to the full per-fragment walk for one frame.
+// 48M uints = 192 MB: ~94k tile slots at K=512 (a heavy frame's soft lights measured ~54k slots
+// on erebus1_09, so this holds every light with headroom; lights past the cap fall back to the
+// full per-fragment walk for one frame). The TAIL of the buffer (SPILL_ELEMENTS, see the header)
+// is reserved for overflowed tiles' spilled full lists - tile-slot allocation stops short of it.
 static const int SW_TILE_BUFFER_ELEMENTS = 48 << 20;
 
 SoftTileBinPass::SoftTileBinPass( nvrhi::IDevice* device )
@@ -59,6 +60,9 @@ void SoftTileBinPass::BeginView( nvrhi::ICommandList* commandList, const viewDef
 	{
 		return;
 	}
+
+	// reset the spill-region bump allocator: every view re-allocates the tail from zero
+	commandList->clearBufferUInt( m_SpillCounter, 0 );
 
 	// screen-tile grid covers the whole render target (absolute tile coords, like SV_Position >> 4)
 	const int screenW = viewDef->viewport.x2 + 1;
@@ -128,6 +132,7 @@ void SoftTileBinPass::EnsurePipeline()
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 0 ),	// t0 : tri stream + caster table (joint buffer, float4)
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 2 ),	// t2 : shared per-tile depth min/max
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : tile lists
+		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 1 ),	// u1 : spill-region bump allocator (1 uint)
 	};
 	m_Layout = m_Device->createBindingLayout( ld );
 
@@ -152,6 +157,15 @@ void SoftTileBinPass::EnsurePipeline()
 	td.keepInitialState = true;
 	td.debugName = "SoftTileBin/Tiles";
 	m_TileBuffer = m_Device->createBuffer( td );
+
+	nvrhi::BufferDesc scd;
+	scd.byteSize = 4 * sizeof( uint32_t );		// [0] bump cursor (= total demand), [1] overflow tiles, [2] max per-tile count
+	scd.structStride = sizeof( uint32_t );
+	scd.canHaveUAVs = true;
+	scd.initialState = nvrhi::ResourceStates::UnorderedAccess;
+	scd.keepInitialState = true;
+	scd.debugName = "SoftTileBin/SpillCounter";
+	m_SpillCounter = m_Device->createBuffer( scd );
 
 	// --- shared depth min/max reduce (once per view; every light's bin pass reads it) ---
 	m_MinMaxShader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softtile_minmax", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT ) );
@@ -226,7 +240,8 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	const int tilesY = py2 / TILE_SIZE - tileOy + 1;
 	const int slots = tilesX * tilesY * ( TILE_K + 1 );
 	extern idCVar r_rtAccelDebug;
-	if( m_Cursor + slots > SW_TILE_BUFFER_ELEMENTS )
+	// tile-slot allocation stops short of the spill tail (overflowed tiles' full lists live there)
+	if( m_Cursor + slots > SW_TILE_BUFFER_ELEMENTS - SPILL_ELEMENTS )
 	{
 		if( r_rtAccelDebug.GetBool() )
 		{
@@ -271,7 +286,8 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	cb.minmax[0] = m_MinMaxTilesX;
 	extern idCVar r_softShadowUmbraTiles;
 	cb.minmax[1] = r_softShadowUmbraTiles.GetBool() ? 1 : 0;	// whole-tile umbra sentinel enable
-	cb.minmax[2] = cb.minmax[3] = 0;
+	cb.minmax[2] = SW_TILE_BUFFER_ELEMENTS - SPILL_ELEMENTS;	// spill region base (uint elements)
+	cb.minmax[3] = SW_TILE_BUFFER_ELEMENTS;						// spill region end
 
 	nvrhi::BindingSetDesc sd;
 	sd.bindings =
@@ -280,6 +296,7 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, edgeBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 2, m_MinMaxBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_TileBuffer ),
+		nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_SpillCounter ),
 	};
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
 
@@ -294,4 +311,34 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	outTileOy = tileOy;
 	outTilesX = tilesX;
 	return outBase;
+}
+
+// blocking debug readback of the spill allocator/stats ([0] demand, [1] overflow tiles, [2] max
+// per-tile count) - bench/diagnostic instrument: SILENT spill exhaustion is a perf leak the
+// correctness gate can never see, so the gate bench prints these after its timing loop.
+bool SoftTileBinPass::DebugReadSpillStats( uint32_t out[4] )
+{
+	if( m_SpillCounter == nullptr )
+	{
+		return false;
+	}
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = 4 * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftTileBin/SpillStatsReadback";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_SpillCounter, 0, 4 * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	void* p = m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( p == nullptr )
+	{
+		return false;
+	}
+	memcpy( out, p, 4 * sizeof( uint32_t ) );
+	m_Device->unmapBuffer( staging );
+	return true;
 }

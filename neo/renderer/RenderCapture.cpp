@@ -2287,6 +2287,17 @@ int R_SoftShadowGate( const char* arg )
 							"%d soft records (%d dropped), %d soft lights (%d term, %d binned)\n",
 							cap.name.c_str(), ms, 1000.0 / ms, benchFrames, ( int )mapLights.size(),
 							benchRecords, benchDropped, benchSoftLights, benchTermLights, benchBinnedLights );
+			// spill accounting from the LAST bench frame: silent spill-region exhaustion sends the
+			// starved tiles back to the O(all-casters) full walk - a perf leak the correctness gate
+			// can never see, so the demand must be printed next to the region size it must fit in.
+			uint32_t spillStats[4] = {};
+			if( backEnd.GetSoftTileBinPass() != NULL && backEnd.GetSoftTileBinPass()->GetSpillStats( spillStats ) && spillStats[1] > 0 )
+			{
+				common->Printf( "[softgate] BENCH %-14s spill: demand %u of %d region (%s), %u overflow tiles, worst tile %u tris\n",
+								cap.name.c_str(), spillStats[0], SoftTileBinPass::SPILL_ELEMENTS,
+								spillStats[0] > ( uint32_t )SoftTileBinPass::SPILL_ELEMENTS ? "EXHAUSTED" : "fits",
+								spillStats[1], spillStats[2] );
+			}
 			for( qhandle_t bh : benchLights )
 			{
 				rw->FreeLightDef( bh );

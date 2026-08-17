@@ -34,6 +34,7 @@ version. See <http://www.gnu.org/licenses/>.
 #define SW_TILE_SIZE	16
 #define SW_TILE_K		512		// must match softtile_bin.cs.hlsl + SoftTileBinPass.h
 #define SW_TILE_UMBRA	0xFFFFFFFEu	// whole-tile umbra sentinel (softtile_bin.cs.hlsl): term is exactly 0
+#define SW_TILE_SPILL	0xFFFFFFFDu	// overflowed tile spilled its FULL list: slot+1/+2 = ( span offset, count )
 
 // *INDENT-OFF*
 // Declared BEFORE the include: the coverage functions read these globals directly (HLSL).
@@ -156,7 +157,14 @@ void main( uint3 tid : SV_DispatchThreadID )
 			u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;
 			return;
 		}
-		if( swCnt != 0xFFFFFFFFu )
+		if( swCnt == SW_TILE_SPILL )
+		{
+			// overflowed tile, full list spilled: walk the span - same walker, arbitrary flat base
+			const uint swOfs = t_SoftTiles[ swSlot + 1 ];
+			const uint swSpN = t_SoftTiles[ swSlot + 2 ];
+			swOcc = SoftShadow_FaceCoverageList( swP, swL, swR, g_range.x, ( int )swOfs, ( int )swSpN, swRotAng );
+		}
+		else if( swCnt != 0xFFFFFFFFu )
 		{
 			swOcc = SoftShadow_FaceCoverageList( swP, swL, swR, g_range.x, swSlot + 1, ( int )swCnt, swRotAng );
 		}

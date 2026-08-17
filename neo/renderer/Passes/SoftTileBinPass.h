@@ -53,6 +53,13 @@ public:
 		return m_TileBuffer;
 	}
 
+	// blocking readback of the spill allocator/stats: [0] total demand (uint elements),
+	// [1] overflow-tile count, [2] max per-tile survivor count. Bench/diagnostic only.
+	bool GetSpillStats( uint32_t out[4] )
+	{
+		return DebugReadSpillStats( out );
+	}
+
 	static const int TILE_SIZE = 16;
 	static const int TILE_K = 512;			// indices per tile; must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl.
 	// Measured (erebus1_05/07/09): K=64 overflowed the DENSE tiles - exactly the expensive ones -
@@ -62,9 +69,21 @@ public:
 	// 8x8 tiles MEASURED WORSE (17.9/22.1/23.8 vs 16.7/19.6/20.1 ms on erebus1_05/07/09): 4x the
 	// prepass and per-tile list overhead, while the dense tiles' relevant sets barely shrink - a
 	// triangle near one tile is near its neighbours too. Do not retry without a new idea.
+	// SPILL region (2026-08-17): tiles denser than K no longer fall back to the O(all-casters) full
+	// walk (measured ~12 ms/frame at softcap0061 live density - K cannot chase it: K=1024 recovered
+	// only ~4 ms at +320 MB). Instead the bin CS bump-allocates a span from the buffer TAIL and
+	// writes the tile's FULL index list there (SW_TILE_SPILL sentinel + span descriptor in the tile
+	// slot); consumers walk the span like a normal list. Exhausted region -> old sentinel fallback.
+	// Spill partition of the SAME 48M buffer (no extra VRAM): measured demand at softcap0061 1080p
+	// is 19.4M elements (7670 overflow tiles, avg ~2.5k tris, worst 7121) against a 16.4M tile-slot
+	// peak - 24M/24M fits both with headroom. Higher render resolutions can exhaust either half;
+	// both degrade gracefully (slots: light falls to full walk; spill: tile falls to full walk) and
+	// the gate bench prints the spill demand so exhaustion is never silent.
+	static const int SPILL_ELEMENTS = 24 << 20;
 
 private:
 	void EnsurePipeline();
+	bool DebugReadSpillStats( uint32_t out[4] );
 
 	nvrhi::DeviceHandle				m_Device;
 	bool							m_PipelineTried = false;
@@ -73,6 +92,7 @@ private:
 	nvrhi::ComputePipelineHandle	m_Pipeline;
 	nvrhi::BufferHandle				m_ConstantBuffer;
 	nvrhi::BufferHandle				m_TileBuffer;
+	nvrhi::BufferHandle				m_SpillCounter;	// 1-uint global bump allocator for the spill tail (cleared per view)
 	nvrhi::ShaderHandle				m_MinMaxShader;
 	nvrhi::BindingLayoutHandle		m_MinMaxLayout;
 	nvrhi::ComputePipelineHandle	m_MinMaxPipeline;

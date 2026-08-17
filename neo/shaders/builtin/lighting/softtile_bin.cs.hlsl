@@ -40,7 +40,10 @@ version. See <http://www.gnu.org/licenses/>.
 // *INDENT-OFF*
 StructuredBuffer<float4>	t_Edges		: register( t0 );	// STREAM V2: tri stream (3 float4/tri) + caster table (2 float4/caster), whole joint buffer
 StructuredBuffer<uint>		t_MinMax	: register( t2 );	// per-SCREEN-tile depth min/max bits (softtile_minmax.cs.hlsl)
-RWStructuredBuffer<uint>	u_Tiles		: register( u0 );	// [count | K indices] per tile
+RWStructuredBuffer<uint>	u_Tiles		: register( u0 );	// [count | K indices] per tile + SPILL region at the buffer tail
+RWStructuredBuffer<uint>	u_SpillCnt	: register( u1 );	// spill allocator + stats (cleared per view): [0] bump cursor
+															// (== total demand: failed allocations bump it too),
+															// [1] overflow-tile count, [2] max per-tile survivor count
 
 cbuffer c_TileBin : register( b0 )
 {
@@ -52,7 +55,7 @@ cbuffer c_TileBin : register( b0 )
 	int4	g_tileRect;		// tile origin x, y (in tiles), tilesX, tilesY
 	int4	g_range;		// firstElem (tri stream float4 base), numCasters, outBase (uint elements), casterBase (float4 elements)
 	float4	g_screen;		// viewport W, H, viewport origin x, y
-	int4	g_minmax;		// screen tiles X (t_MinMax row stride), unused x3
+	int4	g_minmax;		// screen tiles X (t_MinMax row stride), umbra-tiles enable, SPILL region base, SPILL region end (uint elements)
 };
 
 #define SW_NEAR_EPS 1e-3f
@@ -62,9 +65,18 @@ cbuffer c_TileBin : register( b0 )
 // EVERY receiver in the tile -> the coverage integral saturates to 1 everywhere in the tile, so the
 // consumers write term 0 without walking. Distinct from the overflow sentinel 0xFFFFFFFF.
 #define SW_TILE_UMBRA 0xFFFFFFFEu
+// per-tile SPILL sentinel (count slot value): the tile's survivor list exceeded SW_TILE_K, so its FULL
+// index list was written to a bump-allocated span in the spill region instead; the tile's first two
+// index words hold ( absolute span offset, count ). Consumers walk the span exactly like a tile list -
+// the old 0xFFFFFFFF overflow sentinel (O(all-casters) full-walk fallback, measured ~12 ms/frame at
+// live density) is now only the spill-region-exhausted fallback. Must match softterm.cs.hlsl +
+// interactionSM.ps.hlsl.
+#define SW_TILE_SPILL 0xFFFFFFFDu
 // *INDENT-ON*
 
 groupshared uint gsCount;
+groupshared uint gsSpillBase;	// absolute uint element of this tile's spill span; 0xFFFFFFFF = none/failed
+groupshared uint gsSpillFill;	// pass-2 append cursor within the span
 groupshared float3 gsCentre;
 groupshared float  gsRad;
 groupshared float3 gsNrm;
@@ -97,6 +109,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	{
 		gsCount = 0u;
 		gsUmbra = 0u;
+		gsSpillBase = 0xFFFFFFFFu;
 	}
 
 	// ---- tile depth min/max from the SHARED once-per-view reduce (softtile_minmax.cs.hlsl) ----
@@ -284,8 +297,76 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	}
 	GroupMemoryBarrierWithGroupSync();
 
+	// ---- SPILL PASS (overflowed tiles) -------------------------------------------------------
+	// gsCount counted EVERY stage-2 survivor, but only the first K fit the tile slot. Allocate a
+	// span of gsCount elements from the spill region [g_minmax.z, g_minmax.w) via the global bump
+	// counter and RE-RUN the stage-2 cull, appending every surviving index there. The re-walk is
+	// deterministic (same inputs, same culls => exactly gsCount survivors again); its append ORDER
+	// differs from a K-fit list, which is irrelevant - the consumers union a per-sample mask
+	// (order-independence ledgered by the big-occluder-first rejection). The umbra proof is
+	// skipped (already resolved in pass 1). Region exhausted -> keep the old 0xFFFFFFFF sentinel
+	// (full-walk fallback): graceful degradation, never corruption.
+	if( gsUmbra == 0u && gsCount > SW_TILE_K )
+	{
+		if( tid == 0 )
+		{
+			uint rel;
+			InterlockedAdd( u_SpillCnt[0], gsCount, rel );
+			uint dead;
+			InterlockedAdd( u_SpillCnt[1], 1u, dead );		// stats: overflow-tile count
+			InterlockedMax( u_SpillCnt[2], gsCount );		// stats: worst per-tile survivor count
+			const uint base = ( uint )g_minmax.z + rel;
+			gsSpillBase = ( base + gsCount <= ( uint )g_minmax.w ) ? base : 0xFFFFFFFFu;
+			gsSpillFill = 0u;
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if( gsSpillBase != 0xFFFFFFFFu )
+		{
+			for( int cc2 = 0; cc2 < g_range.y; cc2++ )
+			{
+				if( cc2 < SW_BIN_MAX_CASTERS && ( gsCasterKeep[cc2 >> 5] & ( 1u << ( cc2 & 31 ) ) ) == 0u )
+				{
+					continue;
+				}
+				float4 c1 = t_Edges[ g_range.w + cc2 * 2 + 1 ];		// ( firstTri, numTris, 0, 0 )
+				const int triFirst = ( int )c1.x;
+				const int triEnd   = triFirst + ( int )c1.y;
+				for( int t = triFirst + ( int )tid; t < triEnd; t += 64 )
+				{
+					const int b = g_range.x + t * 3;
+					float4 r0 = t_Edges[ b + 0 ];
+					float4 r1 = t_Edges[ b + 1 ];
+					float4 r2 = t_Edges[ b + 2 ];
+					float3 tcen = ( float3( r0.x, r0.y, r0.z ) + float3( r1.x, r1.y, r1.z ) + float3( r2.x, r2.y, r2.z ) ) * ( 1.0f / 3.0f );
+					float  triRad = r1.w + tR;						// IDENTICAL cull to pass 1 - keep in lock-step
+					float3 rc = tcen - Pc;
+					float  cd = dot( rc, nrm );
+					if( cd + triRad < eps ) { continue; }
+					if( cd - triRad > distPL + tR ) { continue; }
+					float3 perp = rc - cd * nrm;
+					float  coneR = swR * ( cd + triRad ) / max( distPL - tR, 1e-4f );
+					if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+					uint slot;
+					InterlockedAdd( gsSpillFill, 1u, slot );
+					if( slot < gsCount )							// == gsCount by determinism; guard is belt-and-braces
+					{
+						u_Tiles[ gsSpillBase + slot ] = ( uint )t;	// TRIANGLE index (stream v2)
+					}
+				}
+			}
+			if( tid == 0 )
+			{
+				// span descriptor in the tile's (otherwise dead) first two index words
+				u_Tiles[ outSlot + 1 ] = gsSpillBase;
+				u_Tiles[ outSlot + 2 ] = gsCount;
+			}
+		}
+	}
+
 	if( tid == 0 )
 	{
-		u_Tiles[outSlot] = ( gsUmbra != 0u ) ? SW_TILE_UMBRA : ( ( gsCount > SW_TILE_K ) ? 0xFFFFFFFFu : gsCount );
+		u_Tiles[outSlot] = ( gsUmbra != 0u ) ? SW_TILE_UMBRA
+						   : ( ( gsCount <= SW_TILE_K ) ? gsCount
+							   : ( ( gsSpillBase != 0xFFFFFFFFu ) ? SW_TILE_SPILL : 0xFFFFFFFFu ) );
 	}
 }

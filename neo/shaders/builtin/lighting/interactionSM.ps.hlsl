@@ -65,6 +65,7 @@ StructuredBuffer<float4> t_SoftEdges : register( t12 VK_DESCRIPTOR_SET( 0 ) );
 #define SW_TILE_K 512
 #define SW_TILE_SIZE 16
 #define SW_TILE_UMBRA 0xFFFFFFFEu	// whole-tile umbra sentinel (softtile_bin.cs.hlsl): occlusion is exactly 1
+#define SW_TILE_SPILL 0xFFFFFFFDu	// overflowed tile spilled its FULL list: slot+1/+2 = ( span offset, count )
 StructuredBuffer<uint> t_SoftTiles : register( t13 VK_DESCRIPTOR_SET( 0 ) );
 // Compute-decoupled term (r_softShadowCompute): softterm.cs.hlsl already evaluated this light's
 // coverage integral (same include, exact positions from the softpos G-buffer) into an R32F atlas of
@@ -257,10 +258,18 @@ void main( PS_IN fragment, out PS_OUT result )
 			swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( SW_TILE_K + 1 );
 			swCnt  = t_SoftTiles[ swSlot ];
 		}
-		const bool swBinned = ( swSlot >= 0 ) && ( swCnt != 0xFFFFFFFFu ) && ( swCnt != SW_TILE_UMBRA );
+		const bool swBinned = ( swSlot >= 0 ) && ( swCnt != 0xFFFFFFFFu ) && ( swCnt != SW_TILE_UMBRA ) && ( swCnt != SW_TILE_SPILL );
 		if( ( swSlot >= 0 ) && ( swCnt == SW_TILE_UMBRA ) )
 		{
 			swOcc = 1.0;	// whole tile provably in umbra (bin sentinel): the integral saturates to 1
+		}
+		else if( ( swSlot >= 0 ) && ( swCnt == SW_TILE_SPILL ) )
+		{
+			// overflowed tile, full list spilled to the buffer tail: walk the span - same walker,
+			// arbitrary flat base (the wave-uniform scalar-list check self-handles the non-slot base)
+			const uint swOfs = t_SoftTiles[ swSlot + 1 ];
+			const uint swSpN = t_SoftTiles[ swSlot + 2 ];
+			swOcc = SoftShadow_FaceCoverageList( swCovP, swL, swR, swFirstElem, int( swOfs ), int( swSpN ), swRotAng );
 		}
 		else if( swBinned )
 		{
