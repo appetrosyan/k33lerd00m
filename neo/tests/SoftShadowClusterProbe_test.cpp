@@ -350,3 +350,341 @@ STUDY_TEST( SoftShadowClusterProbe, amortization_on_real_capture )
 				 lightsProbed, aggFlat / aggTwo );
 	CHECK( aggTwo < aggFlat );		// two-level must at least not be WORSE
 }
+
+// PROXY-FRONT DIFFERENTIATOR (study instrument): measures, on real receivers against the real
+// stream, the quantities that pick between the three occluder-reduction fronts:
+//   B (importance-cull sub-resolution clusters): viable iff many cluster tests are SUB-CELL
+//     (angular radius below the 16-sample integrator's own resolution) AND those rarely block.
+//   A (per-cluster proxy quads):                 sized by the sub-cell clusters that DO block
+//     (can't drop, must be replaced) and their OPACITY (sparse clusters can't be proxied).
+//   D (prefiltered far-field occlusion):         viable iff blocking is dominated by FAR first
+//     hits (a coarse field reproduces them) and per-receiver occlusion COMPLEXITY is high
+//     (many distinct contributing clusters -> per-cluster methods stay expensive).
+// Sample cell: the disk's angular radius / 4 (16 samples ~ 4x4 angular cells).
+// Run:  SOFTCAP=/path/to/softcap0061.softcap ./rbdoom3bfg_tests @study:ClusterProbe
+STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL )
+	{
+		std::printf( "    [proxyprobe] SOFTCAP unset; skipping\n" );
+		CHECK( true );
+		return;
+	}
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) )
+	{
+		CHECK( false );
+		return;
+	}
+
+	const int LEAF = 32;
+	const int MAX_RECV = 250;
+
+	// aggregates over heavy lights
+	double aTests = 0, aSubCell = 0, aSubCellBlk = 0, aBlockers = 0, aRecv = 0;
+	double aOpacBlkSub = 0;
+	long   nOpacBlkSub = 0;
+	// first-hit distance buckets over BLOCKED samples (world units)
+	long hitLt8 = 0, hit8to32 = 0, hit32to128 = 0, hitGt128 = 0;
+	int lightsProbed = 0;
+
+	for( size_t li = 0; li < cap.lights.size(); li++ )
+	{
+		const softcapLight_t& L = cap.lights[li];
+		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
+		{
+			continue;
+		}
+		const size_t base4 = ( size_t )L.firstEdge * 2;
+		const size_t nTris = ( ( size_t )L.edgeCount * 2 ) / 3;
+		if( nTris < 256 )
+		{
+			continue;
+		}
+		auto F4 = [&]( size_t j ) -> const float*
+		{
+			return ( j & 1 ) ? cap.edges[j >> 1].e1 : cap.edges[j >> 1].e0;
+		};
+		std::vector<probeTri_t> tris( nTris );
+		std::vector<float> triArea( nTris );
+		for( size_t t = 0; t < nTris; t++ )
+		{
+			const float* a = F4( base4 + t * 3 + 0 );
+			const float* b = F4( base4 + t * 3 + 1 );
+			const float* c = F4( base4 + t * 3 + 2 );
+			probeTri_t& pt = tris[t];
+			pt.v0 = float3( a[0], a[1], a[2] );
+			pt.v1 = float3( b[0], b[1], b[2] );
+			pt.v2 = float3( c[0], c[1], c[2] );
+			pt.cen = ( pt.v0 + pt.v1 + pt.v2 ) * ( 1.0f / 3.0f );
+			pt.rad = std::fmax( len3( pt.v0 - pt.cen ), std::fmax( len3( pt.v1 - pt.cen ), len3( pt.v2 - pt.cen ) ) ) * 1.00001f;
+			float3 cr = cross( pt.v1 - pt.v0, pt.v2 - pt.v0 );
+			triArea[t] = 0.5f * len3( cr );
+		}
+
+		// spatial clusters, leaf 32 (the shipped build)
+		struct clu_t
+		{
+			float3 cen;
+			float  rad;
+			std::vector<int> members;
+			float  triAreaSum;
+		};
+		std::vector<clu_t> clusters;
+		{
+			std::vector<int> all( nTris );
+			for( size_t t = 0; t < nTris; t++ )
+			{
+				all[t] = ( int )t;
+			}
+			std::vector<std::vector<int>> stack;
+			stack.push_back( all );
+			while( !stack.empty() )
+			{
+				std::vector<int> cur = std::move( stack.back() );
+				stack.pop_back();
+				if( ( int )cur.size() <= LEAF )
+				{
+					clu_t cl;
+					cl.members = cur;
+					float3 acc( 0, 0, 0 );
+					for( int t : cur )
+					{
+						acc = acc + tris[t].cen;
+					}
+					cl.cen = acc * ( 1.0f / ( int )cur.size() );
+					float r = 0.0f;
+					cl.triAreaSum = 0.0f;
+					for( int t : cur )
+					{
+						r = std::fmax( r, len3( tris[t].v0 - cl.cen ) );
+						r = std::fmax( r, len3( tris[t].v1 - cl.cen ) );
+						r = std::fmax( r, len3( tris[t].v2 - cl.cen ) );
+						cl.triAreaSum += triArea[t];
+					}
+					cl.rad = r * 1.00001f;
+					clusters.push_back( cl );
+					continue;
+				}
+				float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+				for( int t : cur )
+				{
+					const float3& c = tris[t].cen;
+					mn = float3( std::fmin( mn.x, c.x ), std::fmin( mn.y, c.y ), std::fmin( mn.z, c.z ) );
+					mx = float3( std::fmax( mx.x, c.x ), std::fmax( mx.y, c.y ), std::fmax( mx.z, c.z ) );
+				}
+				float3 ext = mx - mn;
+				int axis = ( ext.x >= ext.y && ext.x >= ext.z ) ? 0 : ( ( ext.y >= ext.z ) ? 1 : 2 );
+				auto key = [&]( int t ) -> float
+				{
+					const float3& c = tris[t].cen;
+					return axis == 0 ? c.x : ( axis == 1 ? c.y : c.z );
+				};
+				std::nth_element( cur.begin(), cur.begin() + cur.size() / 2, cur.end(),
+								  [&]( int a, int b )
+				{
+					return key( a ) < key( b );
+				} );
+				std::vector<int> lo( cur.begin(), cur.begin() + cur.size() / 2 );
+				std::vector<int> hi( cur.begin() + cur.size() / 2, cur.end() );
+				stack.push_back( std::move( lo ) );
+				stack.push_back( std::move( hi ) );
+			}
+		}
+
+		// receivers: this light's real receiver surfaces
+		std::vector<float3> recvPts;
+		for( const softcapReceiver_t& r : cap.receivers )
+		{
+			if( r.lightIndex != ( uint32_t )li )
+			{
+				continue;
+			}
+			const uint32_t triCount = r.numIndex / 3;
+			for( uint32_t t = 0; t < triCount; t++ )
+			{
+				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
+				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
+				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
+				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
+				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+			}
+		}
+		if( recvPts.empty() )
+		{
+			continue;
+		}
+		const size_t stride = std::max( ( size_t )1, recvPts.size() / MAX_RECV );
+
+		const float3 Lp( L.origin[0], L.origin[1], L.origin[2] );
+		const float  swR = std::fmax( L.penumbraSize, 1e-2f );
+		const float  eps = 1e-3f;
+
+		double lTests = 0, lSubCell = 0, lSubCellBlk = 0, lBlockers = 0;
+		int lRecv = 0;
+		for( size_t s = 0; s < recvPts.size(); s += stride )
+		{
+			const float3 P = recvPts[s];
+			float3 toL = Lp - P;
+			float distPL = len3( toL );
+			if( distPL < 1e-3f )
+			{
+				continue;
+			}
+			float3 nrm = toL * ( 1.0f / distPL );
+			// 16 Hammersley disk targets (mirrors GateTruthVisibility, rotation-free)
+			float3 lx = ( std::fabs( nrm.x ) < 0.9f ) ? cross( float3( 1, 0, 0 ), nrm ) : cross( float3( 0, 1, 0 ), nrm );
+			lx = normalize( lx );
+			float3 ly = cross( nrm, lx );
+			float3 tgt[16];
+			for( int k = 0; k < 16; k++ )
+			{
+				uint32_t bits = ( uint32_t )k;
+				bits = ( bits << 16 ) | ( bits >> 16 );
+				bits = ( ( bits & 0x55555555u ) << 1 ) | ( ( bits & 0xAAAAAAAAu ) >> 1 );
+				bits = ( ( bits & 0x33333333u ) << 2 ) | ( ( bits & 0xCCCCCCCCu ) >> 2 );
+				bits = ( ( bits & 0x0F0F0F0Fu ) << 4 ) | ( ( bits & 0xF0F0F0F0u ) >> 4 );
+				bits = ( ( bits & 0x00FF00FFu ) << 8 ) | ( ( bits & 0xFF00FF00u ) >> 8 );
+				double ri = ( double )bits * 2.3283064365386963e-10;
+				double rr = std::sqrt( ( k + 0.5 ) / 16.0 ) * swR;
+				double th = ri * 6.283185307179586;
+				tgt[k] = Lp + lx * ( float )( rr * std::cos( th ) ) + ly * ( float )( rr * std::sin( th ) );
+			}
+			const float cellAng = ( swR / distPL ) * 0.25f;		// sample-cell angular radius
+			float hitDist[16];
+			bool  blocked[16];
+			for( int k = 0; k < 16; k++ )
+			{
+				hitDist[k] = 1e30f;
+				blocked[k] = false;
+			}
+			int recvBlockers = 0;
+			for( const clu_t& cl : clusters )
+			{
+				if( !ConeCullPass( cl.cen, cl.rad, P, nrm, distPL, swR, eps ) )
+				{
+					continue;
+				}
+				lTests += 1;
+				const float cd = dot( cl.cen - P, nrm );
+				const bool subCell = ( cd > 1e-3f ) && ( cl.rad / cd < cellAng );
+				if( subCell )
+				{
+					lSubCell += 1;
+				}
+				bool cluBlocked = false;
+				for( int t : cl.members )
+				{
+					const probeTri_t& pt = tris[t];
+					float3 e1 = pt.v1 - pt.v0, e2 = pt.v2 - pt.v0;
+					for( int k = 0; k < 16; k++ )
+					{
+						float3 dir = tgt[k] - P;
+						float3 h = cross( dir, e2 );
+						float  aa = dot( e1, h );
+						if( std::fabs( aa ) < 1e-12f )
+						{
+							continue;
+						}
+						float inv = 1.0f / aa;
+						float3 sp = P - pt.v0;
+						float u = inv * dot( sp, h );
+						if( u < 0.0f || u > 1.0f )
+						{
+							continue;
+						}
+						float3 q = cross( sp, e1 );
+						float v = inv * dot( dir, q );
+						if( v < 0.0f || u + v > 1.0f )
+						{
+							continue;
+						}
+						float tt = inv * dot( e2, q );
+						if( tt > 1e-4f && tt <= 1.0f )
+						{
+							blocked[k] = true;
+							cluBlocked = true;
+							const float wd = tt * len3( dir );
+							if( wd < hitDist[k] )
+							{
+								hitDist[k] = wd;
+							}
+						}
+					}
+				}
+				if( cluBlocked )
+				{
+					recvBlockers++;
+					if( subCell )
+					{
+						lSubCellBlk += 1;
+						aOpacBlkSub += cl.triAreaSum / ( 3.14159265f * cl.rad * cl.rad );
+						nOpacBlkSub++;
+					}
+				}
+			}
+			for( int k = 0; k < 16; k++ )
+			{
+				if( !blocked[k] )
+				{
+					continue;
+				}
+				if( hitDist[k] < 8.0f )
+				{
+					hitLt8++;
+				}
+				else if( hitDist[k] < 32.0f )
+				{
+					hit8to32++;
+				}
+				else if( hitDist[k] < 128.0f )
+				{
+					hit32to128++;
+				}
+				else
+				{
+					hitGt128++;
+				}
+			}
+			lBlockers += recvBlockers;
+			lRecv++;
+		}
+		if( lRecv == 0 )
+		{
+			continue;
+		}
+		std::printf( "    [proxyprobe] L%zu: %d recv | tests/recv %.1f | sub-cell %.0f%% (blocking %.0f%% of those) | blockers/recv %.1f\n",
+					 li, lRecv, lTests / lRecv, 100.0 * lSubCell / std::fmax( lTests, 1.0 ),
+					 100.0 * lSubCellBlk / std::fmax( lSubCell, 1.0 ), lBlockers / lRecv );
+		aTests += lTests;
+		aSubCell += lSubCell;
+		aSubCellBlk += lSubCellBlk;
+		aBlockers += lBlockers;
+		aRecv += lRecv;
+		lightsProbed++;
+	}
+
+	if( lightsProbed == 0 )
+	{
+		CHECK( true );
+		return;
+	}
+	const long hitTot = hitLt8 + hit8to32 + hit32to128 + hitGt128;
+	std::printf( "    [proxyprobe] AGGREGATE %d lights, %.0f receivers:\n"
+				 "      cluster tests/recv %.1f | SUB-CELL %.0f%% of tests -> B's drop set\n"
+				 "      of sub-cell clusters, %.0f%% BLOCK -> A's proxy set (avg opacity %.2f)\n"
+				 "      occlusion complexity: %.1f blocking clusters/recv (few -> A; many -> D)\n"
+				 "      first-hit dist of blocked samples: <8u %.0f%% | 8-32u %.0f%% | 32-128u %.0f%% | >128u %.0f%%\n"
+				 "      (far-dominated -> a coarse far-field (D) reproduces most blocking)\n",
+				 lightsProbed, aRecv,
+				 aTests / std::fmax( aRecv, 1.0 ), 100.0 * aSubCell / std::fmax( aTests, 1.0 ),
+				 100.0 * aSubCellBlk / std::fmax( aSubCell, 1.0 ),
+				 nOpacBlkSub > 0 ? aOpacBlkSub / nOpacBlkSub : 0.0,
+				 aBlockers / std::fmax( aRecv, 1.0 ),
+				 100.0 * hitLt8 / std::fmax( ( double )hitTot, 1.0 ), 100.0 * hit8to32 / std::fmax( ( double )hitTot, 1.0 ),
+				 100.0 * hit32to128 / std::fmax( ( double )hitTot, 1.0 ), 100.0 * hitGt128 / std::fmax( ( double )hitTot, 1.0 ) );
+	CHECK( aRecv > 0 );
+}
