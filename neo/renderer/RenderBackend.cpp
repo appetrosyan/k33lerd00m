@@ -4203,6 +4203,19 @@ void idRenderBackend::ShadowAtlasPass( const viewDef_t* _viewDef )
 			continue;
 		}
 
+		// FACE-mode analytic soft lights never sample the shadow atlas (face mode never touches
+		// PCSS - the term is the pure coverage integral, in the FS or the compute term pass), so
+		// rasterising up to six shadow-map faces for them is pure waste. The legacy wedge path
+		// (faceCoverage 0) keeps its tiles: its PCSS locator/contact hybrid reads the atlas.
+		{
+			extern idCVar r_softShadowFaceCoverage;
+			if( r_useSoftShadowVolumes.GetBool() && r_softShadowFaceCoverage.GetBool()
+					&& vLight->softEdgeCount > 0 )
+			{
+				continue;
+			}
+		}
+
 		int	side, sideStop;
 
 		if( vLight->parallel )
@@ -4374,6 +4387,19 @@ void idRenderBackend::ShadowAtlasPass( const viewDef_t* _viewDef )
 			// light doesn't cast shadows
 			vLight->imageSize.x = vLight->imageSize.y = -1;
 			continue;
+		}
+
+		// MUST mirror the FACE-mode soft-light skip in the sizing loop above exactly: the two
+		// loops share the running shadowIndex into outputSizes/outputPositions, and a one-sided
+		// skip desyncs the index (measured as an instant crash here).
+		{
+			extern idCVar r_softShadowFaceCoverage;
+			if( r_useSoftShadowVolumes.GetBool() && r_softShadowFaceCoverage.GetBool()
+					&& vLight->softEdgeCount > 0 )
+			{
+				vLight->imageSize.x = vLight->imageSize.y = -1;
+				continue;
+			}
 		}
 
 		const idMaterial* lightShader = vLight->lightShader;
