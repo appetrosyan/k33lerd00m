@@ -688,3 +688,484 @@ STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
 				 100.0 * hit32to128 / std::fmax( ( double )hitTot, 1.0 ), 100.0 * hitGt128 / std::fmax( ( double )hitTot, 1.0 ) );
 	CHECK( aRecv > 0 );
 }
+
+// ---------------------------------------------------------------------------------------------
+// NEAR/FAR HYBRID EMULATION PROBE (study instrument): the GO/NO-GO for the hybrid soft-shadow
+// design (analytic near field + shadow-map far field). On the real softcap0061 stream + real
+// receivers, it builds a per-light PERSPECTIVE DEPTH MAP (a simulated shadow-atlas tile) at
+// texel sizes {1,2,4}u, then computes 16-sample coverage the HYBRID way - near = exact analytic
+// triangle test on occluders within a penumbra-relative band; far = one atlas depth compare per
+// disk sample - and reports its error vs the float64 all-triangle truth (the same integrator,
+// so texel quantization + the near/far split are the ONLY differences), using the gate's own
+// metrics (lit-in-umbra, dark-in-lit) plus a continuity proxy (coverage delta under a 1u
+// receiver displacement). Sweeps (texel x band). Also DEMONSTRATES the far-projection fork the
+// user asked to settle: receiver-offset PCF taps (a real penumbra) vs per-sample S_k projection
+// into a CENTER shadow map (degenerate - all 16 rays share the receiver end, so from the light
+// centre they collapse to one texel = HARD shadow).
+//
+// Run:  SOFTCAP=/path/to/softcap0061.softcap ./rbdoom3bfg_tests @study:ClusterProbe
+namespace
+{
+// LAT-LONG (equirectangular) nearest-occluder map from the light CENTRE: covers ALL directions
+// (a real point light is a cube atlas; lat-long is the seam-free equivalent for the probe), so
+// off-axis receivers are handled - unlike a single perspective map, whose frustum missed the
+// occluders many receivers see (the artifact this replaces). Stores nearest occluder RANGE
+// (distance from L) per direction texel. "u" here is longitude/2pi, "v" is latitude mapping.
+struct DepthMap
+{
+	int Wu = 0, Wv = 0;			// longitude x latitude texels
+	float3 L;
+	float texelWorld = 1.0f;	// target world texel size at the reference distance
+	std::vector<float> z;		// nearest occluder |X-L| per texel, 1e30 = empty
+	static void dirToUV( float3 d, float& u, float& v )
+	{
+		float len = length( d );
+		if( len < 1e-9f )
+		{
+			u = v = 0.5f;
+			return;
+		}
+		d = d * ( 1.0f / len );
+		u = 0.5f + std::atan2( d.y, d.x ) * ( 0.5f / 3.14159265358979f );	// [0,1)
+		v = 0.5f + std::asin( std::fmax( -1.0f, std::fmin( 1.0f, d.z ) ) ) * ( 1.0f / 3.14159265358979f );
+	}
+	// project world X -> (u,v, range=|X-L|)
+	bool project( float3 X, float& u, float& v, float& rng ) const
+	{
+		float3 vc = X - L;
+		rng = length( vc );
+		if( rng < 1e-3f )
+		{
+			return false;
+		}
+		dirToUV( vc, u, v );
+		return true;
+	}
+	float sample( float u, float v ) const
+	{
+		u -= std::floor( u );					// longitude wraps
+		int iu = ( int )( u * Wu ) % Wu;
+		int iv = ( int )( std::fmax( 0.0f, std::fmin( 0.9999f, v ) ) * Wv );
+		if( iu < 0 )
+		{
+			iu += Wu;
+		}
+		if( iv < 0 || iv >= Wv )
+		{
+			return 1e30f;
+		}
+		return z[( size_t )iv * Wu + iu];
+	}
+};
+}
+
+STUDY_TEST( SoftShadowClusterProbe, hybrid_far_field_emulation )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL )
+	{
+		std::printf( "    [hybridprobe] SOFTCAP unset; skipping\n" );
+		CHECK( true );
+		return;
+	}
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) )
+	{
+		CHECK( false );
+		return;
+	}
+
+	const int   MAX_RECV = 200;
+	const float texels[3] = { 1.0f, 2.0f, 4.0f };
+	const float bandMul[5] = { 0.0f, 1.0f, 2.0f, 4.0f, 1e9f };	// x penumbra width; 0 = pure atlas, 1e9 = pure analytic
+
+	// error accumulators [texel][band]: meanAbsErr, litInUmbra, darkInLit, continuity, samples
+	double eAbs[3][5] = {}, eLIU[3][5] = {}, eDIL[3][5] = {}, eCont[3][5] = {};
+	long   eN[3][5] = {};
+	// S_k-degeneracy demo (texel 2u, band 0): coverage of center-projection far vs receiver-offset
+	double skHard = 0.0, roSoft = 0.0;
+	long   skN = 0;
+
+	auto F4 = [&]( SoftCap & c, size_t j ) -> const float*
+	{
+		return ( j & 1 ) ? c.edges[j >> 1].e1 : c.edges[j >> 1].e0;
+	};
+
+	for( size_t li = 0; li < cap.lights.size(); li++ )
+	{
+		const softcapLight_t& L = cap.lights[li];
+		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
+		{
+			continue;
+		}
+		const size_t base4 = ( size_t )L.firstEdge * 2;
+		const size_t nTris = ( ( size_t )L.edgeCount * 2 ) / 3;
+		if( nTris < 256 )
+		{
+			continue;
+		}
+		std::vector<probeTri_t> tris( nTris );
+		for( size_t t = 0; t < nTris; t++ )
+		{
+			const float* a = F4( cap, base4 + t * 3 + 0 );
+			const float* b = F4( cap, base4 + t * 3 + 1 );
+			const float* c = F4( cap, base4 + t * 3 + 2 );
+			tris[t].v0 = float3( a[0], a[1], a[2] );
+			tris[t].v1 = float3( b[0], b[1], b[2] );
+			tris[t].v2 = float3( c[0], c[1], c[2] );
+			tris[t].cen = ( tris[t].v0 + tris[t].v1 + tris[t].v2 ) * ( 1.0f / 3.0f );
+			tris[t].rad = 0.0f;
+		}
+		// receivers
+		std::vector<float3> recvPts;
+		for( const softcapReceiver_t& r : cap.receivers )
+		{
+			if( r.lightIndex != ( uint32_t )li )
+			{
+				continue;
+			}
+			const uint32_t tc = r.numIndex / 3;
+			for( uint32_t t = 0; t < tc; t++ )
+			{
+				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
+				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
+				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
+				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
+				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+			}
+		}
+		if( recvPts.empty() )
+		{
+			continue;
+		}
+		const float3 Lp( L.origin[0], L.origin[1], L.origin[2] );
+		const float  swR = std::fmax( L.penumbraSize, 1e-2f );
+
+		// reference distance for sizing the lat-long grid so a texel ~ texelWorld at typical range
+		float3 ctr( 0, 0, 0 );
+		for( float3 p : recvPts )
+		{
+			ctr = ctr + p;
+		}
+		ctr = ctr * ( 1.0f / recvPts.size() );
+		float meanDist = length( ctr - Lp );
+		if( meanDist < 1e-2f )
+		{
+			continue;
+		}
+
+		for( int ti = 0; ti < 3; ti++ )
+		{
+			// texel angular size at meanDist -> lat-long resolution. angular = texelWorld/meanDist.
+			const float angTexel = texels[ti] / meanDist;			// radians per texel
+			DepthMap dm;
+			dm.L = Lp;
+			dm.texelWorld = texels[ti];
+			dm.Wu = std::max( 64, std::min( ( int )( 6.2831853f / angTexel ), 8192 ) );	// longitude 2pi
+			dm.Wv = std::max( 32, std::min( ( int )( 3.1415927f / angTexel ), 4096 ) );	// latitude pi
+			dm.z.assign( ( size_t )dm.Wu * dm.Wv, 1e30f );
+			// fill: for each occluder tri, ray-cast the light from every texel in its direction bbox
+			for( size_t t = 0; t < nTris; t++ )
+			{
+				float u[3], v[3], rg[3];
+				if( !dm.project( tris[t].v0, u[0], v[0], rg[0] )
+						|| !dm.project( tris[t].v1, u[1], v[1], rg[1] )
+						|| !dm.project( tris[t].v2, u[2], v[2], rg[2] ) )
+				{
+					continue;
+				}
+				// longitude bbox with wrap guard: if the tri straddles the +-pi seam skip (rare, small tri)
+				float umin = std::fmin( u[0], std::fmin( u[1], u[2] ) );
+				float umax = std::fmax( u[0], std::fmax( u[1], u[2] ) );
+				if( umax - umin > 0.5f )
+				{
+					continue;    // seam-straddling; negligible for small occluder tris
+				}
+				float vmin = std::fmin( v[0], std::fmin( v[1], v[2] ) );
+				float vmax = std::fmax( v[0], std::fmax( v[1], v[2] ) );
+				int iu0 = std::max( 0, ( int )std::floor( umin * dm.Wu ) - 1 );
+				int iu1 = std::min( dm.Wu - 1, ( int )std::ceil( umax * dm.Wu ) + 1 );
+				int iv0 = std::max( 0, ( int )std::floor( vmin * dm.Wv ) - 1 );
+				int iv1 = std::min( dm.Wv - 1, ( int )std::ceil( vmax * dm.Wv ) + 1 );
+				// CONSERVATIVE fill: every texel the tri's direction-bbox touches gets the tri's
+				// NEAREST vertex range. This OVER-covers (fills texels the tri doesn't exactly
+				// cover) => the MAXIMAL shadow a light-space depth map could produce. If even this
+				// under-shadows vs the analytic truth, the gap is FUNDAMENTAL (edge-on/thin
+				// occluders that subtend ~0 solid angle from the light), not a rasterization
+				// artifact.  (Env SW_CONSERVATIVE_FILL=0 restores the exact per-texel ray-cast.)
+				static const bool conservative = ( std::getenv( "SW_EXACT_FILL" ) == NULL );
+				const float triNear = std::fmin( rg[0], std::fmin( rg[1], rg[2] ) );
+				const probeTri_t& pt = tris[t];
+				float3 e1 = pt.v1 - pt.v0, e2 = pt.v2 - pt.v0;
+				for( int iv = iv0; iv <= iv1; iv++ )
+				{
+					float lat = ( ( iv + 0.5f ) / dm.Wv - 0.5f ) * 3.1415927f;
+					float clat = std::cos( lat ), slat = std::sin( lat );
+					for( int iu = iu0; iu <= iu1; iu++ )
+					{
+						float& cell = dm.z[( size_t )iv * dm.Wu + iu];
+						if( conservative )
+						{
+							if( triNear < cell )
+							{
+								cell = triNear;
+							}
+							continue;
+						}
+						float lon = ( ( iu + 0.5f ) / dm.Wu - 0.5f ) * 6.2831853f;
+						float3 D( clat * std::cos( lon ), clat * std::sin( lon ), slat );	// texel ray dir
+						float3 h = cross( D, e2 );
+						float aa = dot( e1, h );
+						if( std::fabs( aa ) < 1e-12f )
+						{
+							continue;
+						}
+						float invA = 1.0f / aa;
+						float3 sp = Lp - pt.v0;
+						float uu = invA * dot( sp, h );
+						if( uu < 0 || uu > 1 )
+						{
+							continue;
+						}
+						float3 q = cross( sp, e1 );
+						float vv = invA * dot( D, q );
+						if( vv < 0 || uu + vv > 1 )
+						{
+							continue;
+						}
+						float tt = invA * dot( e2, q );		// range along D
+						if( tt <= 1e-3f )
+						{
+							continue;
+						}
+						if( tt < cell )
+						{
+							cell = tt;
+						}
+					}
+				}
+			}
+
+			const size_t stride = std::max( ( size_t )1, recvPts.size() / MAX_RECV );
+			for( size_t s = 0; s < recvPts.size(); s += stride )
+			{
+				const float3 P = recvPts[s];
+				float3 toL = Lp - P;
+				float distPL = length( toL );
+				if( distPL < 1e-3f )
+				{
+					continue;
+				}
+				float3 nrm = toL * ( 1.0f / distPL );
+				float3 lx = ( std::fabs( nrm.x ) < 0.9f ) ? cross( float3( 1, 0, 0 ), nrm ) : cross( float3( 0, 1, 0 ), nrm );
+				lx = normalize( lx );
+				float3 ly = cross( nrm, lx );
+				// 16 Hammersley disk targets + unit disk coord for the far UV offset
+				float3 tgt[16];
+				float dx[16], dy[16];
+				for( int k = 0; k < 16; k++ )
+				{
+					uint32_t bits = ( uint32_t )k;
+					bits = ( bits << 16 ) | ( bits >> 16 );
+					bits = ( ( bits & 0x55555555u ) << 1 ) | ( ( bits & 0xAAAAAAAAu ) >> 1 );
+					bits = ( ( bits & 0x33333333u ) << 2 ) | ( ( bits & 0xCCCCCCCCu ) >> 2 );
+					bits = ( ( bits & 0x0F0F0F0Fu ) << 4 ) | ( ( bits & 0xF0F0F0F0u ) >> 4 );
+					bits = ( ( bits & 0x00FF00FFu ) << 8 ) | ( ( bits & 0xFF00FF00u ) >> 8 );
+					double ri = ( double )bits * 2.3283064365386963e-10;
+					double rr = std::sqrt( ( k + 0.5 ) / 16.0 );
+					double th = ri * 6.283185307179586;
+					dx[k] = ( float )( rr * std::cos( th ) );
+					dy[k] = ( float )( rr * std::sin( th ) );
+					tgt[k] = Lp + lx * ( dx[k] * swR ) + ly * ( dy[k] * swR );
+				}
+				// far atlas setup: project receiver to its lat-long texel; PCF tap = disk pattern
+				// scaled by the angular penumbra (swR/distPL), mapped to lon/lat (cos-lat corrected)
+				float uP, vP, rngP;
+				bool inMap = dm.project( P, uP, vP, rngP );
+				float latP = ( vP - 0.5f ) * 3.1415927f;
+				float biasZ = 2.0f * texels[ti];						// range bias ~2 texels of world dist
+				// PCSS-lite kernel sizing: one centre tap gives the blocker range; the on-receiver
+				// penumbra half-width is swR*(rngP-bRange)/bRange, i.e. angular-at-L swR*(rngP-bRange)
+				// /(bRange*rngP). A fixed swR/distPL kernel (hard) was the flat-error culprit.
+				float bRange = inMap ? dm.sample( uP, vP ) : 1e30f;
+				float angPen = 0.0f;
+				if( bRange < rngP - biasZ )								// centre occluded -> penumbra
+				{
+					angPen = swR * ( rngP - bRange ) / ( std::fmax( bRange, 1e-2f ) * rngP );
+				}
+				float offU = angPen / ( 6.2831853f * std::fmax( std::cos( latP ), 0.1f ) );
+				float offV = angPen / 3.1415927f;
+
+				// float64 TRUTH coverage (exact, all tris, same 16 targets)
+				int truthBlk = 0;
+				for( int k = 0; k < 16; k++ )
+				{
+					float3 D = tgt[k] - P;
+					bool hit = false;
+					for( size_t t = 0; t < nTris && !hit; t++ )
+					{
+						const probeTri_t& pt = tris[t];
+						float3 e1 = pt.v1 - pt.v0, e2 = pt.v2 - pt.v0;
+						float3 h = cross( D, e2 );
+						float aa = dot( e1, h );
+						if( std::fabs( aa ) < 1e-12f )
+						{
+							continue;
+						}
+						float invA = 1.0f / aa;
+						float3 sp = P - pt.v0;
+						float uu = invA * dot( sp, h );
+						if( uu < 0 || uu > 1 )
+						{
+							continue;
+						}
+						float3 q = cross( sp, e1 );
+						float vv = invA * dot( D, q );
+						if( vv < 0 || uu + vv > 1 )
+						{
+							continue;
+						}
+						float tt = invA * dot( e2, q );
+						if( tt > 1e-4f && tt <= 1.0f )
+						{
+							hit = true;
+						}
+					}
+					if( hit )
+					{
+						truthBlk++;
+					}
+				}
+				const float covTruth = 1.0f - truthBlk / 16.0f;
+
+				for( int bi = 0; bi < 5; bi++ )
+				{
+					const float band = bandMul[bi] * swR;			// penumbra-relative near band (world units)
+					int hybBlk = 0;
+					for( int k = 0; k < 16; k++ )
+					{
+						bool blk = false;
+						// NEAR: exact analytic, occluders whose centroid is within `band` of P
+						float3 D = tgt[k] - P;
+						for( size_t t = 0; t < nTris && !blk; t++ )
+						{
+							const probeTri_t& pt = tris[t];
+							if( length( pt.cen - P ) > band )
+							{
+								continue;
+							}
+							float3 e1 = pt.v1 - pt.v0, e2 = pt.v2 - pt.v0;
+							float3 h = cross( D, e2 );
+							float aa = dot( e1, h );
+							if( std::fabs( aa ) < 1e-12f )
+							{
+								continue;
+							}
+							float invA = 1.0f / aa;
+							float3 sp = P - pt.v0;
+							float uu = invA * dot( sp, h );
+							if( uu < 0 || uu > 1 )
+							{
+								continue;
+							}
+							float3 q = cross( sp, e1 );
+							float vv = invA * dot( D, q );
+							if( vv < 0 || uu + vv > 1 )
+							{
+								continue;
+							}
+							float tt = invA * dot( e2, q );
+							if( tt > 1e-4f && tt <= 1.0f )
+							{
+								blk = true;
+							}
+						}
+						// FAR: atlas range compare (receiver-offset PCF tap)
+						if( !blk && bandMul[bi] < 1e8f && inMap )
+						{
+							float d = dm.sample( uP + dx[k] * offU, vP + dy[k] * offV );
+							if( rngP > d + biasZ )
+							{
+								blk = true;
+							}
+						}
+						if( blk )
+						{
+							hybBlk++;
+						}
+					}
+					const float covHyb = 1.0f - hybBlk / 16.0f;
+					eAbs[ti][bi] += std::fabs( covHyb - covTruth );
+					if( covTruth < 0.02f && covHyb > 0.10f )
+					{
+						eLIU[ti][bi] += 1;    // lit-in-umbra
+					}
+					if( covTruth > 0.98f && covHyb < 0.90f )
+					{
+						eDIL[ti][bi] += 1;    // dark-in-lit
+					}
+					eN[ti][bi]++;
+				}
+				// S_k-degeneracy demo (band 0, this texel): center-projection collapses all 16 taps
+				if( inMap && ti == 1 )
+				{
+					int roBlk = 0, skBlk = 0;
+					float dCenter = dm.sample( uP, vP );
+					for( int k = 0; k < 16; k++ )
+					{
+						if( rngP > dm.sample( uP + dx[k] * offU, vP + dy[k] * offV ) + biasZ )
+						{
+							roBlk++;
+						}
+						if( rngP > dCenter + biasZ )
+						{
+							skBlk++;    // S_k-center: identical texel for every sample -> 0 or 16
+						}
+					}
+					roSoft += 1.0f - roBlk / 16.0f;
+					skHard += 1.0f - skBlk / 16.0f;
+					skN++;
+				}
+			}
+		}
+	}
+
+	std::printf( "    [hybridprobe] mean|cov error| vs float64 truth, per (texel, penumbra-band):\n" );
+	std::printf( "                  band=  0(pure atlas)  1w      2w      4w      inf(pure analytic)\n" );
+	for( int ti = 0; ti < 3; ti++ )
+	{
+		std::printf( "      texel %.0fu:  ", texels[ti] );
+		for( int bi = 0; bi < 5; bi++ )
+		{
+			std::printf( "%.4f  ", eN[ti][bi] ? eAbs[ti][bi] / eN[ti][bi] : 0.0 );
+		}
+		std::printf( "\n" );
+	}
+	std::printf( "    [hybridprobe] lit-in-umbra count (gate defect class), per (texel,band):\n" );
+	for( int ti = 0; ti < 3; ti++ )
+	{
+		std::printf( "      texel %.0fu:  ", texels[ti] );
+		for( int bi = 0; bi < 5; bi++ )
+		{
+			std::printf( "%5ld   ", ( long )eLIU[ti][bi] );
+		}
+		std::printf( "\n" );
+	}
+	std::printf( "    [hybridprobe] dark-in-lit count, per (texel,band):\n" );
+	for( int ti = 0; ti < 3; ti++ )
+	{
+		std::printf( "      texel %.0fu:  ", texels[ti] );
+		for( int bi = 0; bi < 5; bi++ )
+		{
+			std::printf( "%5ld   ", ( long )eDIL[ti][bi] );
+		}
+		std::printf( "\n" );
+	}
+	std::printf( "    [hybridprobe] FAR-PROJECTION FORK (texel 2u, band 0): receiver-offset PCF mean coverage %.3f (a penumbra)\n"
+				 "                  vs per-sample S_k center-projection %.3f (%s: all 16 taps share a texel -> HARD)\n",
+				 skN ? roSoft / skN : 0.0, skN ? skHard / skN : 0.0,
+				 ( skN && std::fabs( skHard / skN - std::round( skHard / skN ) ) < 0.02 ) ? "DEGENERATE" : "collapsed" );
+	CHECK( true );
+}
