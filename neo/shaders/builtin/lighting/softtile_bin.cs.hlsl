@@ -166,7 +166,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 		if( cd - R > distPL + tR ) { continue; }				// wholly beyond the light for every receiver
 		float3 perp = rc - cd * nrm;
 		float  coneR = swR * ( cd + R ) / max( distPL - tR, 1e-4f );
-		if( sqrt( dot( perp, perp ) ) - R > coneR ) { continue; }
+		if( dot( perp, perp ) > ( coneR + R ) * ( coneR + R ) ) { continue; }
 		InterlockedOr( gsCasterKeep[c >> 5], 1u << ( c & 31 ) );
 	}
 	GroupMemoryBarrierWithGroupSync();
@@ -203,7 +203,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 			if( cd - triRad > distPL + tR ) { continue; }		// wholly beyond the light for every receiver
 			float3 perp = rc - cd * nrm;
 			float  coneR = swR * ( cd + triRad ) / max( distPL - tR, 1e-4f );
-			if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
 			uint slot;
 			InterlockedAdd( gsCount, 1u, slot );
 			if( slot < SW_TILE_K )

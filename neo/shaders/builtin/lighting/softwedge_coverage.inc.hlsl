@@ -911,6 +911,9 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			// swF.nrm, cross-section radius swR at depth swDistPL. A triangle that cannot reach that cone can
 			// hit NO sample, so skip its ray tests entirely. Conservative (over-keeps) => bit-exact. triRad is
 			// precomputed at stream-build time (a hair inflated) and carried in r0.w.
+			// The reject is squared (perp.perp > (coneR+triRad)^2) rather than sqrt(perp.perp)-triRad > coneR:
+			// coneR>0 (cd+triRad>=swEps after the slab tests) and triRad>=0, so the square is monotone and the
+			// reject set is unchanged. Drops one sqrt per triangle per fragment on the ~70%-of-term cull path.
 			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
 			float3 rc   = tcen - swP;
 			float  cd   = dot( rc, swF.nrm );						// centroid depth along the cone axis
@@ -919,7 +922,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			if( cd - triRad > swDistPL ) { continue; }				// wholly beyond the light
 			float3 perp = rc - cd * swF.nrm;
 			float  coneR = swR * ( cd + triRad ) / swDistPL;		// max cone radius over the triangle's depth span
-			if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }	// outside the sample cone: cannot occlude
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }	// outside the sample cone: cannot occlude
 #if SW_FACE_PROFILE == 2
 			swProbe += cd; continue;		// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
 #endif
@@ -1112,7 +1115,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		if( cd - triRad > swDistPL ) { continue; }
 		float3 perp = rc - cd * swF.nrm;
 		float  coneR = swR * ( cd + triRad ) / swDistPL;
-		if( sqrt( dot( perp, perp ) ) - triRad > coneR ) { continue; }
+		if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
 #if SW_FACE_PROFILE == 2
 		swProbe += cd;
 		continue;													// TIMING PROBE: + per-triangle cone culls
