@@ -1846,6 +1846,32 @@ int R_SoftShadowGate( const char* arg )
 			}
 			s_armed = false;
 			GateReadR32F( globalImages->currentRenderHDRImage, anaA );
+			// bit-exactness instrument: an FNV hash of the raw analytic term, printed per light, lets
+			// two gate runs under different perf configs (tile binning on/off, wave jump, ...) prove
+			// "no pixel changed" across processes - the probes' tolerances can't see sub-threshold
+			// differences, a hash can.
+			{
+				uint32_t swHashSum = 2166136261u;
+				for( size_t hi = 0; hi < anaA.t.size(); hi++ )
+				{
+					uint32_t b;
+					memcpy( &b, &anaA.t[hi], 4 );
+					swHashSum = ( swHashSum ^ b ) * 16777619u;
+				}
+				common->Printf( "[softgate] %s L%d anaTerm hash %08x\n", cap.name.c_str(), li, swHashSum );
+			}
+			// diagnostic mode: ALWAYS dump the analytic term as a PPM (not just on defects) so the
+			// LOOK of the term - banding, grain, plateaus - is inspectable offline. The probes only
+			// count classified defects; "gate green but visually banded" is exactly the blind spot.
+			{
+				extern idCVar r_rtAccelDebug;
+				if( r_rtAccelDebug.GetBool() )
+				{
+					std::vector<uint8_t> allValid( ( size_t )anaA.W * anaA.H, 1 );
+					idStr ppm = va( "softgate_term_%s_L%d.ppm", cap.name.c_str(), li );
+					GateWritePPM( ppm.c_str(), anaA, allValid, std::vector<uint8_t>() );
+				}
+			}
 			GateReadR32F( globalImages->currentDepthImage, depthA );
 			GateRenderFrame( rw, &rv );
 			GateReadR32F( globalImages->currentRenderHDRImage, anaB );

@@ -48,11 +48,19 @@ int RunAllUnitTests( const char* filter )
 	// otherwise a suite substring. `./rbdoom3bfg_tests @unit` is the seconds-long dev loop.
 	const bool onlyUnit  = ( filter != NULL && std::strcmp( filter, "@unit" ) == 0 );
 	const bool onlyPipe  = ( filter != NULL && std::strcmp( filter, "@pipe" ) == 0 );
-	const bool onlyStudy = ( filter != NULL && std::strcmp( filter, "@study" ) == 0 );
+	const bool onlyStudy = ( filter != NULL && std::strncmp( filter, "@study", 6 ) == 0 );
+	// "@study:<suite-substring>" runs a SINGLE study instrument with its output streaming live -
+	// piping the whole @study tier through grep batches all feedback to the end (user preference:
+	// never filter test output through pipes; select in the runner instead).
+	const char* studyName = ( onlyStudy && filter[6] == ':' ) ? filter + 7 : NULL;
 	int studySkipped = 0;
 	for( idUnitTestCase* tc : idUnitTestRegistry() )
 	{
-		if( onlyStudy ) { if( !tc->study ) { continue; } }
+		if( onlyStudy )
+		{
+			if( !tc->study ) { continue; }
+			if( studyName != NULL && std::strstr( tc->suite, studyName ) == NULL ) { continue; }
+		}
 		else if( tc->study ) { studySkipped++; continue; }
 		else if( onlyUnit ) { if( tc->pipeline ) { continue; } }
 		else if( onlyPipe ) { if( !tc->pipeline ) { continue; } }
