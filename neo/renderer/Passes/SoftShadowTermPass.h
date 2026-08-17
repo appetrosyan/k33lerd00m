@@ -45,7 +45,7 @@ public:
 	// the position G-buffer to ShaderResource (same explicit-transition precedent as the tile-bin
 	// depth read). Returns false when the pass cannot run this view (no pipeline / atlas exceeds
 	// the device texture limit).
-	bool BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* worldPosTexture );
+	bool BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* worldPosTexture, nvrhi::ITexture* worldNormalTexture );
 
 	// Dispatch the coverage integral for one soft light over its scissor rect into the next free
 	// atlas slot. tileBase/tileOx/tileOy/tilesX are this light's SoftTileBinPass result (base -1 =
@@ -71,12 +71,15 @@ public:
 		return m_TermTexture;
 	}
 
-	// Atlas slot grid: SLOT_COLS x SLOT_ROWS screen-size R32F slots (R32F so the term is BIT-EXACT
-	// against the fragment integral - the designed anaTerm-hash A/B property; drop to R16F only
-	// after that gate is green if the memory matters). 12 slots covers the measured "up to ~a
-	// dozen" soft lights per frame; lights beyond the budget keep the in-shader integral.
-	// ponytail: fixed grid of full-screen slots (4K = ~398 MB, allocated only once the cvar is on);
-	// pack scissor-sized rects instead if the memory ever matters.
+	// Atlas slot grid: SLOT_COLS x SLOT_ROWS screen-size R16F slots. R16F is BIT-EXACT for the
+	// face-coverage term, not merely tolerable: the term is always popcount/SW_FACE_SAMPLES = k/16
+	// (k=0..16), plus the early-outs writing exactly 0.0 and 1.0 - every k/16 is k*2^-4, which fp16
+	// represents exactly (<=4 mantissa bits), and the interaction reads it via Load (no filtering,
+	// no bleed). So the anaTerm-hash A/B stays identical while the atlas HALVES (~235 MB -> ~118 MB
+	// at 1440p) and the per-pixel term write + interaction read bandwidth halve - a real win on
+	// bandwidth-bound / lower-VRAM hardware. 12 slots covers the measured "up to ~a dozen" soft
+	// lights per frame; lights beyond the budget keep the in-shader integral.
+	// ponytail: fixed grid of full-screen slots; pack scissor-sized rects instead if VRAM ever bites.
 	static const int SLOT_COLS = 4;
 	static const int SLOT_ROWS = 3;
 
@@ -91,6 +94,7 @@ private:
 	nvrhi::BufferHandle				m_ConstantBuffer;
 	nvrhi::TextureHandle			m_TermTexture;
 	nvrhi::TextureHandle			m_WorldPos;		// this view's position G-buffer (set by BeginView)
+	nvrhi::TextureHandle			m_WorldNormal;	// this view's shading-normal G-buffer (N.L early-out)
 	int								m_SlotW = 0;	// screen-size slot extents the atlas was built for
 	int								m_SlotH = 0;
 	int								m_Cursor = 0;	// slots handed out this view

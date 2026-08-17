@@ -170,6 +170,13 @@ struct globalFramebuffers_t
 	// a compute pre-pass writes 1x1 (fine: contact/kinks) vs 2x2 (coarse: smooth penumbra) per tile.
 	nvrhi::TextureHandle		softShadowRateImage;
 	uint32_t					softShadowRateTile;		// device shading-rate-image texel size (px), 0 = VRS unsupported
+
+	// Analytic soft shadows, back-facing receiver early-out: the world SHADING normal, softpos's 2nd
+	// MRT (RGBA16F, render res), read by softterm.cs to skip N.L<=0 receivers. A STANDALONE nvrhi
+	// texture (not an idImageManager intrinsic image) on purpose - adding a member to idImageManager
+	// perturbs its layout and trips a latent heap-overflow bug (deterministic AllocImage segfault at
+	// init); the shading-rate image above is the precedent for owning a render target here instead.
+	nvrhi::TextureHandle		softShadowNormalImage;
 };
 
 extern globalFramebuffers_t globalFramebuffers;

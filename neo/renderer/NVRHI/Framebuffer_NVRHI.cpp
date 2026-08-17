@@ -101,6 +101,7 @@ void Framebuffer::Shutdown()
 	// texture release segfaults - the crash on every quit (backtrace: ~globalFramebuffers_t ->
 	// RefCounter<ITexture>::Release -> vulkan::Texture::~Texture, reproducible headless).
 	globalFramebuffers.softShadowRateImage = nullptr;
+	globalFramebuffers.softShadowNormalImage = nullptr;	// same exit-teardown guard as the rate image
 }
 
 void Framebuffer::ResizeFramebuffers( bool reloadImages )
@@ -255,10 +256,28 @@ void Framebuffer::ResizeFramebuffers( bool reloadImages )
 
 	// Analytic soft shadows, compute decoupling (r_softShadowCompute): the softpos pass re-draws
 	// the depth-prepassed surfaces at depth-EQUAL against the scene depth, writing the exact
-	// interpolated world position for the softterm compute integral.
+	// interpolated world position (attachment 0) for the softterm compute integral, plus the world
+	// shading normal (attachment 1) for the term's N.L<=0 back-facing early-out. The normal target is
+	// a STANDALONE nvrhi texture (see the softShadowNormalImage note in Framebuffer.h - keeping it out
+	// of idImageManager avoids a latent layout-overflow crash); render res, RGBA16F, RT + SRV.
+	{
+		const uint32_t sw = globalImages->softShadowPosImage->texture->getDesc().width;
+		const uint32_t sh = globalImages->softShadowPosImage->texture->getDesc().height;
+		nvrhi::TextureDesc nd;
+		nd.width = sw;
+		nd.height = sh;
+		nd.format = nvrhi::Format::RGBA16_FLOAT;
+		nd.dimension = nvrhi::TextureDimension::Texture2D;
+		nd.isRenderTarget = true;
+		nd.initialState = nvrhi::ResourceStates::ShaderResource;
+		nd.keepInitialState = true;
+		nd.debugName = "_softShadowNormal";
+		globalFramebuffers.softShadowNormalImage = deviceManager->GetDevice()->createTexture( nd );
+	}
 	globalFramebuffers.softShadowPosFBO = new Framebuffer( "_softShadowPos",
 			nvrhi::FramebufferDesc()
 			.addColorAttachment( globalImages->softShadowPosImage->texture )
+			.addColorAttachment( globalFramebuffers.softShadowNormalImage )
 			.setDepthAttachment( globalImages->currentDepthImage->texture ) );
 
 	globalFramebuffers.smaaInputFBO = new Framebuffer( "_smaaInput",

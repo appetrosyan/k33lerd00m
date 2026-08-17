@@ -3171,6 +3171,7 @@ void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurf
 
 	// clear so never-rasterised pixels (sky) hold a recognisable origin instead of stale garbage
 	commandList->clearTextureFloat( globalImages->softShadowPosImage->GetTextureHandle(), nvrhi::AllSubresources, nvrhi::Color( 0.0f ) );
+	commandList->clearTextureFloat( globalFramebuffers.softShadowNormalImage, nvrhi::AllSubresources, nvrhi::Color( 0.0f ) );
 
 	globalFramebuffers.softShadowPosFBO->Bind();
 
@@ -3186,10 +3187,7 @@ void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurf
 	GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO | GLS_DEPTHMASK | GLS_DEPTHFUNC_EQUAL );
 	GL_Color( colorWhite );
 
-	// the gbuffer binding layout carries material texture slots the softpos shader never reads;
-	// park a valid texture there so the binding set builds
-	GL_SelectTexture( 0 );
-	globalImages->blackImage->Bind();
+	// texunit 1 slot: parked (the layout carries it; softpos.ps only samples the bump at t0)
 	GL_SelectTexture( 1 );
 	globalImages->blackImage->Bind();
 	GL_SelectTexture( 0 );
@@ -3250,6 +3248,28 @@ void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurf
 			idRenderMatrix::Transpose( *( idRenderMatrix* )drawSurf->space->modelMatrix, modelMatrix );
 			SetVertexParms( RENDERPARM_MODELMATRIX_X, modelMatrix[0], 4 );
 		}
+
+		// per-surface BUMP for the world shading normal (2nd MRT -> softterm N.L early-out). The bump
+		// image + texcoord matrix are picked EXACTLY as the interaction path does (GetBumpStage +
+		// SetupInteractionStage), so softpos.ps decodes the same shading normal the interaction lights
+		// with. No bump stage -> the flat normal map + identity matrix (a geometric normal).
+		const shaderStage_t* swBump = surfaceMaterial->GetBumpStage();
+		idVec4 swBumpMat[2] = { idVec4( 1, 0, 0, 0 ), idVec4( 0, 1, 0, 0 ) };
+		GL_SelectTexture( 0 );
+		if( swBump != NULL && swBump->texture.image != NULL )
+		{
+			swBump->texture.image->Bind();
+			if( swBump->texture.hasMatrix )
+			{
+				SetupInteractionStage( swBump, surfaceRegs, NULL, swBumpMat, NULL );
+			}
+		}
+		else
+		{
+			globalImages->flatNormalMap->Bind();
+		}
+		SetVertexParm( RENDERPARM_BUMPMATRIX_S, swBumpMat[0].ToFloatPtr() );
+		SetVertexParm( RENDERPARM_BUMPMATRIX_T, swBumpMat[1].ToFloatPtr() );
 
 		DrawElementsWithCounters( drawSurf );
 	}
@@ -4849,7 +4869,8 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 	// of whichever light happened to be last in view order. Pure scheduling: bit-identical output,
 	// only which lights get the fast path changes.
 	if( wantTerms && softShadowTermPass->BeginView( target, viewDef,
-			( nvrhi::ITexture* )globalImages->softShadowPosImage->GetTextureID() ) )
+			( nvrhi::ITexture* )globalImages->softShadowPosImage->GetTextureID(),
+			globalFramebuffers.softShadowNormalImage.Get() ) )
 	{
 		idList<const viewLight_t*> swTermOrder;
 		for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )

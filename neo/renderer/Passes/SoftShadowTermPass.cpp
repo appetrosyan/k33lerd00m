@@ -68,6 +68,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		nvrhi::BindingLayoutItem::Texture_SRV( 2 ),				// t2 : exact world position G-buffer
 		nvrhi::BindingLayoutItem::Texture_SRV( 3 ),				// t3 : light falloff (coverage early-out)
 		nvrhi::BindingLayoutItem::Texture_SRV( 4 ),				// t4 : light projection (coverage early-out)
+		nvrhi::BindingLayoutItem::Texture_SRV( 5 ),				// t5 : world shading normal (N.L early-out)
 		nvrhi::BindingLayoutItem::Sampler( 0 ),					// s0 : falloff sampler
 		nvrhi::BindingLayoutItem::Sampler( 1 ),					// s1 : projection sampler
 		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),				// u0 : term atlas
@@ -88,11 +89,12 @@ void SoftShadowTermPass::EnsurePipeline()
 	m_ConstantBuffer = m_Device->createBuffer( cb );
 }
 
-bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* worldPosTexture )
+bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* worldPosTexture, nvrhi::ITexture* worldNormalTexture )
 {
 	m_Cursor = 0;
 	m_Valid = false;
 	m_WorldPos = worldPosTexture;
+	m_WorldNormal = worldNormalTexture;
 	EnsurePipeline();
 	if( m_Pipeline == nullptr || worldPosTexture == nullptr )
 	{
@@ -120,7 +122,7 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 		nvrhi::TextureDesc td;
 		td.width = newW * SLOT_COLS;
 		td.height = newH * SLOT_ROWS;
-		td.format = nvrhi::Format::R32_FLOAT;
+		td.format = nvrhi::Format::R16_FLOAT;	// term is k/16, exactly representable in fp16 (see header)
 		td.isUAV = true;
 		td.initialState = nvrhi::ResourceStates::UnorderedAccess;
 		td.keepInitialState = true;
@@ -134,6 +136,10 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 	// ShaderResource so the compute reads are ordered after the raster writes (same explicit
 	// barrier precedent as the SoftTileBinPass depth read).
 	commandList->setTextureState( worldPosTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+	if( worldNormalTexture != nullptr )
+	{
+		commandList->setTextureState( worldNormalTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+	}
 
 	m_Valid = true;
 	return true;
@@ -210,7 +216,9 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	}
 	cb.flags[0] = ( coverageEarlyOut && falloffTex != NULL && projTex != NULL ) ? 1 : 0;
 	cb.flags[1] = ( int )casterFirstElem;	// caster table base (float4 elements) - stream v2
-	cb.flags[2] = cb.flags[3] = 0;
+	extern idCVar r_softShadowBackfaceCull;
+	cb.flags[2] = r_softShadowBackfaceCull.GetBool() ? 1 : 0;	// N.L<=0 early-out enable
+	cb.flags[3] = 0;
 
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.
@@ -235,6 +243,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		nvrhi::BindingSetItem::Texture_SRV( 2, m_WorldPos ),
 		nvrhi::BindingSetItem::Texture_SRV( 3, fallT ),
 		nvrhi::BindingSetItem::Texture_SRV( 4, projT ),
+		nvrhi::BindingSetItem::Texture_SRV( 5, m_WorldNormal ? m_WorldNormal.Get() : m_WorldPos.Get() ),
 		nvrhi::BindingSetItem::Sampler( 0, fallS ),
 		nvrhi::BindingSetItem::Sampler( 1, projS ),
 		nvrhi::BindingSetItem::Texture_UAV( 0, m_TermTexture ),

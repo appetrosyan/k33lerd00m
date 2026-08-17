@@ -47,6 +47,7 @@ Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world positio
 // black + any sampler when g_flags.x == 0 (early-out ineligible/disabled).
 Texture2D<float4>			t_Falloff	: register( t3 );
 Texture2D<float4>			t_Proj		: register( t4 );
+Texture2D<float4>			t_WorldNormal	: register( t5 );	// world SHADING normal (softpos 2nd MRT), N.L<=0 early-out
 SamplerState				s_Falloff	: register( s0 );	// the falloff image's OWN sampler (zero-clamp border preserved)
 SamplerState				s_Proj		: register( s1 );	// the projection image's OWN sampler
 RWTexture2D<float>			u_Term		: register( u0 );	// R32F term atlas, one screen-size slot per light
@@ -110,6 +111,20 @@ void main( uint3 tid : SV_DispatchThreadID )
 				swSkip = ( max( max( swProj.x * swFall.x, swProj.y * swFall.y ), swProj.z * swFall.z ) <= 0.0f );
 			}
 		}
+		// BACK-FACING RECEIVER early-out: the interaction masks BOTH diffuse and specular by
+		// saturate(dot(shadingNormal, lightVector)) (lambert = ldotN; USE_HALF_LAMBERT off), so a
+		// receiver with N.L <= 0 contributes EXACTLY 0 regardless of the shadow term. softpos wrote the
+		// world SHADING normal with the interaction's exact bump decode, so this N.L matches the
+		// interaction's ldotN; at the ldotN=0 boundary the contribution vanishes, so the shortcut is
+		// lossless (the term is Load()ed per pixel, no filtering to bleed a wrong value). Self-disables
+		// under half-Lambert (where the term matters down to N.L=-1).
+#if !defined( USE_HALF_LAMBERT )
+		if( !swSkip && g_flags.z != 0 )		// g_flags.z = r_softShadowBackfaceCull (A/B toggle)
+		{
+			const float3 swN = t_WorldNormal.Load( int3( px, 0 ) ).xyz;
+			swSkip = ( dot( swN, g_lightR.xyz - swP ) <= 0.0f );	// L-P unnormalised: the sign is all that matters
+		}
+#endif
 		if( swSkip )
 		{
 			u_Term[ uint2( px + g_tile.zw ) ] = 1.0f;

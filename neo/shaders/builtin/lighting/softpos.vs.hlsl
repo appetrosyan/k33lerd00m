@@ -41,11 +41,22 @@ struct VS_OUT
 {
 	float4 position		: SV_Position;
 	float4 texcoord0	: TEXCOORD0_centroid;	// interpolated model position (interactionSM texcoord7)
+	// back-facing early-out (softterm.cs): the world TANGENT FRAME rows so the PS can build the world
+	// SHADING normal - built exactly like gbuffer.vs (tangent/bitangent/normal rotated to world by the
+	// model matrix). texcoord1.xy = bump texcoord; z carries the PSX affine warp.
+	float4 texcoord1	: TEXCOORD1_centroid;
+	float3 texcoord2	: TEXCOORD2_centroid;
+	float3 texcoord3	: TEXCOORD3_centroid;
+	float3 texcoord4	: TEXCOORD4_centroid;
 };
 // *INDENT-ON*
 
 void main( VS_IN vertex, out VS_OUT result )
 {
+	float4 vNormal = vertex.normal * 2.0 - 1.0;
+	float4 vTangent = vertex.tangent * 2.0 - 1.0;
+	float3 vBitangent = cross( vNormal.xyz, vTangent.xyz ) * vTangent.w;
+
 #if USE_GPU_SKINNING
 	// identical to interactionSM.vs: same joint fetch, same weights, same dot order
 	const float w0 = vertex.color2.x;
@@ -79,8 +90,29 @@ void main( VS_IN vertex, out VS_OUT result )
 	modelPosition.y = dot4( matY, vertex.position );
 	modelPosition.z = dot4( matZ, vertex.position );
 	modelPosition.w = 1.0;
+
+	float3 normal;
+	normal.x = dot3( matX, vNormal );
+	normal.y = dot3( matY, vNormal );
+	normal.z = dot3( matZ, vNormal );
+	normal = normalize( normal );
+
+	float3 tangent;
+	tangent.x = dot3( matX, vTangent );
+	tangent.y = dot3( matY, vTangent );
+	tangent.z = dot3( matZ, vTangent );
+	tangent = normalize( tangent );
+
+	float3 bitangent;
+	bitangent.x = dot3( matX, vBitangent );
+	bitangent.y = dot3( matY, vBitangent );
+	bitangent.z = dot3( matZ, vBitangent );
+	bitangent = normalize( bitangent );
 #else
 	float4 modelPosition = vertex.position;
+	float3 normal = vNormal.xyz;
+	float3 tangent = vTangent.xyz;
+	float3 bitangent = vBitangent.xyz;
 #endif
 
 	result.position.x = dot4( modelPosition, pc.rpMVPmatrixX );
@@ -91,4 +123,27 @@ void main( VS_IN vertex, out VS_OUT result )
 	result.position.xyz = psxVertexJitter( pc.rpPSXDistortions, pc.rpProjectionMatrixW, result.position );
 
 	result.texcoord0 = modelPosition;
+
+	// bump texcoord (matches gbuffer.vs / interactionSM.vs), with the PSX affine warp in .z
+	result.texcoord1 = float4( 0.0, 0.0, 1.0, 0.0 );
+	result.texcoord1.x = dot4( vertex.texcoord.xy, pc.rpBumpMatrixS );
+	result.texcoord1.y = dot4( vertex.texcoord.xy, pc.rpBumpMatrixT );
+	if( pc.rpPSXDistortions.z > 0.0 )
+	{
+		float dist = length( pc.rpLocalViewOrigin - modelPosition );
+		float warp = psxAffineWarp( dist );
+		result.texcoord1.z = warp;
+		result.texcoord1.xy *= warp;
+	}
+
+	// world tangent frame rows (tangent-space -> world), exactly as gbuffer.vs
+	result.texcoord2.x = dot3( tangent, pc.rpModelMatrixX );
+	result.texcoord3.x = dot3( tangent, pc.rpModelMatrixY );
+	result.texcoord4.x = dot3( tangent, pc.rpModelMatrixZ );
+	result.texcoord2.y = dot3( bitangent, pc.rpModelMatrixX );
+	result.texcoord3.y = dot3( bitangent, pc.rpModelMatrixY );
+	result.texcoord4.y = dot3( bitangent, pc.rpModelMatrixZ );
+	result.texcoord2.z = dot3( normal, pc.rpModelMatrixX );
+	result.texcoord3.z = dot3( normal, pc.rpModelMatrixY );
+	result.texcoord4.z = dot3( normal, pc.rpModelMatrixZ );
 }
