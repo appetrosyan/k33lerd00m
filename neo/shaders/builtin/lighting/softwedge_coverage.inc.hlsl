@@ -901,8 +901,22 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		for( int t = swTriFirst; t < swTriEnd; t++ )
 		{
 			const int b = swTriBase + t * 3;
-			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, triRad )
-			float4 r1 = t_SoftEdges[ b + 1 ];						// ( v1.xyz, 0 )
+			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, v0-radius ) - coarse reject reads ONLY this
+			// COARSE v0-CENTERED REJECT: rejects far triangles from r0 alone, so r1/r2 (48B, the measured
+			// dominant per-fragment cost) load lazily only for survivors. The v0-sphere contains the whole
+			// triangle, so this only ever DEFERS a reject the tight centroid re-cull below also makes =>
+			// coverage is BIT-EXACT. Squared, sqrt-free (coneR>0 after the slab tests, v0-radius>=0).
+			{
+				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
+				float  cd0 = dot( rc0, swF.nrm );
+				float  vr0 = r0.w;
+				if( cd0 + vr0 < swEps ) { continue; }
+				if( cd0 - vr0 > swDistPL ) { continue; }
+				float3 pp0 = rc0 - cd0 * swF.nrm;
+				float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
+				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+			}
+			float4 r1 = t_SoftEdges[ b + 1 ];						// ( v1.xyz, centroid-radius ) - lazy: survivors only
 			float4 r2 = t_SoftEdges[ b + 2 ];						// ( v2.xyz, 0 )
 			float3 v0 = float3( r0.x, r0.y, r0.z );
 			float3 v1 = float3( r1.x, r1.y, r1.z );
@@ -917,7 +931,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
 			float3 rc   = tcen - swP;
 			float  cd   = dot( rc, swF.nrm );						// centroid depth along the cone axis
-			float  triRad = r0.w;
+			float  triRad = r1.w;	// centroid radius (tight): exact original bound, so the sample-gated set is bit-exact
 			if( cd + triRad < swEps ) { continue; }					// wholly behind the receiver
 			if( cd - triRad > swDistPL ) { continue; }				// wholly beyond the light
 			float3 perp = rc - cd * swF.nrm;
@@ -1110,7 +1124,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
 		float3 rc   = tcen - swP;
 		float  cd   = dot( rc, swF.nrm );
-		float  triRad = r0.w;
+		float  triRad = r1.w;	// centroid radius (tight): exact original bound, so the sample-gated set is bit-exact
 		if( cd + triRad < swEps ) { continue; }
 		if( cd - triRad > swDistPL ) { continue; }
 		float3 perp = rc - cd * swF.nrm;

@@ -756,9 +756,16 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 		// shader's cone cull stays conservative under GPU float rounding (never drops a real occluder). Must match
 		// SoftTriRad in the tests' SoftShadowBox.h.
 		idVec3 cen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+		// TWO radii for the two-stage fragment cull. r0.w = v0-CENTERED radius (coarse): the per-fragment
+		// cull reads ONLY r0 to reject far triangles, loading v1/v2 lazily for survivors - the 48B record
+		// fetch is the measured-dominant per-fragment cost. r1.w = CENTROID radius (tight): survivors
+		// re-cull with the exact original bound before the sample test, so coverage stays BIT-EXACT (the
+		// coarse v0-sphere contains the triangle, so it only ever DEFERS a reject the tight cull also makes).
+		// Both a hair inflated vs GPU float rounding. Must match SoftTriRad/SoftTriRadV0 in SoftShadowBox.h.
 		float triRad = Max( ( v0 - cen ).Length(), Max( ( v1 - cen ).Length(), ( v2 - cen ).Length() ) ) * 1.00001f;
-		recs[n++] = idVec4( v0.x, v0.y, v0.z, triRad );
-		recs[n++] = idVec4( v1.x, v1.y, v1.z, 0.0f );
+		float v0Rad  = Max( ( v1 - v0 ).Length(), ( v2 - v0 ).Length() ) * 1.00001f;
+		recs[n++] = idVec4( v0.x, v0.y, v0.z, v0Rad );
+		recs[n++] = idVec4( v1.x, v1.y, v1.z, triRad );
 		recs[n++] = idVec4( v2.x, v2.y, v2.z, 0.0f );
 	}
 

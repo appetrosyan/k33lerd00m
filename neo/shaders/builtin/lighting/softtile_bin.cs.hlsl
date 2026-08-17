@@ -196,7 +196,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 			float4 r1 = t_Edges[ b + 1 ];
 			float4 r2 = t_Edges[ b + 2 ];
 			float3 tcen = ( float3( r0.x, r0.y, r0.z ) + float3( r1.x, r1.y, r1.z ) + float3( r2.x, r2.y, r2.z ) ) * ( 1.0f / 3.0f );
-			float  triRad = r0.w + tR;							// apex may sit anywhere in the tile AABB
+			float  triRad = r1.w + tR;							// r1.w = centroid radius (tight); apex may sit anywhere in the tile AABB
 			float3 rc = tcen - Pc;
 			float  cd = dot( rc, nrm );
 			if( cd + triRad < eps ) { continue; }				// wholly behind every receiver in the tile

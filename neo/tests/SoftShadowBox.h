@@ -216,6 +216,15 @@ inline float LiveShadow( const std::vector<float4>& rec, float3 P, float3 L, flo
 // CONSERVATIVE (never drops a real occluder) even against GPU float rounding. Precomputed here and carried in
 // recA.e0.w, so SoftShadow_FaceCoverage reads it instead of recomputing it every fragment. Must match the
 // engine's R_CollectPenumbraFaces so the C++-compiled shader in the tests sees the same value the GPU would.
+// v0-CENTERED radius (coarse), stored in r0.w: the fragment cull reads only r0 to reject, loading
+// v1/v2 lazily for survivors. Matches Interaction.cpp's v0Rad. The v0-sphere contains the triangle.
+inline float SoftTriRadV0( float3 v0, float3 v1, float3 v2 )
+{
+	float r = std::fmax( len3( v1 - v0 ), len3( v2 - v0 ) );
+	return r * 1.00001f;
+}
+
+// CENTROID radius (tight), stored in r1.w: the exact original bound; survivors re-cull with it.
 inline float SoftTriRad( float3 v0, float3 v1, float3 v2 )
 {
 	float3 cen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
@@ -280,8 +289,8 @@ inline FaceCasterCPU BuildFaceCasterUnit( const Box& b )
 		for( int t = 0; t < 2; t++ )
 		{
 			float3 v0 = b.c[idx[t * 3 + 0]], v1 = b.c[idx[t * 3 + 1]], v2 = b.c[idx[t * 3 + 2]];
-			fc.tris.push_back( float4( v0.x, v0.y, v0.z, SoftTriRad( v0, v1, v2 ) ) );
-			fc.tris.push_back( float4( v1.x, v1.y, v1.z, 0 ) );
+			fc.tris.push_back( float4( v0.x, v0.y, v0.z, SoftTriRadV0( v0, v1, v2 ) ) );
+			fc.tris.push_back( float4( v1.x, v1.y, v1.z, SoftTriRad( v0, v1, v2 ) ) );
 			fc.tris.push_back( float4( v2.x, v2.y, v2.z, 0 ) );
 		}
 	}
@@ -373,8 +382,8 @@ inline FaceCasterCPU BuildFaceCasterFromMesh( const float* verts, const uint32_t
 		const float* p1 = &verts[idx[t + 1] * 3];
 		const float* p2 = &verts[idx[t + 2] * 3];
 		float3 v0( p0[0], p0[1], p0[2] ), v1( p1[0], p1[1], p1[2] ), v2( p2[0], p2[1], p2[2] );
-		fc.tris.push_back( float4( v0.x, v0.y, v0.z, SoftTriRad( v0, v1, v2 ) ) );
-		fc.tris.push_back( float4( v1.x, v1.y, v1.z, 0 ) );
+		fc.tris.push_back( float4( v0.x, v0.y, v0.z, SoftTriRadV0( v0, v1, v2 ) ) );
+		fc.tris.push_back( float4( v1.x, v1.y, v1.z, SoftTriRad( v0, v1, v2 ) ) );
 		fc.tris.push_back( float4( v2.x, v2.y, v2.z, 0 ) );
 		fc.shellEdges.push_back( { v0, v1 } );
 		fc.shellEdges.push_back( { v1, v2 } );
