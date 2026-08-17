@@ -289,4 +289,120 @@ TEST( SoftShadowTileBin, umbra_sentinel_certificate_implies_saturated_integral )
 	CHECK( certified > 20 );					// the property must not be vacuously green
 }
 
+// ------------------------------------------------------------- SPILL cluster walk (stream v3)
+// Overflowed tiles spill CLUSTER records (k-d leaves of <=32 tris, built in R_CollectPenumbraFaces;
+// caster c1.zw spans them) and the consumers walk them with SoftShadow_FaceCoverageClusterList.
+// PROPERTIES: (1) the complete cluster list must agree BIT-IDENTICALLY with the full walk (the
+// cluster cull is conservative and the per-tri gate is unchanged); (2) a conservatively bin-culled
+// cluster list (the shader's tile-grain ball cull) must too, including for displaced receivers.
+TEST( SoftShadowTileBin, spill_cluster_walk_bit_identical_and_cull_lossless )
+{
+	uint32_t seed = 0xBEEF01u;
+	int probes = 0;
+	for( int scene = 0; scene < 12; scene++ )
+	{
+		FaceStreamCPU buf;
+		for( int b = 0; b < 3; b++ )
+		{
+			float3 c( Rnd( seed, -60, 60 ), Rnd( seed, -60, 60 ), Rnd( seed, 20, 90 ) );
+			float3 h( Rnd( seed, 2, 30 ), Rnd( seed, 2, 30 ), Rnd( seed, 1, 18 ) );
+			buf.Append( BuildFaceCasterUnit( MakeBox( c, h ) ) );
+		}
+		float3 L( Rnd( seed, -25, 25 ), Rnd( seed, -25, 25 ), Rnd( seed, 110, 170 ) );
+		float  swR = Rnd( seed, 2, 24 );
+
+		// append cluster records after the tris (offsets are ABSOLUTE, placement is free): chunks
+		// of <=4 tris per caster so multiple clusters exist even on 12-tri boxes
+		std::vector<float4> cbuf = buf.buf;
+		struct clu_t
+		{
+			uint32_t absOfs;
+			int caster;
+			float3 cen;
+			float rad;
+		};
+		std::vector<clu_t> clusters;
+		for( int cas = 0; cas < buf.nCasters; cas++ )
+		{
+			const float4& c1 = buf.buf[cas * 2 + 1];
+			const int first = ( int )c1.x, cnt = ( int )c1.y;
+			for( int f = first; f < first + cnt; f += 4 )
+			{
+				const int leaf = std::min( 4, first + cnt - f );
+				float3 acc( 0, 0, 0 );
+				for( int t = f; t < f + leaf; t++ )
+				{
+					const int b = buf.triBase() + t * 3;
+					acc = acc + ( float3( buf.buf[b].x, buf.buf[b].y, buf.buf[b].z )
+								  + float3( buf.buf[b + 1].x, buf.buf[b + 1].y, buf.buf[b + 1].z )
+								  + float3( buf.buf[b + 2].x, buf.buf[b + 2].y, buf.buf[b + 2].z ) ) * ( 1.0f / 3.0f );
+				}
+				const float3 cen = acc * ( 1.0f / leaf );
+				float rad = 0.0f;
+				for( int t = f; t < f + leaf; t++ )
+				{
+					const int b = buf.triBase() + t * 3;
+					for( int k = 0; k < 3; k++ )
+					{
+						rad = std::fmax( rad, len3( float3( buf.buf[b + k].x, buf.buf[b + k].y, buf.buf[b + k].z ) - cen ) );
+					}
+				}
+				rad *= 1.00001f;
+				clu_t cl;
+				cl.absOfs = ( uint32_t )cbuf.size();
+				cl.caster = cas;
+				cl.cen = cen;
+				cl.rad = rad;
+				cbuf.push_back( float4( cen.x, cen.y, cen.z, rad ) );
+				cbuf.push_back( float4( ( float )f, ( float )leaf, 0, 0 ) );
+				clusters.push_back( cl );
+			}
+		}
+		std::vector<uint32_t> all;
+		for( const clu_t& cl : clusters )
+		{
+			all.push_back( cl.absOfs );
+		}
+		SoftEdgeBuffer eb{ cbuf.data(), ( int )cbuf.size() };
+
+		for( int p = 0; p < 40; p++ )
+		{
+			float3 P( Rnd( seed, -80, 80 ), Rnd( seed, -80, 80 ), Rnd( seed, -8, 6 ) );
+			float full = SoftShadow_FaceCoverage( P, L, swR, buf.triBase(), 0, buf.nCasters, SoftRotAngle( P ), eb );
+
+			// 1) complete cluster list == full walk, bit-identical
+			SoftTileBuffer tbAll{ all.data(), ( int )all.size() };
+			float listAll = SoftShadow_FaceCoverageClusterList( P, L, swR, buf.triBase(), 0, ( int )all.size(), SoftRotAngle( P ), tbAll, eb );
+			CHECK( full == listAll );
+
+			// 2) bin-culled cluster list (caster ball then cluster ball, the shader's spill order)
+			//    == full, for the probe point AND a displaced receiver inside the tile ball
+			float tR = Rnd( seed, 0.5f, 12.0f );
+			std::vector<uint32_t> culled;
+			for( const clu_t& cl : clusters )
+			{
+				const float4& c0 = buf.buf[cl.caster * 2 + 0];
+				if( !BinKeepBall( float3( c0.x, c0.y, c0.z ), c0.w, P, tR, L, swR ) )
+				{
+					continue;
+				}
+				if( BinKeepBall( cl.cen, cl.rad, P, tR, L, swR ) )
+				{
+					culled.push_back( cl.absOfs );
+				}
+			}
+			SoftTileBuffer tbCul{ culled.data(), ( int )culled.size() };
+			float listCulled = SoftShadow_FaceCoverageClusterList( P, L, swR, buf.triBase(), 0, ( int )culled.size(), SoftRotAngle( P ), tbCul, eb );
+			CHECK( full == listCulled );
+
+			float3 Pd = P + float3( Rnd( seed, -1, 1 ), Rnd( seed, -1, 1 ), Rnd( seed, -1, 1 ) ) * ( tR * 0.57f );
+			float fullD = SoftShadow_FaceCoverage( Pd, L, swR, buf.triBase(), 0, buf.nCasters, SoftRotAngle( Pd ), eb );
+			float listD = SoftShadow_FaceCoverageClusterList( Pd, L, swR, buf.triBase(), 0, ( int )culled.size(), SoftRotAngle( Pd ), tbCul, eb );
+			CHECK( fullD == listD );
+			probes++;
+		}
+	}
+	CHECK( probes == 480 );
+}
+
 } // namespace

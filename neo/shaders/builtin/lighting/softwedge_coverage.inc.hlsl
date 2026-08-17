@@ -1186,6 +1186,171 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
 
+// SPILL-tile walk (STREAM V3 clusters): the list entries are ABSOLUTE float4 element offsets of
+// CLUSTER records - k-d spatial leaves of <=32 triangles built at stream time, 2 float4 each:
+// ( centre.xyz, radius )( firstTri, numTris, 0, 0 ). One 16B sphere cull rejects a whole span (the
+// measured ~3.6x cone-test amortization on dense receivers, tests/SoftShadowClusterProbe_test.cpp),
+// which is exactly what the OVERFLOWED tiles need: their tri lists exceed SW_TILE_K, and walking
+// thousands of triangles per fragment was the measured ~12 ms residual. Normal (fitting) tiles keep
+// the flat tri-index walk above - at moderate density the cluster indirection measured NET WORSE
+// (wave-union keeps most clusters, so the overhead has nothing to amortize; erebus1_05 +3.7 ms with
+// all-cluster lists) - so clusters serve ONLY the spill. Conservative at every level: a kept
+// cluster's triangles still run the coarse v0 + tight centroid culls + sample test below, so the
+// sample-gated triangle set - and the coverage - is BIT-EXACT vs the full walk.
+// Setup/tri-test/close duplicated from SoftShadow_FaceCoverageList per the house pattern above.
+SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float swR, int swFirstElem,
+		int swListBase, int swListCount, float swRotAng SW_TILEBUF_PARAM SW_EDGEBUF_PARAM )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float  swDistPL = swF.distPL;
+	const float swEps = SW_NEAR_EPS;
+#if SW_FACE_SAMPLES == 8
+	const float2 swDisk[8] =
+	{
+		float2( 0.250000f, 0.000000f), float2(-0.319290f, 0.292496f),
+		float2( 0.048872f,-0.556877f), float2( 0.402444f, 0.524918f),
+		float2(-0.738535f,-0.130636f), float2( 0.699605f,-0.445031f),
+		float2(-0.234004f, 0.870484f), float2(-0.446271f,-0.859268f),
+	};
+	const uint swNbr[8] =
+	{
+		0x08609443u, 0x0e218086u, 0x06121407u, 0x082284c0u,
+		0x066008e1u, 0x08138c40u, 0x0a220061u, 0x06508082u,
+	};
+#elif SW_FACE_SAMPLES == 16
+	const float2 swDisk[16] =
+	{
+		float2( 0.176777f, 0.000000f), float2(-0.225772f, 0.206826f),
+		float2( 0.034558f,-0.393771f), float2( 0.284571f, 0.371173f),
+		float2(-0.522223f,-0.092374f), float2( 0.494695f,-0.314685f),
+		float2(-0.165466f, 0.615525f), float2(-0.315561f,-0.607594f),
+		float2( 0.684642f, 0.250030f), float2(-0.712256f, 0.294009f),
+		float2( 0.343354f,-0.733729f), float2( 0.253730f, 0.808932f),
+		float2(-0.764746f,-0.443186f), float2( 0.897134f,-0.197232f),
+		float2(-0.547507f, 0.778772f), float2(-0.126487f,-0.976090f),
+	};
+	const uint swNbr[16] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x0a132d00u,
+		0x0023a581u, 0x0681014du, 0x0091adc1u, 0x00a231e2u,
+		0x02b281a3u, 0x00c33824u, 0x1a03bc45u, 0x00e0a0c3u,
+		0x02f124e4u, 0x04350105u, 0x06458526u, 0x08560947u,
+	};
+#else
+	#error SoftShadow_FaceCoverageClusterList supports SW_FACE_SAMPLES 8 or 16
+#endif
+	float3 swBase = swL - swP;
+	float3 swSu = swF.u * swR;
+	float3 swSv = swF.v * swR;
+	float  swCa = cos( swRotAng );
+	float  swSa = sin( swRotAng );
+
+#if SW_FP16_LOOP
+	float  swMD = SoftMaxComp3( swBase ) + SoftMaxComp3( swSu ) + SoftMaxComp3( swSv );
+	float  swKD = 1.0f / max( swMD, 1e-19f );
+	float3 swU2 = swSu * swCa + swSv * swSa;
+	float3 swV2 = swSv * swCa - swSu * swSa;
+#endif
+
+	uint swMask = 0u;
+	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+	for( int li = 0; li < swListCount; li++ )
+	{
+		const int se = ( int )t_SoftTiles[ swListBase + li ];		// ABSOLUTE cluster-record offset
+		float4 q0 = t_SoftEdges[ se + 0 ];							// ( centre.xyz, radius )
+		{
+			float3 crc  = float3( q0.x, q0.y, q0.z ) - swP;
+			float  ccd  = dot( crc, swF.nrm );
+			float  crad = q0.w;
+			if( ccd + crad < swEps ) { continue; }
+			if( ccd - crad > swDistPL ) { continue; }
+			float3 cperp = crc - ccd * swF.nrm;
+			float  cconeR = swR * ( ccd + crad ) / swDistPL;
+			if( dot( cperp, cperp ) > ( cconeR + crad ) * ( cconeR + crad ) ) { continue; }
+		}
+		float4 q1 = t_SoftEdges[ se + 1 ];							// ( firstTri, numTris, 0, 0 ) - survivors only
+		const int swTriFirst = ( int )q1.x;
+		const int swTriEnd   = swTriFirst + ( int )q1.y;
+		for( int t = swTriFirst; t < swTriEnd; t++ )
+		{
+			const int b = swFirstElem + t * 3;
+			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, v0-radius ) - coarse reject reads ONLY this
+			{
+				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
+				float  cd0 = dot( rc0, swF.nrm );
+				float  vr0 = r0.w;
+				if( cd0 + vr0 < swEps ) { continue; }
+				if( cd0 - vr0 > swDistPL ) { continue; }
+				float3 pp0 = rc0 - cd0 * swF.nrm;
+				float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
+				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+			}
+			float4 r1 = t_SoftEdges[ b + 1 ];
+			float4 r2 = t_SoftEdges[ b + 2 ];
+			float3 v0 = float3( r0.x, r0.y, r0.z );
+			float3 v1 = float3( r1.x, r1.y, r1.z );
+			float3 v2 = float3( r2.x, r2.y, r2.z );
+			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+			float3 rc   = tcen - swP;
+			float  cd   = dot( rc, swF.nrm );
+			float  triRad = r1.w;	// centroid radius (tight): exact original bound => bit-exact gate
+			if( cd + triRad < swEps ) { continue; }
+			if( cd - triRad > swDistPL ) { continue; }
+			float3 perp = rc - cd * swF.nrm;
+			float  coneR = swR * ( cd + triRad ) / swDistPL;
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+			float3 edge1 = v1 - v0;
+			float3 edge2 = v2 - v0;
+			float3 sp = swP - v0;
+			float3 qq   = cross( sp, edge1 );
+			float  e2qq = dot( edge2, qq );
+#if SW_FP16_LOOP
+			swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+												 swBase, swU2, swV2, swMD, swKD, swDisk );
+#else
+			for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+			{
+				if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+				float2 s0  = swDisk[i];
+				float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+				float3 dir = swBase + swSu * sc.x + swSv * sc.y;
+				float3 h   = cross( dir, edge2 );
+				float  aa  = dot( edge1, h );
+				if( abs( aa ) < 1e-12f ) { continue; }
+				float  inv = 1.0f / aa;
+				float  u   = inv * dot( sp, h );
+				if( u < 0.0f || u > 1.0f ) { continue; }
+				float  vv  = inv * dot( dir, qq );
+				if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+				float  tt  = inv * e2qq;
+				if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+			}
+#endif	// SW_FP16_LOOP
+			if( swMask == swAll ) { break; }
+		}
+		if( swMask == swAll ) { break; }
+	}
+	if( swMask != 0u && swMask != swAll )
+	{
+		uint filled = swMask;
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+			uint nb = swNbr[i];
+			int blocked = 0;
+			for( int k = 0; k < 6; k++ )
+			{
+				int j = ( int )( ( nb >> ( 5 * k ) ) & 31u );
+				if( ( swMask & ( 1u << j ) ) != 0u ) { blocked++; }
+			}
+			if( blocked >= 5 ) { filled |= ( 1u << i ); }
+		}
+		swMask = filled;
+	}
+	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
+}
+
 // Dispatcher: the pixel shader picks the coverage path by the SIGN of the count (rpJitterTexScale.z):
 // negative = FRONT-FACE stream v2 (r_softShadowFaceCoverage; abs = CASTER count, swFirstElem = tri stream
 // base, swCasterBase = caster table base), positive = light-silhouette edge stream (abs = record count;

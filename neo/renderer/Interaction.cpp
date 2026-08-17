@@ -727,10 +727,12 @@ DROPPING most soft records over the frame budget.
 */
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
 		const idRenderLightLocal* light, float penumbraSize, const float* modelToWorld,
-		idVec4** outElems, int* outNumElems )
+		idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters )
 {
 	*outElems = NULL;
 	*outNumElems = 0;
+	*outClusters = NULL;
+	*outNumClusters = 0;
 
 	if( tri->indexes == NULL || tri->numIndexes < 3 || penumbraSize <= 0.0f )
 	{
@@ -739,38 +741,108 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 
 	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
 	const int numTris = tri->numIndexes / 3;
-	idVec4* recs = ( idVec4* )R_FrameAlloc( ( size_t )numTris * 3 * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
 
-	int n = 0;
+	// pass 1: transform every triangle to world ONCE into a transient scratch (the emit below is in
+	// cluster order, so it cannot stream straight out of the index list)
+	idVec3* wv = ( idVec3* )R_FrameAlloc( ( size_t )numTris * 3 * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
+	idVec3* wc = ( idVec3* )R_FrameAlloc( ( size_t )numTris * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
 	for( int t = 0; t < numTris; t++ )
 	{
-		const triIndex_t ia = tri->indexes[t * 3 + 0];
-		const triIndex_t ib = tri->indexes[t * 3 + 1];
-		const triIndex_t ic = tri->indexes[t * 3 + 2];
-		idVec3 v0, v1, v2;
-		R_LocalPointToGlobal( modelToWorld, verts[ia].xyz, v0 );
-		R_LocalPointToGlobal( modelToWorld, verts[ib].xyz, v1 );
-		R_LocalPointToGlobal( modelToWorld, verts[ic].xyz, v2 );
-		// Precompute the per-triangle bounding radius (max |vertex - centroid|) once here, carried in r0.w,
-		// so SoftShadow_FaceCoverage reads it instead of recomputing it every fragment. A hair inflated so the
-		// shader's cone cull stays conservative under GPU float rounding (never drops a real occluder). Must match
-		// SoftTriRad in the tests' SoftShadowBox.h.
-		idVec3 cen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
-		// TWO radii for the two-stage fragment cull. r0.w = v0-CENTERED radius (coarse): the per-fragment
-		// cull reads ONLY r0 to reject far triangles, loading v1/v2 lazily for survivors - the 48B record
-		// fetch is the measured-dominant per-fragment cost. r1.w = CENTROID radius (tight): survivors
-		// re-cull with the exact original bound before the sample test, so coverage stays BIT-EXACT (the
-		// coarse v0-sphere contains the triangle, so it only ever DEFERS a reject the tight cull also makes).
-		// Both a hair inflated vs GPU float rounding. Must match SoftTriRad/SoftTriRadV0 in SoftShadowBox.h.
-		float triRad = Max( ( v0 - cen ).Length(), Max( ( v1 - cen ).Length(), ( v2 - cen ).Length() ) ) * 1.00001f;
-		float v0Rad  = Max( ( v1 - v0 ).Length(), ( v2 - v0 ).Length() ) * 1.00001f;
-		recs[n++] = idVec4( v0.x, v0.y, v0.z, v0Rad );
-		recs[n++] = idVec4( v1.x, v1.y, v1.z, triRad );
-		recs[n++] = idVec4( v2.x, v2.y, v2.z, 0.0f );
+		R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 0]].xyz, wv[t * 3 + 0] );
+		R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 1]].xyz, wv[t * 3 + 1] );
+		R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 2]].xyz, wv[t * 3 + 2] );
+		wc[t] = ( wv[t * 3 + 0] + wv[t * 3 + 1] + wv[t * 3 + 2] ) * ( 1.0f / 3.0f );
+	}
+
+	// STREAM V3 CLUSTERS: k-d median split of the surface's triangles (by centroid, longest axis,
+	// in-place nth_element partition => leaves are CONTIGUOUS index runs) into <= SW_CLUSTER_TRIS
+	// leaves, each bounded by a sphere. The bin culls cluster spheres against the tile cone and the
+	// fragment walk culls them against its sample cone, so a rejected cluster skips its whole span
+	// for one 16B test - the measured amortization on softcap0061 receivers is ~3.6x fewer cone
+	// tests (probe: tests/SoftShadowClusterProbe_test.cpp; spatial split beats stream order ~2x).
+	// Conservative at every level, so coverage stays BIT-EXACT: a cluster cull can only DEFER
+	// per-triangle rejects the unchanged tight cull + sample test still make.
+	const int SW_CLUSTER_TRIS = 32;
+	int* order = ( int* )R_FrameAlloc( ( size_t )numTris * sizeof( int ), FRAME_ALLOC_UNKNOWN );
+	for( int t = 0; t < numTris; t++ )
+	{
+		order[t] = t;
+	}
+	const int maxClusters = numTris / ( SW_CLUSTER_TRIS / 2 ) + 2;
+	idVec4* clus = ( idVec4* )R_FrameAlloc( ( size_t )maxClusters * 2 * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
+	idVec4* recs = ( idVec4* )R_FrameAlloc( ( size_t )numTris * 3 * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
+	int nClus = 0, n = 0;
+
+	struct range_t
+	{
+		int lo, hi;
+	};
+	range_t stack[64];
+	int sp = 0;
+	stack[sp++] = { 0, numTris };
+	while( sp > 0 )
+	{
+		const range_t r = stack[--sp];
+		const int count = r.hi - r.lo;
+		if( count > SW_CLUSTER_TRIS && sp < 63 )
+		{
+			// split at the median of the longest centroid-extent axis (in-place partition)
+			idVec3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+			for( int i = r.lo; i < r.hi; i++ )
+			{
+				const idVec3& c = wc[order[i]];
+				mn.x = Min( mn.x, c.x );	mx.x = Max( mx.x, c.x );
+				mn.y = Min( mn.y, c.y );	mx.y = Max( mx.y, c.y );
+				mn.z = Min( mn.z, c.z );	mx.z = Max( mx.z, c.z );
+			}
+			const idVec3 ext = mx - mn;
+			const int axis = ( ext.x >= ext.y && ext.x >= ext.z ) ? 0 : ( ( ext.y >= ext.z ) ? 1 : 2 );
+			const int mid = r.lo + count / 2;
+			std::nth_element( order + r.lo, order + mid, order + r.hi,
+							  [&]( int a, int b )
+			{
+				return wc[a][axis] < wc[b][axis];
+			} );
+			stack[sp++] = { r.lo, mid };
+			stack[sp++] = { mid, r.hi };
+			continue;
+		}
+		// LEAF: emit its triangles contiguously (cluster-ordered stream) + one cluster record.
+		// Per-tri radii as before: r0.w = v0-CENTERED coarse radius (fragment reads ONLY r0 to
+		// reject), r1.w = CENTROID tight radius (survivors re-cull with the exact original bound).
+		// Both a hair inflated vs GPU float rounding. Must match SoftTriRad/SoftTriRadV0 in
+		// SoftShadowBox.h.
+		const int firstTriOut = n / 3;
+		idVec3 acc( 0, 0, 0 );
+		for( int i = r.lo; i < r.hi; i++ )
+		{
+			acc += wc[order[i]];
+		}
+		const idVec3 ccen = acc * ( 1.0f / count );
+		float crad = 0.0f;
+		for( int i = r.lo; i < r.hi; i++ )
+		{
+			const int t = order[i];
+			const idVec3& v0 = wv[t * 3 + 0];
+			const idVec3& v1 = wv[t * 3 + 1];
+			const idVec3& v2 = wv[t * 3 + 2];
+			crad = Max( crad, Max( ( v0 - ccen ).Length(), Max( ( v1 - ccen ).Length(), ( v2 - ccen ).Length() ) ) );
+			const idVec3& cen = wc[t];
+			float triRad = Max( ( v0 - cen ).Length(), Max( ( v1 - cen ).Length(), ( v2 - cen ).Length() ) ) * 1.00001f;
+			float v0Rad  = Max( ( v1 - v0 ).Length(), ( v2 - v0 ).Length() ) * 1.00001f;
+			recs[n++] = idVec4( v0.x, v0.y, v0.z, v0Rad );
+			recs[n++] = idVec4( v1.x, v1.y, v1.z, triRad );
+			recs[n++] = idVec4( v2.x, v2.y, v2.z, 0.0f );
+		}
+		clus[nClus * 2 + 0] = idVec4( ccen.x, ccen.y, ccen.z, crad * 1.00001f );
+		clus[nClus * 2 + 1] = idVec4( ( float )firstTriOut, ( float )count, 0.0f, 0.0f );
+		nClus++;
 	}
 
 	*outElems = recs;
 	*outNumElems = n;
+	*outClusters = clus;
+	*outNumClusters = nClus;
 }
 
 /*

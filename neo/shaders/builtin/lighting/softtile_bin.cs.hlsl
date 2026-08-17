@@ -297,68 +297,76 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	}
 	GroupMemoryBarrierWithGroupSync();
 
-	// ---- SPILL PASS (overflowed tiles) -------------------------------------------------------
-	// gsCount counted EVERY stage-2 survivor, but only the first K fit the tile slot. Allocate a
-	// span of gsCount elements from the spill region [g_minmax.z, g_minmax.w) via the global bump
-	// counter and RE-RUN the stage-2 cull, appending every surviving index there. The re-walk is
-	// deterministic (same inputs, same culls => exactly gsCount survivors again); its append ORDER
-	// differs from a K-fit list, which is irrelevant - the consumers union a per-sample mask
-	// (order-independence ledgered by the big-occluder-first rejection). The umbra proof is
-	// skipped (already resolved in pass 1). Region exhausted -> keep the old 0xFFFFFFFF sentinel
-	// (full-walk fallback): graceful degradation, never corruption.
+	// ---- SPILL PASS (overflowed tiles), STREAM V3 CLUSTERS -----------------------------------
+	// gsCount counted EVERY stage-2 tri survivor, but only the first K fit the tile slot. Instead
+	// of spilling the huge tri list (v1 spill: 19.4M-element demand at softcap0061), spill this
+	// tile's surviving CLUSTER records - the caster table's k-d leaf spheres (<=32 tris each,
+	// caster c1.zw = cluster span, built in R_CollectPenumbraFaces). The dense tiles that overflow
+	// are exactly where the per-fragment cluster amortization wins (~3.6x fewer cone tests,
+	// tests/SoftShadowClusterProbe_test.cpp); FITTING tiles keep the flat tri walk, which measured
+	// FASTER than clusters at moderate density (erebus1_05 +3.7 ms with all-cluster lists).
+	// Consumers walk a SPILL span with SoftShadow_FaceCoverageClusterList. The allocation is a
+	// cheap upper bound (sum of surviving casters' cluster counts by lane 0); the strided cull
+	// appends only surviving clusters and the descriptor stores the ACTUAL count. Region
+	// exhausted -> the old 0xFFFFFFFF sentinel (full-walk fallback): graceful, never corrupt.
 	if( gsUmbra == 0u && gsCount > SW_TILE_K )
 	{
 		if( tid == 0 )
 		{
+			uint bound = 0u;
+			for( int cb = 0; cb < g_range.y; cb++ )
+			{
+				if( cb < SW_BIN_MAX_CASTERS && ( gsCasterKeep[cb >> 5] & ( 1u << ( cb & 31 ) ) ) == 0u )
+				{
+					continue;
+				}
+				bound += ( uint )t_Edges[ g_range.w + cb * 2 + 1 ].w;	// caster's numClusters
+			}
 			uint rel;
-			InterlockedAdd( u_SpillCnt[0], gsCount, rel );
+			InterlockedAdd( u_SpillCnt[0], bound, rel );
 			uint dead;
 			InterlockedAdd( u_SpillCnt[1], 1u, dead );		// stats: overflow-tile count
-			InterlockedMax( u_SpillCnt[2], gsCount );		// stats: worst per-tile survivor count
+			InterlockedMax( u_SpillCnt[2], bound );			// stats: worst per-tile cluster bound
 			const uint base = ( uint )g_minmax.z + rel;
-			gsSpillBase = ( base + gsCount <= ( uint )g_minmax.w ) ? base : 0xFFFFFFFFu;
+			gsSpillBase = ( bound > 0u && base + bound <= ( uint )g_minmax.w ) ? base : 0xFFFFFFFFu;
 			gsSpillFill = 0u;
 		}
 		GroupMemoryBarrierWithGroupSync();
 		if( gsSpillBase != 0xFFFFFFFFu )
 		{
+			const int cluBase = g_range.w + g_range.y * 2;			// cluster table rides after the casters
 			for( int cc2 = 0; cc2 < g_range.y; cc2++ )
 			{
 				if( cc2 < SW_BIN_MAX_CASTERS && ( gsCasterKeep[cc2 >> 5] & ( 1u << ( cc2 & 31 ) ) ) == 0u )
 				{
 					continue;
 				}
-				float4 c1 = t_Edges[ g_range.w + cc2 * 2 + 1 ];		// ( firstTri, numTris, 0, 0 )
-				const int triFirst = ( int )c1.x;
-				const int triEnd   = triFirst + ( int )c1.y;
-				for( int t = triFirst + ( int )tid; t < triEnd; t += 64 )
+				float4 c1 = t_Edges[ g_range.w + cc2 * 2 + 1 ];		// ( firstTri, numTris, firstCluster, numClusters )
+				const int cluFirst = ( int )c1.z;
+				const int cluEnd   = cluFirst + ( int )c1.w;
+				for( int cl = cluFirst + ( int )tid; cl < cluEnd; cl += 64 )
 				{
-					const int b = g_range.x + t * 3;
-					float4 r0 = t_Edges[ b + 0 ];
-					float4 r1 = t_Edges[ b + 1 ];
-					float4 r2 = t_Edges[ b + 2 ];
-					float3 tcen = ( float3( r0.x, r0.y, r0.z ) + float3( r1.x, r1.y, r1.z ) + float3( r2.x, r2.y, r2.z ) ) * ( 1.0f / 3.0f );
-					float  triRad = r1.w + tR;						// IDENTICAL cull to pass 1 - keep in lock-step
-					float3 rc = tcen - Pc;
+					const int q = cluBase + cl * 2;
+					float4 q0 = t_Edges[ q + 0 ];					// ( centre.xyz, radius ) - tile-grain cull
+					float  cluRad = q0.w + tR;						// apex may sit anywhere in the tile AABB
+					float3 rc = float3( q0.x, q0.y, q0.z ) - Pc;
 					float  cd = dot( rc, nrm );
-					if( cd + triRad < eps ) { continue; }
-					if( cd - triRad > distPL + tR ) { continue; }
+					if( cd + cluRad < eps ) { continue; }
+					if( cd - cluRad > distPL + tR ) { continue; }
 					float3 perp = rc - cd * nrm;
-					float  coneR = swR * ( cd + triRad ) / max( distPL - tR, 1e-4f );
-					if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+					float  coneR = swR * ( cd + cluRad ) / max( distPL - tR, 1e-4f );
+					if( dot( perp, perp ) > ( coneR + cluRad ) * ( coneR + cluRad ) ) { continue; }
 					uint slot;
 					InterlockedAdd( gsSpillFill, 1u, slot );
-					if( slot < gsCount )							// == gsCount by determinism; guard is belt-and-braces
-					{
-						u_Tiles[ gsSpillBase + slot ] = ( uint )t;	// TRIANGLE index (stream v2)
-					}
+					u_Tiles[ gsSpillBase + slot ] = ( uint )q;		// ABSOLUTE cluster-record offset (stream v3)
 				}
 			}
+			GroupMemoryBarrierWithGroupSync();						// all appends (and gsSpillFill) final
 			if( tid == 0 )
 			{
 				// span descriptor in the tile's (otherwise dead) first two index words
 				u_Tiles[ outSlot + 1 ] = gsSpillBase;
-				u_Tiles[ outSlot + 2 ] = gsCount;
+				u_Tiles[ outSlot + 2 ] = gsSpillFill;				// ACTUAL surviving-cluster count
 			}
 		}
 	}

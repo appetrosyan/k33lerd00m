@@ -74,11 +74,12 @@ public:
 	// only ~4 ms at +320 MB). Instead the bin CS bump-allocates a span from the buffer TAIL and
 	// writes the tile's FULL index list there (SW_TILE_SPILL sentinel + span descriptor in the tile
 	// slot); consumers walk the span like a normal list. Exhausted region -> old sentinel fallback.
-	// Spill partition of the SAME 48M buffer (no extra VRAM): measured demand at softcap0061 1080p
-	// is 19.4M elements (7670 overflow tiles, avg ~2.5k tris, worst 7121) against a 16.4M tile-slot
-	// peak - 24M/24M fits both with headroom. Higher render resolutions can exhaust either half;
-	// both degrade gracefully (slots: light falls to full walk; spill: tile falls to full walk) and
-	// the gate bench prints the spill demand so exhaustion is never silent.
+	// Spill partition of the SAME 48M buffer (no extra VRAM). STREAM V3: overflowed tiles spill
+	// CLUSTER records (k-d leaves of <=32 tris), so the measured softcap0061 1080p demand collapsed
+	// from 19.4M tri entries to 1.45M cluster entries (7670 overflow tiles, worst 334 clusters) -
+	// 24M is now deep headroom even for 4K. Both halves degrade gracefully (slots: light falls to
+	// full walk; spill: tile falls to full walk) and the gate bench prints the spill demand so
+	// exhaustion is never silent.
 	static const int SPILL_ELEMENTS = 24 << 20;
 
 private:

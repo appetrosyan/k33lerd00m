@@ -159,10 +159,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 		}
 		if( swCnt == SW_TILE_SPILL )
 		{
-			// overflowed tile, full list spilled: walk the span - same walker, arbitrary flat base
+			// overflowed tile: the span holds this tile's surviving CLUSTER records (stream v3) -
+			// the two-level walk amortizes the cone cull ~3.6x exactly where lists are huge
 			const uint swOfs = t_SoftTiles[ swSlot + 1 ];
 			const uint swSpN = t_SoftTiles[ swSlot + 2 ];
-			swOcc = SoftShadow_FaceCoverageList( swP, swL, swR, g_range.x, ( int )swOfs, ( int )swSpN, swRotAng );
+			swOcc = SoftShadow_FaceCoverageClusterList( swP, swL, swR, g_range.x, ( int )swOfs, ( int )swSpN, swRotAng );
 		}
 		else if( swCnt != 0xFFFFFFFFu )
 		{

@@ -103,6 +103,9 @@ struct drawSurf_t
 												// WEDGE mode: silhouette edge records. FACE mode (v2): idVec4 triples per
 												// triangle, cast to this type; the two modes never mix in one frame.
 	int						numSoftEdges;		// WEDGE: record count. FACE v2: count in FLOAT4 ELEMENTS (3 per triangle)
+	const idVec4*			softClusters;		// FACE v3: this caster's cluster table (2 float4/cluster: sphere +
+												// ( firstTri, numTris ) surface-local), frame mem; NULL in wedge mode
+	int						numSoftClusters;	// FACE v3: CLUSTER count (2 float4 elements each)
 	int						numIndexes;
 	vertCacheHandle_t		indexCache;			// triIndex_t
 	vertCacheHandle_t		ambientCache;		// idDrawVert

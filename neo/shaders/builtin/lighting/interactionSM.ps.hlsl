@@ -265,11 +265,11 @@ void main( PS_IN fragment, out PS_OUT result )
 		}
 		else if( ( swSlot >= 0 ) && ( swCnt == SW_TILE_SPILL ) )
 		{
-			// overflowed tile, full list spilled to the buffer tail: walk the span - same walker,
-			// arbitrary flat base (the wave-uniform scalar-list check self-handles the non-slot base)
+			// overflowed tile: the span holds this tile's surviving CLUSTER records (stream v3) -
+			// the two-level walk amortizes the cone cull ~3.6x exactly where lists are huge
 			const uint swOfs = t_SoftTiles[ swSlot + 1 ];
 			const uint swSpN = t_SoftTiles[ swSlot + 2 ];
-			swOcc = SoftShadow_FaceCoverageList( swCovP, swL, swR, swFirstElem, int( swOfs ), int( swSpN ), swRotAng );
+			swOcc = SoftShadow_FaceCoverageClusterList( swCovP, swL, swR, swFirstElem, int( swOfs ), int( swSpN ), swRotAng );
 		}
 		else if( swBinned )
 		{
