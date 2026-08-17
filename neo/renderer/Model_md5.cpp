@@ -557,20 +557,35 @@ void idMD5Mesh::UpdateSurface( const struct renderEntity_s* ent, const idJointMa
 
 	CalculateBounds( entJoints, tri->bounds );
 
-	// Stencil shadow volumes for animated casters. The shadow vertex shader is position-only (no GPU
-	// skinning), so an animated model needs CPU-posed shadow geometry for the current pose. Hand the
-	// frontend the silhouette topology (built once in the deform info) plus PERSISTENT posed positions;
-	// the frontend builds the per-frame shadow cache + per-light volume from them. Persistent because a
+	// CPU-posed shadow geometry for animated casters. The stencil shadow vertex shader is position-only
+	// (no GPU skinning), and the ANALYTIC soft-shadow face collect (R_CollectPenumbraFaces) streams CPU
+	// triangles too - both need the model's CURRENT pose on the CPU. Hand the frontend the silhouette
+	// topology (built once in the deform info) plus PERSISTENT posed positions; persistence because a
 	// cached dynamic model (a settled ragdoll) stops calling UpdateSurface, but the frontend still runs
-	// every frame - without persistence the shadow would vanish the moment the corpse comes to rest.
-	// Gated on stencil shadows being the active method so animated rendering is untouched otherwise.
+	// every frame - without it the shadow would vanish the moment the corpse comes to rest.
+	//
+	// The gate MUST include the soft-shadow face path: it originally covered only stencil shadows, and
+	// under the shipped config (r_useStencilShadows 0, face coverage on) posedShadowVerts stayed NULL,
+	// so the collect fell back to tri->verts = BIND POSE under GPU skinning. Every skinned caster then
+	// shadowed from a T-posed phantom standing inside its rendered body - measured on softcap0042 as
+	// the ragdoll's "large black bands on top of itself" (its own bind-pose copy 7.9u mean / 64u max
+	// from the drawn pose blocking its receivers).
 	extern idCVar r_useStencilShadows;
 	extern idCVar r_useRTShadows;
-	if( r_useStencilShadows.GetBool() && !r_useRTShadows.GetBool() &&
-			shader->SurfaceCastsShadow() && deformInfo->silEdges != NULL )
+	extern idCVar r_useSoftShadowVolumes;
+	extern idCVar r_softShadowFaceCoverage;
+	const bool needPosedShadow = ( r_useStencilShadows.GetBool() && !r_useRTShadows.GetBool() )
+								 || ( r_useSoftShadowVolumes.GetBool() && r_softShadowFaceCoverage.GetBool() );
+	if( needPosedShadow && shader->SurfaceCastsShadow() )
 	{
-		tri->numSilEdges = deformInfo->numSilEdges;
-		tri->silEdges = deformInfo->silEdges;
+		// silhouette topology only exists for 2-manifold meshes; the FACE collect streams raw
+		// triangles and must get posed verts even when silEdges creation failed (rails, decor -
+		// and any non-manifold skinned mesh, which would otherwise shadow from its bind pose).
+		if( deformInfo->silEdges != NULL )
+		{
+			tri->numSilEdges = deformInfo->numSilEdges;
+			tri->silEdges = deformInfo->silEdges;
+		}
 
 		// Under GPU skinning tri->verts is bind pose, so pose a copy by the joints into the owned,
 		// persistent posedShadowVerts (leaving tri->verts, which rendering references, untouched).
