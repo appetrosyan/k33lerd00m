@@ -164,6 +164,14 @@ struct backEndCounters_t
 
 	int		c_copyFrameBuffer;
 
+	// Soft-shadow PATH PROVENANCE (per view): which evaluation path each soft light's term
+	// actually took this frame. A "bit-exact either way" fallback turns a placement bug into a
+	// silent perf leak the correctness gate cannot see (measured: the tile-rect Y-flip bug hid
+	// exactly this way for days) - so the paths taken are first-class, benchable values.
+	int		c_softLightsTotal;		// lights with a face stream this view
+	int		c_softLightsTerm;		// of those, term precomputed by softterm.cs (rpUser6 mode 1)
+	int		c_softLightsBinned;		// of those, walking tile-binned lists (rpUser7 base >= 0)
+
 	float	c_overDraw;
 
 	uint64	cpuTotalMicroSec;		// total microseconds for backend run

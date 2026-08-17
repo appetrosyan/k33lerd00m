@@ -2169,6 +2169,7 @@ int R_SoftShadowGate( const char* arg )
 			}
 			const int t0 = Sys_Microseconds();
 			int benchRecords = 0, benchDropped = 0;
+			int benchSoftLights = 0, benchTermLights = 0, benchBinnedLights = 0;
 			for( int f = 0; f < benchFrames; f++ )
 			{
 				// pipelined like the game loop: frontend builds frame f while the GPU draws f-1
@@ -2178,6 +2179,14 @@ int R_SoftShadowGate( const char* arg )
 				benchDropped = Max( benchDropped, tr.pc.c_softShadowDroppedEdges );
 				const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
 				tr.RenderCommandBuffers( cmd );
+				// PATH PROVENANCE, sampled from the backend counters of the frame just rendered:
+				// which evaluation path each soft light's term actually took. term < total or
+				// binned < total is not an error (slot budget, ineligible lights) but it must be
+				// VISIBLE - a silent bit-exact fallback is a perf leak the gate cannot see (the
+				// tile-rect Y-flip bug hid exactly this way).
+				benchSoftLights   = Max( benchSoftLights,   backEnd.pc.c_softLightsTotal );
+				benchTermLights   = Max( benchTermLights,   backEnd.pc.c_softLightsTerm );
+				benchBinnedLights = Max( benchBinnedLights, backEnd.pc.c_softLightsBinned );
 			}
 			tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );	// drain the last frame
 			const double ms = ( Sys_Microseconds() - t0 ) / 1000.0 / benchFrames;
@@ -2185,9 +2194,9 @@ int R_SoftShadowGate( const char* arg )
 			// erased whole lights' soft shadows - such a bench time is a lie (faster because shadows
 			// are missing), so the drop count must be printed next to the ms it taints.
 			common->Printf( "[softgate] BENCH %-14s %6.2f ms/frame (%4.0f FPS) over %d frames, %d map lights, "
-							"%d soft records (%d dropped)\n",
+							"%d soft records (%d dropped), %d soft lights (%d term, %d binned)\n",
 							cap.name.c_str(), ms, 1000.0 / ms, benchFrames, ( int )mapLights.size(),
-							benchRecords, benchDropped );
+							benchRecords, benchDropped, benchSoftLights, benchTermLights, benchBinnedLights );
 			for( qhandle_t bh : benchLights )
 			{
 				rw->FreeLightDef( bh );
