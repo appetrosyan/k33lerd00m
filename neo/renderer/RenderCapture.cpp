@@ -1537,7 +1537,13 @@ float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR )
 				continue;
 			}
 			double t = ( e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2] ) * inv;
-			if( t > 1e-6 && t < 1.0 )
+			// near-clip MUST match the shipped shader's contact-shadow bias (softwedge_coverage.inc.hlsl
+			// 'tt > 1e-4f && tt <= 1.0f'): the shader suppresses occluders within ~1e-4 of the ray length
+			// of the receiver (anti-acne - a 1e-6 clip mints self-shadow acne on every near-contact
+			// surface). An arbiter with a 100x tighter clip sees "umbra" the shader intentionally (and
+			// correctly) does not cast, minting phantom LIT_IN_UMBRA at sub-0.05-unit near-contacts. Trace
+			// the SAME contact model the shader ships so the truth judges the shader's real output.
+			if( t > 1e-4 && t <= 1.0 )
 			{
 				hit = true;
 			}
@@ -2036,6 +2042,25 @@ int R_SoftShadowGate( const char* arg )
 											 ? idVec3( s_lights[0].origin[0], s_lights[0].origin[1], s_lights[0].origin[2] )
 											 : clOrg;
 					const float diskR = cl.penumbraSize;
+						// EXACT softpos receiver positions (RGBA32F: xyz world, w=1 valid) - the point the
+						// shipped shader actually shaded. The arbiter judges truth HERE, not at a
+						// depth-unprojected point: depth reconstruction is grazing-unstable (the very reason
+						// softpos exists), so unprojecting reintroduces that error and mints false
+						// LIT_IN_UMBRA at thin/grazing pixels where the reconstructed point lands in umbra
+						// while the shaded surface point is lit. Falls back to unprojection where softpos is
+						// unavailable (never rasterised, or the readback failed).
+						std::vector<float> posBuf;
+						{
+							float* pp = NULL;
+							if( globalImages->softShadowPosImage != NULL && globalImages->softShadowPosImage->GetTextureHandle() != NULL
+									&& R_ReadPixelsRGBA32F( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+											globalImages->softShadowPosImage->GetTextureHandle(),
+											nvrhi::ResourceStates::ShaderResource, &pp, W, H ) && pp != NULL )
+							{
+								posBuf.assign( pp, pp + ( size_t )W * H * 4 );
+								R_StaticFree( pp );
+							}
+						}
 					std::function<float( int, int )> truthAt = [&]( int x, int y ) -> float
 					{
 						size_t i = ( size_t )y * W + x;
@@ -2044,7 +2069,11 @@ int R_SoftShadowGate( const char* arg )
 						{
 							return -1.0f;
 						}
-						float wp[3];
+						if( !posBuf.empty() && posBuf[i * 4 + 3] != 0.0f )
+							{
+								return GateTruthVisibility( idVec3( posBuf[i * 4 + 0], posBuf[i * 4 + 1], posBuf[i * 4 + 2] ), gLightOrg, diskR );
+							}
+							float wp[3];
 						GateUnproject( invArb.ToFloatPtr(), x, y, W, H, dep, wp );
 						return GateTruthVisibility( idVec3( wp[0], wp[1], wp[2] ), gLightOrg, diskR );
 					};

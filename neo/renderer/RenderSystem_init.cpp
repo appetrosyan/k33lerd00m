@@ -1199,6 +1199,70 @@ bool R_ReadPixelsR32F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrh
 	return true;
 }
 
+// like R_ReadPixelsR32F but keeps all four channels (used by the soft-shadow gate to read the exact
+// softpos receiver world position - the point the shipped shader actually shaded)
+bool R_ReadPixelsRGBA32F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, float** pic, int picWidth, int picHeight )
+{
+	nvrhi::TextureDesc desc = texture->getDesc();
+
+	nvrhi::CommandListHandle commandList = device->createCommandList();
+	commandList->open();
+
+	if( textureState != nvrhi::ResourceStates::Unknown )
+	{
+		commandList->beginTrackingTextureState( texture, nvrhi::TextureSubresourceSet( 0, 1, 0, 1 ), textureState );
+	}
+
+	desc.format = nvrhi::Format::RGBA32_FLOAT;
+	desc.isRenderTarget = true;
+	desc.isTypeless = false;
+	desc.initialState = nvrhi::ResourceStates::RenderTarget;
+	desc.keepInitialState = true;
+
+	nvrhi::TextureHandle tempTexture = device->createTexture( desc );
+	nvrhi::FramebufferHandle tempFramebuffer = device->createFramebuffer( nvrhi::FramebufferDesc().addColorAttachment( tempTexture ) );
+	pPasses->BlitTexture( commandList, tempFramebuffer, texture );
+
+	nvrhi::StagingTextureHandle stagingTexture = device->createStagingTexture( desc, nvrhi::CpuAccessMode::Read );
+	commandList->copyTexture( stagingTexture, nvrhi::TextureSlice(), tempTexture, nvrhi::TextureSlice() );
+
+	if( textureState != nvrhi::ResourceStates::Unknown )
+	{
+		commandList->setTextureState( texture, nvrhi::TextureSubresourceSet( 0, 1, 0, 1 ), textureState );
+		commandList->commitBarriers();
+	}
+
+	commandList->close();
+	device->executeCommandList( commandList );
+
+	size_t rowPitch = 0;
+	void* pData = device->mapStagingTexture( stagingTexture, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, &rowPitch );
+	if( !pData )
+	{
+		return false;
+	}
+
+	float* out = ( float* )R_StaticAlloc( ( size_t )picWidth * picHeight * 4 * sizeof( float ) );
+	*pic = out;
+	const char* base = static_cast<const char*>( pData );
+	const int rows = Min( ( int )desc.height, picHeight );
+	const int cols = Min( ( int )desc.width, picWidth );
+	for( int y = 0; y < rows; y++ )
+	{
+		const float* row = reinterpret_cast<const float*>( base + ( size_t )y * rowPitch );
+		for( int x = 0; x < cols; x++ )
+		{
+			out[( y * picWidth + x ) * 4 + 0] = row[x * 4 + 0];
+			out[( y * picWidth + x ) * 4 + 1] = row[x * 4 + 1];
+			out[( y * picWidth + x ) * 4 + 2] = row[x * 4 + 2];
+			out[( y * picWidth + x ) * 4 + 3] = row[x * 4 + 3];
+		}
+	}
+
+	device->unmapStagingTexture( stagingTexture );
+	return true;
+}
+
 /*
 ==================
 R_CaptureHDRScreenshot

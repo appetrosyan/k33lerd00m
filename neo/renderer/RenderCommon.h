@@ -1420,6 +1420,8 @@ NVRHI helpers
 bool R_ReadPixelsRGB8( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, const char* fullname );
 bool R_ReadPixelsRGB16F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, byte** pic, int picWidth, int picHeight, bool filterCorruption = true );
 bool R_ReadPixelsR32F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, float** pic, int picWidth, int picHeight );
+// like R_ReadPixelsR32F but keeps all four channels (4 floats/pixel, xyzw interleaved) - RGBA32F sources
+bool R_ReadPixelsRGBA32F( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrhi::ITexture* texture, nvrhi::ResourceStates textureState, float** pic, int picWidth, int picHeight );
 
 // writes the current FP16 scene buffer (pre-tonemap linear HDR) to screenshots/<baseName>.exr
 void R_CaptureHDRScreenshot( const char* baseName );
