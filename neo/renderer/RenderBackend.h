@@ -430,6 +430,25 @@ private:
 	// light's draws and consumed where rpUser6 is written: ofsX < 0 = no term => in-shader integral
 	int								currentSoftTermOfsX;
 	int								currentSoftTermOfsY;
+	// batched soft-shadow compute results (DispatchSoftShadowComputePhases, run in DrawViewInternal
+	// right after the softpos fill): one entry per soft light, looked up in DrawInteractions'
+	// light loop. With r_softShadowAsyncCompute the phases record onto softComputeCL and run on
+	// the ASYNC COMPUTE queue, overlapping the ambient/SSAO/shadow-atlas raster between the
+	// softpos fill and the light loop; the frame-end graphics submission waits on them.
+	struct softTileBinResult_t
+	{
+		const viewLight_t* vLight;
+		int base, ox, oy, tilesX;
+	};
+	struct softTermResult_t
+	{
+		const viewLight_t* vLight;
+		int ofsX, ofsY;
+	};
+	idStaticList<softTileBinResult_t, 256>	softTileBins;
+	idStaticList<softTermResult_t, 12>		softTerms;		// 12 = SoftShadowTermPass::SLOT_COLS * SLOT_ROWS
+	nvrhi::CommandListHandle		softComputeCL;			// async-queue command list, created lazily
+	void							DispatchSoftShadowComputePhases();
 	HdrGuiCompositePass*			hdrGuiCompositePass;
 	MipMapGenPass*					hiZGenPass;
 	TonemapPass*					toneMapPass;

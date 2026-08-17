@@ -867,9 +867,17 @@ bool DeviceManager_VK::findQueueFamilies( vk::PhysicalDevice physicalDevice, vk:
 		}
 	}
 
+	// the async compute queue is an OPTIMISATION, not a requirement: hardware without a
+	// dedicated compute family (no compute-without-graphics queue) just loses the async path
+	// (r_softShadowAsyncCompute self-disables when the device has no compute queue) instead of
+	// rejecting the whole physical device.
+	if( m_ComputeQueueFamily == -1 && m_DeviceParams.enableComputeQueue )
+	{
+		m_DeviceParams.enableComputeQueue = false;
+	}
+
 	if( m_GraphicsQueueFamily == -1 ||
 			m_PresentQueueFamily == -1 ||
-			( m_ComputeQueueFamily == -1 && m_DeviceParams.enableComputeQueue ) ||
 			( m_TransferQueueFamily == -1 && m_DeviceParams.enableCopyQueue ) )
 	{
 		return false;
@@ -1347,6 +1355,10 @@ bool DeviceManager_VK::CreateDeviceAndSwapChain()
 	// RB: control these through the cmdline
 	m_DeviceParams.enableNvrhiValidationLayer = r_useValidationLayers.GetInteger() > 0;
 	m_DeviceParams.enableDebugRuntime = r_useValidationLayers.GetInteger() > 1;
+	// async compute queue for the soft-shadow bin/term dispatches (r_softShadowAsyncCompute):
+	// created unconditionally when the hardware has a family for it - one extra VkQueue is free,
+	// and resources then get CONCURRENT sharing from boot so the queue can be used at any time.
+	m_DeviceParams.enableComputeQueue = true;
 
 	// SRS - DynamicLoader is in a separate namespace in newer versions of Vulkan-Hpp
 #if VK_HEADER_VERSION >= 301

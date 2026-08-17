@@ -4705,6 +4705,203 @@ void idRenderBackend::StencilSelectLight( const viewLight_t* vLight )
 
 /*
 ==================
+idRenderBackend::DispatchSoftShadowComputePhases
+
+Batched soft-shadow compute: the shared depth min/max reduce + per-light tile-bin dispatches
+(r_softShadowTileBin) and the per-light coverage-term dispatches (r_softShadowCompute). Runs in
+DrawViewInternal right after the softpos fill - everything it reads (scene depth, the exact-
+position G-buffer, the frame's edge streams in mapped vertex-cache memory) is complete there.
+Results land in the softTileBins / softTerms member lists for DrawInteractions' light loop.
+
+r_softShadowAsyncCompute: record the phases on softComputeCL and run them on the ASYNC COMPUTE
+queue instead - the graphics work recorded so far is submitted early, the compute queue waits on
+that submission, and the graphics queue's NEXT submission (frame end) waits on the compute
+instance. The dispatches then overlap the ambient/SSAO/shadow-atlas raster that sits between the
+softpos fill and the light loop. Self-disables without a device compute queue.
+==================
+*/
+void idRenderBackend::DispatchSoftShadowComputePhases()
+{
+	softTileBins.Clear();
+	softTerms.Clear();
+
+	extern idCVar r_softShadowTileBin;
+	extern idCVar r_softShadowCompute;
+	extern idCVar r_softShadowFaceCoverage;
+	extern idCVar r_softShadowAsyncCompute;
+	extern idCVar r_shadowPenumbraSize;
+
+	const bool face = r_softShadowFaceCoverage.GetBool() && r_useSoftShadowVolumes.GetBool();
+	const bool wantBins = face && softTileBinPass != NULL && r_softShadowTileBin.GetBool();
+	const bool wantTerms = face && softShadowTermPass != NULL && r_softShadowCompute.GetBool();
+	if( !wantBins && !wantTerms )
+	{
+		return;
+	}
+
+	nvrhi::IDevice* dev = deviceManager->GetDevice();
+	const bool async = r_softShadowAsyncCompute.GetBool() && dev->queryFeatureSupport( nvrhi::Feature::ComputeQueue );
+
+	nvrhi::ICommandList* target = commandList;
+	uint64 gInstance = 0;
+	if( async )
+	{
+		// submit the graphics work recorded so far (depth prepass + softpos fill) so the compute
+		// queue has real work to overlap; the graphics command list reopens and keeps recording.
+		commandList->close();
+		gInstance = dev->executeCommandList( commandList );
+		commandList->open();
+		if( softComputeCL == nullptr )
+		{
+			// enableImmediateExecution false: nvrhi allows only ONE immediate command list open at
+			// a time, and the main graphics CL is it - this one records deferred and is executed
+			// explicitly on the compute queue below.
+			softComputeCL = dev->createCommandList( nvrhi::CommandListParameters()
+								.setQueueType( nvrhi::CommandQueue::Compute )
+								.setEnableImmediateExecution( false ) );
+		}
+		softComputeCL->open();
+		target = softComputeCL;
+	}
+
+	// ---- tile binning: one shared depth min/max reduce + N bin dispatches ----
+	if( wantBins )
+	{
+		softTileBinPass->BeginView( target, viewDef,
+									( nvrhi::ITexture* )globalImages->currentDepthImage->GetTextureID() );
+		for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
+		{
+			if( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() )
+			{
+				continue;
+			}
+			if( vLight->softEdgeCount <= 0 || vLight->softPairCount <= 0 || softTileBins.Num() >= 256 )
+			{
+				continue;
+			}
+			const vertCacheHandle_t eh = vLight->softEdgeCache;
+			const vertCacheHandle_t ph = vLight->softPairCache;
+			const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+			const uint pairOfs = ( uint )( ( ph >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+			nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+			softTileBinResult_t r;
+			r.vLight = vLight;
+			r.ox = r.oy = r.tilesX = 0;
+			r.base = softTileBinPass->BinLight(
+						 target, viewDef, vLight,
+						 joint, edgeOfs / 16u,		// edge base in float4 elements
+						 joint, pairOfs / 4u,		// pair base in uint elements
+						 vLight->softPairCount,
+						 r_shadowPenumbraSize.GetFloat(),
+						 r.ox, r.oy, r.tilesX );
+			if( r.base >= 0 )
+			{
+				softTileBins.Append( r );
+			}
+		}
+	}
+
+	// ---- coverage terms: per-light dispatches consuming the tile lists above ----
+	if( wantTerms && softShadowTermPass->BeginView( target, viewDef,
+			( nvrhi::ITexture* )globalImages->softShadowPosImage->GetTextureID() ) )
+	{
+		for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
+		{
+			if( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() )
+			{
+				continue;
+			}
+			if( vLight->softEdgeCount <= 0 )
+			{
+				continue;
+			}
+			// this light's tile-binning result from the phase above; base -1 = full walk in-shader
+			int tileBase = -1, tileOx = 0, tileOy = 0, tileTilesX = 0;
+			for( int sb = 0; sb < softTileBins.Num(); sb++ )
+			{
+				if( softTileBins[sb].vLight == vLight )
+				{
+					tileBase   = softTileBins[sb].base;
+					tileOx     = softTileBins[sb].ox;
+					tileOy     = softTileBins[sb].oy;
+					tileTilesX = softTileBins[sb].tilesX;
+					break;
+				}
+			}
+			const vertCacheHandle_t eh = vLight->softEdgeCache;
+			const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+			nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+
+			// coverage early-out eligibility: the CS can mirror the FS's falloff-first zero
+			// test only when ONE static plane set represents the light - a single stage with
+			// no stage texture matrix. Multi-stage / matrixed lights (rare) and any active
+			// debug shader (the anaTerm-hash instrument needs the full field) integrate the
+			// whole rect instead - always correct, just unskipped.
+			extern idCVar r_softShadowDebugShader;
+			idImage* swProjImg = NULL;
+			bool swEarly = ( r_softShadowDebugShader.GetInteger() == 0 ) && ( vLight->falloffImage != NULL );
+			if( swEarly && vLight->lightShader != NULL && vLight->lightShader->GetNumStages() == 1 )
+			{
+				const shaderStage_t* swStage = vLight->lightShader->GetStage( 0 );
+				if( swStage->texture.image != NULL && !swStage->texture.hasMatrix )
+				{
+					swProjImg = swStage->texture.image;
+				}
+			}
+			swEarly = swEarly && ( swProjImg != NULL );
+
+			softTermResult_t t;
+			t.vLight = vLight;
+			t.ofsX = t.ofsY = -1;
+			if( softShadowTermPass->AddLight(
+						target, viewDef, vLight,
+						joint, edgeOfs / 16u,		// edge base in float4 elements
+						vLight->softEdgeCount,		// face-stream record count (FS swN)
+						r_shadowPenumbraSize.GetFloat(),
+						tileBase, tileOx, tileOy, tileTilesX,
+						( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
+						swEarly ? ( nvrhi::ITexture* )vLight->falloffImage->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
+						swEarly ? ( nvrhi::ISampler* )vLight->falloffImage->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
+						swEarly ? ( nvrhi::ITexture* )swProjImg->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
+						swEarly ? ( nvrhi::ISampler* )swProjImg->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
+						swEarly,
+						t.ofsX, t.ofsY ) )
+			{
+				softTerms.Append( t );
+			}
+		}
+	}
+
+	if( async )
+	{
+		// hand the consumers' states over explicitly: the graphics light loop binds the tile
+		// lists (t13) and term atlas (t14) as SRVs, and cross-queue automatic transitions are
+		// exactly the hazard class that has bitten before - transition on the producing queue.
+		if( softTileBinPass != NULL && softTileBinPass->GetTileBuffer() != nullptr )
+		{
+			softComputeCL->setBufferState( softTileBinPass->GetTileBuffer(), nvrhi::ResourceStates::ShaderResource );
+		}
+		if( softShadowTermPass != NULL && softShadowTermPass->GetTermTexture() != nullptr )
+		{
+			softComputeCL->setTextureState( softShadowTermPass->GetTermTexture(), nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+		}
+		softComputeCL->commitBarriers();
+		softComputeCL->close();
+		dev->queueWaitForCommandList( nvrhi::CommandQueue::Compute, nvrhi::CommandQueue::Graphics, gInstance );
+		const uint64 cInstance = dev->executeCommandList( softComputeCL, nvrhi::CommandQueue::Compute );
+		// the NEXT graphics submission (frame end) consumes the lists/terms - make it wait
+		dev->queueWaitForCommandList( nvrhi::CommandQueue::Graphics, nvrhi::CommandQueue::Compute, cInstance );
+	}
+	else
+	{
+		// compute dispatches on the graphics command list invalidate nvrhi's cached graphics
+		// state (same caveat as the RT mask dispatch): force the next draw to fully re-set.
+		currentPipeline = nullptr;
+	}
+}
+
+/*
+==================
 idRenderBackend::DrawInteractions
 ==================
 */
@@ -4736,152 +4933,10 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 
 	Framebuffer* previousFramebuffer = Framebuffer::GetActiveFramebuffer();
 
-	// Analytic soft shadows, TILE BINNING (r_softShadowTileBin): bin EVERY soft light's face stream
-	// up front as one batched compute phase - one shared depth min/max reduce + N bin dispatches +
-	// a single compute->graphics transition, instead of a pipeline bubble inside the light loop per
-	// light (and instead of re-reducing the same tile depths once per light). Results are looked up
-	// per light below and fed to the pixel shader via rpUser7.
-	struct softTileBinResult_t
-	{
-		const viewLight_t* vLight;
-		int base, ox, oy, tilesX;
-	};
-	idStaticList<softTileBinResult_t, 256> softTileBins;
-	{
-		extern idCVar r_softShadowTileBin;
-		extern idCVar r_softShadowFaceCoverage;
-		if( softTileBinPass != NULL && r_softShadowTileBin.GetBool() && r_softShadowFaceCoverage.GetBool()
-				&& r_useSoftShadowVolumes.GetBool() )
-		{
-			extern idCVar r_shadowPenumbraSize;
-			softTileBinPass->BeginView( commandList, viewDef,
-										( nvrhi::ITexture* )globalImages->currentDepthImage->GetTextureID() );
-			for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
-			{
-				if( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() )
-				{
-					continue;
-				}
-				if( vLight->softEdgeCount <= 0 || vLight->softPairCount <= 0 || softTileBins.Num() >= 256 )
-				{
-					continue;
-				}
-				const vertCacheHandle_t eh = vLight->softEdgeCache;
-				const vertCacheHandle_t ph = vLight->softPairCache;
-				const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
-				const uint pairOfs = ( uint )( ( ph >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
-				nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
-				softTileBinResult_t r;
-				r.vLight = vLight;
-				r.ox = r.oy = r.tilesX = 0;
-				r.base = softTileBinPass->BinLight(
-							 commandList, viewDef, vLight,
-							 joint, edgeOfs / 16u,		// edge base in float4 elements
-							 joint, pairOfs / 4u,		// pair base in uint elements
-							 vLight->softPairCount,
-							 r_shadowPenumbraSize.GetFloat(),
-							 r.ox, r.oy, r.tilesX );
-				if( r.base >= 0 )
-				{
-					softTileBins.Append( r );
-				}
-			}
-			// compute dispatches invalidate nvrhi's graphics state (same caveat as the RT mask
-			// dispatch): force the pipeline cache dirty so the next draw fully re-sets.
-			currentPipeline = nullptr;
-		}
-	}
-
-	// Analytic soft shadows, COMPUTE DECOUPLING (r_softShadowCompute): evaluate every soft light's
-	// coverage integral as one batched compute phase (after the tile binning above, whose lists the
-	// term shader consumes) into the R32F term atlas, so the interaction pixel shader just Loads
-	// its light's term texel via rpUser6 instead of integrating per fragment in wave64. Lights the
-	// pass rejects (out of atlas slots / pass unavailable) simply stay on the in-shader integral -
-	// bit-exact either way by design.
-	struct softTermResult_t
-	{
-		const viewLight_t* vLight;
-		int ofsX, ofsY;
-	};
-	idStaticList<softTermResult_t, SoftShadowTermPass::SLOT_COLS* SoftShadowTermPass::SLOT_ROWS> softTerms;
-	{
-		extern idCVar r_softShadowCompute;
-		extern idCVar r_softShadowFaceCoverage;
-		if( softShadowTermPass != NULL && r_softShadowCompute.GetBool() && r_softShadowFaceCoverage.GetBool()
-				&& r_useSoftShadowVolumes.GetBool()
-				&& softShadowTermPass->BeginView( commandList, viewDef,
-						( nvrhi::ITexture* )globalImages->softShadowPosImage->GetTextureID() ) )
-		{
-			extern idCVar r_shadowPenumbraSize;
-			for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )
-			{
-				if( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() )
-				{
-					continue;
-				}
-				if( vLight->softEdgeCount <= 0 )
-				{
-					continue;
-				}
-				// this light's tile-binning result from the phase above; base -1 = full walk in-shader
-				int tileBase = -1, tileOx = 0, tileOy = 0, tileTilesX = 0;
-				for( int sb = 0; sb < softTileBins.Num(); sb++ )
-				{
-					if( softTileBins[sb].vLight == vLight )
-					{
-						tileBase   = softTileBins[sb].base;
-						tileOx     = softTileBins[sb].ox;
-						tileOy     = softTileBins[sb].oy;
-						tileTilesX = softTileBins[sb].tilesX;
-						break;
-					}
-				}
-				const vertCacheHandle_t eh = vLight->softEdgeCache;
-				const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
-				nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
-
-				// coverage early-out eligibility: the CS can mirror the FS's falloff-first zero
-				// test only when ONE static plane set represents the light - a single stage with
-				// no stage texture matrix. Multi-stage / matrixed lights (rare) and any active
-				// debug shader (the anaTerm-hash instrument needs the full field) integrate the
-				// whole rect instead - always correct, just unskipped.
-				extern idCVar r_softShadowDebugShader;
-				idImage* swProjImg = NULL;
-				bool swEarly = ( r_softShadowDebugShader.GetInteger() == 0 ) && ( vLight->falloffImage != NULL );
-				if( swEarly && vLight->lightShader != NULL && vLight->lightShader->GetNumStages() == 1 )
-				{
-					const shaderStage_t* swStage = vLight->lightShader->GetStage( 0 );
-					if( swStage->texture.image != NULL && !swStage->texture.hasMatrix )
-					{
-						swProjImg = swStage->texture.image;
-					}
-				}
-				swEarly = swEarly && ( swProjImg != NULL );
-
-				softTermResult_t t;
-				t.vLight = vLight;
-				t.ofsX = t.ofsY = -1;
-				if( softShadowTermPass->AddLight(
-							commandList, viewDef, vLight,
-							joint, edgeOfs / 16u,		// edge base in float4 elements
-							vLight->softEdgeCount,		// face-stream record count (FS swN)
-							r_shadowPenumbraSize.GetFloat(),
-							tileBase, tileOx, tileOy, tileTilesX,
-							( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
-							swEarly ? ( nvrhi::ITexture* )vLight->falloffImage->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
-							swEarly ? ( nvrhi::ISampler* )vLight->falloffImage->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
-							swEarly ? ( nvrhi::ITexture* )swProjImg->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
-							swEarly ? ( nvrhi::ISampler* )swProjImg->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
-							swEarly,
-							t.ofsX, t.ofsY ) )
-				{
-					softTerms.Append( t );
-				}
-			}
-			// compute dispatches invalidate nvrhi's graphics state: force a full re-set on the next draw
-			currentPipeline = nullptr;
-		}
-	}
+	// Tile-bin lists and precomputed coverage terms were dispatched by
+	// DispatchSoftShadowComputePhases (DrawViewInternal, right after the softpos fill - possibly
+	// on the ASYNC COMPUTE queue); their per-light results are looked up from the softTileBins /
+	// softTerms members inside the light loop below and fed to the pixel shader via rpUser7/rpUser6.
 
 	// Ray-traced shadows: the world TLAS was built and rtShadowsActiveThisView set in
 	// DrawViewInternal, BEFORE the shadow-map atlas pass, so the atlas could skip the
@@ -4975,6 +5030,22 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				currentSoftTermOfsX = softTerms[st].ofsX;
 				currentSoftTermOfsY = softTerms[st].ofsY;
 				break;
+			}
+		}
+
+		// path provenance (backEndCounters_t doc): record which evaluation path this light's
+		// term actually takes, so the bench can print it - a silent fallback is a perf leak
+		// the correctness gate can never see.
+		if( vLight->softEdgeCount > 0 )
+		{
+			pc.c_softLightsTotal++;
+			if( currentSoftTermOfsX >= 0 )
+			{
+				pc.c_softLightsTerm++;
+			}
+			if( currentSoftTileBase >= 0 )
+			{
+				pc.c_softLightsBinned++;
 			}
 		}
 
@@ -7331,6 +7402,12 @@ void idRenderBackend::DrawViewInternal( const viewDef_t* _viewDef, const int ste
 	if( is3D )
 	{
 		FillSoftShadowPosBuffer( drawSurfs, numDrawSurfs );
+
+		// batched soft-shadow compute (tile bins + coverage terms): everything it needs (depth,
+		// exact positions, the frame's mapped edge streams) is complete here, and hoisting it out
+		// of DrawInteractions lets r_softShadowAsyncCompute overlap it with the HiZ/ambient/SSAO/
+		// shadow-atlas work below on the async compute queue.
+		DispatchSoftShadowComputePhases();
 	}
 
 	//-------------------------------------------------
