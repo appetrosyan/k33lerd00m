@@ -207,11 +207,16 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 		return -1;
 	}
 
-	// tile rect over the light's scissor, in ABSOLUTE screen pixels (SV_Position space)
+	// tile rect over the light's scissor, in ABSOLUTE screen pixels (SV_Position space).
+	// scissorRect is GL-convention (origin bottom-left); SV_Position is top-down, so Y flips
+	// against viewport.y2 - the EXACT mapping RenderInteractions feeds GL_Scissor. The old
+	// unflipped mapping placed the rect mirrored for every non-fullscreen light: the bins
+	// landed off the light's true pixels, and the FS's out-of-rect fallback silently walked
+	// the full stream (bit-exact, which is why the gate never saw it - only the bench paid).
 	const int px1 = viewDef->viewport.x1 + vLight->scissorRect.x1;
-	const int py1 = viewDef->viewport.y1 + vLight->scissorRect.y1;
+	const int py1 = viewDef->viewport.y2 - vLight->scissorRect.y2;
 	const int px2 = viewDef->viewport.x1 + vLight->scissorRect.x2;
-	const int py2 = viewDef->viewport.y1 + vLight->scissorRect.y2;
+	const int py2 = viewDef->viewport.y2 - vLight->scissorRect.y1;
 	if( px2 < px1 || py2 < py1 )
 	{
 		return -1;
