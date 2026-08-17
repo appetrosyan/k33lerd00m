@@ -4839,6 +4839,25 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				const vertCacheHandle_t eh = vLight->softEdgeCache;
 				const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
 				nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+
+				// coverage early-out eligibility: the CS can mirror the FS's falloff-first zero
+				// test only when ONE static plane set represents the light - a single stage with
+				// no stage texture matrix. Multi-stage / matrixed lights (rare) and any active
+				// debug shader (the anaTerm-hash instrument needs the full field) integrate the
+				// whole rect instead - always correct, just unskipped.
+				extern idCVar r_softShadowDebugShader;
+				idImage* swProjImg = NULL;
+				bool swEarly = ( r_softShadowDebugShader.GetInteger() == 0 ) && ( vLight->falloffImage != NULL );
+				if( swEarly && vLight->lightShader != NULL && vLight->lightShader->GetNumStages() == 1 )
+				{
+					const shaderStage_t* swStage = vLight->lightShader->GetStage( 0 );
+					if( swStage->texture.image != NULL && !swStage->texture.hasMatrix )
+					{
+						swProjImg = swStage->texture.image;
+					}
+				}
+				swEarly = swEarly && ( swProjImg != NULL );
+
 				softTermResult_t t;
 				t.vLight = vLight;
 				t.ofsX = t.ofsY = -1;
@@ -4849,6 +4868,11 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 							r_shadowPenumbraSize.GetFloat(),
 							tileBase, tileOx, tileOy, tileTilesX,
 							( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
+							swEarly ? ( nvrhi::ITexture* )vLight->falloffImage->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
+							swEarly ? ( nvrhi::ISampler* )vLight->falloffImage->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
+							swEarly ? ( nvrhi::ITexture* )swProjImg->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
+							swEarly ? ( nvrhi::ISampler* )swProjImg->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
+							swEarly,
 							t.ofsX, t.ofsY ) )
 				{
 					softTerms.Append( t );

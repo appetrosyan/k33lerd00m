@@ -28,9 +28,11 @@ struct viewLight_t;
 // depth-EQUAL - never reconstructed from depth) and the SoftTileBinPass tile lists, writing the
 // visibility term into an R32F atlas of screen-size slots (one per light). The interaction pixel
 // shader then Loads its light's term texel (rpUser6 selects mode + slot offset) instead of running
-// the integral per fragment in wave64. 32-thread workgroups (8x4) so RDNA3 can pick wave32 (VOPD
-// dual-issue); this vendored nvrhi exposes no VK_EXT_subgroup_size_control, so the wave size is
-// ultimately the driver's choice.
+// the integral per fragment in wave64. 32-thread workgroups (8x4) so RDNA3 picks wave32 (VOPD
+// dual-issue) - VERIFIED 2026-08-17 in the final ISA (s_and_saveexec_b32 exec masks, v_dual_*
+// pairs through the packed-fp16 sample loop); this vendored nvrhi exposes no
+// VK_EXT_subgroup_size_control, so this rides RADV's small-workgroup heuristic rather than an
+// explicit requirement - re-verify the disasm if the driver or workgroup size ever changes.
 // Everything is conservative: no pipeline / atlas too large for the device / out of slots => the
 // caller leaves the light on the in-shader integral (bit-exact by design either way).
 class SoftShadowTermPass
@@ -50,11 +52,17 @@ public:
 	// not binned => the shader runs the full walk - bit-exact fallback, same as the pixel shader).
 	// On success fills the slot's pixel offset (add to SV_Position to address the atlas) and
 	// returns true; false = out of slots (light stays on the in-shader integral).
+	// falloffTex/projTex + their samplers drive the coverage early-out (the fix for the measured
+	// 1.8x scissor-overcoverage loss); coverageEarlyOut false (debug shaders active, multi-stage
+	// light shader, stage texture matrix) integrates the full rect - the bit-exact instrument mode.
 	bool AddLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
 				   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem, int faceCount,
 				   float penumbraRadius,
 				   int tileBase, int tileOx, int tileOy, int tilesX,
 				   nvrhi::IBuffer* tileBuffer,
+				   nvrhi::ITexture* falloffTex, nvrhi::ISampler* falloffSamp,
+				   nvrhi::ITexture* projTex, nvrhi::ISampler* projSamp,
+				   bool coverageEarlyOut,
 				   int& outOfsX, int& outOfsY );
 
 	nvrhi::ITexture* GetTermTexture() const

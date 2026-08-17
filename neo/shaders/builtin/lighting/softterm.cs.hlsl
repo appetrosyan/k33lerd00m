@@ -41,6 +41,13 @@ StructuredBuffer<uint>		t_SoftTiles	: register( t1 );	// per-tile triangle lists
 #include "softwedge_coverage.inc.hlsl"
 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
+// this light's falloff/projection textures (the same ones the interaction PS samples): the
+// COVERAGE early-out below skips the integral where their product is exactly zero. Bound to
+// black + any sampler when g_flags.x == 0 (early-out ineligible/disabled).
+Texture2D<float4>			t_Falloff	: register( t3 );
+Texture2D<float4>			t_Proj		: register( t4 );
+SamplerState				s_Falloff	: register( s0 );	// the falloff image's OWN sampler (zero-clamp border preserved)
+SamplerState				s_Proj		: register( s1 );	// the projection image's OWN sampler
 RWTexture2D<float>			u_Term		: register( u0 );	// R32F term atlas, one screen-size slot per light
 
 cbuffer c_Term : register( b0 )
@@ -49,6 +56,14 @@ cbuffer c_Term : register( b0 )
 	int4	g_range;	// firstElem (edge float4 base), faceCount (records), tileBase | -1, tilesX
 	int4	g_tile;		// tile origin x, y (in tiles), atlas slot offset x, y (in pixels)
 	int4	g_rect;		// scissor origin x, y (absolute pixels), width, height
+	float4	g_falloffS;	// WORLD-space light falloff plane (vLight->lightProject[3])
+	float4	g_projS;	// WORLD-space light projection planes (vLight->lightProject[0..2]);
+	float4	g_projT;	//   the VS folds these into model space per surface - plane . worldPos
+	float4	g_projQ;	//   yields the same texcoord value the PS's idtex2Dproj consumes
+	int4	g_flags;	// x: 1 = coverage early-outs enabled (0 under debug shaders so the
+						//    anaTerm-hash instrument stays full-field, and for lights the CPU
+						//    could not qualify: multi-stage light shaders / stage texture
+						//    matrices, where one static plane set cannot represent the stages)
 };
 // *INDENT-ON*
 
@@ -63,9 +78,42 @@ void main( uint3 tid : SV_DispatchThreadID )
 
 	// EXACT receiver position (same value the interaction PS computes from texcoord7 x model
 	// matrix; softpos.ps stored it at float32). Pixels never rasterised by the position pass
-	// (sky, translucent-only) hold the clear value; the interaction shader never reads the term
-	// there (translucent draws keep the in-shader integral, sky draws no soft interaction).
-	const float3 swP = t_WorldPos.Load( int3( px, 0 ) ).xyz;
+	// (sky, translucent-only) hold the clear value (w == 0); the interaction shader never reads
+	// the term there (translucent draws keep the in-shader integral, sky draws no soft
+	// interaction), so writing 1.0 and skipping the integral is free.
+	const float4 swPos = t_WorldPos.Load( int3( px, 0 ) );
+	const float3 swP = swPos.xyz;
+
+	// COVERAGE EARLY-OUTS - the fix for the measured 1.8x loss of the first compute-decoupling
+	// cut (see r_softShadowCompute help): the fragment path pays only for pixels that survive
+	// depth/scissor/stencil culling AND its falloff-first zero test, while this dispatch covers
+	// the whole scissor rect. Mirror both tests here so the covered pixel sets converge.
+	// Skipped pixels WRITE 1.0 (never a bare return): the interaction PS may still Load any
+	// pixel inside the scissor - on the exact-zero boundary its own interpolated falloff sample
+	// can disagree with ours in the last bit, and 1.0 x (a contribution of exactly ~0) is the
+	// value the falloff-first FS path produces there anyway.
+	if( g_flags.x != 0 )
+	{
+		bool swSkip = ( swPos.w == 0.0f );				// never rasterised: no receiver here
+		if( !swSkip )
+		{
+			const float4 swWP = float4( swP.x, swP.y, swP.z, 1.0f );
+			const float  swPw = dot( swWP, g_projQ );
+			if( swPw > 0.0f )							// behind the projection apex: keep the integral (conservative)
+			{
+				float2 swFuv = float2( dot( swWP, g_falloffS ), 0.5f );
+				float2 swPuv = float2( dot( swWP, g_projS ), dot( swWP, g_projT ) ) / swPw;
+				float4 swFall = t_Falloff.SampleLevel( s_Falloff, swFuv, 0 );
+				float4 swProj = t_Proj.SampleLevel( s_Proj, swPuv, 0 );
+				swSkip = ( max( max( swProj.x * swFall.x, swProj.y * swFall.y ), swProj.z * swFall.z ) <= 0.0f );
+			}
+		}
+		if( swSkip )
+		{
+			u_Term[ uint2( px + g_tile.zw ) ] = 1.0f;
+			return;
+		}
+	}
 
 	const float3 swL = g_lightR.xyz;
 	const float  swR = max( g_lightR.w, 1e-2 );
