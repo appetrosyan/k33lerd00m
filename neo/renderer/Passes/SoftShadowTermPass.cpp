@@ -51,6 +51,7 @@ void SoftShadowTermPass::EnsurePipeline()
 	m_PipelineTried = true;
 
 	idList<shaderMacro_t> macros;
+	macros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// shipped permutation (must be explicit now the cfg declares {0,1})
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
 	{
@@ -80,6 +81,38 @@ void SoftShadowTermPass::EnsurePipeline()
 	pd.CS = m_Shader;
 	m_Pipeline = m_Device->createComputePipeline( pd );
 
+	// WALK-ATTRIBUTION counting permutation: same shader with -D SW_GPU_WALK_COUNTERS=1 (adds a u1
+	// counter UAV). Separate layout+pipeline so the shipped pipeline stays byte-identical; used only
+	// when r_softShadowWalkCounters is set. Failure here is non-fatal (counters just unavailable).
+	{
+		idList<shaderMacro_t> cntMacros;
+		cntMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "1" ) );
+		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
+		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
+		// blob path (LoadShader keys the .bin on shader.name only) - it forces a separate entry whose
+		// macros make FindPermutationInBlob select the =1 variant.
+		m_ShaderCnt = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, "walkcnt", cntMacros, true, LAYOUT_DRAW_VERT ) );
+		if( m_ShaderCnt != nullptr )
+		{
+			nvrhi::BindingLayoutDesc lc = ld;
+			lc.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 1 ) );	// u1 : walk counters
+			m_LayoutCnt = m_Device->createBindingLayout( lc );
+			nvrhi::ComputePipelineDesc pc;
+			pc.bindingLayouts = { m_LayoutCnt };
+			pc.CS = m_ShaderCnt;
+			m_PipelineCnt = m_Device->createComputePipeline( pc );
+
+			nvrhi::BufferDesc wc;
+			wc.byteSize = 8 * sizeof( uint32_t );
+			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
+			wc.canHaveUAVs = true;
+			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;
+			wc.keepInitialState = true;
+			wc.debugName = "SoftShadowTerm/WalkCounters";
+			m_WalkCntBuffer = m_Device->createBuffer( wc );
+		}
+	}
+
 	nvrhi::BufferDesc cb;
 	cb.byteSize = sizeof( SoftTermCB );
 	cb.isConstantBuffer = true;
@@ -92,8 +125,17 @@ void SoftShadowTermPass::EnsurePipeline()
 bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* worldPosTexture, nvrhi::ITexture* worldNormalTexture )
 {
 	m_Cursor = 0;
+	m_ShelfX = m_ShelfY = m_ShelfH = 0;	// reset the scissor packer for this view
 	m_Valid = false;
 	m_WorldPos = worldPosTexture;
+	// walk-attribution counting: snapshot the cvar; clear the counter buffer so this view's totals
+	// start at zero. Only active when the counting pipeline built (m_PipelineCnt).
+	extern idCVar r_softShadowWalkCounters;
+	m_WalkCntEnabled = r_softShadowWalkCounters.GetBool() && m_PipelineCnt != nullptr && m_WalkCntBuffer != nullptr;
+	if( m_WalkCntEnabled )
+	{
+		commandList->clearBufferUInt( m_WalkCntBuffer, 0 );		// same as the spill counter's proven clear
+	}
 	m_WorldNormal = worldNormalTexture;
 	EnsurePipeline();
 	if( m_Pipeline == nullptr || worldPosTexture == nullptr )
@@ -160,16 +202,6 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	{
 		return false;
 	}
-	if( m_Cursor >= SLOT_COLS * SLOT_ROWS )
-	{
-		extern idCVar r_rtAccelDebug;
-		if( r_rtAccelDebug.GetBool() )
-		{
-			common->Printf( "SoftShadowTerm: OUT OF SLOTS (%d), light keeps the in-shader integral\n", m_Cursor );
-		}
-		return false;						// out of slots: the light stays on the in-shader integral
-	}
-
 	// light scissor in ABSOLUTE screen pixels (SV_Position space) - same mapping as BinLight:
 	// scissorRect is GL-convention (bottom-up), SV_Position is top-down => Y flips against
 	// viewport.y2. The old unflipped mapping wrote the term into a MIRRORED rect for every
@@ -184,9 +216,46 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		return false;
 	}
 
-	const int slot = m_Cursor++;
-	const int slotOfsX = ( slot % SLOT_COLS ) * m_SlotW;
-	const int slotOfsY = ( slot / SLOT_COLS ) * m_SlotH;
+	// SCISSOR-PACK the atlas (replaces the fixed full-screen grid): place this light's scissor-sized
+	// rect on a shelf. Total lit area across a frame's soft lights is ~3-7x screen (measured), so a
+	// COLS*ROWS-screen atlas holds far more than COLS*ROWS lights when scissors are sub-screen - the
+	// "many small lights" rooms that previously spilled the excess onto the wave64 in-shader integral.
+	const int atlasW = m_SlotW * SLOT_COLS;
+	const int atlasH = m_SlotH * SLOT_ROWS;
+	const int rw = px2 - px1 + 1;
+	const int rh = py2 - py1 + 1;
+	if( rw > atlasW || rh > atlasH )
+	{
+		return false;						// a single rect larger than the whole atlas: keep the integral
+	}
+	if( m_ShelfX + rw > atlasW )			// no room on the current shelf: start a new one below
+	{
+		m_ShelfX = 0;
+		m_ShelfY += m_ShelfH;
+		m_ShelfH = 0;
+	}
+	if( m_ShelfY + rh > atlasH )
+	{
+		extern idCVar r_rtAccelDebug;
+		if( r_rtAccelDebug.GetBool() )
+		{
+			common->Printf( "SoftShadowTerm: atlas full (%d lights packed), light keeps the in-shader integral\n", m_Cursor );
+		}
+		return false;						// atlas genuinely full: the light stays on the in-shader integral
+	}
+	const int atlasX = m_ShelfX;
+	const int atlasY = m_ShelfY;
+	m_ShelfX += rw;
+	if( rh > m_ShelfH )
+	{
+		m_ShelfH = rh;
+	}
+	m_Cursor++;
+	// the CS writes u_Term[px + offset] and the interaction PS reads term.Load(SV_Position + offset);
+	// px == SV_Position == absolute screen pixel, so offset = atlasOrigin - scissorOrigin lands both
+	// at packed-local coords. Both consumers are UNCHANGED - only the offset value differs.
+	const int slotOfsX = atlasX - px1;
+	const int slotOfsY = atlasY - py1;
 
 	SoftTermCB cb;
 	cb.lightR[0] = vLight->globalLightOrigin.x;
@@ -248,16 +317,50 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		nvrhi::BindingSetItem::Sampler( 1, projS ),
 		nvrhi::BindingSetItem::Texture_UAV( 0, m_TermTexture ),
 	};
-	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
+	// WALK-COUNTERS: the counting permutation needs u1 in its binding set + layout; the shipped path
+	// uses neither. Everything else is identical.
+	const bool cnt = m_WalkCntEnabled;
+	if( cnt )
+	{
+		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_WalkCntBuffer ) );
+	}
+	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, cnt ? m_LayoutCnt : m_Layout );
 
 	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;
-	cs.pipeline = m_Pipeline;
+	cs.pipeline = cnt ? m_PipelineCnt : m_Pipeline;
 	cs.bindings = { set };
 	commandList->setComputeState( cs );
 	commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
 
 	outOfsX = slotOfsX;
 	outOfsY = slotOfsY;
+	return true;
+}
+
+bool SoftShadowTermPass::GetWalkStats( uint32_t out[8] )
+{
+	if( !m_WalkCntEnabled || m_WalkCntBuffer == nullptr )
+	{
+		return false;
+	}
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = 8 * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowTerm/WalkCountersReadback";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 8 * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	void* p = m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( p == nullptr )
+	{
+		return false;
+	}
+	memcpy( out, p, 8 * sizeof( uint32_t ) );
+	m_Device->unmapBuffer( staging );
 	return true;
 }

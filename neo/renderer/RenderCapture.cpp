@@ -27,6 +27,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 #include <vector>
 #include <map>
+#include <set>
 #include <cstdio>
 #include <algorithm>
 
@@ -1283,6 +1284,142 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path, idRenderWorld* w
 					hdr.numMeshVerts, hdr.numMeshIdx / 3, s_capturedCasterEntity );
 }
 
+// ---- bench scene reconstruction: DEDUPED per-object captured casters -------------------------------
+// The softcap stores each caster mesh once PER LIGHT it casts for (~3.5x duplication), so the single
+// map-spanning blob R_SoftShadowSpawnCapturedCasters builds is both duplicated AND unculled (every
+// light over-processes the whole soup -> the measured 4-min bench hang). This spawns each DISTINCT
+// physical object (deduped by first-vertex position + vert count, world space) as its OWN entity with
+// tight bounds, so the frontend culls it per light exactly like the live scene. This is the faithful
+// bench caster set: world casters AND the dynamic objects (items/props/gibs) the static map parse
+// cannot reproduce - the dominant shadow load in heavy rooms.
+static std::vector<qhandle_t>     s_benchCasterEntities;
+static std::vector<idRenderModel*> s_benchCasterModels;
+static idRenderWorld*             s_benchCasterWorld = NULL;
+
+static void R_SoftShadowClearBenchCasters()
+{
+	if( s_benchCasterWorld != NULL )
+	{
+		for( qhandle_t h : s_benchCasterEntities )
+		{
+			if( h != -1 )
+			{
+				s_benchCasterWorld->FreeEntityDef( h );
+			}
+		}
+	}
+	for( idRenderModel* m : s_benchCasterModels )
+	{
+		if( m != NULL )
+		{
+			renderModelManager->FreeModel( m );
+		}
+	}
+	s_benchCasterEntities.clear();
+	s_benchCasterModels.clear();
+	s_benchCasterWorld = NULL;
+}
+
+static int R_SoftShadowSpawnBenchCasters( const char* path, idRenderWorld* world )
+{
+	R_SoftShadowClearBenchCasters();
+	if( world == NULL )
+	{
+		return 0;
+	}
+	FILE* cf = fopen( path, "rb" );
+	if( cf == NULL )
+	{
+		return 0;
+	}
+	softcapHeader_t hdr;
+	if( fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC || hdr.numMeshVerts == 0 || hdr.numMeshIdx == 0 )
+	{
+		fclose( cf );
+		return 0;
+	}
+	const long castersOff = ( long )sizeof( hdr )
+							+ ( long )hdr.numLights * ( long )sizeof( softcapLight_t )
+							+ ( long )hdr.numEdges  * ( long )sizeof( softcapEdge_t );
+	const long meshVertsOff = castersOff + ( long )hdr.numCasters * ( long )sizeof( softcapCaster_t );
+	std::vector<softcapCaster_t> casters( hdr.numCasters );
+	std::vector<float>    mv( ( size_t )hdr.numMeshVerts * 3 );
+	std::vector<uint32_t> mi( hdr.numMeshIdx );
+	if( fseek( cf, castersOff, SEEK_SET ) != 0
+		|| ( hdr.numCasters > 0 && fread( casters.data(), sizeof( softcapCaster_t ), casters.size(), cf ) != casters.size() )
+		|| fseek( cf, meshVertsOff, SEEK_SET ) != 0
+		|| fread( mv.data(), sizeof( float ), mv.size(), cf ) != mv.size()
+		|| fread( mi.data(), sizeof( uint32_t ), mi.size(), cf ) != mi.size() )
+	{
+		fclose( cf );
+		return 0;
+	}
+	fclose( cf );
+
+	s_benchCasterWorld = world;
+	nvrhi::CommandListHandle cl = deviceManager->GetDevice()->createCommandList();
+	cl->open();
+	std::set<uint64_t> seen;
+	for( uint32_t c = 0; c < hdr.numCasters; c++ )
+	{
+		const softcapCaster_t& C = casters[c];
+		if( C.numVerts == 0 || C.numIndex == 0 )
+		{
+			continue;
+		}
+		// dedup key: first-vertex quantized position + vert count (world space -> one object hashes
+		// identically across the lights it cast for). Matches the offline 815->230 measurement.
+		const float* v0 = &mv[( size_t )C.firstVert * 3];
+		auto q = []( float f ) -> uint64_t { return ( uint64_t )( int64_t )llroundf( f * 8.0f ); };
+		const uint64_t key = ( q( v0[0] ) * 73856093ull ) ^ ( q( v0[1] ) * 19349663ull ) ^ ( q( v0[2] ) * 83492791ull ) ^ ( ( uint64_t )C.numVerts << 1 );
+		if( !seen.insert( key ).second )
+		{
+			continue;			// this physical object already spawned (cast for an earlier light)
+		}
+		srfTriangles_t* tri = R_AllocStaticTriSurf();
+		R_AllocStaticTriSurfVerts( tri, ( int )C.numVerts );
+		R_AllocStaticTriSurfIndexes( tri, ( int )C.numIndex );
+		tri->numVerts = ( int )C.numVerts;
+		tri->numIndexes = ( int )C.numIndex;
+		for( uint32_t i = 0; i < C.numVerts; i++ )
+		{
+			tri->verts[i].Clear();
+			tri->verts[i].xyz.Set( mv[( C.firstVert + i ) * 3 + 0], mv[( C.firstVert + i ) * 3 + 1], mv[( C.firstVert + i ) * 3 + 2] );
+		}
+		for( uint32_t i = 0; i < C.numIndex; i++ )
+		{
+			tri->indexes[i] = ( triIndex_t )( mi[C.firstIndex + i] - C.firstVert );	// MESHIDX is global; rebase local
+		}
+		R_BoundTriSurf( tri );
+
+		modelSurface_t surf;
+		surf.id = 0;
+		surf.shader = declManager->FindMaterial( "_default" );	// lit, casts + receives, like the gameplay original
+		surf.geometry = tri;
+
+		idRenderModel* model = renderModelManager->AllocModel();
+		model->InitEmpty( va( "_softBenchCaster_%u", c ) );
+		model->AddSurface( surf );			// takes ownership of tri
+		model->FinishSurfaces( false );
+		R_CreateStaticBuffersForTri( *tri, cl );
+
+		renderEntity_t re;
+		memset( &re, 0, sizeof( re ) );
+		re.hModel = model;
+		re.axis = mat3_identity;			// MESHVERTS are already world space
+		re.origin.Zero();
+		re.shaderParms[0] = re.shaderParms[1] = re.shaderParms[2] = re.shaderParms[3] = 1.0f;
+		re.noShadow = false;
+		s_benchCasterModels.push_back( model );
+		s_benchCasterEntities.push_back( world->AddEntityDef( &re ) );
+	}
+	cl->close();
+	deviceManager->GetDevice()->executeCommandList( cl );
+	common->Printf( "[softgate] bench caster reconstruction: %u entries -> %d distinct objects spawned\n",
+					hdr.numCasters, ( int )s_benchCasterEntities.size() );
+	return ( int )s_benchCasterEntities.size();
+}
+
 // command wrapper so the headless batch (softShadowShots) can reproduce a capture's DYNAMIC casters (the
 // scripted rock/crate/gibs that loadGame-quick does not spawn) from the command buffer - a safe point,
 // unlike the mid-frame batch tick. Without this the batch rendered the view but an empty floor.
@@ -2233,13 +2370,28 @@ int R_SoftShadowGate( const char* arg )
 			{
 				benchLights.push_back( rw->AddLightDef( &ml ) );
 			}
-			// static model entities: without them the bench frame carries ~half the live soft-record
-			// stream and under-reads the shipped soft cost ~3x (see the map-parse comment above)
+			// CASTER SCENE. Default (BenchReplay on): reconstruct from the .softcap's DEDUPED captured
+			// casters - the exact live soft-caster set, DYNAMIC objects included - and exclude the loaded
+			// worldspawn from soft-casting (its faces are already in the captured set) so nothing is
+			// double-counted. The old path (BenchReplay off) adds the static func_static map guess, which
+			// misses every dynamic caster - the dominant shadow load - and over-counts static geometry.
+			extern idCVar com_softShadowGateBenchReplay;
+			extern idCVar r_softShadowBenchExcludeWorld;
+			const bool benchReplay = com_softShadowGateBenchReplay.GetBool();
 			std::vector<qhandle_t> benchModels;
-			benchModels.reserve( mapModels.size() );
-			for( const renderEntity_t& me : mapModels )
+			if( benchReplay )
 			{
-				benchModels.push_back( rw->AddEntityDef( &me ) );
+				R_SoftShadowSpawnBenchCasters( full.c_str(), rw );
+				cvarSystem->SetCVarInteger( "r_softShadowBenchExcludeWorld", 1 );	// world faces come from the captured set
+			}
+			else
+			{
+				cvarSystem->SetCVarInteger( "r_softShadowBenchExcludeWorld", 0 );
+				benchModels.reserve( mapModels.size() );
+				for( const renderEntity_t& me : mapModels )
+				{
+					benchModels.push_back( rw->AddEntityDef( &me ) );
+				}
 			}
 			R_SoftShadowPinTestConfig( false );
 			cvarSystem->SetCVarInteger( "r_skipAmbient", 0 );
@@ -2260,6 +2412,10 @@ int R_SoftShadowGate( const char* arg )
 			const int t0 = Sys_Microseconds();
 			int benchRecords = 0, benchDropped = 0;
 			int benchSoftLights = 0, benchTermLights = 0, benchBinnedLights = 0;
+			// GRANULAR GPU attribution (accumulated over the timed frames): the soft path split into
+			// its phases via the RLS_SOFT_* timer kinds, so the walk (term) is isolated from bin/pos/read.
+			double gPos = 0, gBin = 0, gTerm = 0, gRead = 0, gGpu = 0;
+			int    gN = 0;
 			for( int f = 0; f < benchFrames; f++ )
 			{
 				// pipelined like the game loop: frontend builds frame f while the GPU draws f-1
@@ -2269,6 +2425,17 @@ int R_SoftShadowGate( const char* arg )
 				benchDropped = Max( benchDropped, tr.pc.c_softShadowDroppedEdges );
 				const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
 				tr.RenderCommandBuffers( cmd );
+				if( backEnd.pc.gpuMicroSec > 0 )		// GPU timer queries valid this frame
+				{
+					// granular soft phases carried on idle shadow timer kinds during the bench
+					// (RenderBackend swDiag): shadowmap=softpos, rtmask=tile-bin, stencil=term/walk.
+					gPos  += backEnd.pc.gpuShadowMapMicroSec;
+					gBin  += backEnd.pc.gpuRTShadowMaskMicroSec;
+					gTerm += backEnd.pc.gpuStencilShadowMicroSec;
+					gRead += backEnd.pc.gpuSoftShadowMicroSec;	// interaction term-atlas READ
+					gGpu  += backEnd.pc.gpuMicroSec;
+					gN++;
+				}
 				// PATH PROVENANCE, sampled from the backend counters of the frame just rendered:
 				// which evaluation path each soft light's term actually took. term < total or
 				// binned < total is not an error (slot budget, ineligible lights) but it must be
@@ -2287,6 +2454,15 @@ int R_SoftShadowGate( const char* arg )
 							"%d soft records (%d dropped), %d soft lights (%d term, %d binned)\n",
 							cap.name.c_str(), ms, 1000.0 / ms, benchFrames, ( int )mapLights.size(),
 							benchRecords, benchDropped, benchSoftLights, benchTermLights, benchBinnedLights );
+			// granular GPU phase attribution (us->ms), averaged over frames with a valid timer query.
+			// soft = pos + bin + term + read; the rest of gpu is everything non-soft.
+			if( gN > 0 )
+			{
+				const double iv = 1.0 / ( 1000.0 * gN );
+				const double soft = ( gPos + gBin + gTerm + gRead ) * iv;
+				common->Printf( "[softgate] BENCH %-14s GPU %.2f ms | soft %.2f (softpos %.2f + tilebin %.2f + TERM/walk %.2f + read %.2f) | rest %.2f ms\n",
+								cap.name.c_str(), gGpu * iv, soft, gPos * iv, gBin * iv, gTerm * iv, gRead * iv, gGpu * iv - soft );
+			}
 			// spill accounting from the LAST bench frame: silent spill-region exhaustion sends the
 			// starved tiles back to the O(all-casters) full walk - a perf leak the correctness gate
 			// can never see, so the demand must be printed next to the region size it must fit in.
@@ -2298,6 +2474,21 @@ int R_SoftShadowGate( const char* arg )
 								spillStats[0] > ( uint32_t )SoftTileBinPass::SPILL_ELEMENTS ? "EXHAUSTED" : "fits",
 								spillStats[1], spillStats[2] );
 			}
+			// GPU per-fragment walk counters (r_softShadowWalkCounters): the shipped TILE-LIST path's
+			// real cull cascade per walked fragment, confirming the CPU attribution's cull-collapse
+			// finding on the actual GPU path. Slots [4]=tight tests [5]=tight culls [6]=MT survivors
+			// [7]=fragments walked (the binned walker fills tight/mtTri only).
+			uint32_t walk[8] = {};
+			if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetWalkStats( walk ) && walk[7] > 0 )
+			{
+				const double f = ( double )walk[7];			// fragments that ran the walk (this frame)
+				// binned FaceCoverageList fills tight/mtTri (slots 4/5/6); spilled ClusterList adds
+				// caster/coarse (0..3). Report both so the cull-collapse (spill) tail is visible.
+				common->Printf( "[softgate] BENCH %-14s walk/frag: tile-list cone-tests %.0f (cull %.0f%%) -> MT survivors %.1f (x16=%.0f sample-tests) | spill coarse-tests %.0f | %u frags\n",
+								cap.name.c_str(), walk[4] / f,
+								100.0 * walk[5] / ( double )( walk[4] ? walk[4] : 1 ),
+								walk[6] / f, 16.0 * walk[6] / f, walk[2] / f, walk[7] );
+			}
 			for( qhandle_t bh : benchLights )
 			{
 				rw->FreeLightDef( bh );
@@ -2306,6 +2497,8 @@ int R_SoftShadowGate( const char* arg )
 			{
 				rw->FreeEntityDef( bh );
 			}
+			R_SoftShadowClearBenchCasters();								// reconstructed captured casters
+			cvarSystem->SetCVarInteger( "r_softShadowBenchExcludeWorld", 0 );
 		}
 
 		R_SoftShadowClearCapturedCasters();
@@ -2313,6 +2506,7 @@ int R_SoftShadowGate( const char* arg )
 
 	if( rw != NULL )
 	{
+		R_SoftShadowClearBenchCasters();
 		R_SoftShadowClearCapturedCasters();
 		renderSystem->FreeRenderWorld( rw );
 	}

@@ -3165,7 +3165,13 @@ void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurf
 	}
 
 	renderLog.OpenBlock( "Render_SoftShadowPos", colorBlue );
-	renderLog.BeginShadowGen( RLS_SOFT );		// attribute the pos fill to the soft GPU counter
+	// GRANULAR ATTRIBUTION (bench only): borrow the otherwise-idle shadow-map timer kind for the
+	// softpos phase so the gate bench can split the soft cost by phase WITHOUT touching the RLS_
+	// enum (adding members to that PCH header is an incremental-build ABI hazard). Shipped game
+	// (r_softShadowBenchExcludeWorld 0) keeps the single RLS_SOFT label - no mislabeling.
+	extern idCVar r_softShadowBenchExcludeWorld;
+	const bool swDiag = r_softShadowBenchExcludeWorld.GetBool();
+	renderLog.BeginShadowGen( swDiag ? RLS_SHADOWMAP : RLS_SOFT );	// softpos G-buffer fill (pos phase)
 
 	Framebuffer* previousFramebuffer = Framebuffer::GetActiveFramebuffer();
 
@@ -4799,12 +4805,13 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 	nvrhi::IDevice* dev = deviceManager->GetDevice();
 	const bool async = r_softShadowAsyncCompute.GetBool() && dev->queryFeatureSupport( nvrhi::Feature::ComputeQueue );
 
+	// GRANULAR ATTRIBUTION (bench only, ABI-safe): borrow idle RT/stencil timer kinds for the bin
+	// and term phases so the gate bench splits the soft cost; shipped game keeps RLS_SOFT.
+	extern idCVar r_softShadowBenchExcludeWorld;
+	const bool swDiag = r_softShadowBenchExcludeWorld.GetBool();
+
 	nvrhi::ICommandList* target = commandList;
 	uint64 gInstance = 0;
-	if( !async )
-	{
-		renderLog.BeginShadowGen( RLS_SOFT );	// attribute bin+term dispatches to the soft GPU counter
-	}
 	if( async )
 	{
 		// submit the graphics work recorded so far (depth prepass + softpos fill) so the compute
@@ -4826,6 +4833,10 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 	}
 
 	// ---- tile binning: one shared depth min/max reduce + N bin dispatches ----
+	if( !async )
+	{
+		renderLog.BeginShadowGen( swDiag ? RLS_RTMASK : RLS_SOFT );	// tile-bin phase
+	}
 	if( wantBins )
 	{
 		softTileBinPass->BeginView( target, viewDef,
@@ -4862,12 +4873,19 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 		}
 	}
 
+	if( !async )
+	{
+		renderLog.EndShadowGen();									// end tile-bin phase
+		renderLog.BeginShadowGen( swDiag ? RLS_STENCIL : RLS_SOFT );	// coverage TERM (the walk) phase
+	}
+
 	// ---- coverage terms: per-light dispatches consuming the tile lists above ----
-	// The term atlas has a fixed slot budget (SLOT_COLS*SLOT_ROWS); lights past it fall back to the
-	// in-shader integral (wave64, the slow path). Hand out slots BIGGEST-SCISSOR-FIRST so an
-	// over-budget frame spills the SMALLEST lights - which cost the least on the fallback - instead
-	// of whichever light happened to be last in view order. Pure scheduling: bit-identical output,
-	// only which lights get the fast path changes.
+	// The term atlas is SCISSOR-PACKED (COLS*ROWS screens of R16F, shelf-packed by light scissor);
+	// it holds far more than a dozen lights when scissors are sub-screen, so the "many small lights"
+	// rooms no longer spill the excess onto the in-shader integral (wave64, the slow path). Only a
+	// genuinely full atlas now falls back. Pack BIGGEST-SCISSOR-FIRST: it is the standard shelf-pack
+	// heuristic (tall rects first minimise shelf waste) AND, if the atlas ever does fill, spills the
+	// SMALLEST lights - cheapest on the fallback. Pure scheduling: bit-identical output.
 	if( wantTerms && softShadowTermPass->BeginView( target, viewDef,
 			( nvrhi::ITexture* )globalImages->softShadowPosImage->GetTextureID(),
 			globalFramebuffers.softShadowNormalImage.Get() ) )
@@ -4879,7 +4897,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 			if( vLight->softEdgeCount <= 0 || vLight->softCasterCount <= 0 ) { continue; }
 			swTermOrder.Append( vLight );
 		}
-		// biggest scissor area first (descending): the fixed slot budget then spills the smallest lights
+		// biggest scissor area first (descending): shelf-pack heuristic; only a full atlas now spills
 		if( swTermOrder.Num() > 1 )
 		{
 			std::stable_sort( swTermOrder.Ptr(), swTermOrder.Ptr() + swTermOrder.Num(),

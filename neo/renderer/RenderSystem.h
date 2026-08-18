@@ -191,7 +191,7 @@ struct backEndCounters_t
 	uint64	gpuStencilShadowMicroSec;
 	uint64	gpuShadowMapMicroSec;		// per-light shadow maps rendered when the atlas is off
 	uint64	gpuRTShadowMaskMicroSec;
-	uint64	gpuSoftShadowMicroSec;		// analytic soft-shadow interaction draws (subset of gpuInteractionsMicroSec)
+	uint64	gpuSoftShadowMicroSec;		// analytic soft-shadow interaction draws / term-atlas READ (subset of gpuInteractionsMicroSec)
 	uint64	gpuShaderPassMicroSec;
 	uint64	gpuFogAllLightsMicroSec;
 	uint64	gpuBloomMicroSec;

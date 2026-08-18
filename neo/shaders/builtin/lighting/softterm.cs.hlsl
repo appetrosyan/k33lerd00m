@@ -40,6 +40,14 @@ version. See <http://www.gnu.org/licenses/>.
 // Declared BEFORE the include: the coverage functions read these globals directly (HLSL).
 StructuredBuffer<float4>	t_SoftEdges	: register( t0 );	// softShadowEdge_t stream (float4 pairs), whole joint buffer
 StructuredBuffer<uint>		t_SoftTiles	: register( t1 );	// per-tile triangle lists (softtile_bin.cs.hlsl)
+#if SW_GPU_WALK_COUNTERS
+// WALK-ATTRIBUTION counting permutation (built only for -D SW_GPU_WALK_COUNTERS=1, bound only under
+// r_softShadowWalkCounters). Declared before the include so the walker's SW_ATTRIB_ADD macro (HLSL
+// counting branch) can InterlockedAdd into it. The shipped permutation (=0) never declares this and
+// gets the empty macro -> byte-identical shader, anaTerm contract preserved. Slots: 0..6 per
+// SW_WALKIDX_* (softwedge_coverage.inc.hlsl), 7 = fragments that ran the walk.
+RWStructuredBuffer<uint>	u_WalkCnt	: register( u1 );
+#endif
 #include "softwedge_coverage.inc.hlsl"
 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
@@ -132,6 +140,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 			return;
 		}
 	}
+
+#if SW_GPU_WALK_COUNTERS
+	InterlockedAdd( u_WalkCnt[ 7 ], 1u );	// this pixel survived the early-outs and runs the walk
+#endif
 
 	const float3 swL = g_lightR.xyz;
 	const float  swR = max( g_lightR.w, 1e-2 );

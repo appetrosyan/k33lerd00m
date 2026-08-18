@@ -1327,7 +1327,14 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				// raw triangles and needs no adjacency - and silEdges creation FAILS on non-2-manifold meshes
 				// (rails, grates, decor), which silently dropped those casters from the soft stream and left
 				// their shadows missing entirely (softgate: the erebus1_05 far-floor EXTENT defects).
-				if( r_useSoftShadowVolumes.GetBool() && ( tri->silEdges != NULL || r_softShadowFaceCoverage.GetBool() ) )
+				// BENCH reconstruction (com_softShadowGateBenchReplay): the captured caster entities ARE
+				// the complete live soft-caster set (world faces included), so the loaded worldspawn must
+				// NOT also soft-cast or every world face is double-counted. Exclude the static world model
+				// from soft collection when this is set; the captured casters carry its contribution.
+				extern idCVar r_softShadowBenchExcludeWorld;
+				const bool swExcludeWorld = r_softShadowBenchExcludeWorld.GetBool()
+											&& entityDef->parms.hModel != NULL && entityDef->parms.hModel->IsStaticWorldModel();
+				if( !swExcludeWorld && r_useSoftShadowVolumes.GetBool() && ( tri->silEdges != NULL || r_softShadowFaceCoverage.GetBool() ) )
 				{
 					const int swCollectStart = Sys_Microseconds();
 					softShadowEdge_t* sedges = NULL;

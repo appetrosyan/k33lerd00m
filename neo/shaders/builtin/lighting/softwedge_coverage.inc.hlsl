@@ -385,6 +385,41 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	#define SW_TILEBUF_PARAM
 #endif
 
+// SW_ATTRIB: op-count instrumentation for the CPU walk-attribution study. TEXTUALLY EMPTY in HLSL
+// (no GPU codegen, anaTerm hashes preserved). In C++ it increments one extern global counter set,
+// gated by a RUNTIME flag g_swAttribOn so (a) every test TU has the IDENTICAL inline body - no ODR
+// divergence - and (b) the microbench (flag off) pays only a predictable, out-of-line compare, not
+// a memory write, so its timing stays clean. Counts live at caster/triangle granularity only (never
+// per-FLOP), so even flag-on cost is O(triangles), not O(triangles x samples). The attribution test
+// defines g_swAttrib / g_swAttribOn and flips the flag around the measured walk.
+#if defined( __cplusplus )
+	struct swAttrib_t
+	{
+		unsigned long long casterTest, casterCull;	// caster bounding-sphere tests / rejects
+		unsigned long long coarseTest, coarseCull;	// per-triangle v0-sphere coarse tests / rejects
+		unsigned long long tightTest, tightCull;	// per-triangle centroid-sphere tight tests / rejects
+		unsigned long long mtTri;					// triangles reaching the Moller-Trumbore + 16-sample loop
+	};
+	extern swAttrib_t g_swAttrib;
+	extern bool       g_swAttribOn;
+	#define SW_ATTRIB_ADD( field, n ) do { if( g_swAttribOn ) { g_swAttrib.field += ( n ); } } while( 0 )
+#elif defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
+	// GPU counting permutation (softterm.cs built with -D SW_GPU_WALK_COUNTERS=1, bound only under
+	// r_softShadowWalkCounters). The counting shader declares u_WalkCnt (register u1) BEFORE this
+	// include. The SHIPPED softterm.cs (=0) and the pixel shader keep the empty macro -> byte-identical
+	// codegen, so the anaTerm bit-exact contract holds. Field->slot map must match SoftShadowTermPass.
+	#define SW_WALKIDX_casterTest	0
+	#define SW_WALKIDX_casterCull	1
+	#define SW_WALKIDX_coarseTest	2
+	#define SW_WALKIDX_coarseCull	3
+	#define SW_WALKIDX_tightTest	4
+	#define SW_WALKIDX_tightCull	5
+	#define SW_WALKIDX_mtTri		6
+	#define SW_ATTRIB_ADD( field, n ) InterlockedAdd( u_WalkCnt[ SW_WALKIDX_##field ], ( uint )( n ) )
+#else
+	#define SW_ATTRIB_ADD( field, n )
+#endif
+
 // swCentreLit > 0.5: the caller GUARANTEES the light-disk centre is visible from swP (AAM penumbra-ring
 // pass: the fragment is outside every hard shadow). Under that guarantee any nonzero winding of a
 // caster's projected silhouette around the disk centre is geometrically impossible - it is the
@@ -886,11 +921,13 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		float4 c0 = t_SoftEdges[ swCasterBase + sc * 2 + 0 ];		// ( centre.xyz, radius )
 		float4 c1 = t_SoftEdges[ swCasterBase + sc * 2 + 1 ];		// ( firstTri, numTris, 0, 0 )
 		float3 dCv = float3( c0.x, c0.y, c0.z ) - swP;
+		SW_ATTRIB_ADD( casterTest, 1 );
 		if( SoftShadow_CullCaster( dCv, c0.w, swF, swSinA, swCosA, swEps ) )
 		{
 			// structural span skip: when EVERY lane culls, the wave branches over the whole span (the
 			// v1 wave-uniform jump, now implicit); a disagreeing lane just idles masked - no lane ever
 			// pays per-record skip iterations. Bit-exact: the cull is conservative.
+			SW_ATTRIB_ADD( casterCull, 1 );
 			continue;
 		}
 		const int swTriFirst = ( int )c1.x;
@@ -902,6 +939,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		{
 			const int b = swTriBase + t * 3;
 			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, v0-radius ) - coarse reject reads ONLY this
+			SW_ATTRIB_ADD( coarseTest, 1 );
 			// COARSE v0-CENTERED REJECT: rejects far triangles from r0 alone, so r1/r2 (48B, the measured
 			// dominant per-fragment cost) load lazily only for survivors. The v0-sphere contains the whole
 			// triangle, so this only ever DEFERS a reject the tight centroid re-cull below also makes =>
@@ -910,11 +948,11 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
 				float  cd0 = dot( rc0, swF.nrm );
 				float  vr0 = r0.w;
-				if( cd0 + vr0 < swEps ) { continue; }
-				if( cd0 - vr0 > swDistPL ) { continue; }
+				if( cd0 + vr0 < swEps ) { SW_ATTRIB_ADD( coarseCull, 1 ); continue; }
+				if( cd0 - vr0 > swDistPL ) { SW_ATTRIB_ADD( coarseCull, 1 ); continue; }
 				float3 pp0 = rc0 - cd0 * swF.nrm;
 				float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
-				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { SW_ATTRIB_ADD( coarseCull, 1 ); continue; }
 			}
 			float4 r1 = t_SoftEdges[ b + 1 ];						// ( v1.xyz, centroid-radius ) - lazy: survivors only
 			float4 r2 = t_SoftEdges[ b + 2 ];						// ( v2.xyz, 0 )
@@ -932,11 +970,13 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			float3 rc   = tcen - swP;
 			float  cd   = dot( rc, swF.nrm );						// centroid depth along the cone axis
 			float  triRad = r1.w;	// centroid radius (tight): exact original bound, so the sample-gated set is bit-exact
-			if( cd + triRad < swEps ) { continue; }					// wholly behind the receiver
-			if( cd - triRad > swDistPL ) { continue; }				// wholly beyond the light
+			SW_ATTRIB_ADD( tightTest, 1 );
+			if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }					// wholly behind the receiver
+			if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }				// wholly beyond the light
 			float3 perp = rc - cd * swF.nrm;
 			float  coneR = swR * ( cd + triRad ) / swDistPL;		// max cone radius over the triangle's depth span
-			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }	// outside the sample cone: cannot occlude
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }	// outside the sample cone: cannot occlude
+			SW_ATTRIB_ADD( mtTri, 1 );	// survivor: pays the Moller-Trumbore + 16-sample test
 #if SW_FACE_PROFILE == 2
 			swProbe += cd; continue;		// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
 #endif
@@ -1125,11 +1165,13 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		float3 rc   = tcen - swP;
 		float  cd   = dot( rc, swF.nrm );
 		float  triRad = r1.w;	// centroid radius (tight): exact original bound, so the sample-gated set is bit-exact
-		if( cd + triRad < swEps ) { continue; }
-		if( cd - triRad > swDistPL ) { continue; }
+		SW_ATTRIB_ADD( tightTest, 1 );	// tris in this fragment's tile list reaching the cone cull
+		if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+		if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
 		float3 perp = rc - cd * swF.nrm;
 		float  coneR = swR * ( cd + triRad ) / swDistPL;
-		if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+		if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+		SW_ATTRIB_ADD( mtTri, 1 );	// survivor: pays the Moller-Trumbore + 16-sample test (the cull-collapse signal)
 #if SW_FACE_PROFILE == 2
 		swProbe += cd;
 		continue;													// TIMING PROBE: + per-triangle cone culls

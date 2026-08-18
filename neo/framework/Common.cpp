@@ -142,6 +142,7 @@ idCVar com_softShadowSelfTest( "com_softShadowSelfTest", "", CVAR_SYSTEM, "run t
 idCVar com_softShadowGate( "com_softShadowGate", "", CVAR_SYSTEM, "run the minimal-init soft-shadow GPU defect gate on this .softcap directory (or 'corpus'), then quit" );
 idCVar com_softShadowGateBench( "com_softShadowGateBench", "0", CVAR_SYSTEM | CVAR_INTEGER, "softgate: additionally time N pipelined FULL frames (all map lights, real shading) per capture and print ms/FPS - the 60-FPS optimisation instrument. 0 = off" );
 idCVar com_softShadowGateBenchOnly( "com_softShadowGateBenchOnly", "0", CVAR_SYSTEM | CVAR_BOOL, "softgate: skip all per-light defect probes and run ONLY the bench frames - fast perf-config sweeps (~seconds per capture instead of a minute). PASS from a bench-only run is NOT a correctness verdict." );
+idCVar com_softShadowGateBenchReplay( "com_softShadowGateBenchReplay", "1", CVAR_SYSTEM | CVAR_BOOL, "softgate bench: reconstruct the caster scene from the .softcap's DEDUPED captured casters (each physical object once, incl. the DYNAMIC items/props the static map parse cannot reproduce - the dominant shadow load) and EXCLUDE the loaded worldspawn from soft-casting (its faces are already in the captured set). Default ON: the frame-time bench is unrepresentative without the dynamics. 0 = old static-map-model guess." );
 
 // For doom classic
 struct Globals;

@@ -480,6 +480,10 @@ public:
 	{
 		return softTileBinPass;
 	}
+	SoftShadowTermPass*	GetSoftShadowTermPass()	// bench/diagnostic access (walk-counter readback)
+	{
+		return softShadowTermPass;
+	}
 };
 
 #endif

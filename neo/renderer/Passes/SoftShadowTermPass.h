@@ -66,6 +66,12 @@ public:
 				   bool coverageEarlyOut,
 				   int& outOfsX, int& outOfsY );
 
+	// Walk-attribution GPU counters (r_softShadowWalkCounters): read the 8-uint counter buffer the
+	// COUNTING permutation accumulated this frame - slots 0..6 = SW_WALKIDX_* (caster/coarse/tight
+	// tests+culls, mtTri), 7 = fragments that ran the walk. Blocking readback (waitForIdle), bench-only.
+	// Returns false when counters were not enabled / buffer absent.
+	bool GetWalkStats( uint32_t out[8] );
+
 	nvrhi::ITexture* GetTermTexture() const
 	{
 		return m_TermTexture;
@@ -91,13 +97,27 @@ private:
 	nvrhi::ShaderHandle				m_Shader;
 	nvrhi::BindingLayoutHandle		m_Layout;
 	nvrhi::ComputePipelineHandle	m_Pipeline;
+	// COUNTING permutation (SW_GPU_WALK_COUNTERS=1): a separate shader/layout/pipeline with an extra
+	// u1 counter UAV, used only when r_softShadowWalkCounters is set so the shipped pipeline above is
+	// byte-identical. m_WalkCntEnabled snapshots the cvar per view.
+	nvrhi::ShaderHandle				m_ShaderCnt;
+	nvrhi::BindingLayoutHandle		m_LayoutCnt;
+	nvrhi::ComputePipelineHandle	m_PipelineCnt;
+	nvrhi::BufferHandle				m_WalkCntBuffer;	// 8 uints, cleared per view, InterlockedAdd'd by the shader
+	bool							m_WalkCntEnabled = false;
 	nvrhi::BufferHandle				m_ConstantBuffer;
 	nvrhi::TextureHandle			m_TermTexture;
 	nvrhi::TextureHandle			m_WorldPos;		// this view's position G-buffer (set by BeginView)
 	nvrhi::TextureHandle			m_WorldNormal;	// this view's shading-normal G-buffer (N.L early-out)
-	int								m_SlotW = 0;	// screen-size slot extents the atlas was built for
+	int								m_SlotW = 0;	// screen-size extent the atlas was built for (atlas = SlotW*COLS x SlotH*ROWS)
 	int								m_SlotH = 0;
-	int								m_Cursor = 0;	// slots handed out this view
+	int								m_Cursor = 0;	// lights packed this view (provenance / debug only)
+	// Shelf packer state (reset per view): lights are placed scissor-sized, left-to-right on shelves
+	// that grow downward, so the atlas holds far more than SLOT_COLS*SLOT_ROWS lights when scissors
+	// are sub-screen (the measured "many small lights" case). Replaces the fixed full-screen grid.
+	int								m_ShelfX = 0;	// next free x on the current shelf
+	int								m_ShelfY = 0;	// current shelf top
+	int								m_ShelfH = 0;	// current shelf height (tallest rect placed on it)
 	bool							m_Valid = false;
 };
 

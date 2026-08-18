@@ -28,6 +28,7 @@ the Free Software Foundation, either version 3 of the License, or
 #include "hlsl_compat.h"
 #include "softwedge_coverage.inc.hlsl"		// the live shader source, compiled as C++ (SW_FUNC=inline)
 #include "SoftShadowBox.h"					// MakeBox / Silhouette / BuildCaster / Box / Rng (namespace swtest)
+#include "SoftShadowMesh.h"					// SoftCap + LoadSoftCap (real-capture microbench)
 #include "idUnitTest.h"
 
 #include <chrono>
@@ -246,4 +247,158 @@ STUDY_TEST( SoftShadowBench, deviation_vs_anchor )
 	std::printf( "    [deviation vs anchor] n=%u  max=%.6f  mean=%.6f  rms=%.6f  p99=%.6f  over-tol(%.4f)=%d\n",
 				 n, mx, mean, rms, p99, DEVIATION_TOL, over );
 	CHECK( mx <= DEVIATION_TOL );	// an optimisation must stay within tol of the exact anchor; raise tol consciously
+}
+
+// ---------------------------------------------------------------------------- REAL-CAPTURE MICROBENCH
+// The A/B filter the plan requires: time the CURRENT walker (SoftShadow_FaceCoverage) vs a proposed
+// REPLACEMENT on a real .softcap's receivers, with a DEVIATION gate proving the replacement is
+// lossless (coverage identical within tol) before it can claim a speedup. Today the "replacement" is
+// the current walker itself (A==B, deviation 0, ratio ~1) so the harness is proven and ready; a
+// candidate from the walk-attribution front (softshadow-walk-attribution memory: ~80 MT survivors/
+// frag) drops into WalkVariant() below and the same run reports lossless? + ns/call delta.
+//
+// CAVEAT (fp32 vs shipped fp16): the C++ path runs the fp32 loop, so ns/call is a PROXY - it proves
+// losslessness + algorithmic (op-count) wins; the definitive speed proof is the GPU walk-phase timer
+// (com_softShadowGateBench, counters OFF). Nothing ships on a CPU win alone.
+//
+// Run:  SOFTCAP=/path/to/foo.softcap ./rbdoom3bfg_tests @study:SoftShadowBench
+namespace
+{
+// the A/B slot. variant 0 = shipped walker; variant 1 = candidate (currently identical). A real
+// candidate replaces the variant-1 body and MUST keep variant 0 byte-for-byte for a fair A/B.
+inline float WalkVariant( int variant, float3 P, float3 L, float swR, int triBase, int casterBase,
+						  int casterCount, float rot, SoftEdgeBuffer buf )
+{
+	if( variant == 0 )
+	{
+		return SoftShadow_FaceCoverage( P, L, swR, triBase, casterBase, casterCount, rot, buf );
+	}
+	// ---- CANDIDATE (variant 1): edit here; keep it lossless vs variant 0 ----
+	return SoftShadow_FaceCoverage( P, L, swR, triBase, casterBase, casterCount, rot, buf );
+}
+}
+
+STUDY_TEST( SoftShadowBench, real_capture )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL )
+	{
+		std::printf( "    [realbench] SOFTCAP unset; skipping\n" );
+		CHECK( true );
+		return;
+	}
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) )
+	{
+		std::printf( "    [realbench] cannot load %s\n", path );
+		CHECK( false );
+		return;
+	}
+	auto F4 = [&]( size_t j ) -> const float*
+	{
+		return ( j & 1 ) ? cap.edges[j >> 1].e1 : cap.edges[j >> 1].e0;
+	};
+
+	// build one work item (combined buffer + P set + light) per soft light, exactly like the
+	// attribution instrument (capture stores only the tri stream -> wrap all tris in one caster).
+	struct Item { std::vector<float4> buf; std::vector<float3> P; float3 L; float swR; int triBase, casterBase; };
+	std::vector<Item> items;
+	const int MAX_RECV = 400;
+	for( size_t li = 0; li < cap.lights.size(); li++ )
+	{
+		const softcapLight_t& L = cap.lights[li];
+		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 ) { continue; }
+		const size_t base4 = ( size_t )L.firstEdge * 2;
+		const size_t nTris = ( ( size_t )L.edgeCount * 2 ) / 3;
+		if( nTris == 0 ) { continue; }
+		Item it;
+		it.buf.reserve( nTris * 3 + 2 );
+		float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+		for( size_t t = 0; t < nTris; t++ )
+			for( int k = 0; k < 3; k++ )
+			{
+				const float* v = F4( base4 + t * 3 + k );
+				it.buf.push_back( float4( v[0], v[1], v[2], v[3] ) );
+				mn = float3( std::fmin( mn.x, v[0] ), std::fmin( mn.y, v[1] ), std::fmin( mn.z, v[2] ) );
+				mx = float3( std::fmax( mx.x, v[0] ), std::fmax( mx.y, v[1] ), std::fmax( mx.z, v[2] ) );
+			}
+		float3 cen = ( mn + mx ) * 0.5f;
+		it.buf.push_back( float4( cen.x, cen.y, cen.z, len3( mx - mn ) * 0.5f + 1e-2f ) );
+		it.buf.push_back( float4( 0.0f, ( float )nTris, 0.0f, 0.0f ) );
+		it.triBase = 0;
+		it.casterBase = ( int )( nTris * 3 );
+		it.L = float3( L.origin[0], L.origin[1], L.origin[2] );
+		it.swR = std::fmax( L.penumbraSize, 1e-2f );
+		for( const softcapReceiver_t& r : cap.receivers )
+		{
+			if( r.lightIndex != ( uint32_t )li ) { continue; }
+			const uint32_t tc = r.numIndex / 3;
+			for( uint32_t t = 0; t < tc; t++ )
+			{
+				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
+				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
+				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
+				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
+				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				it.P.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+			}
+		}
+		if( it.P.empty() ) { continue; }
+		if( it.P.size() > ( size_t )MAX_RECV )
+		{
+			const size_t stride = it.P.size() / MAX_RECV;
+			std::vector<float3> sub;
+			for( size_t s = 0; s < it.P.size(); s += stride ) { sub.push_back( it.P[s] ); }
+			it.P.swap( sub );
+		}
+		items.push_back( std::move( it ) );
+	}
+	if( items.empty() )
+	{
+		std::printf( "    [realbench] no soft lights with receivers\n" );
+		CHECK( true );
+		return;
+	}
+
+	// DEVIATION gate: variant 0 vs variant 1 must be identical (lossless) per receiver.
+	double maxDev = 0.0;
+	long   nEval = 0;
+	for( const Item& it : items )
+		for( const float3& P : it.P )
+		{
+			float a = WalkVariant( 0, P, it.L, it.swR, it.triBase, it.casterBase, 1, SoftRotAngle( P ), SoftEdgeBuffer{ ( float4* )it.buf.data(), ( int )it.buf.size() } );
+			float b = WalkVariant( 1, P, it.L, it.swR, it.triBase, it.casterBase, 1, SoftRotAngle( P ), SoftEdgeBuffer{ ( float4* )it.buf.data(), ( int )it.buf.size() } );
+			maxDev = std::fmax( maxDev, std::fabs( a - b ) );
+			nEval++;
+		}
+
+	// TIMING: current (v0) then candidate (v1), same inputs, REPS passes.
+	const int REPS = 4;
+	volatile double sink = 0;
+	auto timeVariant = [&]( int variant ) -> double
+	{
+		double acc = 0.0;
+		std::chrono::high_resolution_clock::time_point t0 = std::chrono::high_resolution_clock::now();
+		for( int rep = 0; rep < REPS; rep++ )
+			for( const Item& it : items )
+			{
+				SoftEdgeBuffer buf{ ( float4* )it.buf.data(), ( int )it.buf.size() };
+				for( const float3& P : it.P )
+				{
+					acc += WalkVariant( variant, P, it.L, it.swR, it.triBase, it.casterBase, 1, SoftRotAngle( P ), buf );
+				}
+			}
+		std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+		sink += acc;
+		return std::chrono::duration<double, std::nano>( t1 - t0 ).count();
+	};
+	double ns0 = timeVariant( 0 );
+	double ns1 = timeVariant( 1 );
+	long calls = nEval * REPS;
+
+	std::printf( "    [realbench] %zu lights, %ld receiver-frags | current %.1f ns/call  candidate %.1f ns/call  (%.2fx)\n",
+				 items.size(), nEval, ns0 / calls, ns1 / calls, ns1 > 1e-6 ? ns0 / ns1 : 0.0 );
+	std::printf( "    [realbench] lossless? max|cov(current)-cov(candidate)| = %.6f  (sink=%.4g)\n", maxDev, ( double )sink );
+	CHECK( maxDev <= 1e-6 );		// candidate must be lossless vs current; ns/call is measurement only
 }

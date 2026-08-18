@@ -1169,3 +1169,403 @@ STUDY_TEST( SoftShadowClusterProbe, hybrid_far_field_emulation )
 				 ( skN && std::fabs( skHard / skN - std::round( skHard / skN ) ) < 0.02 ) ? "DEGENERATE" : "collapsed" );
 	CHECK( true );
 }
+
+// ---------------------------------------------------------------------------------------------
+// PENUMBRA-COLLAPSE PROBE (study instrument): the GO/NO-GO for the FAR-shadow speedup that does
+// NOT touch the analytic method - it just spends fewer of the 16 disk samples where the penumbra
+// projects sub-pixel. A small/distant light casts a shadow whose penumbra half-width on the
+// receiver is w ~= swR*cd/(distPL-cd) (disk half-angle swR/distPL times the occluder->receiver
+// gap cd). Projected to the SCREEN through the captured camera, when w < ~1 px the 16-sample
+// integrator is resolving a transition thinner than one pixel: a single hard ray gives the SAME
+// on-screen result (the graded penumbra values live inside one pixel; neighbours are 0 and 1
+// anyway). So: collapse 16 -> 1 sample when the projected widest local penumbra is sub-pixel.
+// EXACT geometry either way - no atlas, no representation gap (unlike the depth-map far field,
+// which UNDER-shadows irreducibly). This is the lever for "big room, many small lights".
+//
+// Measured here on real receivers with the REAL captured camera:
+//   - fraction of receivers that collapse, per pixel threshold T in {0.5,1,2}px  (= the win set);
+//   - est. tri-test reduction (collapse cuts the survivingTris x 16 inner loop to x 1; the
+//     cluster cull term is shared, modelled as nTris/32 for the shipped leaf-32 stream);
+//   - mean|coverage error| among collapsed receivers vs the float64 16-sample truth (SAME 16
+//     targets, so non-collapsed error is 0 by construction - this isolates the collapse error);
+//   - gate defect classes among collapsed receivers (lit-in-umbra / dark-in-lit);
+//   - continuity: coverage delta under a 1px screen-tangent receiver displacement, collapsed vs
+//     truth - a collapse must not add shadow-edge crawl beyond the 16-sample path's own.
+// GO iff a threshold gives a real reduction on the small-light lights while holding gate defects
+// ~0 and continuity no worse than the 16-sample path. Output feeds a shader collapse threshold.
+//
+// Run:  SOFTCAP=/path/to/softcap0061.softcap ./rbdoom3bfg_tests @study:ClusterProbe
+namespace
+{
+// 16-sample truth blocked-mask against ALL tris (exact float64 MT), reused for P and P+displaced.
+// Optionally reports the penumbra width of the WIDEST occluder that actually blocks a sample:
+// w = swR*cd/(distPL-cd), cd = blocker distance along the light dir, capped to avoid the
+// near-light singularity (an occluder that hugs the light casts an unboundedly wide edge but is
+// only relevant where it truly blocks). Non-blocking occluders cast no edge here, so they are
+// excluded - the fix for the max-over-all-occluders inflation.
+static int TruthBlocked16( const float3& P, const float3& Lp, float swR,
+						   const std::vector<probeTri_t>& tris, float* wWorldBlk = NULL )
+{
+	float3 toL = Lp - P;
+	float distPL = len3( toL );
+	if( distPL < 1e-3f )
+	{
+		return 0;
+	}
+	float3 nrm = toL * ( 1.0f / distPL );
+	float3 lx = ( std::fabs( nrm.x ) < 0.9f ) ? cross( float3( 1, 0, 0 ), nrm ) : cross( float3( 0, 1, 0 ), nrm );
+	lx = normalize( lx );
+	float3 ly = cross( nrm, lx );
+	float  wMax = 0.0f;
+	int blk = 0;
+	for( int k = 0; k < 16; k++ )
+	{
+		uint32_t bits = ( uint32_t )k;
+		bits = ( bits << 16 ) | ( bits >> 16 );
+		bits = ( ( bits & 0x55555555u ) << 1 ) | ( ( bits & 0xAAAAAAAAu ) >> 1 );
+		bits = ( ( bits & 0x33333333u ) << 2 ) | ( ( bits & 0xCCCCCCCCu ) >> 2 );
+		bits = ( ( bits & 0x0F0F0F0Fu ) << 4 ) | ( ( bits & 0xF0F0F0F0u ) >> 4 );
+		bits = ( ( bits & 0x00FF00FFu ) << 8 ) | ( ( bits & 0xFF00FF00u ) >> 8 );
+		double ri = ( double )bits * 2.3283064365386963e-10;
+		double rr = std::sqrt( ( k + 0.5 ) / 16.0 ) * swR;
+		double th = ri * 6.283185307179586;
+		float3 tgt = Lp + lx * ( float )( rr * std::cos( th ) ) + ly * ( float )( rr * std::sin( th ) );
+		float3 D = tgt - P;
+		bool hit = false;
+		for( size_t t = 0; t < tris.size(); t++ )
+		{
+			const probeTri_t& pt = tris[t];
+			float3 e1 = pt.v1 - pt.v0, e2 = pt.v2 - pt.v0;
+			float3 h = cross( D, e2 );
+			float aa = dot( e1, h );
+			if( std::fabs( aa ) < 1e-12f )
+			{
+				continue;
+			}
+			float invA = 1.0f / aa;
+			float3 sp = P - pt.v0;
+			float uu = invA * dot( sp, h );
+			if( uu < 0 || uu > 1 )
+			{
+				continue;
+			}
+			float3 q = cross( sp, e1 );
+			float vv = invA * dot( D, q );
+			if( vv < 0 || uu + vv > 1 )
+			{
+				continue;
+			}
+			float tt = invA * dot( e2, q );
+			if( tt > 1e-4f && tt <= 1.0f )
+			{
+				hit = true;
+				if( wWorldBlk )		// widest BLOCKING occluder's penumbra, cd capped at 0.9*distPL
+				{
+					float cd = std::fmin( dot( pt.cen - P, nrm ), distPL * 0.9f );
+					if( cd > 1e-3f )
+					{
+						float w = swR * cd / ( distPL - cd );
+						if( w > wMax )
+						{
+							wMax = w;
+						}
+					}
+				}
+				else
+				{
+					break;	// caller only needs the count
+				}
+			}
+		}
+		if( hit )
+		{
+			blk++;
+		}
+	}
+	if( wWorldBlk )
+	{
+		*wWorldBlk = wMax;
+	}
+	return blk;
+}
+// single hard ray to the light CENTRE (the collapsed evaluation): 1 = blocked (cov 0), 0 = lit.
+static bool CentreRayBlocked( const float3& P, const float3& Lp, const std::vector<probeTri_t>& tris )
+{
+	float3 D = Lp - P;
+	for( size_t t = 0; t < tris.size(); t++ )
+	{
+		const probeTri_t& pt = tris[t];
+		float3 e1 = pt.v1 - pt.v0, e2 = pt.v2 - pt.v0;
+		float3 h = cross( D, e2 );
+		float aa = dot( e1, h );
+		if( std::fabs( aa ) < 1e-12f )
+		{
+			continue;
+		}
+		float invA = 1.0f / aa;
+		float3 sp = P - pt.v0;
+		float uu = invA * dot( sp, h );
+		if( uu < 0 || uu > 1 )
+		{
+			continue;
+		}
+		float3 q = cross( sp, e1 );
+		float vv = invA * dot( D, q );
+		if( vv < 0 || uu + vv > 1 )
+		{
+			continue;
+		}
+		float tt = invA * dot( e2, q );
+		if( tt > 1e-4f && tt <= 1.0f )
+		{
+			return true;
+		}
+	}
+	return false;
+}
+}
+
+STUDY_TEST( SoftShadowClusterProbe, penumbra_collapse )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL )
+	{
+		std::printf( "    [collapseprobe] SOFTCAP unset; skipping\n" );
+		CHECK( true );
+		return;
+	}
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) )
+	{
+		CHECK( false );
+		return;
+	}
+
+	// captured camera -> world-units-per-pixel at a receiver's view depth
+	const float3 vOrg( cap.hdr.vieworg[0], cap.hdr.vieworg[1], cap.hdr.vieworg[2] );
+	const float3 vFwd( cap.hdr.viewaxis[0], cap.hdr.viewaxis[1], cap.hdr.viewaxis[2] );	// idMat3 row0 = forward
+	const float3 vRgt( cap.hdr.viewaxis[3], cap.hdr.viewaxis[4], cap.hdr.viewaxis[5] );	// row1 (screen tangent)
+	// The collapse decision happens at RUNTIME resolution, not the capture's window height (several
+	// captures are 200p hidden-window dumps). Judge at a real target res so the numbers are
+	// comparable and trustworthy - default 1080p (the "never below 1080" rule), override SW_SCREENH.
+	const char*  shEnv = std::getenv( "SW_SCREENH" );
+	const float  screenH = ( float )( shEnv ? std::atoi( shEnv ) : 1080 );
+	const float  fovy = cap.hdr.fovy > 1.0f ? cap.hdr.fovy : 73.7f;						// degrees
+	const float  tanH = std::tan( fovy * 0.5f * 3.14159265f / 180.0f );
+	// worldPerPixel(viewZ) = 2*tanH*viewZ / screenH   (vertical); pxPerWorld = 1/that
+
+	const float texelThresh[3] = { 0.5f, 1.0f, 2.0f };	// projected penumbra px below which we collapse
+	const int   MAX_RECV = 300;
+
+	// per-threshold aggregates
+	long   collapsed[3] = {}, total = 0;
+	long   collapsedCons[3] = {};					// conservative (implementable) collapse count
+	double redNumCons[3] = {};						// conservative tri-test cost
+	double redNum[3] = {}, redDen = 0.0;			// tri-test reduction (weighted)
+	double eAbsCol[3] = {};							// mean|err| among collapsed
+	long   liu[3] = {}, dil[3] = {};				// gate defects among collapsed
+	double contCollapse[3] = {}, contTruth = 0.0;	// continuity delta (px-step)
+	long   contN = 0;
+	// diagnostics: WHY collapse fires or not. wPix bins + viewZ bins over eligible receivers.
+	long   wpxBin[6] = {};	// <0.5, <1, <2, <4, <8, >=8 px projected penumbra
+	long   vzBin[5] = {};	// viewZ <64, <128, <256, <512, >=512 world units
+	double vzMin = 1e30, vzMax = 0, wpxSum = 0;
+
+	for( size_t li = 0; li < cap.lights.size(); li++ )
+	{
+		const softcapLight_t& L = cap.lights[li];
+		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
+		{
+			continue;
+		}
+		const size_t base4 = ( size_t )L.firstEdge * 2;
+		const size_t nTris = ( ( size_t )L.edgeCount * 2 ) / 3;
+		if( nTris < 64 )
+		{
+			continue;
+		}
+		auto F4 = [&]( size_t j ) -> const float*
+		{
+			return ( j & 1 ) ? cap.edges[j >> 1].e1 : cap.edges[j >> 1].e0;
+		};
+		std::vector<probeTri_t> tris( nTris );
+		for( size_t t = 0; t < nTris; t++ )
+		{
+			const float* a = F4( base4 + t * 3 + 0 );
+			const float* b = F4( base4 + t * 3 + 1 );
+			const float* c = F4( base4 + t * 3 + 2 );
+			probeTri_t& pt = tris[t];
+			pt.v0 = float3( a[0], a[1], a[2] );
+			pt.v1 = float3( b[0], b[1], b[2] );
+			pt.v2 = float3( c[0], c[1], c[2] );
+			pt.cen = ( pt.v0 + pt.v1 + pt.v2 ) * ( 1.0f / 3.0f );
+			pt.rad = std::fmax( len3( pt.v0 - pt.cen ), std::fmax( len3( pt.v1 - pt.cen ), len3( pt.v2 - pt.cen ) ) ) * 1.00001f;
+		}
+		std::vector<float3> recvPts;
+		for( const softcapReceiver_t& r : cap.receivers )
+		{
+			if( r.lightIndex != ( uint32_t )li )
+			{
+				continue;
+			}
+			const uint32_t tc = r.numIndex / 3;
+			for( uint32_t t = 0; t < tc; t++ )
+			{
+				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
+				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
+				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
+				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
+				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+			}
+		}
+		if( recvPts.empty() )
+		{
+			continue;
+		}
+		const size_t stride = std::max( ( size_t )1, recvPts.size() / MAX_RECV );
+		const float3 Lp( L.origin[0], L.origin[1], L.origin[2] );
+		const float  swR = std::fmax( L.penumbraSize, 1e-2f );
+		const float  eps = 1e-3f;
+		const double clusterCull = ( double )nTris / 32.0;	// shipped leaf-32 cluster count (cull term)
+
+		long   lCollapsed[3] = {}, lTotal = 0;
+		for( size_t s = 0; s < recvPts.size(); s += stride )
+		{
+			const float3 P = recvPts[s];
+			float3 toL = Lp - P;
+			float distPL = len3( toL );
+			if( distPL < 1e-3f )
+			{
+				continue;
+			}
+			float3 nrm = toL * ( 1.0f / distPL );
+			float viewZ = dot( P - vOrg, vFwd );
+			if( viewZ < 1.0f || viewZ > 1e5f || distPL > 1e5f )
+			{
+				continue;    // behind camera, or garbage capture verts (viewZ/dist in the millions)
+			}
+			const float pxPerWorld = screenH / ( 2.0f * tanH * viewZ );
+
+			// cost-model survivor count (cone-passing tris); penumbra width comes from BLOCKERS only.
+			// ALSO track max cd over cone-passing clusters -> the CONSERVATIVE (implementable) penumbra
+			// bound the shader can compute during the cull it already runs, before any per-sample work.
+			long  survTris = 0;
+			float maxCdCone = 0.0f;
+			for( size_t t = 0; t < nTris; t++ )
+			{
+				if( ConeCullPass( tris[t].cen, tris[t].rad, P, nrm, distPL, swR, eps ) )
+				{
+					survTris++;
+					float cd = std::fmin( dot( tris[t].cen - P, nrm ), distPL * 0.9f );
+					if( cd > maxCdCone )
+					{
+						maxCdCone = cd;
+					}
+				}
+			}
+			const float wConsWorld = maxCdCone > 1e-3f ? swR * maxCdCone / ( distPL - maxCdCone ) : 0.0f;
+			const float wPixCons = wConsWorld * pxPerWorld;
+
+			// widest penumbra among occluders that ACTUALLY block a sample (singularity-capped)
+			float wWorldBlk = 0.0f;
+			const int   tBlk = TruthBlocked16( P, Lp, swR, tris, &wWorldBlk );
+			const float covTruth = 1.0f - tBlk / 16.0f;
+			const float wPix = wWorldBlk * pxPerWorld;
+			wpxSum += wPix;
+			wpxBin[ wPix < 0.5f ? 0 : wPix < 1 ? 1 : wPix < 2 ? 2 : wPix < 4 ? 3 : wPix < 8 ? 4 : 5 ]++;
+			vzBin[ viewZ < 64 ? 0 : viewZ < 128 ? 1 : viewZ < 256 ? 2 : viewZ < 512 ? 3 : 4 ]++;
+			vzMin = std::fmin( vzMin, ( double )viewZ );
+			vzMax = std::fmax( vzMax, ( double )viewZ );
+			const bool  cRay = CentreRayBlocked( P, Lp, tris );
+			const float covCollapse = cRay ? 0.0f : 1.0f;
+
+			// continuity reference: truth coverage delta under a 1px screen-tangent step
+			const float worldPerPixel = 1.0f / pxPerWorld;
+			const float3 Pd = P + vRgt * worldPerPixel;
+			const int   tBlkD = TruthBlocked16( Pd, Lp, swR, tris );
+			const float covTruthD = 1.0f - tBlkD / 16.0f;
+			const bool  cRayD = CentreRayBlocked( Pd, Lp, tris );
+			const float covCollapseD = cRayD ? 0.0f : 1.0f;
+			contTruth += std::fabs( covTruth - covTruthD );
+			contN++;
+
+			redDen += ( double )survTris * 16.0 + clusterCull;
+			for( int ti = 0; ti < 3; ti++ )
+			{
+				if( wPix < texelThresh[ti] )
+				{
+					collapsed[ti]++;
+					lCollapsed[ti]++;
+					redNum[ti] += ( double )survTris * 1.0 + clusterCull;	// 1 sample
+					eAbsCol[ti] += std::fabs( covCollapse - covTruth );
+					if( covTruth < 0.02f && covCollapse > 0.10f )
+					{
+						liu[ti]++;
+					}
+					if( covTruth > 0.98f && covCollapse < 0.90f )
+					{
+						dil[ti]++;
+					}
+					// collapsed path's own continuity (px-step): binary center ray delta
+					contCollapse[ti] += std::fabs( covCollapse - covCollapseD );
+				}
+				else
+				{
+					redNum[ti] += ( double )survTris * 16.0 + clusterCull;	// full 16
+					contCollapse[ti] += std::fabs( covTruth - covTruthD );	// non-collapsed == truth
+				}
+				// CONSERVATIVE (shippable) decision: max-cd-over-cone-passing penumbra bound
+				if( wPixCons < texelThresh[ti] )
+				{
+					collapsedCons[ti]++;
+					redNumCons[ti] += ( double )survTris * 1.0 + clusterCull;
+				}
+				else
+				{
+					redNumCons[ti] += ( double )survTris * 16.0 + clusterCull;
+				}
+			}
+			total++;
+			lTotal++;
+		}
+		if( lTotal > 0 )
+		{
+			std::printf( "    [collapseprobe] L%zu swR=%.1f  %ld recv  collapse@1px %.0f%%\n",
+						 li, swR, lTotal, 100.0 * lCollapsed[1] / lTotal );
+		}
+	}
+
+	if( total == 0 || redDen == 0.0 )
+	{
+		std::printf( "    [collapseprobe] no eligible receivers\n" );
+		CHECK( true );
+		return;
+	}
+	std::printf( "    [collapseprobe] AGGREGATE over %ld receivers (real captured camera, fovy %.1f, %.0fp):\n",
+				 total, fovy, screenH );
+	std::printf( "      threshold |  collapsed  |  tri-test cost  |  mean|err|(collapsed) | LIU | DIL | continuity col/truth\n" );
+	for( int ti = 0; ti < 3; ti++ )
+	{
+		const double keep = redNum[ti] / redDen;					// fraction of the walk retained
+		const double col = collapsed[ti] ? eAbsCol[ti] / collapsed[ti] : 0.0;
+		const double cc = contCollapse[ti] / std::fmax( ( double )contN, 1.0 );
+		std::printf( "      %.1f px    |  %5.1f%%    |  %.2fx (=%.0f%%)  |  %.4f            | %3ld | %3ld | %.4f / %.4f\n",
+					 texelThresh[ti], 100.0 * collapsed[ti] / total, 1.0 / keep, 100.0 * keep,
+					 col, liu[ti], dil[ti], cc, contTruth / std::fmax( ( double )contN, 1.0 ) );
+	}
+	std::printf( "      CONSERVATIVE (max-cd cone bound, the SHIPPABLE proxy - collapse set is a gate-safe subset):\n" );
+	for( int ti = 0; ti < 3; ti++ )
+	{
+		const double keep = redNumCons[ti] / redDen;
+		std::printf( "      %.1f px    |  %5.1f%%    |  %.2fx (=%.0f%%)\n",
+					 texelThresh[ti], 100.0 * collapsedCons[ti] / total, 1.0 / keep, 100.0 * keep );
+	}
+	std::printf( "      (GO: a threshold with sizeable collapse%%, tri-test <1.0x, LIU/DIL ~0, continuity col <= truth)\n" );
+	std::printf( "      wPix hist: <0.5=%ld <1=%ld <2=%ld <4=%ld <8=%ld >=8=%ld  (mean %.1f px)\n",
+				 wpxBin[0], wpxBin[1], wpxBin[2], wpxBin[3], wpxBin[4], wpxBin[5], wpxSum / total );
+	std::printf( "      viewZ hist: <64=%ld <128=%ld <256=%ld <512=%ld >=512=%ld  (range %.0f..%.0f wu)\n",
+				 vzBin[0], vzBin[1], vzBin[2], vzBin[3], vzBin[4], vzMin, vzMax );
+	CHECK( true );
+}
