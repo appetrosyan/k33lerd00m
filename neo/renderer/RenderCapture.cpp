@@ -1449,6 +1449,13 @@ struct gateCap_t
 {
 	softcapHeader_t hdr;
 	std::vector<softcapLight_t> lights;
+	// TRUE captured caster meshes - the defect arbiter's PROXY-INDEPENDENT ground truth. The arbiter must
+	// NOT trace the render's consumed edge stream (s_edges): a lossy geometry proxy (r_softShadowProxyBox)
+	// makes the shader consume proxy triangles, so an s_edges arbiter would trace the proxy and rubber-stamp
+	// its own over-shadowing. These meshes are the recorded real geometry, unchanged by any proxy.
+	std::vector<softcapCaster_t> casters;
+	std::vector<float>           meshVerts;	// float3 packed
+	std::vector<uint32_t>        meshIdx;	// GLOBAL into meshVerts (v4+ caps are already global)
 	idStr mapName;
 	idStr path, name;
 };
@@ -1472,6 +1479,23 @@ bool GateLoadCap( const char* path, gateCap_t& cap )
 	{
 		fclose( f );
 		return false;
+	}
+
+	// TRUE caster meshes for the arbiter (see gateCap_t). Blocks follow lights: [edges][casters][meshVerts]
+	// [meshIdx]. On any read failure the arbiter simply has no ground truth and never masks (conservative).
+	{
+		const long castersOff = ( long )sizeof( h ) + ( long )h.numLights * ( long )sizeof( softcapLight_t )
+								+ ( long )h.numEdges * ( long )sizeof( softcapEdge_t );
+		const long meshVOff = castersOff + ( long )h.numCasters * ( long )sizeof( softcapCaster_t );
+		const long meshIOff = meshVOff + ( long )h.numMeshVerts * 3L * ( long )sizeof( float );
+		cap.casters.resize( h.numCasters );
+		cap.meshVerts.resize( ( size_t )h.numMeshVerts * 3 );
+		cap.meshIdx.resize( h.numMeshIdx );
+		bool gok = true;
+		if( h.numCasters   && ( fseek( f, castersOff, SEEK_SET ) != 0 || fread( cap.casters.data(),   sizeof( softcapCaster_t ), cap.casters.size(),   f ) != cap.casters.size() ) )   { gok = false; }
+		if( gok && cap.meshVerts.size() && ( fseek( f, meshVOff, SEEK_SET ) != 0 || fread( cap.meshVerts.data(), sizeof( float ),    cap.meshVerts.size(), f ) != cap.meshVerts.size() ) ) { gok = false; }
+		if( gok && cap.meshIdx.size()   && ( fseek( f, meshIOff, SEEK_SET ) != 0 || fread( cap.meshIdx.data(),   sizeof( uint32_t ), cap.meshIdx.size(),   f ) != cap.meshIdx.size() ) )   { gok = false; }
+		if( !gok ) { cap.casters.clear(); cap.meshVerts.clear(); cap.meshIdx.clear(); }
 	}
 	const long mapOff = ( long )sizeof( h )
 						+ ( long )h.numLights   * ( long )sizeof( softcapLight_t )
@@ -1597,7 +1621,7 @@ void GateCreateStaticInteractionsForLight( idRenderWorld* world, qhandle_t light
 // set the shader consumed, retained by the capture hook): 16 Hammersley disk samples, double-precision
 // Moller-Trumbore. This is the ARBITER for reference-vs-analytic disagreements - the RT reference has a
 // world-units ray bias that blinds it to contact shadows in seams/cracks, which the exact trace sees.
-float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR )
+float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR, const gateCap_t& cap, int li )
 {
 	// disk basis
 	idVec3 ld = L - P;
@@ -1605,6 +1629,10 @@ float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR )
 	if( dist < 1e-3 )
 	{
 		return -1.0f;
+	}
+	if( cap.meshVerts.empty() )
+	{
+		return -1.0f;			// no captured ground-truth mesh: abstain (keeps every candidate defect)
 	}
 	idVec3 lz = ld * ( float )( 1.0 / dist );
 	idVec3 lx = ( idMath::Fabs( lz.x ) < 0.9f ) ? idVec3( 1, 0, 0 ).Cross( lz ) : idVec3( 0, 1, 0 ).Cross( lz );
@@ -1628,30 +1656,22 @@ float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR )
 		double Pd[3] = { P.x, P.y, P.z };
 		double Dd[3] = { tgt.x - P.x, tgt.y - P.y, tgt.z - P.z };
 		bool hit = false;
-		// STREAM V2 (softcap v5): each light's captured blob range is its pure-tri float4 stream
-		// (3 float4 per triangle, zero-padded to an even float4 count so it stores as pair records).
-		// The pad breaks 3-alignment ACROSS lights, so iterate per light range: triangle tri of a
-		// range starting at record 'first' lives at float4s first*2 + 3*tri .. +2.
-		auto F4 = []( size_t j ) -> const float*
+		// PROXY-INDEPENDENT ground truth: the light's TRUE captured caster meshes, NOT the consumed edge
+		// stream (r_softShadowProxyBox replaces that with box tris; an arbiter tracing the proxy would
+		// rubber-stamp its own over-shadow). Trace the full closed mesh: blocked if ANY triangle stops
+		// the ray to the disk sample.
+		for( const softcapCaster_t& C : cap.casters )
 		{
-			return ( j & 1 ) ? s_edges[j >> 1].e1 : s_edges[j >> 1].e0;
-		};
-		for( const auto& er : s_edgeRange )
-		{
-			if( hit )
+			if( ( int )C.lightIndex != li )
 			{
-				break;
+				continue;
 			}
-			const size_t base4 = ( size_t )er.second.first * 2;
-			const size_t nTris = ( ( size_t )er.second.second * 2 ) / 3;	// floor() drops the zero pad
-		for( size_t tri = 0; tri < nTris && !hit; tri++ )
+		for( uint32_t k = C.firstIndex; k + 2 < C.firstIndex + C.numIndex && !hit; k += 3 )
 		{
-			const float* A0 = F4( base4 + tri * 3 + 0 );
-			const float* A1 = F4( base4 + tri * 3 + 1 );
-			const float* A2 = F4( base4 + tri * 3 + 2 );
-			double a[3] = { A0[0], A0[1], A0[2] };
-			double b[3] = { A1[0], A1[1], A1[2] };
-			double c[3] = { A2[0], A2[1], A2[2] };
+			const uint32_t ia = cap.meshIdx[k], ib = cap.meshIdx[k + 1], ic = cap.meshIdx[k + 2];
+			double a[3] = { cap.meshVerts[ia * 3], cap.meshVerts[ia * 3 + 1], cap.meshVerts[ia * 3 + 2] };
+			double b[3] = { cap.meshVerts[ib * 3], cap.meshVerts[ib * 3 + 1], cap.meshVerts[ib * 3 + 2] };
+			double c[3] = { cap.meshVerts[ic * 3], cap.meshVerts[ic * 3 + 1], cap.meshVerts[ic * 3 + 2] };
 			double e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
 			double e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
 			double pv[3] = { Dd[1] * e2[2] - Dd[2] * e2[1], Dd[2] * e2[0] - Dd[0] * e2[2], Dd[0] * e2[1] - Dd[1] * e2[0] };
@@ -2208,11 +2228,11 @@ int R_SoftShadowGate( const char* arg )
 						}
 						if( !posBuf.empty() && posBuf[i * 4 + 3] != 0.0f )
 							{
-								return GateTruthVisibility( idVec3( posBuf[i * 4 + 0], posBuf[i * 4 + 1], posBuf[i * 4 + 2] ), gLightOrg, diskR );
+								return GateTruthVisibility( idVec3( posBuf[i * 4 + 0], posBuf[i * 4 + 1], posBuf[i * 4 + 2] ), gLightOrg, diskR, cap, li );
 							}
 							float wp[3];
 						GateUnproject( invArb.ToFloatPtr(), x, y, W, H, dep, wp );
-						return GateTruthVisibility( idVec3( wp[0], wp[1], wp[2] ), gLightOrg, diskR );
+						return GateTruthVisibility( idVec3( wp[0], wp[1], wp[2] ), gLightOrg, diskR, cap, li );
 					};
 					GateAgreement( anaA, rt, valid, cfg, defects, &defectPx, &crease, truthAt );
 				}
