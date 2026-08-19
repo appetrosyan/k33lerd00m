@@ -255,11 +255,12 @@ void main( PS_IN fragment, out PS_OUT result )
 		uint swCnt  = 0xFFFFFFFFu;
 		if( swTileBase >= 0 && swTx >= 0 && swTy >= 0 )
 		{
-			swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( SW_TILE_K + 1 );
+			int swK = int( pc.rpUser6.w );	// active tile-K = tile-buffer stride (must match bin CS)
+			swSlot = swTileBase + ( swTy * int( pc.rpUser7.y ) + swTx ) * ( swK + 1 );
 			swCnt  = t_SoftTiles[ swSlot ];
 			// HANG-PROOFING (see softterm.cs): non-sentinel counts above K are corrupt tile data -
 			// degrade to the bounded full walk instead of looping the GPU into a device reset
-			if( swCnt > uint( SW_TILE_K ) && swCnt < SW_TILE_SPILL )
+			if( swCnt > uint( swK ) && swCnt < SW_TILE_SPILL )
 			{
 				swCnt = 0xFFFFFFFFu;
 			}

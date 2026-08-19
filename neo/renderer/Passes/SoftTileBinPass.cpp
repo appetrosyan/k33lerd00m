@@ -29,6 +29,7 @@ struct SoftTileBinCB
 	int		range[4];
 	float	screen[4];
 	int		minmax[4];
+	int		tune[4];
 };
 
 // mirrors c_MinMax in softtile_minmax.cs.hlsl
@@ -238,7 +239,13 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	const int tileOy = py1 / TILE_SIZE;
 	const int tilesX = px2 / TILE_SIZE - tileOx + 1;
 	const int tilesY = py2 / TILE_SIZE - tileOy + 1;
-	const int slots = tilesX * tilesY * ( TILE_K + 1 );
+	extern idCVar r_softShadowTileK;
+	// active per-tile index capacity = the tile-buffer STRIDE. Smaller K packs the tile slots denser,
+	// so the common ~80-survivor tiles' count/index words land in cache for the consumer walk; the few
+	// tiles that overflow K spill to the cluster region. Crossover is GPU-specific (cache/bandwidth) -
+	// a calibration knob, default TILE_K (identical to the old fixed layout).
+	const int activeK = idMath::ClampInt( 1, TILE_K, r_softShadowTileK.GetInteger() );
+	const int slots = tilesX * tilesY * ( activeK + 1 );
 	extern idCVar r_rtAccelDebug;
 	// tile-slot allocation stops short of the spill tail (overflowed tiles' full lists live there)
 	if( m_Cursor + slots > SW_TILE_BUFFER_ELEMENTS - SPILL_ELEMENTS )
@@ -246,7 +253,7 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 		if( r_rtAccelDebug.GetBool() )
 		{
 			common->Printf( "SoftTileBin: BUFFER FULL (cursor %d + %d tiles*%d), light falls back to full walk\n",
-							m_Cursor, tilesX * tilesY, TILE_K + 1 );
+							m_Cursor, tilesX * tilesY, activeK + 1 );
 		}
 		return -1;								// buffer full this view: full-walk fallback
 	}
@@ -288,6 +295,7 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	cb.minmax[1] = r_softShadowUmbraTiles.GetBool() ? 1 : 0;	// whole-tile umbra sentinel enable
 	cb.minmax[2] = SW_TILE_BUFFER_ELEMENTS - SPILL_ELEMENTS;	// spill region base (uint elements)
 	cb.minmax[3] = SW_TILE_BUFFER_ELEMENTS;						// spill region end
+	cb.tune[0] = activeK;	// unified active tile-K: stride + write cap + spill threshold
 
 	nvrhi::BindingSetDesc sd;
 	sd.bindings =

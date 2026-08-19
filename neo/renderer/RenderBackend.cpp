@@ -1949,10 +1949,12 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			// compute-term result for this light (r_softShadowCompute): rpUser6 = ( mode, term
 			// atlas slot offset x, y, 0 ). Mode 1 only in FACE mode (the compute pass evaluates
 			// only the face integral) with a dispatched slot; translucent draws cleared the offset.
+			extern idCVar r_softShadowTileK;	// tile-buffer stride, must match SoftTileBinPass (RenderSystem_init.cpp)
 			const bool swTermOn = ( currentSoftTermOfsX >= 0 ) && r_softShadowFaceCoverage.GetBool();
 			float swTermParm[4] = { swTermOn ? 1.0f : 0.0f,
 									( float )( swTermOn ? currentSoftTermOfsX : 0 ),
-									( float )( swTermOn ? currentSoftTermOfsY : 0 ), 0.0f };
+									( float )( swTermOn ? currentSoftTermOfsY : 0 ),
+									( float )idMath::ClampInt( 1, 512, r_softShadowTileK.GetInteger() ) };	// rpUser6.w = tile stride
 			SetFragmentParm( RENDERPARM_USER6, swTermParm );
 		}
 

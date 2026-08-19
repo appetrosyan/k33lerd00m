@@ -287,7 +287,8 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.flags[1] = ( int )casterFirstElem;	// caster table base (float4 elements) - stream v2
 	extern idCVar r_softShadowBackfaceCull;
 	cb.flags[2] = r_softShadowBackfaceCull.GetBool() ? 1 : 0;	// N.L<=0 early-out enable
-	cb.flags[3] = 0;
+	extern idCVar r_softShadowTileK;
+	cb.flags[3] = idMath::ClampInt( 1, 512, r_softShadowTileK.GetInteger() );	// tile-buffer stride (must match bin CS)
 
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.

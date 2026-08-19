@@ -161,12 +161,12 @@ void main( uint3 tid : SV_DispatchThreadID )
 	const int swTy = px.y / SW_TILE_SIZE - g_tile.y;
 	if( g_range.z >= 0 && swTx >= 0 && swTy >= 0 )
 	{
-		const int  swSlot = g_range.z + ( swTy * g_range.w + swTx ) * ( SW_TILE_K + 1 );
+		const int  swSlot = g_range.z + ( swTy * g_range.w + swTx ) * ( g_flags.w + 1 );	// stride = active tile-K
 		uint swCnt  = t_SoftTiles[ swSlot ];
 		// HANG-PROOFING: a count word must be a sane count (<= K) or a known sentinel. Anything else
 		// is corrupt tile data (a stale/aliased slot) - walking it would loop the GPU into a device
 		// reset (observed live: gfx-ring timeout, 10s watchdog). Degrade to the bounded full walk.
-		if( swCnt > ( uint )SW_TILE_K && swCnt < SW_TILE_SPILL )
+		if( swCnt > ( uint )g_flags.w && swCnt < SW_TILE_SPILL )
 		{
 			swCnt = 0xFFFFFFFFu;
 		}

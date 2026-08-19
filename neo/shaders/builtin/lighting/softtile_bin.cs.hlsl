@@ -56,6 +56,7 @@ cbuffer c_TileBin : register( b0 )
 	int4	g_range;		// firstElem (tri stream float4 base), numCasters, outBase (uint elements), casterBase (float4 elements)
 	float4	g_screen;		// viewport W, H, viewport origin x, y
 	int4	g_minmax;		// screen tiles X (t_MinMax row stride), umbra-tiles enable, SPILL region base, SPILL region end (uint elements)
+	int4	g_tune;			// x = spill threshold (tiles denser than this spill to the cluster walk; <= SW_TILE_K, device-calibrated)
 };
 
 #define SW_NEAR_EPS 1e-3f
@@ -103,7 +104,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	const int tileX = g_tileRect.x + ( int )groupId.x;
 	const int tileY = g_tileRect.y + ( int )groupId.y;
 	const int tileIdx = ( int )groupId.y * g_tileRect.z + ( int )groupId.x;
-	const int outSlot = g_range.z + tileIdx * ( SW_TILE_K + 1 );
+	const int outSlot = g_range.z + tileIdx * ( g_tune.x + 1 );	// stride = active tile-K (runtime, r_softShadowTileK)
 
 	if( tid == 0 )
 	{
@@ -219,7 +220,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
 			uint slot;
 			InterlockedAdd( gsCount, 1u, slot );
-			if( slot < SW_TILE_K )
+			if( slot < ( uint )g_tune.x )
 			{
 				u_Tiles[ outSlot + 1 + ( int )slot ] = ( uint )t;	// TRIANGLE index (stream v2)
 			}
@@ -309,7 +310,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	// cheap upper bound (sum of surviving casters' cluster counts by lane 0); the strided cull
 	// appends only surviving clusters and the descriptor stores the ACTUAL count. Region
 	// exhausted -> the old 0xFFFFFFFF sentinel (full-walk fallback): graceful, never corrupt.
-	if( gsUmbra == 0u && gsCount > SW_TILE_K )
+	if( gsUmbra == 0u && gsCount > ( uint )g_tune.x )		// overflowed the active tile-K (= stride = write cap): spill
 	{
 		if( tid == 0 )
 		{
@@ -374,7 +375,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	if( tid == 0 )
 	{
 		u_Tiles[outSlot] = ( gsUmbra != 0u ) ? SW_TILE_UMBRA
-						   : ( ( gsCount <= SW_TILE_K ) ? gsCount
+						   : ( ( gsCount <= ( uint )g_tune.x ) ? gsCount
 							   : ( ( gsSpillBase != 0xFFFFFFFFu ) ? SW_TILE_SPILL : 0xFFFFFFFFu ) );
 	}
 }
