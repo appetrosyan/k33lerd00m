@@ -81,6 +81,384 @@ int fe_rejSurfInter = 0;
 int fe_rejNumIdx = 0;
 int fe_rejIdxStale = 0;
 int fe_rejShadowCache = 0;
+int fe_softUmbraCulledTris = 0;	// r_softShadowUmbraAccum: triangles dropped as fully inside kept same-light umbra
+int fe_softUmbraRecomputes = 0;	// cache rebuilds (a rebuild per frame = volatile stream, cull effectively off)
+
+// ============================ same-light umbra-accumulation cull (r_softShadowUmbraAccum) ===================
+// Per LIGHT (never across lights), walk this light's caster triangles in depth order from the light; kept
+// geometry accumulates; a triangle whose full soft shadow falls inside the shadow of already-kept geometry
+// contributes nothing to the union coverage and is NOT emitted into the walk stream. The composite test is
+// the one VALIDATED offline (tests/SoftShadowProxyFit_test.cpp @study:SoftShadowUmbraAccum, softcap0062/63/
+// 64: 31-35% of records culled, zero supra-quantum false positives - every residual over-cull is below the
+// walk's own 1/16-disk resolution):
+//   1. coplanar-convex merge (signed planes) -> convex hull polygon certificates,
+//   2. exact umbra certificate per kept polygon (plane + edge planes tangent to the light sphere; convex
+//      region, so vertex containment is exact),
+//   3. union containment by recursive midpoint subdivision,
+//   4. aggregate sampled integral vs kept-so-far geometry with DILATED corner probes,
+//   5. two depth-ordered passes; a culled unit's triangles and certificate retire immediately.
+// Results are CACHED per light keyed on the participating surfaces' content hashes; surfaces whose stream
+// changed since the previous frame (dynamics) are VOLATILE - excluded from the cull entirely (kept, and
+// not used as blockers), so a moving caster can neither be wrongly culled nor wrongly cull others.
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <functional>
+
+struct swUmbraCullSurf_t
+{
+	uint64_t		key;		// content hash (identity across frames)
+	const idVec4*	tris;		// world-space tri stream, 3 float4 per triangle
+	int				numTris;
+};
+
+// content hash: FNV over the count and the first/last triangle records - moves/deforms change it
+static uint64_t SwUmbraSurfKey( const idVec4* tris, int numTris )
+{
+	uint64_t h = 1469598103934665603ull;
+	auto mix = [&]( const void* p, size_t n )
+	{
+		const unsigned char* b = ( const unsigned char* )p;
+		for( size_t i = 0; i < n; i++ ) { h = ( h ^ b[i] ) * 1099511628211ull; }
+	};
+	mix( &numTris, sizeof( numTris ) );
+	if( numTris > 0 )
+	{
+		mix( &tris[0], sizeof( idVec4 ) * 3 );
+		mix( &tris[( numTris - 1 ) * 3], sizeof( idVec4 ) * 3 );
+		if( numTris > 2 ) { mix( &tris[( numTris / 2 ) * 3], sizeof( idVec4 ) * 3 ); }
+	}
+	return h;
+}
+
+// masks[surfKey][tri] = 1 -> cull. Constants mirror the validated study exactly.
+static void SwUmbraCullCompute( const std::vector<swUmbraCullSurf_t>& surfs, const idVec3& Lp, float swR,
+								std::unordered_map<uint64_t, std::vector<unsigned char>>& outMasks )
+{
+	struct Tri { idVec3 v[3]; int owner; float depth; };
+	std::vector<Tri> tris;
+	std::vector<int> surfBase( surfs.size() );
+	for( size_t o = 0; o < surfs.size(); o++ )
+	{
+		surfBase[o] = ( int )tris.size();
+		for( int t = 0; t < surfs[o].numTris; t++ )
+		{
+			Tri T;
+			for( int k = 0; k < 3; k++ ) { const idVec4& r = surfs[o].tris[t * 3 + k]; T.v[k].Set( r.x, r.y, r.z ); }
+			T.owner = ( int )o;
+			T.depth = Min( ( T.v[0] - Lp ).Length(), Min( ( T.v[1] - Lp ).Length(), ( T.v[2] - Lp ).Length() ) );
+			tris.push_back( T );
+		}
+	}
+	if( tris.empty() ) { return; }
+
+	struct Cert
+	{
+		idVec3 nt, V0;
+		idVec3 en[12], ea[12]; int ne;
+		idVec3 axis; float cosH, dMin;
+	};
+	auto makePolyCert = [&]( const idVec3* pv, int n, Cert& out ) -> bool
+	{
+		if( n < 3 || n > 12 ) { return false; }
+		idVec3 nt = ( pv[1] - pv[0] ).Cross( pv[2] - pv[0] );
+		float ntl = nt.Length(); if( ntl <= 1e-6f ) { return false; }
+		nt *= 1.0f / ntl;
+		float dL = nt * ( Lp - pv[0] ); if( dL < 0.0f ) { nt = -nt; dL = -dL; }
+		if( dL <= swR + 1e-3f ) { return false; }
+		idVec3 cen( 0, 0, 0 ); for( int k = 0; k < n; k++ ) { cen += pv[k]; } cen *= 1.0f / n;
+		for( int e = 0; e < n; e++ )
+		{
+			idVec3 Va = pv[e], Vb = pv[( e + 1 ) % n];
+			idVec3 ed = Vb - Va; float el2 = ed * ed; if( el2 < 1e-12f ) { return false; }
+			idVec3 u2 = ed * ( 1.0f / idMath::Sqrt( el2 ) );
+			idVec3 w = Lp - Va; idVec3 wp = w - u2 * ( w * u2 ); float W2 = wp * wp;
+			if( W2 <= swR * swR + 1e-6f ) { return false; }
+			float invW = 1.0f / idMath::Sqrt( W2 ); idVec3 n0 = wp * invW; idVec3 m = u2.Cross( n0 );
+			float sinT = swR * invW, cosT = idMath::Sqrt( Max( 1.0f - sinT * sinT, 0.0f ) );
+			float sigma = ( ( m * ( cen - Va ) ) >= 0.0f ) ? 1.0f : -1.0f;
+			out.en[e] = n0 * sinT + m * ( sigma * cosT );
+			out.ea[e] = Va;
+		}
+		out.ne = n; out.nt = nt; out.V0 = pv[0];
+		idVec3 ax = cen - Lp; float axl = ax.Length(); if( axl < 1e-4f ) { return false; }
+		out.axis = ax * ( 1.0f / axl );
+		out.cosH = 1.0f;
+		out.dMin = dL;			// nearest possible umbra point = perpendicular light-to-plane distance
+		for( int k = 0; k < n; k++ )
+		{
+			idVec3 dv = pv[k] - Lp; float dl = dv.Length();
+			if( dl > 1e-4f ) { out.cosH = Min( out.cosH, ( dv * ( 1.0f / dl ) ) * out.axis ); }
+		}
+		out.cosH -= 1e-3f;
+		return true;
+	};
+	auto inCert = [&]( const Cert& C, const idVec3& v ) -> bool
+	{
+		float distPL = ( Lp - v ).Length();
+		if( ( C.nt * ( v - C.V0 ) ) >= -2e-4f * distPL ) { return false; }
+		for( int e = 0; e < C.ne; e++ ) { if( ( C.en[e] * ( v - C.ea[e] ) ) < 0.0f ) { return false; } }
+		return true;
+	};
+
+	// emission units: coplanar-convex hull merges (signed plane key - opposite-facing tris never merge)
+	struct Unit { std::vector<int> members; std::vector<idVec3> poly; float depth; };
+	std::vector<Unit> units;
+	{
+		std::unordered_map<uint64_t, std::vector<int>> groups;
+		for( size_t i = 0; i < tris.size(); i++ )
+		{
+			const Tri& T = tris[i];
+			idVec3 n = ( T.v[1] - T.v[0] ).Cross( T.v[2] - T.v[0] );
+			float nl = n.Length();
+			if( nl < 1e-9f ) { Unit u; u.members = { ( int )i }; u.poly = { T.v[0], T.v[1], T.v[2] }; u.depth = T.depth; units.push_back( u ); continue; }
+			n *= 1.0f / nl;
+			float d = n * T.v[0];
+			uint64_t key = ( ( uint64_t )T.owner << 40 )
+						   ^ ( ( uint64_t )( int64_t )idMath::Rint( n.x * 512 ) & 0x3FF )
+						   ^ ( ( ( uint64_t )( int64_t )idMath::Rint( n.y * 512 ) & 0x3FF ) << 10 )
+						   ^ ( ( ( uint64_t )( int64_t )idMath::Rint( n.z * 512 ) & 0x3FF ) << 20 )
+						   ^ ( ( ( uint64_t )( int64_t )idMath::Rint( d * 2.0f ) & 0xFFFF ) << 24 );
+			groups[key].push_back( ( int )i );
+		}
+		for( auto& kv : groups )
+		{
+			std::vector<int>& g = kv.second;
+			bool merged = false;
+			if( g.size() >= 2 )
+			{
+				const Tri& T0 = tris[g[0]];
+				idVec3 n = ( T0.v[1] - T0.v[0] ).Cross( T0.v[2] - T0.v[0] ); n.Normalize();
+				idVec3 e0 = ( ( idMath::Fabs( n.z ) < 0.9f ) ? idVec3( 0, 0, 1 ) : idVec3( 1, 0, 0 ) ).Cross( n ); e0.Normalize();
+				idVec3 e1 = n.Cross( e0 );
+				// coincident duplicate tris (spawned capture casters over live geometry) double-count the
+				// area sum, letting a NON-convex union pass the hull test -> unsound over-cull. Skip the
+				// merge attempt when the group contains a duplicate (per-tri units stay sound).
+				bool dup3 = false;
+				{
+					std::unordered_set<uint64_t> triKeys;
+					for( int gi : g )
+					{
+						const Tri& T = tris[gi];
+						uint64_t tk = 1469598103934665603ull;
+						for( int k = 0; k < 3; k++ )
+						{
+							int64_t q[3] = { ( int64_t )idMath::Rint( T.v[k].x * 8.0f ), ( int64_t )idMath::Rint( T.v[k].y * 8.0f ), ( int64_t )idMath::Rint( T.v[k].z * 8.0f ) };
+							tk = ( tk ^ ( uint64_t )( q[0] * 73856093 + q[1] * 19349663 + q[2] * 83492791 ) ) * 1099511628211ull;
+						}
+						if( !triKeys.insert( tk ).second ) { dup3 = true; break; }
+					}
+				}
+				std::vector<std::pair<float, float>> p2; std::vector<idVec3> p3;
+				double triArea = 0;
+				if( dup3 ) { p2.clear(); }		// duplicates present: leave p2 empty so the hull attempt below rejects
+				for( int gi : g )
+				{
+					if( dup3 ) { break; }
+					const Tri& T = tris[gi];
+					triArea += 0.5 * ( ( T.v[1] - T.v[0] ).Cross( T.v[2] - T.v[0] ) ).Length();
+					for( int k = 0; k < 3; k++ )
+					{
+						float u = ( T.v[k] - T0.v[0] ) * e0, v = ( T.v[k] - T0.v[0] ) * e1;
+						bool dup = false;
+						for( auto& q : p2 ) { if( idMath::Fabs( q.first - u ) < 1e-3f && idMath::Fabs( q.second - v ) < 1e-3f ) { dup = true; break; } }
+						if( !dup ) { p2.push_back( { u, v } ); p3.push_back( T.v[k] ); }
+					}
+				}
+				if( p2.size() >= 3 && p2.size() <= 64 )
+				{
+					std::vector<int> idx( p2.size() );
+					for( size_t k = 0; k < idx.size(); k++ ) { idx[k] = ( int )k; }
+					std::sort( idx.begin(), idx.end(), [&]( int a, int b ) { return p2[a] < p2[b]; } );
+					auto cr2 = [&]( int o, int a, int b ) { return ( double )( p2[a].first - p2[o].first ) * ( p2[b].second - p2[o].second ) - ( double )( p2[a].second - p2[o].second ) * ( p2[b].first - p2[o].first ); };
+					std::vector<int> hull( 2 * idx.size() ); int hn = 0;
+					for( size_t k = 0; k < idx.size(); k++ ) { while( hn >= 2 && cr2( hull[hn - 2], hull[hn - 1], idx[k] ) <= 0 ) { hn--; } hull[hn++] = idx[k]; }
+					int lower = hn + 1;
+					for( int k = ( int )idx.size() - 2; k >= 0; k-- ) { while( hn >= lower && cr2( hull[hn - 2], hull[hn - 1], idx[k] ) <= 0 ) { hn--; } hull[hn++] = idx[k]; }
+					hn--;
+					double hullArea = 0;
+					for( int k = 0; k < hn; k++ ) { int a = hull[k], b = hull[( k + 1 ) % hn]; hullArea += 0.5 * ( ( double )p2[a].first * p2[b].second - ( double )p2[b].first * p2[a].second ); }
+					hullArea = idMath::Fabs( ( float )hullArea );
+					if( hn >= 3 && hn <= 12 && triArea >= hullArea * 0.999 )
+					{
+						Unit u; u.members = g;
+						u.depth = 1e30f;
+						for( int gi : g ) { u.depth = Min( u.depth, tris[gi].depth ); }
+						for( int k = 0; k < hn; k++ ) { u.poly.push_back( p3[hull[k]] ); }
+						units.push_back( u ); merged = true;
+					}
+				}
+			}
+			if( !merged )
+			{
+				for( int gi : g ) { Unit u; u.members = { gi }; u.poly = { tris[gi].v[0], tris[gi].v[1], tris[gi].v[2] }; u.depth = tris[gi].depth; units.push_back( u ); }
+			}
+		}
+	}
+	std::sort( units.begin(), units.end(), []( const Unit& a, const Unit& b ) { return a.depth < b.depth; } );
+
+	std::vector<Cert> certs; certs.reserve( 1024 );
+	std::vector<unsigned char> certAlive; certAlive.reserve( 1024 );
+	std::vector<unsigned char> culled( tris.size(), 0 );
+	std::vector<int> triCert( tris.size(), -1 );
+	const int SUBDIV = 3;
+	std::function<bool( const idVec3&, const idVec3&, const idVec3&, int )> inUnion =
+		[&]( const idVec3& a, const idVec3& b, const idVec3& c, int depth ) -> bool
+	{
+		for( size_t ci = 0; ci < certs.size(); ci++ )
+		{
+			if( !certAlive[ci] ) { continue; }
+			const Cert& C = certs[ci];
+			bool maybe = true;
+			const idVec3 vv[3] = { a, b, c };
+			for( int k = 0; k < 3 && maybe; k++ )
+			{
+				idVec3 dv = vv[k] - Lp; float dl = dv.Length();
+				if( dl <= C.dMin || ( dv * ( 1.0f / dl ) ) * C.axis < C.cosH ) { maybe = false; }
+			}
+			if( !maybe ) { continue; }
+			if( inCert( C, a ) && inCert( C, b ) && inCert( C, c ) ) { return true; }
+		}
+		if( depth <= 0 ) { return false; }
+		idVec3 ab = ( a + b ) * 0.5f, bc = ( b + c ) * 0.5f, ca = ( c + a ) * 0.5f;
+		return inUnion( a, ab, ca, depth - 1 ) && inUnion( ab, b, bc, depth - 1 )
+			   && inUnion( ca, bc, c, depth - 1 ) && inUnion( ab, bc, ca, depth - 1 );
+	};
+
+	// aggregate fallback: kept-so-far blockers per surf (bounding sphere precull), Moller-Trumbore segments
+	struct BSph { idVec3 c; float r; };
+	std::vector<BSph> bs( surfs.size() );
+	for( size_t o = 0; o < surfs.size(); o++ )
+	{
+		idVec3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+		for( int t = 0; t < surfs[o].numTris * 3; t++ )
+		{
+			const idVec4& r = surfs[o].tris[t];
+			mn.x = Min( mn.x, r.x ); mn.y = Min( mn.y, r.y ); mn.z = Min( mn.z, r.z );
+			mx.x = Max( mx.x, r.x ); mx.y = Max( mx.y, r.y ); mx.z = Max( mx.z, r.z );
+		}
+		bs[o].c = ( mn + mx ) * 0.5f; bs[o].r = ( mx - mn ).Length() * 0.5f + 1e-2f;
+	}
+	std::vector<std::vector<int>> keptOf( surfs.size() );
+	auto rayBlockedByKept = [&]( const idVec3& P, const idVec3& tgt ) -> bool
+	{
+		idVec3 seg = tgt - P; float segL = seg.Length(); if( segL < 1e-4f ) { return true; }
+		idVec3 dir = seg * ( 1.0f / segL );
+		for( size_t b = 0; b < surfs.size(); b++ )
+		{
+			if( keptOf[b].empty() ) { continue; }
+			idVec3 oc = bs[b].c - P; float tp = oc * dir;
+			if( tp < -bs[b].r || tp > segL + bs[b].r ) { continue; }
+			float tc = Max( 0.0f, Min( tp, segL ) );
+			idVec3 q = P + dir * tc - bs[b].c;
+			if( q * q > bs[b].r * bs[b].r ) { continue; }
+			for( int qi : keptOf[b] )
+			{
+				if( culled[qi] ) { continue; }
+				const Tri& K = tris[qi];
+				idVec3 e1 = K.v[1] - K.v[0], e2 = K.v[2] - K.v[0], pv = seg.Cross( e2 );
+				float det = e1 * pv; if( idMath::Fabs( det ) < 1e-12f ) { continue; }
+				float inv = 1.0f / det; idVec3 tv = P - K.v[0];
+				float u = ( tv * pv ) * inv; if( u < -1e-6f || u > 1.0f + 1e-6f ) { continue; }
+				idVec3 qv = tv.Cross( e1 );
+				float v = ( seg * qv ) * inv; if( v < -1e-6f || u + v > 1.0f + 1e-6f ) { continue; }
+				float t = ( e2 * qv ) * inv;
+				if( t > 1e-5f && t < 1.0f - 1e-5f ) { return true; }
+			}
+		}
+		return false;
+	};
+	auto triFullyShadowedByKept = [&]( const Tri& T ) -> bool
+	{
+		static const float BC[26][3] = { {1.f/3,1.f/3,1.f/3}, {0.6f,0.2f,0.2f}, {0.2f,0.6f,0.2f}, {0.2f,0.2f,0.6f}, {0.45f,0.45f,0.1f}, {0.1f,0.45f,0.45f},
+										 {0.9f,0.05f,0.05f}, {0.05f,0.9f,0.05f}, {0.05f,0.05f,0.9f}, {0.475f,0.475f,0.05f}, {0.05f,0.475f,0.475f}, {0.475f,0.05f,0.475f},
+										 {0.96f,0.02f,0.02f}, {0.02f,0.96f,0.02f}, {0.02f,0.02f,0.96f}, {0.25f,0.5f,0.25f},
+										 {1.12f,-0.06f,-0.06f}, {-0.06f,1.12f,-0.06f}, {-0.06f,-0.06f,1.12f}, {0.56f,0.56f,-0.12f},
+										 {1.3f,-0.15f,-0.15f}, {-0.15f,1.3f,-0.15f}, {-0.15f,-0.15f,1.3f},
+										 {-0.12f,0.56f,0.56f}, {0.56f,-0.12f,0.56f}, {0.65f,0.65f,-0.3f} };
+		const int KD = 32;
+		for( int s = 0; s < 26; s++ )
+		{
+			idVec3 P = T.v[0] * BC[s][0] + T.v[1] * BC[s][1] + T.v[2] * BC[s][2];
+			idVec3 toL = Lp - P; float dL = toL.Length(); if( dL < 1e-3f ) { return false; }
+			idVec3 nrm = toL * ( 1.0f / dL );
+			idVec3 u2 = ( ( idMath::Fabs( nrm.z ) < 0.9f ) ? idVec3( 0, 0, 1 ) : idVec3( 1, 0, 0 ) ).Cross( nrm ); u2.Normalize();
+			idVec3 v2 = nrm.Cross( u2 );
+			for( int k = 0; k < KD; k++ )
+			{
+				float a = ( float )( 2.0 * 3.14159265358979 * k / KD );
+				float rr = swR * idMath::Sqrt( ( k + 0.5f ) / KD );
+				if( !rayBlockedByKept( P, Lp + u2 * ( rr * idMath::Cos( a ) ) + v2 * ( rr * idMath::Sin( a ) ) ) ) { return false; }
+			}
+		}
+		return true;
+	};
+
+	const int PASSES = 2;
+	for( int pass = 0; pass < PASSES; pass++ )
+	{
+		for( const Unit& U : units )
+		{
+			if( culled[U.members[0]] ) { continue; }
+			bool cull = false;
+			if( U.poly.size() == 3 )
+			{
+				cull = inUnion( U.poly[0], U.poly[1], U.poly[2], SUBDIV );
+			}
+			else
+			{
+				cull = true;
+				for( size_t k = 1; k + 1 < U.poly.size() && cull; k++ ) { cull = inUnion( U.poly[0], U.poly[k], U.poly[k + 1], SUBDIV ); }
+			}
+			// AGGRESSIVE stage (default OFF - gate-red): the sampled aggregate integral vs kept-so-far.
+			// The 26x32 (surface x disk) sampling under-covers the 4D ray domain that receiver fragments
+			// integrate CONTINUOUSLY, so residual slivers show as lit-in-umbra at gate resolution
+			// (measured: +9 LIT_IN_UMBRA +1 STEP on softcap0064 L6/L10; the certificate stages alone are
+			// conservative in both dimensions and hold the gate at 0). Kept behind a knob until the
+			// aggregate is made conservative (disk-union coverage instead of ray sampling).
+			extern idCVar r_softShadowUmbraAccumAggressive;
+			if( !cull && r_softShadowUmbraAccumAggressive.GetBool() )
+			{
+				cull = true;
+				for( int m : U.members ) { if( !triFullyShadowedByKept( tris[m] ) ) { cull = false; break; } }
+			}
+			if( cull )
+			{
+				for( int m : U.members ) { culled[m] = 1; }
+				if( triCert[U.members[0]] >= 0 ) { certAlive[triCert[U.members[0]]] = 0; }
+				continue;
+			}
+			if( pass == 0 )
+			{
+				Cert nc;
+				if( makePolyCert( U.poly.data(), ( int )U.poly.size(), nc ) )
+				{
+					certs.push_back( nc ); certAlive.push_back( 1 );
+					for( int m : U.members ) { triCert[m] = ( int )certs.size() - 1; }
+				}
+				for( int m : U.members ) { keptOf[tris[m].owner].push_back( m ); }
+			}
+		}
+	}
+
+	for( size_t o = 0; o < surfs.size(); o++ )
+	{
+		std::vector<unsigned char> mask( surfs[o].numTris, 0 );
+		bool any = false;
+		for( int t = 0; t < surfs[o].numTris; t++ ) { if( culled[surfBase[o] + t] ) { mask[t] = 1; any = true; } }
+		if( any ) { outMasks[surfs[o].key] = std::move( mask ); }
+	}
+}
+
+// per-light cull cache: comboKey over the STABLE surfaces; masks by surface content hash. Volatile
+// surfaces (content changed since last frame) never participate.
+struct swUmbraLightCache_t
+{
+	uint64_t comboKey = 0;
+	std::unordered_map<uint64_t, std::vector<unsigned char>> masks;
+	std::unordered_set<uint64_t> prevKeys, curKeys;
+};
+static std::unordered_map<int, swUmbraLightCache_t> s_swUmbraCache;
 // RB begin
 idCVar r_forceShadowMapsOnAlphaTestedSurfaces( "r_forceShadowMapsOnAlphaTestedSurfaces", "1", CVAR_RENDERER | CVAR_BOOL, "0 = same shadowing as with stencil shadows, 1 = ignore noshadows for alpha tested materials" );
 // RB end
@@ -1721,6 +2099,8 @@ void R_AddModels()
 
 		extern idCVar r_softShadowFaceCoverage;
 		const bool swFaceMode = r_softShadowFaceCoverage.GetBool();
+		extern idCVar r_softShadowUmbraAccum;
+		const bool swUmbraAccum = swFaceMode && r_softShadowUmbraAccum.GetBool();
 
 		for( viewLight_t* vLight = tr.viewDef->viewLights; vLight != NULL; vLight = vLight->next )
 		{
@@ -1785,6 +2165,59 @@ void R_AddModels()
 				}
 				edgesUsed += ( total + casterElems + clusterElems + 1 ) / 2;
 
+				// ---- r_softShadowUmbraAccum: per-surface cull masks (cached; volatile surfaces excluded) ----
+				// A surface participates only when its content hash matched last frame (statics; the bench's
+				// reconstructed casters). The joint cull recomputes only when the STABLE set changes.
+				std::vector<const std::vector<unsigned char>*> swMasks;
+				if( swUmbraAccum && vLight->lightDef != NULL )
+				{
+					swUmbraLightCache_t& cache = s_swUmbraCache[vLight->lightDef->index];
+					std::vector<std::pair<const drawSurf_t*, uint64_t>> surfKeys;
+					for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
+					{
+						surfKeys.push_back( { s, SwUmbraSurfKey( ( const idVec4* )s->softEdges, s->numSoftEdges / 3 ) } );
+					}
+					extern idCVar r_softShadowUmbraAccumMargin;
+					// cull against an INFLATED disk: only drop a triangle when even the enlarged disk is fully
+					// blocked -> boundary slivers keep their shadow with margin (the gate's arbiter tolerance)
+					const float swRlight = Max( r_shadowPenumbraSize.GetFloat(), 1e-2f )
+										   * Max( 1.0f, r_softShadowUmbraAccumMargin.GetFloat() );
+					uint64_t comboKey = 0x9E3779B97F4A7C15ull ^ ( uint64_t )( int64_t )( swRlight * 64.0f );
+					int nStable = 0;
+					for( auto& sk : surfKeys )
+					{
+						if( cache.prevKeys.count( sk.second ) ) { comboKey ^= sk.second * 0x2545F4914F6CDD1Dull; nStable++; }
+					}
+					comboKey ^= ( uint64_t )nStable << 1;
+					if( comboKey != cache.comboKey && nStable > 0 )
+					{
+						std::vector<swUmbraCullSurf_t> cullSurfs;
+						for( auto& sk : surfKeys )
+						{
+							if( !cache.prevKeys.count( sk.second ) ) { continue; }
+							cullSurfs.push_back( { sk.second, ( const idVec4* )sk.first->softEdges, sk.first->numSoftEdges / 3 } );
+						}
+						cache.masks.clear();
+						SwUmbraCullCompute( cullSurfs, vLight->lightDef->globalLightOrigin, swRlight, cache.masks );
+						cache.comboKey = comboKey;
+						fe_softUmbraRecomputes++;
+					}
+					swMasks.reserve( surfKeys.size() );
+					for( auto& sk : surfKeys )
+					{
+						const std::vector<unsigned char>* m = NULL;
+						if( cache.prevKeys.count( sk.second ) )
+						{
+							auto it = cache.masks.find( sk.second );
+							if( it != cache.masks.end() && ( int )it->second.size() == sk.first->numSoftEdges / 3 ) { m = &it->second; }
+						}
+						swMasks.push_back( m );
+						cache.curKeys.insert( sk.second );
+					}
+					cache.prevKeys.swap( cache.curKeys );
+					cache.curKeys.clear();
+				}
+
 				idVec4* triFlat = ( idVec4* )R_FrameAlloc( ( total + 1 ) * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );	// +1: zero pad for the pair-based capture copy
 				idVec4* casFlat = ( idVec4* )R_FrameAlloc( ( casterElems + clusterElems ) * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
 				idVec4* cluFlat = casFlat + casterElems;		// cluster block rides after the casters
@@ -1795,6 +2228,7 @@ void R_AddModels()
 				int  openFirstTri = 0;
 				int  openFirstClu = 0;
 				bool casterOpen = false;
+				int  swSurfIdx = 0;
 				idVec3 gmn( 1e30f, 1e30f, 1e30f ), gmx( -1e30f, -1e30f, -1e30f );
 				for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 				{
@@ -1817,6 +2251,44 @@ void R_AddModels()
 						gmn.Set( 1e30f, 1e30f, 1e30f );
 						gmx.Set( -1e30f, -1e30f, -1e30f );
 						curSpace = s->space;
+					}
+					const std::vector<unsigned char>* swM = ( swSurfIdx < ( int )swMasks.size() ) ? swMasks[swSurfIdx] : NULL;
+					swSurfIdx++;
+					if( swM != NULL && s->numSoftClusters > 0 )
+					{
+						// r_softShadowUmbraAccum: cluster-driven masked emit. Clusters partition the surface's
+						// tris into contiguous runs in emission order (R_CollectPenumbraFaces), so skipping
+						// culled tris keeps each cluster's kept subset contiguous; the rebuilt record keeps the
+						// original sphere (conservative bound for a subset). Empty clusters are dropped.
+						const idVec4* src = ( const idVec4* )s->softEdges;
+						const int numTrisSurf = s->numSoftEdges / 3;
+						for( int k = 0; k < s->numSoftClusters; k++ )
+						{
+							const idVec4 c0 = s->softClusters[k * 2 + 0];
+							const idVec4 c1s = s->softClusters[k * 2 + 1];
+							const int first = ( int )c1s.x, cnt = ( int )c1s.y;
+							const int runStart = nElems / 3;
+							for( int t = first; t < first + cnt && t < numTrisSurf; t++ )
+							{
+								if( ( *swM )[t] ) { fe_softUmbraCulledTris++; continue; }
+								for( int e = 0; e < 3; e++ )
+								{
+									const idVec4& v = src[t * 3 + e];
+									gmn.x = Min( gmn.x, v.x );	gmx.x = Max( gmx.x, v.x );
+									gmn.y = Min( gmn.y, v.y );	gmx.y = Max( gmx.y, v.y );
+									gmn.z = Min( gmn.z, v.z );	gmx.z = Max( gmx.z, v.z );
+									triFlat[nElems++] = v;
+								}
+							}
+							const int kept = nElems / 3 - runStart;
+							if( kept > 0 )
+							{
+								cluFlat[nClu * 2 + 0] = c0;
+								cluFlat[nClu * 2 + 1] = idVec4( ( float )runStart, ( float )kept, c1s.z, c1s.w );
+								nClu++;
+							}
+						}
+						continue;
 					}
 					// this surface's clusters, with firstTri rebased into the light's tri stream
 					const int surfBaseTri = nElems / 3;
@@ -1848,21 +2320,25 @@ void R_AddModels()
 					nCas++;
 				}
 
-				vLight->softEdgeCache = vertexCache.AllocJoint( triFlat, total, sizeof( idVec4 ) );
-				vLight->softEdgeCount = total;					// FACE mode: count in FLOAT4 elements
-				vLight->softCasterCache = vertexCache.AllocJoint( casFlat, casterElems + clusterElems, sizeof( idVec4 ) );
+				// EMITTED counts (== the pre-pass totals when r_softShadowUmbraAccum is off - byte-identical
+				// path; smaller when the cull dropped tris/clusters). The cluster block still starts at
+				// casterElems = numCasters*2 (casters are never dropped), matching softtile_bin's
+				// casterBase + numCasters*2, so consumers need no change.
+				vLight->softEdgeCache = vertexCache.AllocJoint( triFlat, nElems, sizeof( idVec4 ) );
+				vLight->softEdgeCount = nElems;					// FACE mode: count in FLOAT4 elements
+				vLight->softCasterCache = vertexCache.AllocJoint( casFlat, casterElems + nClu * 2, sizeof( idVec4 ) );
 				vLight->softCasterCount = nCas;
 
 				if( R_SoftShadowCaptureArmed() )
 				{
-					triFlat[total].Zero();						// pad the odd tail for the pair-based copy
-					R_CaptureLightEdges( vLight, ( const softShadowEdge_t* )triFlat, ( total + 1 ) / 2 );
+					triFlat[nElems].Zero();						// pad the odd tail for the pair-based copy
+					R_CaptureLightEdges( vLight, ( const softShadowEdge_t* )triFlat, ( nElems + 1 ) / 2 );
 				}
 
 				tr.pc.c_softShadowLights++;
 				tr.pc.c_softShadowCasters += nCas;
-				tr.pc.c_softShadowEdges += total;
-				tr.pc.c_softShadowMaxEdgesPerLight = Max( tr.pc.c_softShadowMaxEdgesPerLight, total );
+				tr.pc.c_softShadowEdges += nElems;
+				tr.pc.c_softShadowMaxEdgesPerLight = Max( tr.pc.c_softShadowMaxEdgesPerLight, nElems );
 				continue;
 			}
 
