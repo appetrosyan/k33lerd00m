@@ -725,6 +725,8 @@ loop (same failure as the caster-header jump-skip). The "wins" in early runs wer
 DROPPING most soft records over the frame budget.
 =====================
 */
+int fe_softProxyBoxed = 0;	// r_softShadowProxyBox: casters replaced by their 12-tri AABB proxy (diagnostic)
+
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
 		const idRenderLightLocal* light, float penumbraSize, const float* modelToWorld,
 		idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters )
@@ -740,17 +742,78 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 	}
 
 	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
-	const int numTris = tri->numIndexes / 3;
+	int numTris = tri->numIndexes / 3;
+
+	// BOX-PROXY (r_softShadowProxyBox): a caster mesh whose vertices all hug their own AABB IS a box
+	// (crate/panel/machinery); the mesh is a lossy discretization of that box, so replacing it with the
+	// 12-triangle AABB proxy is equal-or-better and cuts the walk's record count ~100x for that caster.
+	// Round/detailed/L-shaped meshes have interior verts far from every face -> fail the test -> keep
+	// their triangles. Verts drive the whole pipeline below (transform, cluster, emit) unchanged.
+	extern idCVar r_softShadowProxyBox, r_softShadowProxyBoxGap;
+	extern int fe_softProxyBoxed;
+	const int SW_PROXY_MIN_TRIS = 64;			// below this the 12-tri box saves too little to bother
+	idVec3 boxLocal[36];						// 12 tris x 3 local-space box verts (when proxied)
+	bool useBox = false;
+	if( r_softShadowProxyBox.GetBool() && numTris >= SW_PROXY_MIN_TRIS && tri->numVerts > 0 )
+	{
+		idVec3 lmn( 1e30f, 1e30f, 1e30f ), lmx( -1e30f, -1e30f, -1e30f );
+		for( int v = 0; v < tri->numVerts; v++ )
+		{
+			const idVec3& p = verts[v].xyz;
+			lmn.x = Min( lmn.x, p.x ); lmn.y = Min( lmn.y, p.y ); lmn.z = Min( lmn.z, p.z );
+			lmx.x = Max( lmx.x, p.x ); lmx.y = Max( lmx.y, p.y ); lmx.z = Max( lmx.z, p.z );
+		}
+		const idVec3 ext = lmx - lmn;
+		const float diag = ext.Length();
+		if( diag > 1e-3f )
+		{
+			float maxGap = 0.0f;				// worst vertex's distance INTO the box from its nearest face
+			for( int v = 0; v < tri->numVerts; v++ )
+			{
+				const idVec3& p = verts[v].xyz;
+				const float g = Min( Min( Min( p.x - lmn.x, lmx.x - p.x ), Min( p.y - lmn.y, lmx.y - p.y ) ), Min( p.z - lmn.z, lmx.z - p.z ) );
+				maxGap = Max( maxGap, g );
+			}
+			if( maxGap < r_softShadowProxyBoxGap.GetFloat() * diag )
+			{
+				useBox = true;
+				fe_softProxyBoxed++;
+				idVec3 corner[8];
+				for( int c = 0; c < 8; c++ )
+				{
+					corner[c].Set( ( c & 1 ) ? lmx.x : lmn.x, ( c & 2 ) ? lmx.y : lmn.y, ( c & 4 ) ? lmx.z : lmn.z );
+				}
+				static const int F[6][4] = { {0,2,6,4}, {1,3,7,5}, {0,1,5,4}, {2,3,7,6}, {0,1,3,2}, {4,5,7,6} };
+				int b = 0;
+				for( int f = 0; f < 6; f++ )
+				{
+					boxLocal[b++] = corner[F[f][0]]; boxLocal[b++] = corner[F[f][1]]; boxLocal[b++] = corner[F[f][2]];
+					boxLocal[b++] = corner[F[f][0]]; boxLocal[b++] = corner[F[f][2]]; boxLocal[b++] = corner[F[f][3]];
+				}
+				numTris = 12;
+			}
+		}
+	}
 
 	// pass 1: transform every triangle to world ONCE into a transient scratch (the emit below is in
-	// cluster order, so it cannot stream straight out of the index list)
+	// cluster order, so it cannot stream straight out of the index list). Box proxy: transform its 12
+	// local tris instead of the mesh's; the cluster/emit path below is identical either way.
 	idVec3* wv = ( idVec3* )R_FrameAlloc( ( size_t )numTris * 3 * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
 	idVec3* wc = ( idVec3* )R_FrameAlloc( ( size_t )numTris * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
 	for( int t = 0; t < numTris; t++ )
 	{
-		R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 0]].xyz, wv[t * 3 + 0] );
-		R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 1]].xyz, wv[t * 3 + 1] );
-		R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 2]].xyz, wv[t * 3 + 2] );
+		if( useBox )
+		{
+			R_LocalPointToGlobal( modelToWorld, boxLocal[t * 3 + 0], wv[t * 3 + 0] );
+			R_LocalPointToGlobal( modelToWorld, boxLocal[t * 3 + 1], wv[t * 3 + 1] );
+			R_LocalPointToGlobal( modelToWorld, boxLocal[t * 3 + 2], wv[t * 3 + 2] );
+		}
+		else
+		{
+			R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 0]].xyz, wv[t * 3 + 0] );
+			R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 1]].xyz, wv[t * 3 + 1] );
+			R_LocalPointToGlobal( modelToWorld, verts[tri->indexes[t * 3 + 2]].xyz, wv[t * 3 + 2] );
+		}
 		wc[t] = ( wv[t * 3 + 0] + wv[t * 3 + 1] + wv[t * 3 + 2] ) * ( 1.0f / 3.0f );
 	}
 
