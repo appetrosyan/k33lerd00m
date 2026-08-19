@@ -40,6 +40,7 @@ version. See <http://www.gnu.org/licenses/>.
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <unordered_set>
 
 using namespace swtest;
 
@@ -1358,6 +1359,12 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 	const int KDISK = 8;			// ground-truth disk rays per surface sample
 	const int KS = 6;				// ground-truth surface samples per triangle
 	const int FN_STRIDE = 7;		// kept-triangle stride for the false-negative estimate
+	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
+	const int SUBDIV_DEPTH = envI( "UMB_SUBDIV", 3 );	// union-containment midpoint subdivision depth
+	const int PASSES = envI( "UMB_PASSES", 2 );			// depth-ordered passes (pass 2+ sees ALL certificates)
+	const int CELLAGG = envI( "UMB_CELLAGG", 1 );		// 1 = CONSERVATIVE cell-cert aggregate (new), 0 = legacy sampled rays
+	const int CELLS_G = envI( "UMB_CELLS", 6 );			// light-sphere ball-grid resolution per axis
+	long cellCertsBuilt = 0, cellCertFails = 0;			// diagnostics
 
 	auto raySphere2 = []( float3 O, float3 dir, float3 C, float r, float tmax ) -> bool
 	{
@@ -1383,6 +1390,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 	long fnCause[4] = { 0, 0, 0, 0 };	// 0=GRAZE 1=LATER 2=CERT(union gap) 3=other
 	long fpSev[4] = { 0, 0, 0, 0 };		// FP severity by unblocked audit rays (of 512): <=2, <=8, <=32, >32
 	long fpUnblockedMax = 0;
+	long fnAchievable = 0;				// FN tris the converged cull test would NOW accept (real residual)
 
 	for( uint32_t li = 0; li < cap.lights.size(); li++ )
 	{
@@ -1473,24 +1481,27 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 			return true;
 		};
 		// polygon certificate: same construction over a CONVEX CCW vert loop (sigma oriented by centroid)
-		auto makePolyCert = [&]( const float3* pv, int n, Cert& out ) -> bool
+		// certificate w.r.t. an ARBITRARY light ball (LC, LR): the umbra region of polygon pv against that
+		// ball. LC=Lp, LR=swR is the classic full-light certificate; a CELL of the light-sphere grid gives
+		// the per-cell certificate the conservative aggregate composes (different blockers per cell).
+		auto makePolyCertAt = [&]( const float3* pv, int n, float3 LC, float LR, Cert& out ) -> bool
 		{
 			if( n < 3 || n > 12 ) { return false; }
 			float3 nt = cross( pv[1] - pv[0], pv[2] - pv[0] );
 			float ntl = std::sqrt( dot( nt, nt ) ); if( ntl <= 1e-6f ) { return false; }
 			nt = nt * ( 1.0f / ntl );
-			float dL = dot( nt, Lp - pv[0] ); if( dL < 0.0f ) { nt = nt * -1.0f; dL = -dL; }
-			if( dL <= swR + 1e-3f ) { return false; }
+			float dL = dot( nt, LC - pv[0] ); if( dL < 0.0f ) { nt = nt * -1.0f; dL = -dL; }
+			if( dL <= LR + 1e-3f ) { return false; }
 			float3 cen( 0, 0, 0 ); for( int k = 0; k < n; k++ ) { cen = cen + pv[k]; } cen = cen * ( 1.0f / n );
 			for( int e = 0; e < n; e++ )
 			{
 				float3 Va = pv[e], Vb = pv[( e + 1 ) % n];
 				float3 ed = Vb - Va; float el2 = dot( ed, ed ); if( el2 < 1e-12f ) { return false; }
 				float3 u2 = ed * ( 1.0f / std::sqrt( el2 ) );
-				float3 w = Lp - Va; float3 wp = w - u2 * dot( w, u2 ); float W2 = dot( wp, wp );
-				if( W2 <= swR * swR + 1e-6f ) { return false; }
+				float3 w = LC - Va; float3 wp = w - u2 * dot( w, u2 ); float W2 = dot( wp, wp );
+				if( W2 <= LR * LR + 1e-6f ) { return false; }
 				float invW = 1.0f / std::sqrt( W2 ); float3 n0 = wp * invW; float3 m = cross( u2, n0 );
-				float sinT = swR * invW, cosT = std::sqrt( std::fmax( 1.0f - sinT * sinT, 0.0f ) );
+				float sinT = LR * invW, cosT = std::sqrt( std::fmax( 1.0f - sinT * sinT, 0.0f ) );
 				float sigma = ( dot( m, cen - Va ) >= 0.0f ) ? 1.0f : -1.0f;	// interior = polygon centroid side
 				out.en[e] = n0 * sinT + m * ( sigma * cosT );
 				out.ea[e] = Va;
@@ -1498,19 +1509,23 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 			out.ne = n;
 			out.nt = nt; out.V0 = pv[0];
 			out.src[0] = pv[0]; out.src[1] = pv[1]; out.src[2] = pv[2];
-			float3 ax = cen - Lp; float axl = std::sqrt( dot( ax, ax ) ); if( axl < 1e-4f ) { return false; }
+			float3 ax = cen - LC; float axl = std::sqrt( dot( ax, ax ) ); if( axl < 1e-4f ) { return false; }
 			out.axis = ax * ( 1.0f / axl );
 			out.cosH = 1.0f;
-			out.dMin = dL;			// nearest possible umbra point = the light's perpendicular distance to
-									// the PLANE (a vertex min under-bounds when the light sits over the
+			out.dMin = dL;			// nearest possible umbra point = the ball's perpendicular distance to
+									// the PLANE (a vertex min under-bounds when the ball sits over the
 									// polygon interior -> wrongly pruned containment, measured FN source)
 			for( int k = 0; k < n; k++ )
 			{
-				float3 dv = pv[k] - Lp; float dl = std::sqrt( dot( dv, dv ) );
+				float3 dv = pv[k] - LC; float dl = std::sqrt( dot( dv, dv ) );
 				if( dl > 1e-4f ) { out.cosH = std::fmin( out.cosH, dot( dv * ( 1.0f / dl ), out.axis ) ); }
 			}
 			out.cosH -= 1e-3f;
 			return true;
+		};
+		auto makePolyCert = [&]( const float3* pv, int n, Cert& out ) -> bool
+		{
+			return makePolyCertAt( pv, n, Lp, swR, out );
 		};
 
 		// ---- EMISSION UNITS: coplanar groups whose triangle UNION is CONVEX (tri-area sum == 2D hull
@@ -1545,7 +1560,25 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 			{
 				std::vector<int>& g = kv.second;
 				bool merged = false;
-				if( g.size() >= 2 )
+				// TRUE PLANARITY gate: the quantized plane key admits ~0.5u of sag, and a hull built from
+				// sagging tris certifies a FLATTENED polygon that does not physically exist - the
+				// full-sphere tangent slack hid it; the cell certificates exposed it (measured FP at G=12:
+				// a 4-gon certifier whose real triangles do not block the ray). Require every group vert
+				// within a tight absolute distance of the actual plane before merging.
+				bool planarOK = g.size() >= 2;
+				if( planarOK )
+				{
+					const Tri& T0g = tris[g[0]];
+					float3 ng = normalize( cross( T0g.v[1] - T0g.v[0], T0g.v[2] - T0g.v[0] ) );
+					for( size_t gi2 = 0; gi2 < g.size() && planarOK; gi2++ )
+					{
+						for( int k = 0; k < 3 && planarOK; k++ )
+						{
+							if( std::fabs( dot( ng, tris[g[gi2]].v[k] - T0g.v[0] ) ) > 0.03f ) { planarOK = false; }
+						}
+					}
+				}
+				if( planarOK )
 				{
 					// 2D hull of the group's verts in the plane basis; convex-union iff areas match
 					const Tri& T0 = tris[g[0]];
@@ -1601,16 +1634,18 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 		std::sort( units.begin(), units.end(), []( const Unit& a, const Unit& b ) { return a.depth < b.depth; } );
 
 		std::vector<Cert> certs; certs.reserve( 1024 );
+		std::vector<uint8_t> certAlive; certAlive.reserve( 1024 );	// pass 2 retires a culled unit's cert
 		std::vector<uint8_t> culled( tris.size(), 0 );
 		std::vector<int> culledBy( tris.size(), -1 );
 		// is triangle (a,b,c) contained in the UNION of accumulated umbras? whole-in-one-cert first; else
 		// split at edge midpoints (each leaf inside ONE cert => leaf in the union; all leaves => whole tri).
 		// Sound: every cert's polygon is KEPT geometry, so union containment = every ray blocked by kept tris.
-		const int SUBDIV = 3;
+		const int SUBDIV = SUBDIV_DEPTH;
 		std::function<bool( float3, float3, float3, int, int& )> inUnion = [&]( float3 a, float3 b, float3 c, int depth, int& by ) -> bool
 		{
 			for( size_t ci = 0; ci < certs.size(); ci++ )
 			{
+				if( !certAlive[ci] ) { continue; }
 				const Cert& C = certs[ci];
 				bool maybe = true;
 				float3 vv[3] = { a, b, c };
@@ -1643,6 +1678,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 				if( !raySphere2( P, dir, blockers[b].c, blockers[b].r, segL ) ) { continue; }
 				for( int q : keptOf[b] )
 				{
+					if( culled[q] ) { continue; }		// pass 2 retires culled tris immediately
 					const Tri& K = tris[q];
 					// Moller-Trumbore segment test (mirrors RayHitsMesh)
 					float3 e1 = K.v[1] - K.v[0], e2 = K.v[2] - K.v[0], pv = cross( seg, e2 );
@@ -1689,39 +1725,171 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 		std::vector<int> casToBlocker( cap.casters.size(), -1 );
 		for( size_t b = 0; b < blockers.size(); b++ ) { casToBlocker[blockers[b].owner] = ( int )b; }
 
-		for( const Unit& U : units )
+		// ---- CONSERVATIVE CELL AGGREGATE: cover the light SPHERE with a ball grid; unit U is cullable
+		// iff EVERY cell has SOME kept unit whose certificate w.r.t. that cell-ball contains all of U's
+		// verts. Different blockers per cell = the multi-blocker union, conservative in the light dimension
+		// (ball inflation) and EXACT in the surface dimension (convexity + vertex containment) - no
+		// sampling anywhere. Grazing blockers (no full-sphere cert) still yield per-cell certs.
+		std::vector<float3> cellC; float cellRad = 0.0f;
 		{
-			bool cull = false; int by = -1;
-			if( U.poly.size() == 3 )
+			const int G = CELLS_G;
+			const float step = 2.0f * swR / G;
+			cellRad = 0.5f * step * 1.7320508f;
+			for( int i = 0; i < G; i++ )
+				for( int j = 0; j < G; j++ )
+					for( int k = 0; k < G; k++ )
+					{
+						float3 off( -swR + ( i + 0.5f ) * step, -swR + ( j + 0.5f ) * step, -swR + ( k + 0.5f ) * step );
+						if( std::sqrt( dot( off, off ) ) <= swR + cellRad ) { cellC.push_back( Lp + off ); }
+					}
+		}
+		std::vector<int> keptUnitIdx; std::vector<uint8_t> keptUnitAlive;
+		std::vector<int> unitKeptPos( units.size(), -1 );
+		std::unordered_map<uint64_t, Cert> cellCertMemo;
+		std::unordered_set<uint64_t> cellCertBad;
+		std::vector<int> cellLastHit( cellC.size(), -1 );
+		auto cellCovered = [&]( const Unit& U, int ci ) -> bool
+		{
+			auto tryW = [&]( int w ) -> bool
 			{
-				cull = inUnion( U.poly[0], U.poly[1], U.poly[2], SUBDIV, by );
-			}
-			else
+				if( w < 0 || !keptUnitAlive[w] ) { return false; }
+				const uint64_t key = ( ( uint64_t )w << 24 ) | ( uint64_t )ci;
+				if( cellCertBad.count( key ) ) { return false; }
+				auto it = cellCertMemo.find( key );
+				if( it == cellCertMemo.end() )
+				{
+					const Unit& W = units[keptUnitIdx[w]];
+					Cert tmp;
+					if( !makePolyCertAt( W.poly.data(), ( int )W.poly.size(), cellC[ci], cellRad, tmp ) )
+					{
+						cellCertBad.insert( key ); cellCertFails++; return false;
+					}
+					it = cellCertMemo.emplace( key, tmp ).first; cellCertsBuilt++;
+				}
+				const Cert& C = it->second;
+				for( size_t k = 0; k < U.poly.size(); k++ )
+				{
+					float3 dv = U.poly[k] - Lp; float dl = std::sqrt( dot( dv, dv ) );
+					if( dl <= C.dMin * 0.5f ) { return false; }		// loose prune only; the exact test decides
+					if( !inCert( C, U.poly[k] ) ) { return false; }
+				}
+				return true;
+			};
+			if( tryW( cellLastHit[ci] ) ) { return true; }
+			for( int w = ( int )keptUnitIdx.size() - 1; w >= 0; w-- )	// near-depth kept units first (later = deeper)
 			{
-				// merged hull: fan-triangulate and require every fan triangle union-contained
-				cull = true;
-				for( size_t k = 1; k + 1 < U.poly.size() && cull; k++ ) { cull = inUnion( U.poly[0], U.poly[k], U.poly[k + 1], SUBDIV, by ); }
+				if( w == cellLastHit[ci] ) { continue; }
+				if( tryW( w ) ) { cellLastHit[ci] = w; return true; }
 			}
-			if( !cull )
+			return false;
+		};
+		auto conservativeAggregate = [&]( const Unit& U ) -> bool
+		{
+			for( size_t ci = 0; ci < cellC.size(); ci++ ) { if( !cellCovered( U, ( int )ci ) ) { return false; } }
+			return true;
+		};
+		std::vector<int> triUnit( tris.size(), -1 );
+		for( size_t ui = 0; ui < units.size(); ui++ ) { for( int m : units[ui].members ) { triUnit[m] = ( int )ui; } }
+		// FP forensics: which cell claims to cover the escaping ray, which kept unit certified it, and does
+		// that unit's polygon actually block the ray (RayHitsMesh over its fan)?
+		auto diagFP = [&]( size_t ti, float3 P, float3 tgt )
+		{
+			int ui = triUnit[ti]; if( ui < 0 ) { std::printf( "        [diag] no unit\n" ); return; }
+			const Unit& U = units[ui];
+			// cells containing the target
+			for( size_t ci = 0; ci < cellC.size(); ci++ )
 			{
-				// certificate miss: sampled aggregate integral vs kept-so-far geometry, with DILATED corner
-				// probes in the sample set (the audit localized escaping slivers at corners).
-				cull = true;
-				for( int m : U.members ) { if( !triFullyShadowedByKept( tris[m] ) ) { cull = false; break; } }
-				if( cull ) { by = -2; }
+				float3 d = tgt - cellC[ci];
+				if( std::sqrt( dot( d, d ) ) > cellRad ) { continue; }
+				// find the certifying kept unit for this cell (re-run the scan)
+				int hitW = -1;
+				{
+					for( int w = ( int )keptUnitIdx.size() - 1; w >= 0 && hitW < 0; w-- )
+					{
+						if( !keptUnitAlive[w] ) { continue; }
+						const uint64_t key = ( ( uint64_t )w << 24 ) | ( uint64_t )ci;
+						auto it = cellCertMemo.find( key );
+						if( it == cellCertMemo.end() ) { continue; }		// only memoized certs can have certified
+						const Cert& C = it->second;
+						bool inside = true;
+						for( size_t k = 0; k < U.poly.size() && inside; k++ ) { if( !inCert( C, U.poly[k] ) ) { inside = false; } }
+						if( inside ) { hitW = w; }
+					}
+				}
+				if( hitW < 0 ) { std::printf( "        [diag] cell %zu contains tgt but NO memoized cert covers unit -> coverage hole?!\n", ci ); continue; }
+				const Unit& W = units[keptUnitIdx[hitW]];
+				bool blocks = false;
+				for( size_t k = 1; k + 1 < W.poly.size() && !blocks; k++ )
+				{
+					float wv[9] = { W.poly[0].x, W.poly[0].y, W.poly[0].z, W.poly[k].x, W.poly[k].y, W.poly[k].z, W.poly[k + 1].x, W.poly[k + 1].y, W.poly[k + 1].z };
+					uint32_t wi2[3] = { 0, 1, 2 };
+					if( RayHitsMesh( P, tgt - P, wv, wi2, 3 ) ) { blocks = true; }
+				}
+				const uint64_t dkey = ( ( uint64_t )hitW << 24 ) | ( uint64_t )ci;
+				const Cert& DC = cellCertMemo.find( dkey )->second;
+				std::printf( "        [diag] cell %zu certifier W(unit %d, %zu-gon) blocksRay=%d PinCert=%d Uverts=%zu | planeDot(P) %.4f | W0(%.1f,%.1f,%.1f) W2(%.1f,%.1f,%.1f) cellC(%.1f,%.1f,%.1f) r%.2f\n",
+							 ci, keptUnitIdx[hitW], W.poly.size(), blocks ? 1 : 0, inCert( DC, P ) ? 1 : 0, U.poly.size(),
+							 dot( DC.nt, P - DC.V0 ),
+							 W.poly[0].x, W.poly[0].y, W.poly[0].z, W.poly[2].x, W.poly[2].y, W.poly[2].z, cellC[ci].x, cellC[ci].y, cellC[ci].z, cellRad );
 			}
-			if( cull )
+		};
+
+		// PASS 1: certificates accumulate from kept nearer units. PASS 2+: every surviving unit re-tested
+		// with ALL surviving certificates visible (pass 1 withholds a large slanted blocker's certificate
+		// from victims processed before it - nearest-vert depth misorders along individual rays). Soundness
+		// across passes: depth order + IMMEDIATE retirement of a culled unit's tris and certificate, so a
+		// certification chain can never pass through something that is itself culled (no mutual removal).
+		for( int pass = 0; pass < PASSES; pass++ )
+		{
+			for( size_t ui = 0; ui < units.size(); ui++ )
 			{
-				for( int m : U.members ) { culled[m] = 1; culledBy[m] = by; nCulled++; culledRec += 1; }
-				continue;
+				const Unit& U = units[ui];
+				if( culled[U.members[0]] ) { continue; }		// unit already gone (members cull together)
+				bool cull = false; int by = -1;
+				if( U.poly.size() == 3 )
+				{
+					cull = inUnion( U.poly[0], U.poly[1], U.poly[2], SUBDIV, by );
+				}
+				else
+				{
+					// merged hull: fan-triangulate and require every fan triangle union-contained
+					cull = true;
+					for( size_t k = 1; k + 1 < U.poly.size() && cull; k++ ) { cull = inUnion( U.poly[0], U.poly[k], U.poly[k + 1], SUBDIV, by ); }
+				}
+				if( !cull )
+				{
+					if( CELLAGG )
+					{
+						cull = conservativeAggregate( U );
+					}
+					else
+					{
+						// legacy: sampled aggregate integral vs kept-so-far (known unsound at gate resolution)
+						cull = true;
+						for( int m : U.members ) { if( !triFullyShadowedByKept( tris[m] ) ) { cull = false; break; } }
+					}
+					if( cull ) { by = -2; }
+				}
+				if( cull )
+				{
+					for( int m : U.members ) { culled[m] = 1; culledBy[m] = by; nCulled++; culledRec += 1; }
+					if( triCert[U.members[0]] >= 0 ) { certAlive[triCert[U.members[0]]] = 0; }	// retire the unit's own cert
+					if( unitKeptPos[ui] >= 0 ) { keptUnitAlive[unitKeptPos[ui]] = 0; }			// retire from the cell aggregate
+					continue;
+				}
+				if( pass == 0 )
+				{
+					Cert nc;
+					if( makePolyCert( U.poly.data(), ( int )U.poly.size(), nc ) )
+					{
+						certs.push_back( nc ); certAlive.push_back( 1 );
+						for( int m : U.members ) { triCert[m] = ( int )certs.size() - 1; }
+					}
+					unitKeptPos[ui] = ( int )keptUnitIdx.size();
+					keptUnitIdx.push_back( ( int )ui ); keptUnitAlive.push_back( 1 );
+					for( int m : U.members ) { int b = casToBlocker[tris[m].owner]; if( b >= 0 ) { keptOf[b].push_back( m ); } }
+				}
 			}
-			Cert nc;
-			if( makePolyCert( U.poly.data(), ( int )U.poly.size(), nc ) )
-			{
-				certs.push_back( nc );
-				for( int m : U.members ) { triCert[m] = ( int )certs.size() - 1; }
-			}
-			for( int m : U.members ) { int b = casToBlocker[tris[m].owner]; if( b >= 0 ) { keptOf[b].push_back( m ); } }
 		}
 		// Backface propagation DISABLED: measured on softcap0062 it produced the study's ONLY false
 		// positive (an open-mesh caster: front faces culled by DIFFERENT certificates union-cover the
@@ -1802,6 +1970,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 					nFP++;
 					fpSev[( unblockedCnt <= 6 ) ? 0 : ( unblockedCnt <= 24 ? 1 : ( unblockedCnt <= 96 ? 2 : 3 ) )]++;	// 96/1536 = one 1/16 walk quantum
 					fpUnblockedMax = std::max( fpUnblockedMax, ( long )unblockedCnt );
+					if( nFP <= 3 && culledBy[i] == -2 && std::getenv( "UMB_DIAG" ) != NULL ) { diagFP( i, failP, failTgt ); }
 					if( nFP <= 8 )
 					{
 						std::printf( "      [FP] L%u caster c%u depth %.0f front %d culledBy %d\n", li, tris[i].owner, tris[i].depth, tris[i].front ? 1 : 0, culledBy[i] );
@@ -1829,6 +1998,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 				if( redundant( i ) )
 				{
 					fnRedundant++;
+					if( triFullyShadowedByKept( tris[i] ) ) { fnAchievable++; }	// the cull test WOULD pass now -> real residual miss; else structural tax
 					// WHY was this redundancy missed? find the blocker of the centroid->light-centre ray and
 					// classify: GRAZE (blocker plane too edge-on to emit a cert), LATER (blocker deeper than
 					// T - depth order withheld its cert), CERT (blocker's cert exists - union-resolution gap).
@@ -1878,5 +2048,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 				 fnCause[0], fnCause[1], fnCause[2], fnCause[3] );
 	std::printf( "      FP severity (unblocked of 1536 audit rays; 96 = one 1/16 walk quantum): <=6: %ld | 7-24: %ld | 25-96: %ld | >96 SUPRA-QUANTUM: %ld  (max %ld)\n",
 				 fpSev[0], fpSev[1], fpSev[2], fpSev[3], fpUnblockedMax );
+	std::printf( "      FN split: %ld of %ld redundant-but-kept would pass the cull test NOW (real residual); the rest is structural tax (mutual redundancy + dilation safety)\n",
+				 fnAchievable, fnRedundant );
 	CHECK( true );
 }

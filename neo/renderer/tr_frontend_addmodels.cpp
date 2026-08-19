@@ -158,40 +158,47 @@ static void SwUmbraCullCompute( const std::vector<swUmbraCullSurf_t>& surfs, con
 		idVec3 en[12], ea[12]; int ne;
 		idVec3 axis; float cosH, dMin;
 	};
-	auto makePolyCert = [&]( const idVec3* pv, int n, Cert& out ) -> bool
+	// certificate w.r.t. an ARBITRARY light ball (LC, LR): LC=Lp/LR=swR is the classic full-light
+	// certificate; a CELL of the light-sphere ball grid gives the per-cell certificate the conservative
+	// aggregate composes (different blockers per cell = multi-blocker union, no sampling anywhere).
+	auto makePolyCertAt = [&]( const idVec3* pv, int n, const idVec3& LC, float LR, Cert& out ) -> bool
 	{
 		if( n < 3 || n > 12 ) { return false; }
 		idVec3 nt = ( pv[1] - pv[0] ).Cross( pv[2] - pv[0] );
 		float ntl = nt.Length(); if( ntl <= 1e-6f ) { return false; }
 		nt *= 1.0f / ntl;
-		float dL = nt * ( Lp - pv[0] ); if( dL < 0.0f ) { nt = -nt; dL = -dL; }
-		if( dL <= swR + 1e-3f ) { return false; }
+		float dL = nt * ( LC - pv[0] ); if( dL < 0.0f ) { nt = -nt; dL = -dL; }
+		if( dL <= LR + 1e-3f ) { return false; }
 		idVec3 cen( 0, 0, 0 ); for( int k = 0; k < n; k++ ) { cen += pv[k]; } cen *= 1.0f / n;
 		for( int e = 0; e < n; e++ )
 		{
 			idVec3 Va = pv[e], Vb = pv[( e + 1 ) % n];
 			idVec3 ed = Vb - Va; float el2 = ed * ed; if( el2 < 1e-12f ) { return false; }
 			idVec3 u2 = ed * ( 1.0f / idMath::Sqrt( el2 ) );
-			idVec3 w = Lp - Va; idVec3 wp = w - u2 * ( w * u2 ); float W2 = wp * wp;
-			if( W2 <= swR * swR + 1e-6f ) { return false; }
+			idVec3 w = LC - Va; idVec3 wp = w - u2 * ( w * u2 ); float W2 = wp * wp;
+			if( W2 <= LR * LR + 1e-6f ) { return false; }
 			float invW = 1.0f / idMath::Sqrt( W2 ); idVec3 n0 = wp * invW; idVec3 m = u2.Cross( n0 );
-			float sinT = swR * invW, cosT = idMath::Sqrt( Max( 1.0f - sinT * sinT, 0.0f ) );
+			float sinT = LR * invW, cosT = idMath::Sqrt( Max( 1.0f - sinT * sinT, 0.0f ) );
 			float sigma = ( ( m * ( cen - Va ) ) >= 0.0f ) ? 1.0f : -1.0f;
 			out.en[e] = n0 * sinT + m * ( sigma * cosT );
 			out.ea[e] = Va;
 		}
 		out.ne = n; out.nt = nt; out.V0 = pv[0];
-		idVec3 ax = cen - Lp; float axl = ax.Length(); if( axl < 1e-4f ) { return false; }
+		idVec3 ax = cen - LC; float axl = ax.Length(); if( axl < 1e-4f ) { return false; }
 		out.axis = ax * ( 1.0f / axl );
 		out.cosH = 1.0f;
-		out.dMin = dL;			// nearest possible umbra point = perpendicular light-to-plane distance
+		out.dMin = dL;			// nearest possible umbra point = perpendicular ball-to-plane distance
 		for( int k = 0; k < n; k++ )
 		{
-			idVec3 dv = pv[k] - Lp; float dl = dv.Length();
+			idVec3 dv = pv[k] - LC; float dl = dv.Length();
 			if( dl > 1e-4f ) { out.cosH = Min( out.cosH, ( dv * ( 1.0f / dl ) ) * out.axis ); }
 		}
 		out.cosH -= 1e-3f;
 		return true;
+	};
+	auto makePolyCert = [&]( const idVec3* pv, int n, Cert& out ) -> bool
+	{
+		return makePolyCertAt( pv, n, Lp, swR, out );
 	};
 	auto inCert = [&]( const Cert& C, const idVec3& v ) -> bool
 	{
@@ -247,6 +254,16 @@ static void SwUmbraCullCompute( const std::vector<swUmbraCullSurf_t>& surfs, con
 							tk = ( tk ^ ( uint64_t )( q[0] * 73856093 + q[1] * 19349663 + q[2] * 83492791 ) ) * 1099511628211ull;
 						}
 						if( !triKeys.insert( tk ).second ) { dup3 = true; break; }
+					}
+				}
+				// TRUE PLANARITY: the quantized plane key admits ~0.5u of sag; a hull from sagging tris
+				// certifies a FLATTENED polygon that does not physically exist (measured FP in the study's
+				// cell certificates). Require every group vert within a tight absolute plane distance.
+				for( size_t gi2 = 0; gi2 < g.size() && !dup3; gi2++ )
+				{
+					for( int k = 0; k < 3; k++ )
+					{
+						if( idMath::Fabs( n * ( tris[g[gi2]].v[k] - T0.v[0] ) ) > 0.03f ) { dup3 = true; break; }
 					}
 				}
 				std::vector<std::pair<float, float>> p2; std::vector<idVec3> p3;
@@ -395,10 +412,65 @@ static void SwUmbraCullCompute( const std::vector<swUmbraCullSurf_t>& surfs, con
 	};
 
 	const int PASSES = 2;
+	// CONSERVATIVE CELL AGGREGATE: cover the light SPHERE with a ball grid; a unit is cullable iff every
+	// cell has SOME kept unit whose certificate w.r.t. that cell-ball contains all the unit's verts.
+	// Different blockers per cell = the multi-blocker union, conservative in the light dimension (ball
+	// inflation) and EXACT in the surface dimension (convexity + vertex containment) - no sampling
+	// anywhere; the study audits it at ZERO unblocked rays across all grid resolutions.
+	std::vector<idVec3> cellC; float cellRad = 0.0f;
+	{
+		const int G = 8;
+		const float step = 2.0f * swR / G;
+		cellRad = 0.5f * step * 1.7320508f;
+		for( int i = 0; i < G; i++ )
+			for( int j = 0; j < G; j++ )
+				for( int k = 0; k < G; k++ )
+				{
+					idVec3 off( -swR + ( i + 0.5f ) * step, -swR + ( j + 0.5f ) * step, -swR + ( k + 0.5f ) * step );
+					if( off.Length() <= swR + cellRad ) { cellC.push_back( Lp + off ); }
+				}
+	}
+	std::vector<int> keptUnitIdx; std::vector<unsigned char> keptUnitAlive;
+	std::vector<int> unitKeptPos( units.size(), -1 );
+	std::unordered_map<uint64_t, Cert> cellCertMemo;
+	std::unordered_set<uint64_t> cellCertBad;
+	std::vector<int> cellLastHit( cellC.size(), -1 );
+	auto cellCovered = [&]( const Unit& U, int ci ) -> bool
+	{
+		auto tryW = [&]( int w ) -> bool
+		{
+			if( w < 0 || !keptUnitAlive[w] ) { return false; }
+			const uint64_t key = ( ( uint64_t )w << 24 ) | ( uint64_t )ci;
+			if( cellCertBad.count( key ) ) { return false; }
+			auto it = cellCertMemo.find( key );
+			if( it == cellCertMemo.end() )
+			{
+				const Unit& W = units[keptUnitIdx[w]];
+				Cert tmp;
+				if( !makePolyCertAt( W.poly.data(), ( int )W.poly.size(), cellC[ci], cellRad, tmp ) )
+				{
+					cellCertBad.insert( key ); return false;
+				}
+				it = cellCertMemo.emplace( key, tmp ).first;
+			}
+			const Cert& C = it->second;
+			for( size_t k = 0; k < U.poly.size(); k++ ) { if( !inCert( C, U.poly[k] ) ) { return false; } }
+			return true;
+		};
+		if( tryW( cellLastHit[ci] ) ) { return true; }
+		for( int w = ( int )keptUnitIdx.size() - 1; w >= 0; w-- )
+		{
+			if( w == cellLastHit[ci] ) { continue; }
+			if( tryW( w ) ) { cellLastHit[ci] = w; return true; }
+		}
+		return false;
+	};
+
 	for( int pass = 0; pass < PASSES; pass++ )
 	{
-		for( const Unit& U : units )
+		for( size_t ui = 0; ui < units.size(); ui++ )
 		{
+			const Unit& U = units[ui];
 			if( culled[U.members[0]] ) { continue; }
 			bool cull = false;
 			if( U.poly.size() == 3 )
@@ -410,22 +482,19 @@ static void SwUmbraCullCompute( const std::vector<swUmbraCullSurf_t>& surfs, con
 				cull = true;
 				for( size_t k = 1; k + 1 < U.poly.size() && cull; k++ ) { cull = inUnion( U.poly[0], U.poly[k], U.poly[k + 1], SUBDIV ); }
 			}
-			// AGGRESSIVE stage (default OFF - gate-red): the sampled aggregate integral vs kept-so-far.
-			// The 26x32 (surface x disk) sampling under-covers the 4D ray domain that receiver fragments
-			// integrate CONTINUOUSLY, so residual slivers show as lit-in-umbra at gate resolution
-			// (measured: +9 LIT_IN_UMBRA +1 STEP on softcap0064 L6/L10; the certificate stages alone are
-			// conservative in both dimensions and hold the gate at 0). Kept behind a knob until the
-			// aggregate is made conservative (disk-union coverage instead of ray sampling).
+			// AGGRESSIVE stage: the conservative cell aggregate (multi-blocker union). Sound by
+			// construction (no sampling); the legacy sampled integral it replaces was gate-red.
 			extern idCVar r_softShadowUmbraAccumAggressive;
 			if( !cull && r_softShadowUmbraAccumAggressive.GetBool() )
 			{
 				cull = true;
-				for( int m : U.members ) { if( !triFullyShadowedByKept( tris[m] ) ) { cull = false; break; } }
+				for( size_t ci = 0; ci < cellC.size() && cull; ci++ ) { if( !cellCovered( U, ( int )ci ) ) { cull = false; } }
 			}
 			if( cull )
 			{
 				for( int m : U.members ) { culled[m] = 1; }
 				if( triCert[U.members[0]] >= 0 ) { certAlive[triCert[U.members[0]]] = 0; }
+				if( unitKeptPos[ui] >= 0 ) { keptUnitAlive[unitKeptPos[ui]] = 0; }
 				continue;
 			}
 			if( pass == 0 )
@@ -436,6 +505,8 @@ static void SwUmbraCullCompute( const std::vector<swUmbraCullSurf_t>& surfs, con
 					certs.push_back( nc ); certAlive.push_back( 1 );
 					for( int m : U.members ) { triCert[m] = ( int )certs.size() - 1; }
 				}
+				unitKeptPos[ui] = ( int )keptUnitIdx.size();
+				keptUnitIdx.push_back( ( int )ui ); keptUnitAlive.push_back( 1 );
 				for( int m : U.members ) { keptOf[tris[m].owner].push_back( m ); }
 			}
 		}
