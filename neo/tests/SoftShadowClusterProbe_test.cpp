@@ -253,9 +253,9 @@ STUDY_TEST( SoftShadowClusterProbe, amortization_on_real_capture )
 				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
 				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
 				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
-				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
-				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
-				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+				float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+				float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
 				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
 			}
 		}
@@ -507,9 +507,9 @@ STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
 				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
 				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
 				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
-				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
-				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
-				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+				float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+				float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
 				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
 			}
 		}
@@ -830,9 +830,9 @@ STUDY_TEST( SoftShadowClusterProbe, hybrid_far_field_emulation )
 				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
 				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
 				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
-				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
-				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
-				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+				float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+				float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
 				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
 			}
 		}
@@ -1414,9 +1414,9 @@ STUDY_TEST( SoftShadowClusterProbe, penumbra_collapse )
 				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
 				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
 				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
-				float3 p0( cap.recvVerts[( r.firstVert + i0 ) * 3], cap.recvVerts[( r.firstVert + i0 ) * 3 + 1], cap.recvVerts[( r.firstVert + i0 ) * 3 + 2] );
-				float3 p1( cap.recvVerts[( r.firstVert + i1 ) * 3], cap.recvVerts[( r.firstVert + i1 ) * 3 + 1], cap.recvVerts[( r.firstVert + i1 ) * 3 + 2] );
-				float3 p2( cap.recvVerts[( r.firstVert + i2 ) * 3], cap.recvVerts[( r.firstVert + i2 ) * 3 + 1], cap.recvVerts[( r.firstVert + i2 ) * 3 + 2] );
+				float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+				float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+				float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
 				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
 			}
 		}
