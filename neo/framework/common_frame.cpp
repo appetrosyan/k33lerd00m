@@ -1062,6 +1062,80 @@ void idCommonLocal::Frame()
 
 		mainFrameTiming = frameTiming;
 
+		// ---- REAL-GAME frame probe (com_softShadowFrameProbe N): sample each frame's GPU ms + surf
+		// hit%, then dump a one-shot summary and quit. Drives the shipped loop, so it reproduces the
+		// true in-game hit rate and exposes post-load latency spikes (a spike past the warm frames is a
+		// bug). Non-blocking samples only - never perturbs the frame it measures.
+		{
+			extern idCVar com_softShadowFrameProbe;
+			const int probeN = com_softShadowFrameProbe.GetInteger();
+			if( probeN > 0 )
+			{
+				static idList<float> s_probeMs;
+				static idList<int>   s_probeHit;
+				static int s_probeFrame = 0;
+				static int s_probeBuilds = 0, s_probeClears = 0;
+				{
+					extern void R_SoftCacheWarmDebugCounters( int& builds, int& clears );
+					int b = 0, c = 0;
+					R_SoftCacheWarmDebugCounters( b, c );
+					s_probeBuilds += b;
+					s_probeClears += c;
+				}
+				const double gpuMs = GetRendererGPUMicroseconds() / 1000.0;
+				s_probeFrame++;
+				if( s_probeFrame > 1 && gpuMs > 0.0 )
+				{
+					s_probeMs.Append( ( float )gpuMs );
+					extern bool R_SoftCacheHudStats( uint32_t out[4] );
+					uint32_t sc[4];
+					int hp = -1;
+					if( R_SoftCacheHudStats( sc ) )
+					{
+						const double t = ( double )sc[0] + sc[1] + sc[2] + sc[3];
+						hp = ( t > 0.0 ) ? ( int )( 100.0 * sc[0] / t ) : 0;
+					}
+					s_probeHit.Append( hp );
+				}
+				if( s_probeFrame >= probeN && s_probeMs.Num() > 0 )
+				{
+					const int n = s_probeMs.Num();
+					idList<float> sorted = s_probeMs;
+					std::sort( sorted.Ptr(), sorted.Ptr() + n );
+					const float med = sorted[n / 2];
+					const float p99 = sorted[ Min( n - 1, ( n * 99 ) / 100 ) ];
+					const float mx = sorted[n - 1];
+					double sum = 0.0;
+					for( int i = 0; i < n; i++ ) { sum += s_probeMs[i]; }
+					const double mean = sum / n;
+					// post-warm (skip the first WARM frames = the load-warm burst): a spike here is a bug
+					const int WARM = Min( 90, n / 4 );
+					float postMax = 0.0f;
+					int hitch = 0;
+					for( int i = WARM; i < n; i++ )
+					{
+						postMax = Max( postMax, s_probeMs[i] );
+						if( s_probeMs[i] > 1.5f * med ) { hitch++; }
+					}
+					double hitSum = 0.0;
+					int hitCnt = 0, hitMax = 0;
+					for( int i = 0; i < s_probeHit.Num(); i++ )
+					{
+						if( s_probeHit[i] >= 0 ) { hitSum += s_probeHit[i]; hitCnt++; hitMax = Max( hitMax, s_probeHit[i] ); }
+					}
+					common->Printf( "[softprobe] %d frames | GPU mean %.1f med %.1f p99 %.1f max %.1f ms (%.0f fps mean) | POST-WARM(skip %d) max %.1f, hitches>1.5x %d | surf hit mean %.0f%% max %d%% over %d frames | runtime rebuilds %d, GC clears %d\n",
+									n, mean, med, p99, mx, mean > 0.0 ? 1000.0 / mean : 0.0,
+									WARM, postMax, hitch, hitCnt ? hitSum / hitCnt : 0.0, hitMax, hitCnt,
+									s_probeBuilds, s_probeClears );
+					com_softShadowFrameProbe.SetInteger( 0 );
+					s_probeFrame = 0;
+					s_probeMs.Clear();
+					s_probeHit.Clear();
+					cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "quit\n" );
+				}
+			}
+		}
+
 		session->GetSaveGameManager().Pump();
 	}
 	catch( idException& )
