@@ -953,13 +953,15 @@ indices + counts + penumbra + cache cvars) used to skip redundant re-warms.
 ====================
 */
 bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumbraSize,
-		idList<idVec4>& outTris, idList<idVec4>& outCasters,
-		int& outStaticCasters, int& outStaticTris, uint64_t& outFingerprint )
+		idList<idVec4>& outTris, idList<idVec4>& outCasters, idList<idVec4>& outRecvTris,
+		int& outStaticCasters, int& outStaticTris, int& outRecvTriCount, uint64_t& outFingerprint )
 {
 	outTris.Clear();
 	outCasters.Clear();
+	outRecvTris.Clear();
 	outStaticCasters = 0;
 	outStaticTris = 0;
+	outRecvTriCount = 0;
 	outFingerprint = 0;
 	if( light == NULL || light->lightHasMoved || penumbraSize <= 0.0f )
 	{
@@ -1009,13 +1011,35 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 			}
 			const idMaterial* shader = R_RemapShaderBySkin( surf->shader,
 										ent->parms.customSkin, ent->parms.customShader );
-			if( shader == NULL || !shader->SurfaceCastsShadow() )
+			if( shader == NULL )
 			{
 				continue;
 			}
 			if( R_CullModelBoundsToLight( light, tri->bounds, ent->modelRenderMatrix ) )
 			{
-				continue;	// this surface cannot cast into the light
+				continue;	// this surface is outside the light volume (neither receives nor casts here)
+			}
+			// RECEIVER stream (for the prewarm SEED): the term reads the cache at RECEIVER fragments, so
+			// the seed must claim RECEIVER-surface texels. The historical bug seeded the CASTER stream, so
+			// warm builds populated caster texels the receiver reads never hit (~0% cache hit). Emit this
+			// lit surface's world-space triangles independent of whether it casts; the build still walks
+			// only the casters collected below.
+			if( shader->ReceivesLighting() && tri->verts != NULL && tri->indexes != NULL )
+			{
+				for( int i = 0; i + 3 <= tri->numIndexes; i += 3 )
+				{
+					idVec3 w0, w1, w2;
+					R_LocalPointToGlobal( ent->modelMatrix, tri->verts[ tri->indexes[i + 0] ].xyz, w0 );
+					R_LocalPointToGlobal( ent->modelMatrix, tri->verts[ tri->indexes[i + 1] ].xyz, w1 );
+					R_LocalPointToGlobal( ent->modelMatrix, tri->verts[ tri->indexes[i + 2] ].xyz, w2 );
+					outRecvTris.Append( idVec4( w0.x, w0.y, w0.z, 0.0f ) );
+					outRecvTris.Append( idVec4( w1.x, w1.y, w1.z, 0.0f ) );
+					outRecvTris.Append( idVec4( w2.x, w2.y, w2.z, 0.0f ) );
+				}
+			}
+			if( !shader->SurfaceCastsShadow() )
+			{
+				continue;	// receivers are seeded above; only casters go into the walk stream
 			}
 
 			idVec4* faceElems = NULL;
@@ -1067,6 +1091,7 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 	s_softFaceHeapAlloc = false;
 
 	outStaticTris = outTris.Num() / 3;
+	outRecvTriCount = outRecvTris.Num() / 3;
 	if( outStaticTris == 0 || outStaticCasters == 0 )
 	{
 		return false;

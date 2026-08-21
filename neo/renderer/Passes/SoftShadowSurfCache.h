@@ -165,7 +165,8 @@ private:
 	void EnsurePipeline();
 	bool EnsureResources();								// cvars + pipelines + buffers; ready to dispatch
 	void DoClearIfNeeded( nvrhi::ICommandList* commandList );
-	void EnsureWarmStream( int float4Count );			// (re)create the reused warm-stream buffer
+	void EnsureWarmStream( int float4Count );			// (re)create the reused caster warm-stream buffer
+	void EnsureRecvStream( int float4Count );			// (re)create the reused receiver-tri seed buffer
 
 	nvrhi::DeviceHandle				m_Device;
 	bool							m_PipelineTried = false;
@@ -179,8 +180,10 @@ private:
 	nvrhi::BufferHandle				m_Table;
 	nvrhi::BufferHandle				m_Pool;
 	nvrhi::BufferHandle				m_Queue;
-	nvrhi::BufferHandle				m_WarmStream;		// reused camera-independent warm caster stream
+	nvrhi::BufferHandle				m_WarmStream;		// reused camera-independent warm caster stream (build walks)
 	int								m_WarmStreamF4 = 0;	// its capacity in float4 elements
+	nvrhi::BufferHandle				m_WarmRecvStream;	// reused receiver-tri stream (seed rasterises, keys the reads)
+	int								m_WarmRecvStreamF4 = 0;
 	// Queues are written by the GAME/LOAD thread (interaction/spawn hooks) and drained by the RENDER
 	// thread (GL_StartFrame), so they are mutex-guarded. All m_LightHash / GPU work stays render-thread
 	// only (inside DrainWarmQueue -> WarmLight); the game thread only pushes light indices here.

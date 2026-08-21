@@ -114,7 +114,7 @@ bool SoftShadowSurfCache::EnsureResources()
 {
 	extern idCVar r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
 	extern idCVar r_softShadowSurfCacheBudget, r_softShadowSurfCacheCap, r_softShadowSurfCachePoolCap;
-	extern idCVar r_softShadowSurfCacheErrTol;
+	extern idCVar r_softShadowSurfCacheErrTol, r_softShadowSurfCacheWarmBudget;
 	EnsurePipeline();
 	if( m_Pipeline == nullptr )
 	{
@@ -129,16 +129,18 @@ bool SoftShadowSurfCache::EnsureResources()
 	}
 	const int poolCap = r_softShadowSurfCachePoolCap.GetInteger();
 	const int budget = r_softShadowSurfCacheBudget.GetInteger();
+	const int warmBudget = r_softShadowSurfCacheWarmBudget.GetInteger();
+	const int wantQueue = Max( budget + 1, warmBudget + 1 );	// per-light queue holds one light's claimed texels
 	const float texel = ( float )r_softShadowSurfCacheTexel.GetInteger();
 	const float thr = r_softShadowSurfCacheSecondThr.GetFloat();
 	const float errTol = r_softShadowSurfCacheErrTol.GetFloat();
 	if( m_Table == nullptr || capP2 != m_TableCap || poolCap != m_PoolCap || budget != m_Budget
-			|| texel != m_Texel || thr != m_Thr || errTol != m_ErrTol )
+			|| wantQueue != m_QueueWords || texel != m_Texel || thr != m_Thr || errTol != m_ErrTol )
 	{
 		m_TableCap = capP2;
 		m_PoolCap = poolCap;
 		m_Budget = budget;
-		m_QueueWords = Max( budget + 1, 65537 );	// must hold the warm build's SW_WARM_BUDGET (65536) enqueued texels
+		m_QueueWords = wantQueue;	// must hold the warm build's per-light SW_WARM_BUDGET enqueued texels
 		m_Texel = texel;
 		m_Thr = thr;
 		m_ErrTol = errTol;		// build semantics changed: drop + reseed
@@ -243,6 +245,9 @@ void SoftShadowSurfCache::BuildLight( nvrhi::ICommandList* commandList, const vi
 
 // Returns true if it dispatched a (re)build this call (so the drain does one per frame), false if it
 // cheap-skipped an already-warm light or found nothing to warm.
+// accumulators for the one-shot warm-at-load summary line (reset in WarmMapBurst)
+static int s_warmRecvTotal = 0, s_warmCasterTotal = 0, s_warmStreamedLights = 0;
+
 bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idRenderLightLocal* light )
 {
 	if( light == NULL || m_Pipeline == nullptr || m_Table == nullptr )
@@ -251,8 +256,8 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	}
 	extern idCVar r_shadowPenumbraSize, r_softShadowSurfCacheErrTol;
 	extern bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumbraSize,
-			idList<idVec4>& outTris, idList<idVec4>& outCasters,
-			int& outStaticCasters, int& outStaticTris, uint64_t& outFingerprint );
+			idList<idVec4>& outTris, idList<idVec4>& outCasters, idList<idVec4>& outRecvTris,
+			int& outStaticCasters, int& outStaticTris, int& outRecvTriCount, uint64_t& outFingerprint );
 	extern uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraSize );
 
 	const float penumbra = r_shadowPenumbraSize.GetFloat();
@@ -269,10 +274,10 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		}
 	}
 
-	idList<idVec4> tris, casters;
-	int nCas = 0, nTris = 0;
+	idList<idVec4> tris, casters, recvTris;
+	int nCas = 0, nTris = 0, nRecv = 0;
 	uint64_t fp = 0;
-	if( !R_BuildLightStaticSoftStream( light, penumbra, tris, casters, nCas, nTris, fp ) )
+	if( !R_BuildLightStaticSoftStream( light, penumbra, tris, casters, recvTris, nCas, nTris, nRecv, fp ) )
 	{
 		// no static casters (or moved): remember it so the scan does not re-collect it every pass.
 		lightState_t& se = m_LightHash[ light->index ];
@@ -301,11 +306,28 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	commandList->writeBuffer( m_WarmStream, tris.Ptr(), ( size_t )triF4 * sizeof( idVec4 ), 0 );
 	commandList->writeBuffer( m_WarmStream, casters.Ptr(), ( size_t )casF4 * sizeof( idVec4 ), ( size_t )triF4 * sizeof( idVec4 ) );
 
+	// RECEIVER stream for the seed (separate buffer): the seed rasterises RECEIVER tris to claim the
+	// texels the term reads; the build walks the CASTER stream above. Keying them to the same geometry
+	// is what makes reads hit (the old seed rasterised the casters -> receiver reads missed).
+	s_warmRecvTotal += nRecv;
+	s_warmCasterTotal += nTris;
+	s_warmStreamedLights++;
+	const int recvF4 = recvTris.Num();		// 3 per receiver tri
+	if( recvF4 > 0 )
+	{
+		EnsureRecvStream( recvF4 );
+		if( m_WarmRecvStream != nullptr )
+		{
+			commandList->writeBuffer( m_WarmRecvStream, recvTris.Ptr(), ( size_t )recvF4 * sizeof( idVec4 ), 0 );
+		}
+	}
+
 	// QUEUE-mode warm: the seed ENQUEUES this light's claimed texels; the build consumes only those
 	// (bounded by SW_WARM_BUDGET), NOT the whole 1M-slot table - a whole-table sweep x this light's
 	// casters is what hung the GPU (device removed). One dispatch warms up to SW_WARM_BUDGET texels;
 	// larger lights cache their first SW_WARM_BUDGET texels and the rest fall to the exact miss walk.
-	const int SW_WARM_BUDGET = 65536;
+	extern idCVar r_softShadowSurfCacheWarmBudget;
+	const int SW_WARM_BUDGET = Min( r_softShadowSurfCacheWarmBudget.GetInteger(), m_QueueWords - 1 );
 	commandList->clearBufferUInt( m_Queue, 0 );		// reset the queue count for this light's seed
 
 	SoftSurfBuildCB cb;
@@ -327,17 +349,17 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	cb.params[3] = r_softShadowSurfCacheErrTol.GetFloat();
 	cb.seed[0] = 0;						// QUEUE mode (consume the seed's enqueued slots)
 	cb.seed[1] = 0;
-	cb.seed[2] = nTris;
+	cb.seed[2] = nRecv;					// seed rasterises RECEIVER tris (one thread per tri)
 	cb.seed[3] = ( int )GetLightGeneration( light->index );
 
-	// SEED: one thread per static tri claims + ENQUEUES this light's receiver texels
-	if( m_SeedPipeline != nullptr && nTris > 0 )
+	// SEED: one thread per static RECEIVER tri claims + ENQUEUES this light's receiver texels
+	if( m_SeedPipeline != nullptr && nRecv > 0 && m_WarmRecvStream != nullptr )
 	{
 		nvrhi::BindingSetDesc ss;
 		ss.bindings =
 		{
 			nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
-			nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_WarmStream ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_WarmRecvStream ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_Table ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_Queue ),
 		};
@@ -347,7 +369,7 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		scs.pipeline = m_SeedPipeline;
 		scs.bindings = { seedSet };
 		commandList->setComputeState( scs );
-		commandList->dispatch( ( nTris + 63 ) / 64, 1, 1 );
+		commandList->dispatch( ( nRecv + 63 ) / 64, 1, 1 );
 	}
 
 	// BUILD: consume the enqueued texels (bounded), filling F for each
@@ -395,6 +417,29 @@ void SoftShadowSurfCache::EnsureWarmStream( int float4Count )
 	bd.debugName = "SoftShadowSurfCache/WarmStream";
 	m_WarmStream = m_Device->createBuffer( bd );
 	m_WarmStreamF4 = want;
+}
+
+// (re)create the reused receiver-tri seed buffer when a light's receiver stream needs more room
+void SoftShadowSurfCache::EnsureRecvStream( int float4Count )
+{
+	if( float4Count <= 0 || ( m_WarmRecvStream != nullptr && m_WarmRecvStreamF4 >= float4Count ) )
+	{
+		return;
+	}
+	int want = m_WarmRecvStreamF4 > 0 ? m_WarmRecvStreamF4 : 4096;
+	while( want < float4Count )
+	{
+		want *= 2;
+	}
+	nvrhi::BufferDesc bd;
+	bd.byteSize = ( uint64_t )want * sizeof( idVec4 );
+	bd.structStride = sizeof( idVec4 );		// float4 stride (matches t_SoftEdges StructuredBuffer<float4>)
+	bd.canHaveUAVs = false;
+	bd.initialState = nvrhi::ResourceStates::ShaderResource;
+	bd.keepInitialState = true;
+	bd.debugName = "SoftShadowSurfCache/WarmRecvStream";
+	m_WarmRecvStream = m_Device->createBuffer( bd );
+	m_WarmRecvStreamF4 = want;
 }
 
 bool SoftShadowSurfCache::GetStats( uint32_t out[4] )
@@ -650,6 +695,9 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 	device->executeCommandList( cl );
 	device->waitForIdle();
 
+	s_warmRecvTotal = 0;
+	s_warmCasterTotal = 0;
+	s_warmStreamedLights = 0;
 	const int n = world->lightDefs.Num();
 	int warmed = 0;
 	for( int i = 0; i < n; i++ )
@@ -669,5 +717,6 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 			warmed++;
 		}
 	}
-	common->Printf( "[softsurf] warm-at-load: %d of %d lights warmed\n", warmed, n );
+	common->Printf( "[softsurf] warm-at-load: %d of %d lights warmed | %d recv-tris, %d caster-tris over %d streamed lights\n",
+					warmed, n, s_warmRecvTotal, s_warmCasterTotal, s_warmStreamedLights );
 }
