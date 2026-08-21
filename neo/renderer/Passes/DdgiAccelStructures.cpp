@@ -406,6 +406,14 @@ is used for ray tracing.
 nvrhi::rt::IAccelStruct* DdgiAccelStructures::GetOrBuildBottomLevel( nvrhi::ICommandList* commandList,
 		vertCacheHandle_t vbHandle, vertCacheHandle_t ibHandle, int numVerts, int numIndexes )
 {
+	// HARD GUARD (callers also check, but this is the one function that decodes the offsets): a
+	// frame-cache handle decoded against the STATIC buffers below would build a BLAS over an
+	// unrelated region - garbage geometry - and, keyed per-frame, grow m_BlasCache without bound.
+	if( !vertexCache.CacheIsStatic( vbHandle ) || !vertexCache.CacheIsStatic( ibHandle ) )
+	{
+		return NULL;
+	}
+
 	std::unordered_map<vertCacheHandle_t, nvrhi::rt::AccelStructHandle>::iterator it = m_BlasCache.find( vbHandle );
 	if( it != m_BlasCache.end() )
 	{
