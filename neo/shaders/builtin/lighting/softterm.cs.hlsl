@@ -240,7 +240,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 		const float3 an = abs( swN2 );
 		const int   d  = ( an.x >= an.y && an.x >= an.z ) ? 0 : ( ( an.y >= an.z ) ? 1 : 2 );
 		const float nd = ( d == 0 ) ? swN2.x : ( ( d == 1 ) ? swN2.y : swN2.z );
-		const uint  axis = ( uint )d | ( ( nd < 0.0f ) ? 4u : 0u );
+		// SIGN-AGNOSTIC dominant axis (no |4 sign bit): the prewarm SEED keys receiver texels off the
+		// tri's GEOMETRIC normal (winding-dependent sign), while this reads the SHADING normal - an
+		// opposite sign made every warm read miss. The anchor height is sign-invariant, and back-facing
+		// receivers early-out (N.L<=0), so dropping the sign is lossless and aligns seed and read keys.
+		const uint  axis = ( uint )d;
 		// tangent-plane axes per dominant axis: d=0 -> (u,v)=(y,z), d=1 -> (z,x), d=2 -> (x,y)
 		// (explicit selects, no dynamic vector subscripts; MUST match softsurf_build.cs.hlsl)
 		const float g  = g_surfParams.x;

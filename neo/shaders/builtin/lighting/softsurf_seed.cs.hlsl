@@ -73,7 +73,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 	{
 		return;					// degenerate triangle
 	}
-	const uint axis = ( uint )d | ( ( nd < 0.0f ) ? 4u : 0u );
+	// SIGN-AGNOSTIC dominant axis (no |4 sign bit): must match the term CS read key. The geometric
+	// normal's sign is winding-dependent and disagreed with the shading normal the term reads, so the
+	// sign bit made every warm read miss. Anchor height h below is sign-invariant, so this is lossless.
+	const uint axis = ( uint )d;
 
 	// project to the tangent axes - the SAME mapping as the term CS key derivation:
 	// d=0 -> (u,v)=(y,z), d=1 -> (z,x), d=2 -> (x,y)
