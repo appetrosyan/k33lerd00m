@@ -33,7 +33,13 @@ the Free Software Foundation, either version 3 of the License, or
 
 #include "../tests/SoftShadowGate.h"	// dependency-free defect analyzer, shared with rbdoom3bfg_tests
 
+#if defined(__linux__) || defined(__APPLE__)
+	#include <fcntl.h>		// open: the gate's single-instance lock
+	#include <sys/file.h>	// flock
+#endif
+
 extern DeviceManager* deviceManager;
+void Com_SoftShadowGateHeartbeat();		// softgate progress watchdog (Common.cpp)
 
 // soft light's real atlas placement, published by the backend (RenderBackend.cpp) so the tile dump
 // reads the tiles the locator actually samples instead of a stale hardcoded offset.
@@ -1531,6 +1537,9 @@ bool GateLoadCap( const char* path, gateCap_t& cap )
 
 void GateRenderFrame( idRenderWorld* rw, renderView_t* rv )
 {
+	// softgate progress watchdog heartbeat: every gate/bench/warm frame counts as progress;
+	// a GPU hang or device loss stalls this and the watchdog aborts the run loudly
+	::Com_SoftShadowGateHeartbeat();
 	rw->RenderScene( rv );
 	const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
 	tr.RenderCommandBuffers( cmd );
@@ -1719,17 +1728,79 @@ void GateSetup( const gateCap_t& cap, const softcapLight_t& light )
 	// pinned baseline first, then the per-probe overrides on top of it
 	R_SoftShadowPinTestConfig( false );
 	cvarSystem->SetCVarInteger( "r_skipAmbient", 1 );		// interaction term only: no emissive/ambient pollution
+	// MASKED OCCLUSION CULLING OFF for every gate render - the ROOT CAUSE of the intermittent
+	// "init deadlock" (2026-08-20): the gate's RECONSTRUCTED caster models feed MOC geometry its
+	// AVX2 rasterizer walks out of bounds - a deterministic OOB whose symptom ASLR picks per run
+	// (clean / glibc "double free or corruption (out)" wedging in the abort path / straight SIGSEGV
+	// in RenderTriangles, all caught under gdb). The gate never wants MOC anyway: it is a
+	// still-frame CORRECTNESS instrument that needs the full deterministic caster set - an entity
+	// culled by a software occlusion raster would silently thin the casters. Normal gameplay never
+	// sees the reconstructed models, so the game keeps MOC.
+	cvarSystem->SetCVarInteger( "r_useMaskedOcclusionCulling", 0 );
 	cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", light.penumbraSize );
 	cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", light.penumbraSize );
 }
 
 } // namespace
 
+// Deterministic motion model for the surf-cache A/B bench (com_softShadowGateBenchMotion): perturb a
+// base camera pose by frame index across 4 equal segments - shake / rotate / move / combo - so the
+// bench exercises the screen-shake, panning and dolly the player produces, and their combination. No
+// RNG (pure sinusoids of the frame index), so two runs render bit-identical paths.
+static void R_SoftShadowBenchMotionPose( const idVec3& baseOrg, const idAngles& baseAng, int f, int total, renderView_t* rv )
+{
+	const float t = ( float )f;
+	const int seg = ( total > 0 ) ? Min( 3, ( f * 4 ) / total ) : 3;	// 0 shake, 1 rot, 2 move, 3 combo
+	const bool shake = ( seg == 0 || seg == 3 );
+	const bool rot   = ( seg == 1 || seg == 3 );
+	const bool move  = ( seg == 2 || seg == 3 );
+
+	idAngles ang = baseAng;
+	idVec3   org = baseOrg;
+	if( shake )				// high-frequency sub-degree camera rattle (weapon/impact shake)
+	{
+		ang.yaw   += 0.35f * idMath::Sin( t * 13.1f );
+		ang.pitch += 0.30f * idMath::Sin( t * 11.7f + 1.3f );
+		ang.roll  += 0.20f * idMath::Sin( t * 17.3f );
+	}
+	if( rot )				// steady pan + slow look up/down
+	{
+		ang.yaw   += 0.9f * t;
+		ang.pitch += 8.0f * idMath::Sin( t * 0.05f );
+	}
+	const idMat3 axis = ang.ToMat3();
+	if( move )				// dolly along forward + strafe along the side axis
+	{
+		org += axis[0] * ( 64.0f * idMath::Sin( t * 0.045f ) );
+		org += axis[1] * ( 40.0f * idMath::Sin( t * 0.031f ) );
+	}
+	rv->vieworg  = org;
+	rv->viewaxis = axis;
+}
+
 // Iterates the corpus, prints one defect line per capture x light and the grand total; returns the
 // total defect count (the process exit code, clamped by the caller).
 int R_SoftShadowGate( const char* arg )
 {
 	using namespace swgate;
+
+	// SINGLE-INSTANCE GUARD: two concurrent gate runs contend for the GPU and clobber each other's
+	// softgate_* outputs, silently corrupting BOTH verdicts (observed 2026-08-20: an orphaned run
+	// surviving its killed parent shell overlapped a fresh run - both produced garbage). Hold an
+	// exclusive advisory lock for the whole run; a second instance aborts LOUDLY as a SETUP failure.
+	// The fd is deliberately leaked to process exit (the gate quits the process when done), which
+	// releases the flock; a crashed/killed run releases it automatically too - no stale-lock state.
+#if defined(__linux__) || defined(__APPLE__)
+	{
+		const int swLockFd = open( "softgate.lock", O_CREAT | O_RDWR, 0644 );
+		if( swLockFd < 0 || flock( swLockFd, LOCK_EX | LOCK_NB ) != 0 )
+		{
+			common->Printf( "[softgate] FATAL: another gate instance is running (softgate.lock held) - "
+							"concurrent runs corrupt each other's outputs and GPU timings. Kill it first.\n" );
+			return 1;
+		}
+	}
+#endif
 
 	globalImages->LoadDeferredImages();
 	tr.InvalidateSwapBuffers();		// headless: never present (blocking swap would hang on a hidden surface)
@@ -1756,6 +1827,7 @@ int R_SoftShadowGate( const char* arg )
 		"r_softShadowEmergentUmbra", "r_softShadowContinuous", "r_useTemporalAA", "r_softShadowDebugShader",
 		"r_skipAmbient", "r_skipShadows", "r_shadowPenumbraSize", "r_rtShadowSoftRadius", "r_rtShadowRays",
 		"r_rtShadowDenoise", "r_rtShadowAnalyticPenumbra", "r_rtShadowBias",
+		"r_useMaskedOcclusionCulling", "r_useDDGI",
 	};
 	const int nTouched = ( int )( sizeof( touched ) / sizeof( touched[0] ) );
 	idStrList prev;
@@ -1763,6 +1835,17 @@ int R_SoftShadowGate( const char* arg )
 	{
 		prev.Append( cvarSystem->GetCVarString( touched[i] ) );
 	}
+
+	// MOC off for the WHOLE run (probes set it per light in GateSetup; this covers the bench frames
+	// and any render before the first GateSetup) - see the root-cause note in GateSetup
+	cvarSystem->SetCVarInteger( "r_useMaskedOcclusionCulling", 0 );
+	// DDGI off for the WHOLE run: the gate renders with r_skipAmbient 1, so the probe irradiance is
+	// never consumed - yet DdgiPass::Render rebuilt BLAS/TLAS from the reconstructed occluders EVERY
+	// frame (measured wedge site: malloc inside buildBottomLevelAccelStruct on a corrupted heap;
+	// ASan-clean on our code, so the corruption exposure sits in the uninstrumented accel path this
+	// churn hammers). The RT shadow ORACLE owns its own DdgiAccelStructures instance and is
+	// unaffected. Pure waste removal + corruption-surface removal; restored after the run.
+	cvarSystem->SetCVarInteger( "r_useDDGI", 0 );
 
 	GateCfg cfg;
 	std::vector<GateDefect> all;
@@ -2050,6 +2133,29 @@ int R_SoftShadowGate( const char* arg )
 			cvarSystem->SetCVarInteger( "r_useShadowMapping", 0 );		// back to the pinned soft-path baseline
 			cvarSystem->SetCVarInteger( "r_useSoftShadowVolumes", 1 );
 			cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 8 );
+
+			// surface-fold cache: WARM the cache before the probe stills, so the probes measure the
+			// steady state (SEAM = spatial texel-border disagreement; TEMPORAL = genuine per-frame
+			// instability) instead of the miss->built transition. Each gate light is a fresh
+			// fingerprint (recycled index, new content) => full reseed + table sweep; the sweep takes
+			// tableCap/prewarmBudget frames at the prewarm rate, +2 slack for the seed/restart lag.
+			if( cvarSystem->GetCVarInteger( "r_softShadowSurfCache" ) != 0 )
+			{
+				const int swWarmCap = cvarSystem->GetCVarInteger( "r_softShadowSurfCacheCap" );
+				const int swWarmBud = Max( 4096, cvarSystem->GetCVarInteger( "r_softShadowSurfCachePrewarmBudget" ) );
+				const int swWarmFrames = 2 * ( swWarmCap / swWarmBud ) + 8;	// 2x + slack: the sweep must FINISH every run
+				// FORCE headroom for the warm loop: the build frames themselves blow any realistic
+				// frame budget, which would throttle the sweep mid-warm - and a partially-swept cache
+				// makes the gate's warm population (and so its defect counts) run-dependent (measured:
+				// 454 vs 225 on identical runs before this)
+				const int swPrevGpuBudget = cvarSystem->GetCVarInteger( "r_softShadowSurfCacheGpuBudgetUs" );
+				cvarSystem->SetCVarInteger( "r_softShadowSurfCacheGpuBudgetUs", 999999 );
+				for( int wf = 0; wf < swWarmFrames; wf++ )
+				{
+					GateRenderFrame( rw, &rv );
+				}
+				cvarSystem->SetCVarInteger( "r_softShadowSurfCacheGpuBudgetUs", swPrevGpuBudget );
+			}
 			// ALWAYS retain this render's edge records (the exact caster triangles the shader consumed)
 			// via the capture hook - the defect arbiter float64-traces against them. Diagnostic mode
 			// additionally writes the full .softcap for offline interrogation.
@@ -2100,6 +2206,22 @@ int R_SoftShadowGate( const char* arg )
 				R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
 								  nvrhi::ResourceStates::ShaderResource, va( "softgate_dbg_%s_L%d_anaframe.png", cap.name.c_str(), li ) );
 				cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 8 );
+			}
+
+			// R4 - EXACT term for the cross-texel SEAM probe (surface-fold cache only): the SAME still
+			// with the cache forced off. The exact walk is the same field the cache reconstructs, so any
+			// neighbour step the cached render has beyond this one is a discontinuity the cache
+			// introduced (adjacent texels folding different occluder subsets). The cache buffers persist
+			// across the toggle (BeginView only clears on capacity/fingerprint changes), so this render
+			// does not perturb the warm-up the later captures depend on.
+			swgate::GateImg anaOff;
+			const bool swSurfSeam = ( cvarSystem->GetCVarInteger( "r_softShadowSurfCache" ) != 0 );
+			if( swSurfSeam )
+			{
+				cvarSystem->SetCVarInteger( "r_softShadowSurfCache", 0 );
+				GateRenderFrame( rw, &rv );
+				GateReadR32F( globalImages->currentRenderHDRImage, anaOff );
+				cvarSystem->SetCVarInteger( "r_softShadowSurfCache", 1 );
 			}
 
 			if( !mask1.Valid() || !rt.Valid() || !anaA.Valid() || !anaB.Valid() || !depthA.Valid()
@@ -2189,6 +2311,11 @@ int R_SoftShadowGate( const char* arg )
 				GateTemporal( anaA, anaB, valid, cfg, defects );
 				std::vector<uint8_t> defectPx( ( size_t )W * H, 0 );
 				std::vector<uint8_t> crease = GateCreaseMask( depthA, cfg.guard );
+				// cross-texel SEAM: cached still vs its own exact field (reference-free self-consistency)
+				if( swSurfSeam && anaOff.Valid() && anaOff.W == W && anaOff.H == H )
+				{
+					GateSeam( anaA, anaOff, valid, &crease, cfg, defects );
+				}
 				if( !rtAllLit && !rtAllDark )
 				{
 					// float64 truth arbiter over the retained record triangles (see GateTruthVisibility)
@@ -2362,16 +2489,26 @@ int R_SoftShadowGate( const char* arg )
 			{
 				for( const GateDefect& d : defects )
 				{
-					common->Printf( "[softgate]   %s area=%d bbox=(%d,%d)-(%d,%d)\n",
-									GateKindName( d.kind ), d.area, d.x0, d.y0, d.x1, d.y1 );
+					if( d.kind == GATE_EXTENT && ( d.anaPen + d.truthPen ) > 0 )
+					{
+						common->Printf( "[softgate]   %s area=%d bbox=(%d,%d)-(%d,%d) anaPen=%d truthPen=%d (%s)\n",
+										GateKindName( d.kind ), d.area, d.x0, d.y0, d.x1, d.y1,
+										d.anaPen, d.truthPen,
+										d.anaPen < d.truthPen ? "UNDER-shadow: band too thin/missing" : "OVER-shadow: band too wide" );
+					}
+					else
+					{
+						common->Printf( "[softgate]   %s area=%d bbox=(%d,%d)-(%d,%d)\n",
+										GateKindName( d.kind ), d.area, d.x0, d.y0, d.x1, d.y1 );
+					}
 				}
 			}
 			int counts[GATE_KIND_COUNT];
 			GateTally( defects, counts );
-			common->Printf( "[softgate] %-14s L%d (%dx%d, valid %ld px): TURD=%d ANT=%d LIT_IN_UMBRA=%d STEP=%d EXTENT=%d TEMPORAL=%d CONTINUITY=%d SETUP=%d\n",
+			common->Printf( "[softgate] %-14s L%d (%dx%d, valid %ld px): TURD=%d ANT=%d LIT_IN_UMBRA=%d STEP=%d EXTENT=%d TEMPORAL=%d CONTINUITY=%d SEAM=%d SETUP=%d\n",
 							cap.name.c_str(), li, W, H, validN,
 							counts[GATE_TURD], counts[GATE_ANT], counts[GATE_LIT_IN_UMBRA], counts[GATE_STEP],
-							counts[GATE_EXTENT], counts[GATE_TEMPORAL], counts[GATE_CONTINUITY], counts[GATE_SETUP] );
+							counts[GATE_EXTENT], counts[GATE_TEMPORAL], counts[GATE_CONTINUITY], counts[GATE_SEAM], counts[GATE_SETUP] );
 			all.insert( all.end(), defects.begin(), defects.end() );
 
 			rw->FreeLightDef( lh );
@@ -2412,6 +2549,16 @@ int R_SoftShadowGate( const char* arg )
 				{
 					benchModels.push_back( rw->AddEntityDef( &me ) );
 				}
+			}
+			// static interactions for the added bench lights so the surf cache has a caster chain to warm
+			// (WarmLight walks light->firstInteraction). GenerateAllInteractions cannot be re-run here -
+			// the table was already grown by the added lights and a second full build segfaults - so use
+			// the per-light static creator the gate already relies on. Reconstructed DYNAMIC casters stay
+			// dynamic (see GateCreateStaticInteractionsForLight), so the cache warms STATIC/world casters
+			// only, which is exactly what a static cache can hold. One-time, before the timed frames.
+			for( qhandle_t bh : benchLights )
+			{
+				GateCreateStaticInteractionsForLight( rw, bh );
 			}
 			R_SoftShadowPinTestConfig( false );
 			cvarSystem->SetCVarInteger( "r_skipAmbient", 0 );
@@ -2483,6 +2630,24 @@ int R_SoftShadowGate( const char* arg )
 				common->Printf( "[softgate] BENCH %-14s GPU %.2f ms | soft %.2f (softpos %.2f + tilebin %.2f + TERM/walk %.2f + read %.2f) | rest %.2f ms\n",
 								cap.name.c_str(), gGpu * iv, soft, gPos * iv, gBin * iv, gTerm * iv, gRead * iv, gGpu * iv - soft );
 			}
+			// surface-fold cache path split from the LAST bench frame (r_softShadowSurfCache):
+			// hit% is THE cache-health number - a low rate explains a high TERM ms instantly
+			// (misses pay the full walk) instead of leaving it to conjecture.
+			{
+				uint32_t ss[4] = {};
+				if( backEnd.GetSoftShadowSurfCache() != NULL && backEnd.GetSoftShadowSurfCache()->IsActive()
+						&& backEnd.GetSoftShadowSurfCache()->GetStats( ss ) )
+				{
+					const double tot = ( double )ss[0] + ss[1] + ss[2] + ss[3];
+					if( tot > 0.0 )
+					{
+						int swCur = 0, swCap = 0, swPend = 0;
+						backEnd.GetSoftShadowSurfCache()->GetPrewarmState( swCur, swCap, swPend );
+						common->Printf( "[softgate] BENCH %-14s surf: hit %u (%.1f%%) miss %u walkalways %u anchor-rej %u | prewarm cursor %d/%d pending %d\n",
+										cap.name.c_str(), ss[0], 100.0 * ss[0] / tot, ss[1], ss[2], ss[3], swCur, swCap, swPend );
+					}
+				}
+			}
 			// spill accounting from the LAST bench frame: silent spill-region exhaustion sends the
 			// starved tiles back to the O(all-casters) full walk - a perf leak the correctness gate
 			// can never see, so the demand must be printed next to the region size it must fit in.
@@ -2498,7 +2663,7 @@ int R_SoftShadowGate( const char* arg )
 			// real cull cascade per walked fragment, confirming the CPU attribution's cull-collapse
 			// finding on the actual GPU path. Slots [4]=tight tests [5]=tight culls [6]=MT survivors
 			// [7]=fragments walked (the binned walker fills tight/mtTri only).
-			uint32_t walk[8] = {};
+			uint32_t walk[16] = {};
 			if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetWalkStats( walk ) && walk[7] > 0 )
 			{
 				const double f = ( double )walk[7];			// fragments that ran the walk (this frame)
@@ -2508,7 +2673,142 @@ int R_SoftShadowGate( const char* arg )
 								cap.name.c_str(), walk[4] / f,
 								100.0 * walk[5] / ( double )( walk[4] ? walk[4] : 1 ),
 								walk[6] / f, 16.0 * walk[6] / f, walk[2] / f, walk[7] );
+				// Walk WORK split by FINAL swMask: lit (mask 0 = binned-but-blocks-nothing), penumbra
+				// (0<mask<all = the irreducible partial-cover walk), umbra (mask all = already early-outs).
+				// survivors = triangles reaching the 16-sample MT (the dominant per-fragment cost).
+				const double litF = walk[8],  litS = walk[9];
+				const double penF = walk[10], penS = walk[11];
+				const double umbF = walk[12], umbS = walk[13];
+				const double totS = litS + penS + umbS;
+				const double tf   = litF + penF + umbF;
+				common->Printf( "[softgate] BENCH %-14s walk-buckets: frags lit/pen/umb %.0f/%.0f/%.0f%% | survivor-WORK lit/pen/umb %.0f/%.0f/%.0f%% (%.0f/%.0f/%.0f surv per-frag)\n",
+								cap.name.c_str(),
+								tf > 0 ? 100.0 * litF / tf : 0.0, tf > 0 ? 100.0 * penF / tf : 0.0, tf > 0 ? 100.0 * umbF / tf : 0.0,
+								totS > 0 ? 100.0 * litS / totS : 0.0, totS > 0 ? 100.0 * penS / totS : 0.0, totS > 0 ? 100.0 * umbS / totS : 0.0,
+								litF > 0 ? litS / litF : 0.0, penF > 0 ? penS / penF : 0.0, umbF > 0 ? umbS / umbF : 0.0 );
+				// Where the actual walk goes: of survivors reaching the 16-sample MT, how many CONTRIBUTE
+				// (set >=1 mask bit) vs are tested and block NOTHING (the wasted survivors).
+				const double hitS = walk[14], missS = walk[15], mtotS = hitS + missS;
+				common->Printf( "[softgate] BENCH %-14s survivors@MT: %.0f%% HIT (contribute) / %.0f%% block-NOTHING | %.0f hit + %.0f miss per frag\n",
+								cap.name.c_str(), mtotS > 0 ? 100.0 * hitS / mtotS : 0.0, mtotS > 0 ? 100.0 * missS / mtotS : 0.0,
+								hitS / f, missS / f );
 			}
+			// ---- MOTION A/B (com_softShadowGateBenchMotion N): the surf-cache proof --------------------
+			// Run N frames of camera motion (shake/rotate/move/combo segments) TWICE - cache OFF then ON -
+			// recording each frame's GPU ms. The cache warms one light per frame during the ON pass, so
+			// its FIRST frames spike (the warm builds) then flatten; OFF is a flat uncached baseline.
+			// Reports steady-state gain + hitch counts so a motion-triggered rebuild (the failure we must
+			// NOT see) shows up as ON hitches past the warm ramp. One-shot summary only - never per-frame.
+			extern idCVar com_softShadowGateBenchMotion;
+			const int motionFrames = com_softShadowGateBenchMotion.GetInteger();
+			if( motionFrames > 0 )
+			{
+				const idVec3   baseOrg = rv.vieworg;
+				const idAngles baseAng = rv.viewaxis.ToAngles();
+				const int prevSurf = cvarSystem->GetCVarInteger( "r_softShadowSurfCache" );
+				// CACHE SCENE: the surf cache holds STATIC (world) casters only, so the A/B needs the world
+				// casting and the uncacheable dynamics gone. The default replay scene EXCLUDES the world
+				// (the one thing the cache can hold) -> 0% hits; the all-536-models scene OOMs the frame
+				// arena under motion. Reset to WORLD-ONLY static casters here: drop the replay/captured
+				// soup, let the world cast, and (re)create the per-light static world interactions the
+				// warm walk reads. This is the scene the cache is actually for.
+				R_SoftShadowClearBenchCasters();
+				R_SoftShadowClearCapturedCasters();
+				cvarSystem->SetCVarInteger( "r_softShadowBenchExcludeWorld", 0 );
+				for( qhandle_t bh : benchLights )
+				{
+					GateCreateStaticInteractionsForLight( rw, bh );
+				}
+				// pin the bench lights into the warm queue so the cache resolves them against THIS world
+				// (the game feeds the queue from its interaction hooks; the gate has no game thread).
+				if( backEnd.GetSoftShadowSurfCache() != NULL )
+				{
+					idRenderWorldLocal* rwl = static_cast<idRenderWorldLocal*>( rw );
+					for( qhandle_t bh : benchLights )
+					{
+						if( bh >= 0 && bh < rwl->lightDefs.Num() && rwl->lightDefs[bh] != NULL )
+						{
+							backEnd.GetSoftShadowSurfCache()->EnqueueWarm( rwl->lightDefs[bh] );
+						}
+					}
+				}
+				// force the warm-at-load burst to re-fire against THIS (world-only) scene: the fixed-view
+				// bench already load-warmed the earlier caster scene, so the ON pass frame 0 triggers the
+				// real backend TakeLoadWarm -> WarmMapBurst path (one heavy frame, then flat + warm).
+				if( backEnd.GetSoftShadowSurfCache() != NULL )
+				{
+					backEnd.GetSoftShadowSurfCache()->ResetLoadWarm();
+				}
+				double abSteady[2] = { 0, 0 }, abMax[2] = { 0, 0 };
+				int    abHitch[2] = { 0, 0 };
+				for( int pass = 0; pass < 2; pass++ )
+				{
+					const bool cacheOn = ( pass == 1 );
+					cvarSystem->SetCVarInteger( "r_softShadowSurfCache", cacheOn ? 1 : 0 );
+					std::vector<double> ms;
+					ms.reserve( motionFrames );
+					double segSum[4] = { 0, 0, 0, 0 };
+					int    segN[4]   = { 0, 0, 0, 0 };
+					for( int f = 0; f < motionFrames; f++ )
+					{
+						R_SoftShadowBenchMotionPose( baseOrg, baseAng, f, motionFrames, &rv );
+						rw->RenderScene( &rv );
+						const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+						tr.RenderCommandBuffers( cmd );
+						if( backEnd.pc.gpuMicroSec > 0 )		// GPU timer valid this frame
+						{
+							const double fms = backEnd.pc.gpuMicroSec / 1000.0;
+							ms.push_back( fms );
+							const int seg = Min( 3, ( f * 4 ) / motionFrames );
+							segSum[seg] += fms;
+							segN[seg]++;
+						}
+					}
+					tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );	// drain last
+					if( ms.empty() )
+					{
+						continue;
+					}
+					std::vector<double> srt = ms;
+					std::sort( srt.begin(), srt.end() );
+					const double med  = srt[srt.size() / 2];
+					const double p99  = srt[Min( srt.size() - 1, srt.size() * 99 / 100 )];
+					const double mx   = srt.back();
+					double sum = 0;
+					for( double v : ms ) { sum += v; }
+					const double mean = sum / ms.size();
+					int hitch = 0;
+					for( double v : ms ) { if( v > 1.5 * med ) { hitch++; } }
+					// steady state = last half of the run (past the one-light-per-frame warm ramp)
+					double ssum = 0;
+					int    sn = 0;
+					for( size_t i = ms.size() / 2; i < ms.size(); i++ ) { ssum += ms[i]; sn++; }
+					const double steady = sn ? ssum / sn : mean;
+					abSteady[pass] = steady;
+					abMax[pass]    = mx;
+					abHitch[pass]  = hitch;
+					uint32_t hitPct = 0;
+					uint32_t ss[4] = {};
+					if( cacheOn && backEnd.GetSoftShadowSurfCache() != NULL
+							&& backEnd.GetSoftShadowSurfCache()->GetStats( ss ) )
+					{
+						const double tot = ( double )ss[0] + ss[1] + ss[2] + ss[3];
+						hitPct = tot > 0.0 ? ( uint32_t )( 100.0 * ss[0] / tot ) : 0;
+					}
+					common->Printf( "[softgate] MOTION %-12s cache %s: mean %.2f steady %.2f p99 %.2f max %.2f ms | hitch>1.5x %d/%d | seg shake %.2f rot %.2f move %.2f combo %.2f | hit %u%% [h=%u m=%u wa=%u ar=%u]\n",
+									cap.name.c_str(), cacheOn ? "ON " : "OFF",
+									mean, steady, p99, mx, hitch, ( int )ms.size(),
+									segN[0] ? segSum[0] / segN[0] : 0.0, segN[1] ? segSum[1] / segN[1] : 0.0,
+									segN[2] ? segSum[2] / segN[2] : 0.0, segN[3] ? segSum[3] / segN[3] : 0.0, hitPct, ss[0], ss[1], ss[2], ss[3] );
+				}
+				common->Printf( "[softgate] MOTION %-12s A/B: steady OFF %.2f -> ON %.2f ms (%.0f%% %s) | max OFF %.2f ON %.2f | hitches OFF %d ON %d\n",
+								cap.name.c_str(), abSteady[0], abSteady[1],
+								abSteady[0] > 0.0 ? 100.0 * ( abSteady[0] - abSteady[1] ) / abSteady[0] : 0.0,
+								abSteady[1] <= abSteady[0] ? "faster" : "SLOWER",
+								abMax[0], abMax[1], abHitch[0], abHitch[1] );
+				cvarSystem->SetCVarInteger( "r_softShadowSurfCache", prevSurf );
+			}
+
 			for( qhandle_t bh : benchLights )
 			{
 				rw->FreeLightDef( bh );
@@ -2539,9 +2839,9 @@ int R_SoftShadowGate( const char* arg )
 	int counts[GATE_KIND_COUNT];
 	GateTally( all, counts );
 	common->Printf( "[softgate] ==============================================================\n" );
-	common->Printf( "[softgate] TOTAL: TURD=%d ANT=%d LIT_IN_UMBRA=%d STEP=%d EXTENT=%d TEMPORAL=%d CONTINUITY=%d SETUP=%d\n",
+	common->Printf( "[softgate] TOTAL: TURD=%d ANT=%d LIT_IN_UMBRA=%d STEP=%d EXTENT=%d TEMPORAL=%d CONTINUITY=%d SEAM=%d SETUP=%d\n",
 					counts[GATE_TURD], counts[GATE_ANT], counts[GATE_LIT_IN_UMBRA], counts[GATE_STEP],
-					counts[GATE_EXTENT], counts[GATE_TEMPORAL], counts[GATE_CONTINUITY], counts[GATE_SETUP] );
+					counts[GATE_EXTENT], counts[GATE_TEMPORAL], counts[GATE_CONTINUITY], counts[GATE_SEAM], counts[GATE_SETUP] );
 	common->Printf( "[softgate] TOTAL DEFECTS: %d across %d captures, %d lights -> %s\n",
 					( int )all.size(), capsRun, lightsRun, all.empty() ? "PASS" : "FAIL" );
 	return ( int )all.size();

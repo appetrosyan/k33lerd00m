@@ -143,6 +143,66 @@ idCVar com_softShadowGate( "com_softShadowGate", "", CVAR_SYSTEM, "run the minim
 idCVar com_softShadowGateBench( "com_softShadowGateBench", "0", CVAR_SYSTEM | CVAR_INTEGER, "softgate: additionally time N pipelined FULL frames (all map lights, real shading) per capture and print ms/FPS - the 60-FPS optimisation instrument. 0 = off" );
 idCVar com_softShadowGateBenchOnly( "com_softShadowGateBenchOnly", "0", CVAR_SYSTEM | CVAR_BOOL, "softgate: skip all per-light defect probes and run ONLY the bench frames - fast perf-config sweeps (~seconds per capture instead of a minute). PASS from a bench-only run is NOT a correctness verdict." );
 idCVar com_softShadowGateBenchReplay( "com_softShadowGateBenchReplay", "1", CVAR_SYSTEM | CVAR_BOOL, "softgate bench: reconstruct the caster scene from the .softcap's DEDUPED captured casters (each physical object once, incl. the DYNAMIC items/props the static map parse cannot reproduce - the dominant shadow load) and EXCLUDE the loaded worldspawn from soft-casting (its faces are already in the captured set). Default ON: the frame-time bench is unrepresentative without the dynamics. 0 = old static-map-model guess." );
+idCVar com_softShadowGateBenchMotion( "com_softShadowGateBenchMotion", "0", CVAR_SYSTEM | CVAR_INTEGER, "softgate bench: after the fixed-viewpoint bench, run N motion frames of a surf-cache A/B (cache OFF then ON) over 4 equal segments - shake / rotate / move / combo - recording each frame's GPU ms. Shows the warm-build spikes decaying at the START, then steady-state cache gain and hitch counts. Use N >= ~4x the light count (e.g. 240) so the one-light-per-frame warm completes inside the run. 0 = off.", 0, 4096 );
+idCVar com_softShadowGateWatchdog( "com_softShadowGateWatchdog", "120", CVAR_SYSTEM | CVAR_INTEGER, "softgate PROGRESS watchdog: abort the process (exit 126, loud) when a gate run makes no progress for this many seconds. Progress = shader loads, gate frames, per-capture advances. Catches the intermittent futex-deadlock in engine init (observed 2026-08-20: back-to-back headless launches occasionally wedge mid shader-loading, all threads futex_wait, 0% CPU - a stuck automation run otherwise burns its whole outer timeout). 0 = off. Armed only when com_softShadowGate is set - the normal game never runs it.", 0, 3600 );
+idCVar com_softShadowGateMaxSeconds( "com_softShadowGateMaxSeconds", "900", CVAR_SYSTEM | CVAR_INTEGER, "softgate WALL-CLOCK budget: abort the process (exit 126, loud) when the whole gate run exceeds this many seconds even while making progress. A run that needs an external timeout kill is HIDING an engine defect (a slow-progress hang, a runaway frame) - the run itself must terminate promptly or fail loudly; outer timeouts are belt-and-braces that must never fire. 0 = off.", 0, 7200 );
+
+// softgate progress heartbeat (see com_softShadowGateWatchdog). Called from the shader loader and
+// the gate's frame/capture loops; no-op unless a gate run is configured. The watchdog thread spawns
+// lazily on the first beat, is detached, and never touches engine state - it only observes the
+// counter and _exit(3)s the wedged process so the outer automation moves on immediately.
+#include <atomic>
+#include <thread>
+#include <mutex>
+static std::atomic<uint64_t> com_swGateBeat( 0 );
+void Com_SoftShadowGateHeartbeat()
+{
+	if( com_softShadowGate.GetString()[0] == '\0' || com_softShadowGateWatchdog.GetInteger() <= 0 )
+	{
+		return;
+	}
+	com_swGateBeat.fetch_add( 1, std::memory_order_relaxed );
+	static std::once_flag swWatchdogOnce;
+	std::call_once( swWatchdogOnce, []()
+	{
+		std::thread( []()
+		{
+			uint64_t last = com_swGateBeat.load();
+			int idleSec = 0;
+			int totalSec = 0;
+			for( ;; )
+			{
+				std::this_thread::sleep_for( std::chrono::seconds( 5 ) );
+				totalSec += 5;
+				const int budget = com_softShadowGateMaxSeconds.GetInteger();
+				if( budget > 0 && totalSec >= budget )
+				{
+					// a run that would need an external timeout kill is itself a defect: something in
+					// the engine is progressing too slowly (runaway frame, slow-progress hang)
+					fprintf( stderr, "[softgate] WATCHDOG: wall-clock budget exceeded (%d s) - the run is too slow; treat as an engine defect. Aborting with exit 126.\n", totalSec );
+					fflush( stderr );
+					_exit( 126 );
+				}
+				const uint64_t now = com_swGateBeat.load();
+				if( now != last )
+				{
+					last = now;
+					idleSec = 0;
+					continue;
+				}
+				idleSec += 5;
+				if( idleSec >= com_softShadowGateWatchdog.GetInteger() )
+				{
+					// 126: above the gate's defect-count exit clamp (125), so a watchdog abort can
+					// never be misread as "N defects" by the calling automation
+					fprintf( stderr, "[softgate] WATCHDOG: no progress for %d s - process is wedged (init deadlock / GPU hang). Aborting with exit 126.\n", idleSec );
+					fflush( stderr );
+					_exit( 126 );
+				}
+			}
+		} ).detach();
+	} );
+}
 
 // For doom classic
 struct Globals;
@@ -1243,6 +1303,13 @@ void idCommonLocal::Init( int argc, const char* const* argv, const char* cmdline
 
 		// override cvars from command line
 		StartupVariable( NULL );
+
+		// softgate watchdog: ARM as early as the +set cvars exist, so an init wedge before the
+		// first shader-load heartbeat is still bounded (no-op when the gate is not configured)
+		{
+			extern void Com_SoftShadowGateHeartbeat();
+			Com_SoftShadowGateHeartbeat();
+		}
 
 		consoleUsed = com_allowConsole.GetBool();
 

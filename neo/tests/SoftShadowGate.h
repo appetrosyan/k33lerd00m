@@ -67,13 +67,14 @@ enum gateKind_t
 	GATE_EXTENT,		// penumbra extent off by more than the tolerance (incl. no penumbra at all)
 	GATE_TEMPORAL,		// two identical-state frames differ (jitter/ants)
 	GATE_CONTINUITY,	// lit<->umbra flip of a co-visible world point under a small view displacement
+	GATE_SEAM,			// surf-cache: spatial step the CACHED term has that the EXACT term does not
 	GATE_SETUP,			// the scene could not be reconstructed faithfully - loud, never a silent skip
 	GATE_KIND_COUNT
 };
 
 inline const char* GateKindName( int k )
 {
-	static const char* names[GATE_KIND_COUNT] = { "TURD", "ANT", "LIT_IN_UMBRA", "STEP", "EXTENT", "TEMPORAL", "CONTINUITY", "SETUP" };
+	static const char* names[GATE_KIND_COUNT] = { "TURD", "ANT", "LIT_IN_UMBRA", "STEP", "EXTENT", "TEMPORAL", "CONTINUITY", "SEAM", "SETUP" };
 	return ( k >= 0 && k < GATE_KIND_COUNT ) ? names[k] : "?";
 }
 
@@ -82,6 +83,10 @@ struct GateDefect
 	int kind = 0;
 	int area = 0;
 	int x0 = 0, y0 = 0, x1 = 0, y1 = 0;		// bbox, inclusive
+	// EXTENT diagnosis (0 elsewhere): float64-truth vs analytic penumbra-band sample counts over
+	// the region - the DIRECTION of the deviation (ana < truth = under-shadow / band too thin;
+	// ana > truth = over-shadow) is the first fact any fix needs.
+	int anaPen = 0, truthPen = 0;
 };
 
 struct GateCfg
@@ -102,6 +107,9 @@ struct GateCfg
 	int   guard        = 2;			// px dilation guard on RT masks (misregistration tolerance)
 	float temporalTol  = 1e-6f;		// identical state => identical floats; any real delta is jitter
 	float contDepthTol = 2e-3f;		// ndc-depth tolerance for co-visibility under displacement
+	float seamTol      = 0.09f;		// cached-vs-exact EXCESS neighbour step above this = cache seam
+	//								   (1.5x the 1/16 coverage quantum: the exact term's own quantized
+	//								   steps and the bilerp's smooth gradient both stay under it)
 	int   ResScale( int at1080, int W, int H ) const
 	{
 		double s = ( double )W * H / ( 1920.0 * 1080.0 );
@@ -237,6 +245,53 @@ inline void GateEmit( const std::vector<GateComp>& comps, int kind, std::vector<
 		d.y1 = c.y1;
 		out.push_back( d );
 	}
+}
+
+// ------------------------------------------------------------------ probe: cross-texel seams (surf-cache)
+// The surface-fold cache reconstructs the term per world texel; adjacent texels fold DIFFERENT occluder
+// subsets, so their reconstructions can disagree along the shared border - a spatial step the exact walk
+// does not have. This probe renders the SAME still cached and exact and flags every 4-neighbour pixel
+// pair whose CACHED step exceeds the EXACT step by more than seamTol. Distinct from GATE_TEMPORAL
+// (same-pixel change across frames) and GATE_STEP (cliff vs the RT reference ramp): SEAM is a
+// self-consistency test of the cache against its own exact field, reference-free. Depth creases are
+// excluded (geometry edges legitimately step); chains labeled 8-way so one border line = one defect.
+inline void GateSeam( const GateImg& cached, const GateImg& exact, const std::vector<uint8_t>& valid,
+					  const std::vector<uint8_t>* crease, const GateCfg& cfg, std::vector<GateDefect>& out )
+{
+	const int W = cached.W, H = cached.H;
+	std::vector<uint8_t> seam( ( size_t )W * H, 0 );
+	for( int y = 0; y < H; y++ )
+	{
+		for( int x = 0; x < W; x++ )
+		{
+			const size_t i = ( size_t )y * W + x;
+			if( !valid[i] || ( crease != nullptr && ( *crease )[i] ) )
+			{
+				continue;
+			}
+			for( int n = 0; n < 2; n++ )		// forward neighbours only: each pair tested once
+			{
+				const int nx = x + ( n == 0 ? 1 : 0 );
+				const int ny = y + ( n == 0 ? 0 : 1 );
+				if( nx >= W || ny >= H )
+				{
+					continue;
+				}
+				const size_t j = ( size_t )ny * W + nx;
+				if( !valid[j] || ( crease != nullptr && ( *crease )[j] ) )
+				{
+					continue;
+				}
+				const float dc = std::fabs( cached.t[i] - cached.t[j] );
+				const float de = std::fabs( exact.t[i] - exact.t[j] );
+				if( dc - de > cfg.seamTol )
+				{
+					seam[i] = 1;
+				}
+			}
+		}
+	}
+	GateEmit( GateLabel( seam, W, H, true ), GATE_SEAM, out );
 }
 
 // ------------------------------------------------------------------ probe 1: temporal stability
@@ -510,6 +565,7 @@ inline void GateAgreement( const GateImg& ana, const GateImg& rt, const std::vec
 			// Sample the region uniformly, measure the analytic's penumbra area against the TRUTH's
 			// over the same samples, and mint a defect only if the analytic disagrees with the truth
 			// beyond the tolerance (widened slightly for binomial sampling noise).
+			int anaPenOut = 0, truthPenOut = 0;		// exported for the defect's direction diagnosis
 			if( truthAt )
 			{
 				const int target = 128;
@@ -546,6 +602,8 @@ inline void GateAgreement( const GateImg& ana, const GateImg& rt, const std::vec
 						}
 					}
 				}
+				anaPenOut = anaPen;
+				truthPenOut = truthPen;
 				if( sampled >= 16 )
 				{
 					if( truthPen == 0 && anaPen == 0 )
@@ -566,6 +624,8 @@ inline void GateAgreement( const GateImg& ana, const GateImg& rt, const std::vec
 			d.y0 = c.y0;
 			d.x1 = c.x1;
 			d.y1 = c.y1;
+			d.anaPen = anaPenOut;
+			d.truthPen = truthPenOut;
 			out.push_back( d );
 		}
 	}

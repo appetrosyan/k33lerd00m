@@ -1104,6 +1104,12 @@ void idRenderProgManager::Init( nvrhi::IDevice* device )
 		}
 
 		idLib::Printf( "Loading shader program %s\n", prog.name.c_str() );
+		{
+			// softgate progress watchdog heartbeat: shader loading is exactly where the intermittent
+			// init futex-deadlock wedges (no-op outside gate runs)
+			extern void Com_SoftShadowGateHeartbeat();
+			Com_SoftShadowGateHeartbeat();
+		}
 
 		if( vIndex > -1 && fIndex > -1 )
 		{
