@@ -2575,9 +2575,25 @@ void R_CreateMaskedOcclusionCullingTris( srfTriangles_t* tri )
 	{
 		R_AllocStaticTriSurfMocVerts( tri, tri->numVerts );
 
+		// NON-FINITE GUARD: the MOC AVX2 rasterizer's screen-space clamps are defeated by NaN/inf
+		// (every comparison is false), and a garbage vertex then drives its HiZ-tile index OUT OF
+		// BOUNDS - 32-byte AVX stores into neighbouring glibc heap chunks ("double free or
+		// corruption (out)" / SIGSEGV in RenderTriangles, symptom picked by ASLR - measured
+		// 2026-08-20). A non-finite vertex is a broken asset, not a visibility contributor: replace
+		// it with the origin, which makes its triangles degenerate (zero area) - the rasterizer
+		// rejects those cheaply and safely, and the surface simply occludes nothing.
 		for( int i = 0; i < tri->numVerts; i++ )
 		{
-			tri->mocVerts[i].ToVec3() = tri->verts[i].xyz;
+			const idVec3& v = tri->verts[i].xyz;
+			if( IEEE_FLT_IS_NAN( v.x ) || IEEE_FLT_IS_NAN( v.y ) || IEEE_FLT_IS_NAN( v.z )
+					|| idMath::Fabs( v.x ) > 1e30f || idMath::Fabs( v.y ) > 1e30f || idMath::Fabs( v.z ) > 1e30f )
+			{
+				tri->mocVerts[i].ToVec3().Zero();
+			}
+			else
+			{
+				tri->mocVerts[i].ToVec3() = v;
+			}
 			tri->mocVerts[i].w = 1.0f;
 		}
 	}

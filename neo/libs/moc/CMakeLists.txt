@@ -18,10 +18,14 @@ set( MOC_FILES ${MOC_AVX512_FILES} ${MOC_AVX2_FILES} ${MOC_SSE_FILES} ${MOC_INCL
 #
 if(MSVC)
 	if(MSVC_VERSION LESS 1900)
-		set(CMAKE_CXX_FLAGS "-std=c++11")
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 	endif()
 else()
-	set(CMAKE_CXX_FLAGS "-std=c++11 -m64")
+	# APPEND, never clobber: the old plain set() silently stripped every inherited flag for this
+	# whole directory - including -fsanitize=address - so the MOC rasterizer (a CPU-side AVX2
+	# writer into heap buffers) was INVISIBLE to ASan while being the prime wild-write suspect
+	# (measured 2026-08-20: glibc heap-corruption aborts with SIGSEGV caught inside RenderTriangles).
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -m64")
 endif()
 
 if(MSVC)
