@@ -41,6 +41,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "RenderCommon.h"
 #include "RenderCapture.h"
 #include "Model_local.h"
+#include "Passes/SoftShadowClassify.h"
 
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
 extern idCVar r_useSoftShadowVolumes;	// soft shadow volumes reuse the stencil shadow-volume geometry (RenderSystem_init.cpp)
@@ -83,6 +84,34 @@ int fe_rejIdxStale = 0;
 int fe_rejShadowCache = 0;
 int fe_softUmbraCulledTris = 0;	// r_softShadowUmbraAccum: triangles dropped as fully inside kept same-light umbra
 int fe_softUmbraRecomputes = 0;	// cache rebuilds (a rebuild per frame = volatile stream, cull effectively off)
+
+// ---- Phase 0 static/dynamic ATTRIBUTION (r_softShadowStaticStats / r_softShadowSkipStatic) --------
+// A static-caster x static-light soft shadow is frame-invariant: the analytic term never changes yet is
+// re-collected and re-walked every frame. These per-view counters measure how much of the soft caster
+// mass is that reusable static half - the ceiling any cross-frame cache could remove. Reset per view in
+// R_AddModels, printed in the backend under r_softShadowStaticStats. See plan noble-sniffing-rose.
+int fe_softStaticCasters = 0, fe_softDynCasters = 0;	// caster meshes classified static vs dynamic
+int fe_softStaticRecords = 0, fe_softDynRecords = 0;	// tri-stream float4 records (the walk-relevant mass)
+int fe_softDynLightMoved = 0;						// of the dynamic records: those under a MOVED light
+int fe_softDynGeomMoved = 0;						// of the dynamic records: static light but moving/animated caster
+
+// A soft caster is CACHEABLE-STATIC iff its light is immobile AND its geometry is immobile (static world
+// surface or DM_STATIC entity) AND the entity was not updated this frame. Mirrors the stencil path's
+// static-interaction gate (IsDynamicModel()==DM_STATIC) + event-driven move invalidation (lastModifiedFrameNum).
+// There is no entityHasMoved field; lastModifiedFrameNum vs the frame count is the move proxy.
+static bool R_SoftCasterIsStatic( const idRenderEntityLocal* entityDef, const viewLight_t* vLight )
+{
+	if( vLight == NULL || vLight->lightHasMoved )
+	{
+		return false;
+	}
+	const idRenderModel* m = ( entityDef != NULL ) ? entityDef->parms.hModel : NULL;
+	if( m == NULL || ( !m->IsStaticWorldModel() && m->IsDynamicModel() != DM_STATIC ) )
+	{
+		return false;
+	}
+	return entityDef->lastModifiedFrameNum != tr.frameCount;	// not moved/updated this frame
+}
 
 // ============================ same-light umbra-accumulation cull (r_softShadowUmbraAccum) ===================
 // Per LIGHT (never across lights), walk this light's caster triangles in depth order from the light; kept
@@ -530,6 +559,32 @@ struct swUmbraLightCache_t
 	std::unordered_set<uint64_t> prevKeys, curKeys;
 };
 static std::unordered_map<int, swUmbraLightCache_t> s_swUmbraCache;
+
+// CAMERA-INVARIANT static-caster cache (r_softShadowSurfCache). The surf-fold cache stores residual
+// tri indices POSITIONALLY into the emitted static-prefix stream, so the prefix must be byte-stable
+// across frames or the residual lists point at the wrong triangles and the whole GPU cache is wiped
+// wholesale every frame (the standing-still degradation). The view only collects the statics inside
+// the current frustum/PVS, so idle camera sway alone churns the world-surface set at portal/screen
+// edges. Fix: the FIRST time the view collects a static caster surface we COPY its world-space wedge
+// stream here (frame-alloc'd softEdges do not survive the frame), keyed by a stable identity; every
+// frame we re-emit the WHOLE cached set in key-sorted order, so the prefix is deterministic and the
+// fingerprint only flips when the set genuinely grows/shrinks. Entries unseen for a while are evicted
+// to bound growth across a level (an eviction is one clear, then stable again).
+struct swStaticCaster_t
+{
+	uint64_t key = 0;					// (entityIndex<<32) ^ quantized-first-vertex - stable per surface
+	int      entityIndex = -1;
+	bool     isWorld = false;
+	idRenderEntityLocal* entityDef = NULL;	// persistent renderWorld entity (never frame-alloc)
+	int      lastSeenFrame = 0;
+	std::vector<idVec4> tris;			// world-space triangle stream (numTris*3 float4)
+	std::vector<idVec4> clusters;		// cluster table (numClusters*2 float4), surface-local firstTri
+};
+struct swStaticLightCache_t
+{
+	std::unordered_map<uint64_t, swStaticCaster_t> casters;
+};
+static std::unordered_map<int, swStaticLightCache_t> s_swStaticCasterCache;
 // RB begin
 idCVar r_forceShadowMapsOnAlphaTestedSurfaces( "r_forceShadowMapsOnAlphaTestedSurfaces", "1", CVAR_RENDERER | CVAR_BOOL, "0 = same shadowing as with stencil shadows, 1 = ignore noshadows for alpha tested materials" );
 // RB end
@@ -1783,7 +1838,11 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				extern idCVar r_softShadowBenchExcludeWorld;
 				const bool swExcludeWorld = r_softShadowBenchExcludeWorld.GetBool()
 											&& entityDef->parms.hModel != NULL && entityDef->parms.hModel->IsStaticWorldModel();
-				if( !swExcludeWorld && r_useSoftShadowVolumes.GetBool() && ( tri->silEdges != NULL || r_softShadowFaceCoverage.GetBool() ) )
+				// Phase 0 ceiling probe: drop static-caster x static-light collection so the GPU walk cost
+				// attributable to the reusable static half can be measured (render is intentionally wrong).
+				extern idCVar r_softShadowSkipStatic;
+				const bool swSkipStatic = r_softShadowSkipStatic.GetBool() && R_SoftCasterIsStatic( entityDef, vLight );
+				if( !swExcludeWorld && !swSkipStatic && r_useSoftShadowVolumes.GetBool() && ( tri->silEdges != NULL || r_softShadowFaceCoverage.GetBool() ) )
 				{
 					const int swCollectStart = Sys_Microseconds();
 					softShadowEdge_t* sedges = NULL;
@@ -2173,12 +2232,218 @@ void R_AddModels()
 		extern idCVar r_softShadowUmbraAccum;
 		const bool swUmbraAccum = swFaceMode && r_softShadowUmbraAccum.GetBool();
 
+		fe_softStaticCasters = fe_softDynCasters = 0;
+		fe_softStaticRecords = fe_softDynRecords = 0;
+		fe_softDynLightMoved = fe_softDynGeomMoved = 0;
 		for( viewLight_t* vLight = tr.viewDef->viewLights; vLight != NULL; vLight = vLight->next )
 		{
 			vLight->softEdgeCache = 0;
 			vLight->softEdgeCount = 0;
 			vLight->softCasterCache = 0;
 			vLight->softCasterCount = 0;
+			vLight->softStaticCasterCount = 0;
+			vLight->softStaticTriCount = 0;
+			vLight->softSurfHash = 0;
+
+			// DEPTH-ORDER casters (r_softShadowDepthOrder, measurement): reorder softShadowWedges so casters
+			// NEAREST the light come first. The bin writes each tile list in stream order, so this makes the
+			// tile list ~depth-ordered -> the lit early-out (SW_LIT_EARLYOUT) tests big near-light blockers
+			// before bailing. Caster-runs (contiguous same-space surfs) stay intact; only run order changes.
+			// The walk's mask is a commutative UNION, so WITHOUT the early-out this reorder is bit-exact.
+			extern idCVar r_softShadowDepthOrder;
+			if( r_softShadowDepthOrder.GetBool() && vLight->softShadowWedges != NULL && vLight->lightDef != NULL )
+			{
+				const idVec3 Lorg = vLight->lightDef->globalLightOrigin;
+				struct SwRun { drawSurf_t* head; drawSurf_t* tail; float depth; };
+				std::vector<SwRun> runs;
+				for( drawSurf_t* s = vLight->softShadowWedges; s != NULL; )
+				{
+					const void* sp = s->space;
+					float dep = 1e30f;
+					if( s->softEdges != NULL && s->numSoftEdges > 0 )
+					{
+						const idVec4* e = ( const idVec4* )s->softEdges;
+						dep = ( idVec3( e[0].x, e[0].y, e[0].z ) - Lorg ).LengthSqr();
+					}
+					SwRun run; run.head = s; run.tail = s; run.depth = dep;
+					while( s->nextOnLight != NULL && s->nextOnLight->space == sp ) { s = s->nextOnLight; run.tail = s; }
+					runs.push_back( run );
+					s = s->nextOnLight;
+				}
+				std::sort( runs.begin(), runs.end(), []( const SwRun & a, const SwRun & b ) { return a.depth < b.depth; } );
+				for( size_t i = 0; i < runs.size(); i++ )
+				{
+					runs[i].tail->nextOnLight = ( i + 1 < runs.size() ) ? runs[i + 1].head : NULL;
+				}
+				vLight->softShadowWedges = runs.empty() ? NULL : runs[0].head;
+			}
+
+			// CAMERA-INVARIANT static prefix (r_softShadowSurfCache): rebuild this light's caster chain so
+			// its STATIC portion is the full cached set (key-sorted, deterministic) instead of only the
+			// frustum/PVS subset the view collected this frame. Copies each static caster's world-space
+			// wedge stream on first sight (see s_swStaticCasterCache), then re-emits the whole cached set
+			// every frame - so idle camera sway no longer churns the prefix, the fingerprint stays put,
+			// and the GPU cache stops wiping itself wholesale. The DYNAMIC runs pass through verbatim.
+			{
+				extern idCVar r_softShadowSurfCache, r_softShadowSurfCacheInvariant;
+				if( r_softShadowSurfCache.GetBool() && r_softShadowSurfCacheInvariant.GetBool() && vLight->lightDef != NULL )
+				{
+					swStaticLightCache_t& sc = s_swStaticCasterCache[ vLight->lightDef->index ];
+
+					// (1) split the collected chain into static (copied into the cache) vs dynamic (kept)
+					drawSurf_t* dynHead = NULL;
+					drawSurf_t* dynTail = NULL;
+					for( drawSurf_t* s = vLight->softShadowWedges; s != NULL; )
+					{
+						const void* sp = s->space;
+						drawSurf_t* runHead = s;
+						drawSurf_t* runTail = s;
+						while( runTail->nextOnLight != NULL && runTail->nextOnLight->space == sp ) { runTail = runTail->nextOnLight; }
+						drawSurf_t* nextRun = runTail->nextOnLight;
+
+						if( R_SoftCasterIsStatic( s->space->entityDef, vLight ) )
+						{
+							for( drawSurf_t* q = runHead; q != nextRun; q = q->nextOnLight )
+							{
+								if( q->softEdges == NULL || q->numSoftEdges <= 0 ) { continue; }
+								const idVec4* e = ( const idVec4* )q->softEdges;
+								const int eidx = q->space->entityDef != NULL ? q->space->entityDef->index : -1;
+								const uint64_t vq = ( uint64_t )( int64_t )( e[0].x * 8.0f ) * 0x9E3779B97F4A7C15ull
+													^ ( uint64_t )( int64_t )( e[0].y * 8.0f ) * 0x2545F4914F6CDD1Dull
+													^ ( uint64_t )( int64_t )( e[0].z * 8.0f );
+								const uint64_t key = ( ( uint64_t )( uint32_t )eidx << 32 ) ^ ( vq & 0xFFFFFFFFull );
+								swStaticCaster_t& c = sc.casters[ key ];
+								if( c.entityDef == NULL )		// first sight: copy the persistent stream
+								{
+									c.key = key;
+									c.entityIndex = eidx;
+									c.entityDef = q->space->entityDef;
+									c.isWorld = q->space->entityDef != NULL && q->space->entityDef->parms.hModel != NULL
+												&& q->space->entityDef->parms.hModel->IsStaticWorldModel();
+									c.tris.assign( e, e + q->numSoftEdges );
+									if( q->softClusters != NULL && q->numSoftClusters > 0 )
+									{
+										c.clusters.assign( q->softClusters, q->softClusters + q->numSoftClusters * 2 );
+									}
+								}
+								c.lastSeenFrame = tr.frameCount;
+							}
+						}
+						else	// dynamic run: keep verbatim
+						{
+							runTail->nextOnLight = NULL;
+							if( dynTail == NULL ) { dynHead = runHead; }
+							else { dynTail->nextOnLight = runHead; }
+							dynTail = runTail;
+						}
+						s = nextRun;
+					}
+
+					// (2) evict entries unseen for a while OR whose entity was freed/reused (the cached
+					// entityDef pointer would dangle) - keeps the set bounded across a level walkthrough
+					const idList<idRenderEntityLocal*, TAG_ENTITY>& edefs = vLight->lightDef->world->entityDefs;
+					const int SW_STATIC_EVICT_FRAMES = 600;		// ~10 s: standing/looping an area never evicts
+					for( auto it = sc.casters.begin(); it != sc.casters.end(); )
+					{
+						const int idx = it->second.entityIndex;
+						const bool stale = tr.frameCount - it->second.lastSeenFrame > SW_STATIC_EVICT_FRAMES;
+						const bool dangling = idx < 0 || idx >= edefs.Num() || edefs[idx] != it->second.entityDef;
+						if( stale || dangling ) { it = sc.casters.erase( it ); }
+						else { ++it; }
+					}
+
+					// (3) re-emit the whole cached set, key-sorted; one synth viewEntity per entityDef so
+					// same-entity surfaces group as the view path did (world stays per-surface downstream)
+					std::vector<const swStaticCaster_t*> ordered;
+					ordered.reserve( sc.casters.size() );
+					for( auto& kv : sc.casters ) { ordered.push_back( &kv.second ); }
+					std::sort( ordered.begin(), ordered.end(), []( const swStaticCaster_t * a, const swStaticCaster_t * b )
+					{
+						return a->key < b->key;
+					} );
+
+					std::unordered_map<idRenderEntityLocal*, viewEntity_t*> synthSpace;
+					drawSurf_t* staticHead = NULL;
+					drawSurf_t* staticTail = NULL;
+					for( const swStaticCaster_t* c : ordered )
+					{
+						viewEntity_t*& vent = synthSpace[ c->entityDef ];
+						if( vent == NULL )
+						{
+							vent = ( viewEntity_t* )R_ClearedFrameAlloc( sizeof( *vent ), FRAME_ALLOC_VIEW_ENTITY );
+							vent->entityDef = c->entityDef;
+							vent->index = c->entityIndex;
+							vent->scissorRect = vLight->scissorRect;
+						}
+						drawSurf_t* ds = ( drawSurf_t* )R_FrameAlloc( sizeof( *ds ), FRAME_ALLOC_DRAW_SURFACE );
+						memset( ds, 0, sizeof( *ds ) );
+						ds->space = vent;
+						ds->softEdges = ( softShadowEdge_t* )c->tris.data();
+						ds->numSoftEdges = ( int )c->tris.size();
+						ds->softClusters = c->clusters.empty() ? NULL : const_cast<idVec4*>( c->clusters.data() );
+						ds->numSoftClusters = ( int )c->clusters.size() / 2;
+						ds->scissorRect = vLight->scissorRect;
+						if( staticTail == NULL ) { staticHead = ds; }
+						else { staticTail->nextOnLight = ds; }
+						staticTail = ds;
+					}
+					if( staticTail != NULL ) { staticTail->nextOnLight = dynHead; vLight->softShadowWedges = staticHead; }
+					else { vLight->softShadowWedges = dynHead; }
+				}
+			}
+
+			// SURFACE-FOLD CACHE (r_softShadowSurfCache, probe): order casters STATIC-FIRST so the static
+			// set is a contiguous PREFIX of the caster table + tri stream - the cache's residual lists
+			// store tri indices into that prefix and the dynamic remainder is walked exactly per frame.
+			// The static prefix is additionally sorted by a content key (entity index, quantized first
+			// vertex) so its emission order - and therefore the cached tri indices - is DETERMINISTIC
+			// across frames even if the collection order wobbles with the camera; an order change would
+			// otherwise silently scramble every cached residual list. The walk mask is a commutative
+			// union, so on its own this reorder is bit-exact (same argument as the depth-order block
+			// above; runs AFTER it, so the partition wins and depth order is moot with the cache on).
+			extern idCVar r_softShadowSurfCache;
+			if( r_softShadowSurfCache.GetBool() && vLight->softShadowWedges != NULL && vLight->lightDef != NULL )
+			{
+				struct SwSRun { drawSurf_t* head; drawSurf_t* tail; bool isStatic; uint64_t key; };
+				std::vector<SwSRun> runs;
+				for( drawSurf_t* s = vLight->softShadowWedges; s != NULL; )
+				{
+					const void* sp = s->space;
+					SwSRun run;
+					run.head = s;
+					run.tail = s;
+					run.isStatic = R_SoftCasterIsStatic( s->space->entityDef, vLight );
+					uint64_t vq = 0;
+					if( s->softEdges != NULL && s->numSoftEdges > 0 )
+					{
+						const idVec4* e = ( const idVec4* )s->softEdges;
+						vq = ( uint64_t )( int64_t )( e[0].x * 8.0f ) * 0x9E3779B97F4A7C15ull
+							 ^ ( uint64_t )( int64_t )( e[0].y * 8.0f ) * 0x2545F4914F6CDD1Dull
+							 ^ ( uint64_t )( int64_t )( e[0].z * 8.0f );
+					}
+					run.key = ( ( uint64_t )( uint32_t )( s->space->entityDef != NULL ? s->space->entityDef->index : -1 ) << 32 ) ^ ( vq & 0xFFFFFFFFull );
+					while( s->nextOnLight != NULL && s->nextOnLight->space == sp )
+					{
+						s = s->nextOnLight;
+						run.tail = s;
+					}
+					runs.push_back( run );
+					s = s->nextOnLight;
+				}
+				std::stable_sort( runs.begin(), runs.end(), []( const SwSRun & a, const SwSRun & b )
+				{
+					if( a.isStatic != b.isStatic )
+					{
+						return a.isStatic;    // static prefix first
+					}
+					return a.isStatic ? ( a.key < b.key ) : false;	// deterministic order inside the prefix only
+				} );
+				for( size_t i = 0; i < runs.size(); i++ )
+				{
+					runs[i].tail->nextOnLight = ( i + 1 < runs.size() ) ? runs[i + 1].head : NULL;
+				}
+				vLight->softShadowWedges = runs.empty() ? NULL : runs[0].head;
+			}
 
 			// Perf: prepend each caster's edge block with a HEADER record carrying the caster's
 			// world-space bounding sphere, so the pixel shader can cheaply reject a whole caster that
@@ -2207,7 +2472,22 @@ void R_AddModels()
 				totalClusters += s->numSoftClusters;
 				const bool isWorld = s->space->entityDef != NULL && s->space->entityDef->parms.hModel != NULL
 									 && s->space->entityDef->parms.hModel->IsStaticWorldModel();
-				if( isWorld || s->space != prevSpace ) { numCasters++; prevSpace = s->space; }
+				const bool isNewCaster = isWorld || s->space != prevSpace;
+				if( isNewCaster ) { numCasters++; prevSpace = s->space; }
+
+				// Phase 0 attribution: classify this surface's records (and its caster) static vs dynamic.
+				if( R_SoftCasterIsStatic( s->space->entityDef, vLight ) )
+				{
+					fe_softStaticRecords += s->numSoftEdges;
+					if( isNewCaster ) { fe_softStaticCasters++; }
+				}
+				else
+				{
+					fe_softDynRecords += s->numSoftEdges;
+					if( isNewCaster ) { fe_softDynCasters++; }
+					if( vLight->lightHasMoved ) { fe_softDynLightMoved += s->numSoftEdges; }
+					else { fe_softDynGeomMoved += s->numSoftEdges; }	// static light, moving/animated caster
+				}
 			}
 			if( total <= 0 )
 			{
@@ -2300,6 +2580,14 @@ void R_AddModels()
 				int  openFirstClu = 0;
 				bool casterOpen = false;
 				int  swSurfIdx = 0;
+				// surface-fold cache: the static-first prefix bookkeeping. nCasStatic/nStaticTris track the
+				// contiguous static prefix as casters close; swSurfFold fingerprints the static surfaces in
+				// emission order (order-SENSITIVE on purpose: the cached residual lists index this order).
+				int  nCasStatic = 0;
+				int  nStaticTris = 0;
+				bool swSeenDynCaster = false;
+				bool swCurCasterStatic = false;
+				uint64_t swSurfFold = 0;
 				idVec3 gmn( 1e30f, 1e30f, 1e30f ), gmx( -1e30f, -1e30f, -1e30f );
 				for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 				{
@@ -2315,6 +2603,11 @@ void R_AddModels()
 							casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri, ( float )( nElems / 3 - openFirstTri ),
 															( float )openFirstClu, ( float )( nClu - openFirstClu ) );
 							nCas++;
+							if( swCurCasterStatic && !swSeenDynCaster )
+							{
+								nCasStatic = nCas;    // the static prefix grows while no dynamic caster closed yet
+								nStaticTris = nElems / 3;
+							}
 						}
 						openFirstTri = nElems / 3;
 						openFirstClu = nClu;
@@ -2322,6 +2615,21 @@ void R_AddModels()
 						gmn.Set( 1e30f, 1e30f, 1e30f );
 						gmx.Set( -1e30f, -1e30f, -1e30f );
 						curSpace = s->space;
+						swCurCasterStatic = R_SoftCasterIsStatic( s->space->entityDef, vLight );
+						if( !swCurCasterStatic )
+						{
+							swSeenDynCaster = true;    // prefix ends: later statics (shouldn't happen post-sort) stay "dynamic" = exact walk
+						}
+						else if( !swSeenDynCaster && s->softEdges != NULL && s->numSoftEdges > 0 )
+						{
+							// fingerprint the static surface: entity + record count + quantized first vertex
+							// (catches moves/content swaps; ORDER-sensitive so index scrambles drop the cache)
+							const idVec4* he = ( const idVec4* )s->softEdges;
+							uint64_t h = ( uint64_t )( uint32_t )( s->space->entityDef != NULL ? s->space->entityDef->index : -1 );
+							h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )s->numSoftEdges;
+							h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( he[0].x * 8.0f ) + ( ( uint64_t )( int64_t )( he[0].y * 8.0f ) << 20 ) + ( ( uint64_t )( int64_t )( he[0].z * 8.0f ) << 40 );
+							swSurfFold = swSurfFold * 0x2545F4914F6CDD1Dull + h;
+						}
 					}
 					const std::vector<unsigned char>* swM = ( swSurfIdx < ( int )swMasks.size() ) ? swMasks[swSurfIdx] : NULL;
 					swSurfIdx++;
@@ -2389,6 +2697,104 @@ void R_AddModels()
 					casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri, ( float )( nElems / 3 - openFirstTri ),
 													( float )openFirstClu, ( float )( nClu - openFirstClu ) );
 					nCas++;
+					if( swCurCasterStatic && !swSeenDynCaster )
+					{
+						nCasStatic = nCas;
+						nStaticTris = nElems / 3;
+					}
+				}
+
+				// surface-fold cache: finalize the static-set fingerprint. Folding the emitted static
+				// counts catches umbra-accum mask recomputes / content-count changes the per-surface
+				// fold misses; folding the light origin + cache params drops the cache on any of them.
+				{
+					extern idCVar r_softShadowSurfCache, r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
+					if( r_softShadowSurfCache.GetBool() && nCasStatic > 0 && nStaticTris > 0 )
+					{
+						uint64_t h = swSurfFold;
+						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )nCasStatic;
+						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )nStaticTris;
+						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( vLight->globalLightOrigin.x * 8.0f )
+							+ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.y * 8.0f ) << 20 )
+							+ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.z * 8.0f ) << 40 );
+						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( r_shadowPenumbraSize.GetFloat() * 64.0f );
+						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )r_softShadowSurfCacheTexel.GetInteger();
+						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( r_softShadowSurfCacheSecondThr.GetFloat() * 4096.0f );
+						if( h == 0 )
+						{
+							h = 1;
+						}
+						vLight->softSurfHash = h;
+						vLight->softStaticCasterCount = nCasStatic;
+						vLight->softStaticTriCount = nStaticTris;
+
+						// CAMERA-INVARIANCE PROBE (r_rtAccelDebug): the view-culled softSurfHash (h) churns as
+						// the camera moves; a CAMERA-INVARIANT fingerprint of this light's STATIC caster set -
+						// the SORTED set of static interacting entity indices from the interaction chain (not
+						// view-culled) - should stay stable if nothing actually moves. If invariant is stable
+						// while h churns, camera-independent collection is the sound fix. Diagnostic only.
+						extern idCVar r_softShadowInvProbe;
+						if( r_softShadowInvProbe.GetBool() && vLight->lightDef != NULL )
+						{
+							static std::unordered_map<int, uint64_t> swProbeH, swProbeI;
+							static std::unordered_map<int, int> swChurnH, swChurnI;
+							std::vector<int> statics;
+							int nMovingCasters = 0;			// casters MODIFIED this frame (the shakers) - excluded from static
+							const char* firstMover = "";
+							for( idInteraction* it = vLight->lightDef->firstInteraction; it != NULL; it = it->lightNext )
+							{
+								if( it->IsEmpty() || it->IsDeferred() || it->entityDef == NULL ) { continue; }
+								idRenderEntityLocal* e = it->entityDef;
+								const bool castsShadow = e->parms.hModel != NULL && e->parms.hModel->ModelHasShadowCastingSurfaces();
+								if( castsShadow && e->lastModifiedFrameNum == tr.frameCount )
+								{
+									nMovingCasters++;
+									if( firstMover[0] == '\0' && e->parms.hModel != NULL ) { firstMover = e->parms.hModel->Name(); }
+								}
+								if( !R_SoftCasterIsStatic( e, vLight ) ) { continue; }
+								statics.push_back( e->index );
+							}
+							std::sort( statics.begin(), statics.end() );
+							uint64_t inv = 1469598103934665603ull;
+							for( int idx : statics ) { inv = ( inv ^ ( uint64_t )idx ) * 1099511628211ull; }
+							const int li = vLight->lightDef->index;
+							const bool hadH = swProbeH.count( li ) != 0;
+							const uint64_t pH = swProbeH[li], pI = swProbeI[li];
+							if( hadH && pH != h ) { swChurnH[li]++; }
+							if( hadH && pI != inv ) { swChurnI[li]++; }
+							// DECOMPOSE which fingerprint component churns: surface-fold (set/order),
+							// counts (nCasStatic/nStaticTris), or the quantized light origin.
+							static std::unordered_map<int, uint64_t> swPrevFold, swPrevCounts, swPrevOrg;
+							const uint64_t curFold = swSurfFold;
+							const uint64_t curCounts = ( ( uint64_t )nCasStatic << 32 ) | ( uint64_t )( uint32_t )nStaticTris;
+							const uint64_t curOrg = ( uint64_t )( int64_t )( vLight->globalLightOrigin.x * 8.0f )
+													^ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.y * 8.0f ) << 21 )
+													^ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.z * 8.0f ) << 42 );
+							const bool foldCh = hadH && swPrevFold[li] != curFold;
+							const bool cntCh = hadH && swPrevCounts[li] != curCounts;
+							const bool orgCh = hadH && swPrevOrg[li] != curOrg;
+							swPrevFold[li] = curFold; swPrevCounts[li] = curCounts; swPrevOrg[li] = curOrg;
+							// throttle: accumulate churn every frame but PRINT at most once per second (one
+							// burst per second, one line per light that changed since the last tick).
+							static int swProbeTickMs = 0, swProbeTickFrame = -1;
+							static bool swProbeAllow = false;
+							if( swProbeTickFrame != tr.frameCount )
+							{
+								const int nowMs = Sys_Milliseconds();
+								swProbeAllow = ( nowMs - swProbeTickMs >= 1000 );
+								if( swProbeAllow ) { swProbeTickMs = nowMs; }
+								swProbeTickFrame = tr.frameCount;
+							}
+							if( swProbeAllow && ( !hadH || pH != h || pI != inv || nMovingCasters > 0 || vLight->lightHasMoved ) )
+							{
+								common->Printf( "[surfinv] light %d: viewHash churns=%d [fold=%d cnt=%d org=%d] | INVARIANT churns=%d | %d static | lightHasMoved=%d | %d MOVING%s%s\n",
+												li, swChurnH[li], foldCh ? 1 : 0, cntCh ? 1 : 0, orgCh ? 1 : 0,
+												swChurnI[li], ( int )statics.size(), vLight->lightHasMoved ? 1 : 0,
+												nMovingCasters, nMovingCasters > 0 ? " first=" : "", firstMover );
+							}
+							swProbeH[li] = h; swProbeI[li] = inv;
+						}
+					}
 				}
 
 				// EMITTED counts (== the pre-pass totals when r_softShadowUmbraAccum is off - byte-identical
@@ -2399,6 +2805,44 @@ void R_AddModels()
 				vLight->softEdgeCount = nElems;					// FACE mode: count in FLOAT4 elements
 				vLight->softCasterCache = vertexCache.AllocJoint( casFlat, casterElems + nClu * 2, sizeof( idVec4 ) );
 				vLight->softCasterCount = nCas;
+
+				// WORLD-CELL LIT CLASSIFIER (r_softShadowClassify, M1): build a dense lit/penumbra class grid
+				// over the light's world bounds from the just-assembled world tri stream (triFlat = 3 float4/
+				// tri), pack it into the joint buffer (read via t_SoftEdges in the term CS), and record the
+				// grid params so the term CS can skip provably-lit fragments. Rebuilt every frame in M1.
+				vLight->softClassifyDims[3] = 0;			// default: no classifier -> full walk
+				extern idCVar r_softShadowClassify, r_softShadowClassifyCell;
+				if( r_softShadowClassify.GetBool() && nElems >= 3 )
+				{
+					const idBounds& lb = vLight->globalLightBounds;		// light world influence AABB (snapshot)
+					const float dmn[3] = { lb[0].x, lb[0].y, lb[0].z };
+					const float dmx[3] = { lb[1].x, lb[1].y, lb[1].z };
+					const float lo[3]  = { vLight->globalLightOrigin.x, vLight->globalLightOrigin.y, vLight->globalLightOrigin.z };
+					static idList<idVec4> swClsPacked;		// frontend is single-threaded per view; reused scratch
+					extern idCVar r_rtAccelDebug;
+					softClassifyGrid_t g;
+					if( R_SoftClassifyBuild( lo, r_shadowPenumbraSize.GetFloat(), dmn, dmx,
+											 ( const idVec4* )triFlat, nElems / 3,
+											 Max( 1.0f, ( float )r_softShadowClassifyCell.GetInteger() ), swClsPacked, g ) )
+					{
+						vLight->softClassifyCache = vertexCache.AllocJoint( swClsPacked.Ptr(), swClsPacked.Num(), sizeof( idVec4 ) );
+						vLight->softClassifyAabbCell[0] = g.aabbMin[0];	vLight->softClassifyAabbCell[1] = g.aabbMin[1];
+						vLight->softClassifyAabbCell[2] = g.aabbMin[2];	vLight->softClassifyAabbCell[3] = g.cellSize;
+						vLight->softClassifyDims[0] = g.dims[0];	vLight->softClassifyDims[1] = g.dims[1];
+						vLight->softClassifyDims[2] = g.dims[2];	vLight->softClassifyDims[3] = 1;
+						if( r_rtAccelDebug.GetBool() )
+						{
+							common->Printf( "SoftClassify: dims %dx%dx%d cell %.0f | lit %d pen %d (%.0f%% lit) | tris %d aabb (%.0f %.0f %.0f)-(%.0f %.0f %.0f)\n",
+											g.dims[0], g.dims[1], g.dims[2], g.cellSize, g.nLit, g.nPen,
+											100.0f * g.nLit / Max( 1, g.nLit + g.nPen ), nElems / 3,
+											dmn[0], dmn[1], dmn[2], dmx[0], dmx[1], dmx[2] );
+						}
+					}
+					else if( r_rtAccelDebug.GetBool() )
+					{
+						common->Printf( "SoftClassify: build FAILED (budget/degenerate) tris %d\n", nElems / 3 );
+					}
+				}
 
 				if( R_SoftShadowCaptureArmed() )
 				{

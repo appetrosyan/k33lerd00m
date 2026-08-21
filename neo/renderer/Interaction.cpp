@@ -727,6 +727,23 @@ DROPPING most soft records over the frame budget.
 */
 int fe_softProxyBoxed = 0;	// r_softShadowProxyBox: casters replaced by their 12-tri AABB proxy (diagnostic)
 
+// When the camera-independent WARM path (R_BuildLightStaticSoftStream, backend drain thread) calls
+// R_CollectPenumbraFaces, it must NOT use the frontend frame arena (R_FrameAlloc) - that arena belongs
+// to the frontend and is unsafe / overflow-prone from the backend. This thread_local flag switches its
+// allocations to the heap; the scratch is freed internally and the caller frees the two outputs.
+static thread_local bool s_softFaceHeapAlloc = false;
+static inline void* SoftFaceAlloc( size_t n )
+{
+	return s_softFaceHeapAlloc ? Mem_Alloc( n, TAG_RENDER ) : R_FrameAlloc( n, FRAME_ALLOC_UNKNOWN );
+}
+static inline void SoftFaceScratchFree( void* p )
+{
+	if( s_softFaceHeapAlloc && p != NULL )
+	{
+		Mem_Free( p );
+	}
+}
+
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
 		const idRenderLightLocal* light, float penumbraSize, const float* modelToWorld,
 		idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters )
@@ -798,8 +815,8 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 	// pass 1: transform every triangle to world ONCE into a transient scratch (the emit below is in
 	// cluster order, so it cannot stream straight out of the index list). Box proxy: transform its 12
 	// local tris instead of the mesh's; the cluster/emit path below is identical either way.
-	idVec3* wv = ( idVec3* )R_FrameAlloc( ( size_t )numTris * 3 * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
-	idVec3* wc = ( idVec3* )R_FrameAlloc( ( size_t )numTris * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
+	idVec3* wv = ( idVec3* )SoftFaceAlloc( ( size_t )numTris * 3 * sizeof( idVec3 ) );
+	idVec3* wc = ( idVec3* )SoftFaceAlloc( ( size_t )numTris * sizeof( idVec3 ) );
 	for( int t = 0; t < numTris; t++ )
 	{
 		if( useBox )
@@ -826,14 +843,14 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 	// Conservative at every level, so coverage stays BIT-EXACT: a cluster cull can only DEFER
 	// per-triangle rejects the unchanged tight cull + sample test still make.
 	const int SW_CLUSTER_TRIS = 32;
-	int* order = ( int* )R_FrameAlloc( ( size_t )numTris * sizeof( int ), FRAME_ALLOC_UNKNOWN );
+	int* order = ( int* )SoftFaceAlloc( ( size_t )numTris * sizeof( int ) );
 	for( int t = 0; t < numTris; t++ )
 	{
 		order[t] = t;
 	}
 	const int maxClusters = numTris / ( SW_CLUSTER_TRIS / 2 ) + 2;
-	idVec4* clus = ( idVec4* )R_FrameAlloc( ( size_t )maxClusters * 2 * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
-	idVec4* recs = ( idVec4* )R_FrameAlloc( ( size_t )numTris * 3 * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
+	idVec4* clus = ( idVec4* )SoftFaceAlloc( ( size_t )maxClusters * 2 * sizeof( idVec4 ) );
+	idVec4* recs = ( idVec4* )SoftFaceAlloc( ( size_t )numTris * 3 * sizeof( idVec4 ) );
 	int nClus = 0, n = 0;
 
 	struct range_t
@@ -902,10 +919,264 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 		nClus++;
 	}
 
+	// warm/heap path: release the internal scratch (the two outputs are freed by the caller)
+	SoftFaceScratchFree( wv );
+	SoftFaceScratchFree( wc );
+	SoftFaceScratchFree( order );
+
 	*outElems = recs;
 	*outNumElems = n;
 	*outClusters = clus;
 	*outNumClusters = nClus;
+}
+
+/*
+====================
+R_BuildLightStaticSoftStream
+
+Assemble a light's FULL static soft-shadow caster stream CAMERA-INDEPENDENTLY, straight from its
+interaction chain (plan noble-sniffing-rose). This is what lets the surface-fold cache be BUILT at
+interaction-creation time (map load / scripted spawn / mover settle) instead of reactively per view -
+so it is warm before the camera ever sees the geometry, and camera motion never triggers a build.
+
+Mirrors idInteraction::CreateStaticInteraction's surface selection (HasShadows + SurfaceCastsShadow +
+R_CullModelBoundsToLight) but emits the FACE-coverage triangle stream via R_CollectPenumbraFaces and
+a per-surface caster table in the exact layout the per-view flatten writes (tr_frontend_addmodels):
+tri stream = 3 float4/tri, caster table = 2 float4/caster ( sphere.xyz,radius )( firstTri,numTri,0,0 ).
+The seed/build compute passes read only these two; the cluster block is skipped (they never read it).
+
+Static gate is camera-independent: light immobile + DM_STATIC/world model. The per-frame
+lastModifiedFrameNum check from R_SoftCasterIsStatic is intentionally omitted - warming is a one-time
+build event, not a per-frame decision. Returns false (and empty output) if the light has moved or has
+no static casters. outFingerprint is a camera-invariant identity of the static set (sorted entity
+indices + counts + penumbra + cache cvars) used to skip redundant re-warms.
+====================
+*/
+bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumbraSize,
+		idList<idVec4>& outTris, idList<idVec4>& outCasters,
+		int& outStaticCasters, int& outStaticTris, uint64_t& outFingerprint )
+{
+	outTris.Clear();
+	outCasters.Clear();
+	outStaticCasters = 0;
+	outStaticTris = 0;
+	outFingerprint = 0;
+	if( light == NULL || light->lightHasMoved || penumbraSize <= 0.0f )
+	{
+		return false;
+	}
+
+	s_softFaceHeapAlloc = true;		// backend-safe: R_CollectPenumbraFaces heap-allocs (no frame arena)
+	idList<int> staticEnts;
+	for( const idInteraction* inter = light->firstInteraction; inter != NULL; inter = inter->lightNext )
+	{
+		if( inter->IsEmpty() || inter->IsDeferred() || inter->entityDef == NULL )
+		{
+			continue;
+		}
+		const idRenderEntityLocal* ent = inter->entityDef;
+		const idRenderModel* model = ent->parms.hModel;
+		if( model == NULL || model->NumSurfaces() <= 0 )
+		{
+			continue;
+		}
+		// camera-independent static gate (no lastModifiedFrameNum - this is a build event)
+		if( !model->IsStaticWorldModel() && model->IsDynamicModel() != DM_STATIC )
+		{
+			continue;
+		}
+		if( ent->parms.noShadow )
+		{
+			continue;
+		}
+		if( ent->parms.suppressShadowInLightID && ent->parms.suppressShadowInLightID == light->parms.lightId )
+		{
+			continue;
+		}
+		if( !inter->HasShadows() )
+		{
+			continue;
+		}
+
+		bool entContributed = false;
+		for( int c = 0; c < model->NumSurfaces(); c++ )
+		{
+			const modelSurface_t* surf = model->Surface( c );
+			const srfTriangles_t* tri = ( surf != NULL ) ? surf->geometry : NULL;
+			if( tri == NULL )
+			{
+				continue;
+			}
+			const idMaterial* shader = R_RemapShaderBySkin( surf->shader,
+										ent->parms.customSkin, ent->parms.customShader );
+			if( shader == NULL || !shader->SurfaceCastsShadow() )
+			{
+				continue;
+			}
+			if( R_CullModelBoundsToLight( light, tri->bounds, ent->modelRenderMatrix ) )
+			{
+				continue;	// this surface cannot cast into the light
+			}
+
+			idVec4* faceElems = NULL;
+			int     nElems = 0;
+			idVec4* clusters = NULL;
+			int     nClusters = 0;
+			R_CollectPenumbraFaces( ent, tri, light, penumbraSize, ent->modelMatrix,
+									&faceElems, &nElems, &clusters, &nClusters );
+			if( clusters != NULL )
+			{
+				Mem_Free( clusters );		// warm never uses the cluster block
+			}
+			if( faceElems == NULL || nElems <= 0 )
+			{
+				if( faceElems != NULL )
+				{
+					Mem_Free( faceElems );
+				}
+				continue;
+			}
+
+			// per-surface caster record: world-space bounding sphere over its emitted verts
+			idVec3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+			for( int i = 0; i < nElems; i++ )
+			{
+				const idVec4& v = faceElems[i];
+				mn.x = Min( mn.x, v.x );	mx.x = Max( mx.x, v.x );
+				mn.y = Min( mn.y, v.y );	mx.y = Max( mx.y, v.y );
+				mn.z = Min( mn.z, v.z );	mx.z = Max( mx.z, v.z );
+			}
+			const idVec3 cen = ( mn + mx ) * 0.5f;
+			const float  rad = ( mx - mn ).Length() * 0.5f;
+			const int    firstTri = outTris.Num() / 3;
+			for( int i = 0; i < nElems; i++ )
+			{
+				outTris.Append( faceElems[i] );
+			}
+			outCasters.Append( idVec4( cen.x, cen.y, cen.z, rad ) );
+			outCasters.Append( idVec4( ( float )firstTri, ( float )( nElems / 3 ), 0.0f, 0.0f ) );
+			outStaticCasters++;
+			entContributed = true;
+			Mem_Free( faceElems );		// copied into outTris; release the heap collection
+		}
+		if( entContributed )
+		{
+			staticEnts.Append( ent->index );
+		}
+	}
+	s_softFaceHeapAlloc = false;
+
+	outStaticTris = outTris.Num() / 3;
+	if( outStaticTris == 0 || outStaticCasters == 0 )
+	{
+		return false;
+	}
+
+	// camera-invariant fingerprint = the SET IDENTITY only (sorted static entity indices + penumbra +
+	// cache cvars). Deliberately independent of the collected tri/caster counts so R_LightStaticChainSig
+	// can recompute it CHEAPLY (no face collection) to skip already-warm lights. Per-entity CONTENT
+	// changes (skin/model swap that keeps the same entity in the set) do not move this - they are caught
+	// by the invalidation hooks (UpdateEntityDef teardown -> InvalidateLight forces a rebuild).
+	staticEnts.SortWithTemplate();
+	extern idCVar r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
+	uint64_t fp = 1469598103934665603ull;
+	for( int i = 0; i < staticEnts.Num(); i++ )
+	{
+		fp = ( fp ^ ( uint64_t )( uint32_t )staticEnts[i] ) * 1099511628211ull;
+	}
+	fp = fp * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( penumbraSize * 64.0f );
+	fp = fp * 0x9E3779B97F4A7C15ull + ( uint64_t )r_softShadowSurfCacheTexel.GetInteger();
+	fp = fp * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( r_softShadowSurfCacheSecondThr.GetFloat() * 4096.0f );
+	outFingerprint = fp ? fp : 1;
+	return true;
+}
+
+/*
+====================
+R_LightStaticChainSig
+
+CHEAP recompute of R_BuildLightStaticSoftStream's fingerprint (the static entity-index SET), WITHOUT
+collecting any faces. WarmLight calls this first so a per-light scan skips already-warm lights for
+almost nothing (just a chain walk + a shadow-cast test per surface). Must fold IDENTICALLY to the
+assembler above or the skip is wrong. Returns 0 if the light moved or has no static shadow casters.
+====================
+*/
+uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraSize )
+{
+	if( light == NULL || light->lightHasMoved || penumbraSize <= 0.0f )
+	{
+		return 0;
+	}
+	idList<int> staticEnts;
+	for( const idInteraction* inter = light->firstInteraction; inter != NULL; inter = inter->lightNext )
+	{
+		if( inter->IsEmpty() || inter->IsDeferred() || inter->entityDef == NULL )
+		{
+			continue;
+		}
+		const idRenderEntityLocal* ent = inter->entityDef;
+		const idRenderModel* model = ent->parms.hModel;
+		if( model == NULL || model->NumSurfaces() <= 0 )
+		{
+			continue;
+		}
+		if( !model->IsStaticWorldModel() && model->IsDynamicModel() != DM_STATIC )
+		{
+			continue;
+		}
+		if( ent->parms.noShadow )
+		{
+			continue;
+		}
+		if( ent->parms.suppressShadowInLightID && ent->parms.suppressShadowInLightID == light->parms.lightId )
+		{
+			continue;
+		}
+		if( !inter->HasShadows() )
+		{
+			continue;
+		}
+		bool casts = false;
+		for( int c = 0; c < model->NumSurfaces() && !casts; c++ )
+		{
+			const modelSurface_t* surf = model->Surface( c );
+			const srfTriangles_t* tri = ( surf != NULL ) ? surf->geometry : NULL;
+			if( tri == NULL )
+			{
+				continue;
+			}
+			const idMaterial* shader = R_RemapShaderBySkin( surf->shader,
+										ent->parms.customSkin, ent->parms.customShader );
+			if( shader == NULL || !shader->SurfaceCastsShadow() )
+			{
+				continue;
+			}
+			if( R_CullModelBoundsToLight( light, tri->bounds, ent->modelRenderMatrix ) )
+			{
+				continue;
+			}
+			casts = true;
+		}
+		if( casts )
+		{
+			staticEnts.Append( ent->index );
+		}
+	}
+	if( staticEnts.Num() == 0 )
+	{
+		return 0;
+	}
+	staticEnts.SortWithTemplate();
+	extern idCVar r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
+	uint64_t fp = 1469598103934665603ull;
+	for( int i = 0; i < staticEnts.Num(); i++ )
+	{
+		fp = ( fp ^ ( uint64_t )( uint32_t )staticEnts[i] ) * 1099511628211ull;
+	}
+	fp = fp * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( penumbraSize * 64.0f );
+	fp = fp * 0x9E3779B97F4A7C15ull + ( uint64_t )r_softShadowSurfCacheTexel.GetInteger();
+	fp = fp * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( r_softShadowSurfCacheSecondThr.GetFloat() * 4096.0f );
+	return fp ? fp : 1;
 }
 
 /*
