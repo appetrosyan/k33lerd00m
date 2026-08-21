@@ -1075,6 +1075,7 @@ void idCommonLocal::Frame()
 				static idList<int>   s_probeHit;
 				static int s_probeFrame = 0;
 				static int s_probeBuilds = 0, s_probeClears = 0;
+				static double s_probeH = 0, s_probeM = 0, s_probeW = 0, s_probeA = 0;
 				{
 					extern void R_SoftCacheWarmDebugCounters( int& builds, int& clears );
 					int b = 0, c = 0;
@@ -1094,6 +1095,7 @@ void idCommonLocal::Frame()
 					{
 						const double t = ( double )sc[0] + sc[1] + sc[2] + sc[3];
 						hp = ( t > 0.0 ) ? ( int )( 100.0 * sc[0] / t ) : 0;
+							s_probeH += sc[0]; s_probeM += sc[1]; s_probeW += sc[2]; s_probeA += sc[3];
 					}
 					s_probeHit.Append( hp );
 				}
@@ -1127,6 +1129,12 @@ void idCommonLocal::Frame()
 									n, mean, med, p99, mx, mean > 0.0 ? 1000.0 / mean : 0.0,
 									WARM, postMax, hitch, hitCnt ? hitSum / hitCnt : 0.0, hitMax, hitCnt,
 									s_probeBuilds, s_probeClears );
+					{
+						const double stot = s_probeH + s_probeM + s_probeW + s_probeA;
+						if( stot > 0.0 )
+							common->Printf( "[softprobe] cache-eligible fragments: hit %.0f%% | miss(unbuilt) %.0f%% | walk-always %.0f%% | anchor-rej %.0f%%\n",
+											100.0 * s_probeH / stot, 100.0 * s_probeM / stot, 100.0 * s_probeW / stot, 100.0 * s_probeA / stot );
+					}
 					com_softShadowFrameProbe.SetInteger( 0 );
 					s_probeFrame = 0;
 					s_probeMs.Clear();
