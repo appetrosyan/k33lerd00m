@@ -4,5 +4,6 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${RBDOOM_BIN:-$HERE/../../build/RBDoom3BFG}"
+# s_noSound 1: headless runs are silent (no audio to the host) - these are automated benchmarks
 exec gamescope -W 1920 -H 1080 --backend headless -- \
-    "$BIN" +set com_skipIntroVideos 1 +set r_fullscreen 0 +set r_windowWidth 1920 +set r_windowHeight 1080 "$@"
+    "$BIN" +set com_skipIntroVideos 1 +set s_noSound 1 +set r_fullscreen 0 +set r_windowWidth 1920 +set r_windowHeight 1080 "$@"
