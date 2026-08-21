@@ -44,6 +44,7 @@ inline float  dot( float3 a, float3 b ) { return a.x * b.x + a.y * b.y + a.z * b
 inline float  dot( float2 a, float2 b ) { return a.x * b.x + a.y * b.y; }
 inline float3 cross( float3 a, float3 b ) { return float3( a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x ); }
 inline float  length( float3 a ) { return std::sqrt( dot( a, a ) ); }
+inline float  length( float2 a ) { return std::sqrt( dot( a, a ) ); }
 inline float3 normalize( float3 a ) { float l = length( a ); return l > 0 ? a * ( 1.0f / l ) : a; }
 
 // scalar intrinsics (HLSL names, global scope so the .inc's unqualified calls resolve).
@@ -52,6 +53,7 @@ inline float3 normalize( float3 a ) { float l = length( a ); return l > 0 ? a * 
 // NaN produced inside the shader math was LOUD in the C++ tests but a silent 0-contribution on the
 // GPU; the tests were validating a different failure mode than the one that ships (finding F15/F7).
 inline float saturate( float x ) { return x > 1.0f ? 1.0f : ( x >= 0.0f ? x : 0.0f ); }		// NaN -> 0 (both compares false)
+inline float smoothstep( float e0, float e1, float x ) { float t = saturate( ( x - e0 ) / ( e1 - e0 ) ); return t * t * ( 3.0f - 2.0f * t ); }
 inline float max( float a, float b ) { if( a != a ) { return b; } if( b != b ) { return a; } return a > b ? a : b; }
 inline float min( float a, float b ) { if( a != a ) { return b; } if( b != b ) { return a; } return a < b ? a : b; }
 inline int   max( int a, int b ) { return a > b ? a : b; }

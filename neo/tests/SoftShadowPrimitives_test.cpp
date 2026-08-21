@@ -4441,6 +4441,20 @@ TEST( SoftCaptureInvariant, edge_stream_contract_on_all_committed_captures )
 			const softcapLight_t& L = c.lights[li];
 			CHECK( ( size_t )L.firstEdge + L.edgeCount <= c.edges.size() );		// range valid
 			if( L.penumbraSize <= 0.0f ) { continue; }
+			// v5 FACE captures store a PURE TRIANGLE stream (v0,triRad)(v1,0)(v2,0) - no silhouette edge
+			// chains or inline caster headers, so the chain-closure/header-bound/winding invariants below
+			// (a WEDGE-path contract) do not apply. The v5 contract: every record vertex finite and no
+			// negative-w header markers. (Pre-v5 captures keep the legacy chain checks.)
+			if( c.hdr.version >= 5u )
+			{
+				for( uint32_t rIdx = L.firstEdge; rIdx < L.firstEdge + L.edgeCount && rIdx < c.edges.size(); rIdx++ )
+				{
+					const softcapEdge_t& e = c.edges[rIdx];
+					CHECK( e.e0[3] >= 0.0f );		// no legacy header record (e0.w<0) in a v5 face stream
+					for( int k = 0; k < 3; k++ ) { CHECK( std::isfinite( e.e0[k] ) && std::isfinite( e.e1[k] ) ); }
+				}
+				continue;
+			}
 			float3 Lo( L.origin[0], L.origin[1], L.origin[2] );
 			float3 hCtr( 0, 0, 0 );
 			float  hRad = 0;

@@ -36,6 +36,7 @@ version. See <http://www.gnu.org/licenses/>.
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -461,6 +462,736 @@ STUDY_TEST( SoftShadowProxyFit, feasibility )
 				 100.0 * ( binnedNoEvTris - binnedNoEv2Tris ) / std::fmax( 1.0, binnedNoEvTris ) );
 	std::printf( "      SELF-SHADOWED: %.0fk (%ld casters) of the no-evidence mass are themselves in the light's shadow = %.0f%% of all records = per-caster light-visibility cull ceiling\n",
 				 selfShadowNoEvTris / 1000.0, nSelfShadow, 100.0 * selfShadowNoEvTris / std::fmax( 1.0, totalTris ) );
+	CHECK( true );
+}
+
+// LIT-CLASSIFIER HEADROOM. The GPU walk-bucket measurement (com_softShadowGate + r_softShadowWalkCounters)
+// showed the per-fragment walk WORK is ~81-86% spent in LIT fragments (final mask 0) that walk ~90 caster
+// triangles and block nothing - the 16x16 tile bin is too coarse to prove them lit, so they walk. The
+// static-shadow win hinges on a WORLD-SPACE classifier that proves such fragments lit WITHOUT walking. This
+// study measures the achievable CEILING of that classifier as a function of granularity: how much of the
+// lit-work sits in world cells that are PURELY lit (no penumbra/umbra sample) - a conservative classifier at
+// that cell size could skip exactly those. It mirrors the shader's cull (caster sphere -> per-triangle cone)
+// so 'survivors' == the walk's work weight, then casts the 16 disk rays ONLY at survivors to classify
+// lit/penumbra/umbra. Reports the win curve (cell size -> % of lit-work skippable) so we can tell whether a
+// CHEAP (coarse) classifier captures the 86% or whether lit/penumbra interleave too finely to exploit.
+//   env: LIT_N (disk samples/side, default 4 => 16 to match the shipped mask) | LIT_SPACING (receiver grid
+//        spacing in world units, default 4) | LIT_MAXSAMP (sample cap per light, default 40000)
+// Deterministic: fixed grid, no RNG. Run twice -> bit-identical.
+STUDY_TEST( SoftShadowLitClassifier, headroom )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL ) { std::printf( "    [litclass] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [litclass] cannot load %s\n", path ); CHECK( false ); return; }
+
+	auto envI = []( const char* k, int d )   { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
+	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
+	const int   N       = envI( "LIT_N", 4 );				// disk samples/side (4 => 16, the shipped set size)
+	const float SPACING = envF( "LIT_SPACING", 4.0f );		// receiver grid spacing (world units)
+	const int   MAXSAMP = envI( "LIT_MAXSAMP", 40000 );		// sample cap per light (stride if exceeded)
+
+	// per light: the caster spheres + tri ranges (all same-light casters), for the shader-mirror cull.
+	struct CasterRef { float3 c; float rad; uint32_t first, num; };
+	std::vector<std::vector<CasterRef>> lightCasters( cap.lights.size() );
+	for( const softcapCaster_t& cs : cap.casters )
+	{
+		if( cs.lightIndex >= cap.lights.size() || cs.numIndex < 3 ) { continue; }
+		float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+		for( uint32_t k = cs.firstVert; k < cs.firstVert + cs.numVerts; k++ )
+		{
+			float3 p( cap.meshVerts[k * 3], cap.meshVerts[k * 3 + 1], cap.meshVerts[k * 3 + 2] );
+			mn = float3( std::fmin( mn.x, p.x ), std::fmin( mn.y, p.y ), std::fmin( mn.z, p.z ) );
+			mx = float3( std::fmax( mx.x, p.x ), std::fmax( mx.y, p.y ), std::fmax( mx.z, p.z ) );
+		}
+		CasterRef cr;
+		cr.c = ( mn + mx ) * 0.5f;
+		cr.rad = length( mx - mn ) * 0.5f;
+		cr.first = cs.firstIndex;
+		cr.num = cs.numIndex;
+		lightCasters[cs.lightIndex].push_back( cr );
+	}
+
+	// receiver sample points per light: grid-sample each receiver triangle at ~SPACING so cells down to
+	// ~2*SPACING have several samples (a sparse cell could hide a penumbra sample -> optimistic skip; the
+	// density guards against that). Deterministic barycentric lattice.
+	std::vector<std::vector<float3>> lightPts( cap.lights.size() );
+	std::vector<std::vector<float3>> lightNrm( cap.lights.size() );		// receiver surface normal per sample (SURFACE cache plane)
+	for( const softcapReceiver_t& r : cap.receivers )
+	{
+		if( r.lightIndex >= cap.lights.size() ) { continue; }
+		std::vector<float3>& dst = lightPts[r.lightIndex];
+		std::vector<float3>& dstN = lightNrm[r.lightIndex];
+		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
+		{
+			const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0], i1 = cap.recvIdx[r.firstIndex + t * 3 + 1], i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+			float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+			float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+			float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
+			const float3 nrmT = normalize( cross( p1 - p0, p2 - p0 ) );
+			const float e1 = length( p1 - p0 ), e2 = length( p2 - p0 );
+			const int su = ( int )std::fmax( 1.0f, std::ceil( e1 / SPACING ) );
+			const int sv = ( int )std::fmax( 1.0f, std::ceil( e2 / SPACING ) );
+			for( int a = 0; a <= su; a++ )
+				for( int b = 0; b <= sv; b++ )
+				{
+					float fu = ( float )a / su, fv = ( float )b / sv;
+					if( fu + fv > 1.0f ) { continue; }
+					dst.push_back( p0 + ( p1 - p0 ) * fu + ( p2 - p0 ) * fv );
+					dstN.push_back( nrmT );
+				}
+		}
+	}
+
+	const float CELLS[] = { 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f };
+	const int   NC = ( int )( sizeof( CELLS ) / sizeof( CELLS[0] ) );
+	// per cell size: cell -> ( litWork, hasShadowSample, maxSurvivors ). A cell purely-lit (no pen/umb
+	// sample) is skippable; maxSurv approximates the penumbra cell's cached static list size (memory).
+	// covMin/covMax: the true coverage spread inside a cell = the resolution error a per-cell MASK/TERM
+	// CACHE (option 3) would introduce - a fragment reads its cell's one cached value, so the worst error
+	// is (covMax-covMin)/2 (representative = midpoint). workAll = total walk-work in the cell.
+	struct CellAgg { double litWork = 0; int shadow = 0; int maxSurv = 0; float covMin = 1e30f; float covMax = -1e30f; double workAll = 0; };
+	std::vector<std::unordered_map<uint64_t, CellAgg>> cellMap( NC );
+	// per-light receiver world-AABB -> dense 3D cell count at each G (the dense-grid memory question).
+	std::vector<float3> aabbMin( cap.lights.size(), float3( 1e30f, 1e30f, 1e30f ) ), aabbMax( cap.lights.size(), float3( -1e30f, -1e30f, -1e30f ) );
+	for( size_t L = 0; L < cap.lights.size(); L++ )
+		for( const float3& p : lightPts[L] )
+		{
+			aabbMin[L] = float3( std::fmin( aabbMin[L].x, p.x ), std::fmin( aabbMin[L].y, p.y ), std::fmin( aabbMin[L].z, p.z ) );
+			aabbMax[L] = float3( std::fmax( aabbMax[L].x, p.x ), std::fmax( aabbMax[L].y, p.y ), std::fmax( aabbMax[L].z, p.z ) );
+		}
+
+	double totWork = 0, litWork = 0, penWork = 0, umbWork = 0;
+	long   nLit = 0, nPen = 0, nUmb = 0, nSamp = 0;
+	// NORMAL-AWARE cheap classifier (no ray test): a survivor tri entirely at/below the receiver tangent
+	// plane cannot occlude a light above it (coplanar self-surface tris included) -> drop it; a fragment
+	// with NO survivor rising above the plane is provably LIT. naLit = classified lit; naLitWrong = classed
+	// lit but truth is penumbra/umbra (MUST be 0 for a lossless skip); naLitWork = walk work it would save.
+	long   naLit = 0, naLitWrong = 0;  double naLitWork = 0;
+
+	// ---- OFFLINE TEST-TIGHTNESS BAKE: candidate CONSERVATIVE lit/umbra tests vs the ray-truth class. ----
+	// capture = of ray-truth-lit/umb WORK, how much each test PROVES (and thus would skip); FP = proves
+	// lit/umbra where the ray truth says otherwise (must be ~0 - a light leak / over-dark). The cone test
+	// (surv.empty()) is the shipped tile-bin cull; disk-projection projects each survivor onto the light
+	// disk and proves lit iff none reaches it (m=0 per-point ceiling, or +cell inflation m).
+	double coneLitCap = 0, diskLitCap0 = 0, diskLitCapC = 0, umbCapC = 0;
+	double diskLitFP0 = 0, diskLitFPC = 0, umbFPC = 0;
+	// OPTION 3' : scalar TERM cache + TRILINEAR interp. Store true coverage at grid VERTICES, interpolate
+	// at the fragment. Error = |cov(P) - trilinear(8 corners)|, work-weighted, per cell size. Measured only
+	// for the feasible range (indices TRI_LO..TRI_HI of CELLS) to bound the vertex-eval cost.
+	const int TRI_LO = 1, TRI_HI = 5;			// 8u .. 64u
+	double triW[7] = {0}, triDeg01[7] = {0}, triDeg10[7] = {0}, triErr[7] = {0};
+	// SURFACE cache (planar projection + BILINEAR): the chosen substrate. Coverage sampled at texels on the
+	// fragment's tangent plane (all ON the surface, where the field is smooth), bilinear-interpolated. Error
+	// vs texel size settles the resolution/memory budget. Same TRI_LO..TRI_HI range.
+	double surfW[7] = {0}, surfErr[7] = {0}, surfErr01[7] = {0}, surfErr10[7] = {0};
+	// ELIMINATION targets + REUSE model (user direction 2026-08-19):
+	// noEvWork = survivor-work spent on occluders that shadow NO receiver (pure cull waste).
+	// cont* = walk-work by CONTINUOUS (high-N) coverage class: truly-lit fragments that still walk = a cull
+	//         blunder; penumbra = genuine work.
+	// coh* = occluder-SET overlap (Jaccard) between a penumbra point and a neighbour at world-offset COHD[k]
+	//        = the reuse radius for an exact partial cache (cache the occluder set, re-evaluate exactly).
+	double noEvWork = 0, contLitWork = 0, contPenWork = 0, contUmbWork = 0;
+	const float COHD[5] = { 2, 4, 8, 16, 32 };
+	double cohSum[5] = {0}; long cohN[5] = {0};
+	// COMMON-CHUNK hypothesis (user 2026-08-19): per texel, skip the K common occluders and add a constant C
+	// for their contribution; walk only the variable remainder. K = common-set size (skip fraction); the
+	// crux is C's variation within a texel (measured at offset COHD[COMMON_K]). Reported at that offset.
+	const int COMMON_K = 3;			// 16u texel
+	double commonSkip = 0, commonVar = 0, commonVar01 = 0, commonVar10 = 0; long commonN = 0; double commonWsum = 0;
+	// PER-OCCLUDER DERIVATIVE (refined chunk hypothesis): freeze occluders whose solo-coverage derivative
+	// across the texel is below a threshold (they contribute ~constant), walk only the steep ones. Measures
+	// the SKIPPABLE fraction at 3 thresholds x 3 texel sizes (finer texel -> flatter -> more skippable).
+	const float DERIV_TEX[3] = { 8, 16, 32 };
+	const float DERIV_THR[3] = { 0.02f, 0.05f, 0.10f };
+	double derivSkip[3][3] = {{0}}; long derivOccTot[3] = {0};
+	// LINEAR-PLANE model (user 2026-08-20): fold every occluder's LINEAR term into one per-texel plane
+	// C + grad.offset; walk only occluders with significant SECOND derivative (curvature). Measures the
+	// fraction FOLDABLE (2nd-diff below thr) = the ones we DON'T need to walk.
+	const float SECOND_THR[3] = { 0.01f, 0.03f, 0.06f };
+	double secondFold[3][3] = {{0}}; long secondTot[3] = {0};
+	// SLIVER approximation: shrink the per-tri cone by FRAC (drop edge-clipping survivors = thin slivers),
+	// setting those near-lit fragments toward 1. Measure walk-work saved vs the coverage error it introduces.
+	const float SLIVFRAC[3] = { 0.10f, 0.20f, 0.30f };
+	double slivSaved[3] = {0}, slivErr[3] = {0}, slivErr10[3] = {0};
+	const float testTR = 0.5f * ( float )envI( "LIT_TESTCELL", 16 );	// cell inflation half-extent for the tight tests
+	struct v2 { float x, y; };
+	auto segD = []( v2 p, v2 a, v2 b ) -> float {
+		float abx = b.x - a.x, aby = b.y - a.y, apx = p.x - a.x, apy = p.y - a.y;
+		float tt = ( apx * abx + apy * aby ) / std::fmax( abx * abx + aby * aby, 1e-12f );
+		tt = std::fmin( 1.0f, std::fmax( 0.0f, tt ) );
+		float cx = a.x + abx * tt - p.x, cy = a.y + aby * tt - p.y;
+		return std::sqrt( cx * cx + cy * cy );
+	};
+	auto inTri = []( v2 p, v2 a, v2 b, v2 c ) -> bool {
+		auto sg = []( v2 p1, v2 p2, v2 p3 ) { return ( p1.x - p3.x ) * ( p2.y - p3.y ) - ( p2.x - p3.x ) * ( p1.y - p3.y ); };
+		float d1 = sg( p, a, b ), d2 = sg( p, b, c ), d3 = sg( p, c, a );
+		bool ng = ( d1 < 0 ) || ( d2 < 0 ) || ( d3 < 0 ), ps = ( d1 > 0 ) || ( d2 > 0 ) || ( d3 > 0 );
+		return !( ng && ps );
+	};
+	auto ptTriD = [&]( v2 p, v2 a, v2 b, v2 c ) -> float {
+		if( inTri( p, a, b, c ) ) { return 0.0f; }
+		return std::fmin( segD( p, a, b ), std::fmin( segD( p, b, c ), segD( p, c, a ) ) );
+	};
+
+	for( size_t L = 0; L < cap.lights.size(); L++ )
+	{
+		const std::vector<CasterRef>& cast = lightCasters[L];
+		std::vector<float3>& pts = lightPts[L];
+		if( cast.empty() || pts.empty() ) { continue; }
+		const float3 Lp( cap.lights[L].origin[0], cap.lights[L].origin[1], cap.lights[L].origin[2] );
+		const float  swR = std::fmax( cap.lights[L].penumbraSize, 1e-2f );
+		const int stride = ( int )std::fmax( 1.0, std::ceil( ( double )pts.size() / MAXSAMP ) );
+		const float* rv = cap.meshVerts.data();
+		std::vector<uint32_t> surv;								// survivor tri indices (reused per sample)
+		std::vector<uint32_t> survT[3];							// sliver-tightened survivor subsets (reused)
+
+		// per-caster NO-EVIDENCE flag: does this caster shadow ANY of the light's receiver points (solo)?
+		// A no-evidence caster's tris still get walked (cone reaches disks) but block nothing = pure cull waste.
+		// Cone-precull each receiver (only soup the few the caster could reach) to keep this tractable.
+		std::vector<char> noEv( cast.size(), 1 );
+		{
+			const int rstr = ( int )std::fmax( 1.0, pts.size() / 400.0 );
+			std::vector<uint32_t> solo;
+			for( size_t ci = 0; ci < cast.size(); ci++ )
+			{
+				const CasterRef& cr = cast[ci];
+				solo.clear();
+				for( uint32_t t = 0; t < cr.num; t++ ) { solo.push_back( cap.meshIdx[cr.first + t] ); }
+				for( size_t ri = 0; ri < pts.size() && noEv[ci]; ri += rstr )
+				{
+					const float3 Q = pts[ri]; float3 tl = Lp - Q; float dp = std::fmax( length( tl ), 1e-4f ); float3 nr = tl * ( 1.0f / dp );
+					float3 rc = cr.c - Q; float cd = dot( rc, nr );
+					if( cd + cr.rad < 1e-3f || cd - cr.rad > dp ) { continue; }
+					float3 pp = rc - nr * cd; float cR = swR * ( cd + cr.rad ) / dp;
+					if( dot( pp, pp ) > ( cR + cr.rad ) * ( cR + cr.rad ) ) { continue; }
+					if( MeshTruthShadowSoup( rv, solo.data(), ( uint32_t )solo.size(), Q, Lp, swR, N ) > 1e-4f ) { noEv[ci] = 0; }
+				}
+			}
+		}
+
+		// coverage at an ARBITRARY world point (cull survivors + disk-ray truth) - for grid-VERTEX evals (3').
+		std::vector<uint32_t> vsv;
+		auto coverageAt = [&]( float3 Q ) -> float {
+			float3 tl = Lp - Q; float dp = std::fmax( length( tl ), 1e-4f ); float3 nr = tl * ( 1.0f / dp );
+			const float ep = 1e-3f;
+			vsv.clear();
+			for( const CasterRef& cr : cast )
+			{
+				float3 rc = cr.c - Q; float cdc = dot( rc, nr );
+				if( cdc + cr.rad < ep || cdc - cr.rad > dp ) { continue; }
+				float3 pp = rc - nr * cdc; float cR = swR * ( cdc + cr.rad ) / dp;
+				if( dot( pp, pp ) > ( cR + cr.rad ) * ( cR + cr.rad ) ) { continue; }
+				for( uint32_t t = 0; t < cr.num / 3; t++ )
+				{
+					const uint32_t j0 = cap.meshIdx[cr.first + t * 3 + 0], j1 = cap.meshIdx[cr.first + t * 3 + 1], j2 = cap.meshIdx[cr.first + t * 3 + 2];
+					float3 a( rv[j0 * 3], rv[j0 * 3 + 1], rv[j0 * 3 + 2] ), bb( rv[j1 * 3], rv[j1 * 3 + 1], rv[j1 * 3 + 2] ), cc( rv[j2 * 3], rv[j2 * 3 + 1], rv[j2 * 3 + 2] );
+					float3 tc = ( a + bb + cc ) * ( 1.0f / 3.0f ); float trd = std::fmax( length( a - tc ), std::fmax( length( bb - tc ), length( cc - tc ) ) );
+					float3 r2 = tc - Q; float cd2 = dot( r2, nr );
+					if( cd2 + trd < ep || cd2 - trd > dp ) { continue; }
+					float3 p2 = r2 - nr * cd2; float cr2 = swR * ( cd2 + trd ) / dp;
+					if( dot( p2, p2 ) > ( cr2 + trd ) * ( cr2 + trd ) ) { continue; }
+					vsv.push_back( j0 ); vsv.push_back( j1 ); vsv.push_back( j2 );
+				}
+			}
+			return vsv.empty() ? 0.0f : MeshTruthShadowSoup( rv, vsv.data(), ( uint32_t )vsv.size(), Q, Lp, swR, N );
+		};
+		std::unordered_map<uint64_t, float> vmemo[7];		// per cell-size vertex-coverage cache (this light)
+		auto vkey = []( int ix, int iy, int iz ) -> uint64_t {
+			return ( ( uint64_t )( uint32_t )ix * 0x9E3779B1u ) ^ ( ( uint64_t )( uint32_t )iy * 0x85EBCA77u ) ^ ( ( uint64_t )( uint32_t )iz * 0xC2B2AE3Du );
+		};
+		auto getVCov = [&]( int g, int ix, int iy, int iz ) -> float {
+			const uint64_t k = vkey( ix, iy, iz );
+			auto it = vmemo[g].find( k );
+			if( it != vmemo[g].end() ) { return it->second; }
+			const float c = coverageAt( float3( ix * CELLS[g], iy * CELLS[g], iz * CELLS[g] ) );
+			vmemo[g][k] = c; return c;
+		};
+		// occluder-SET (survivor tri ids) a fragment at Q would walk - for neighbour coherence.
+		auto survAt = [&]( float3 Q, std::vector<uint32_t>& out ) {
+			out.clear();
+			float3 tl = Lp - Q; float dp = std::fmax( length( tl ), 1e-4f ); float3 nr = tl * ( 1.0f / dp );
+			const float ep = 1e-3f;
+			for( const CasterRef& cr : cast )
+			{
+				float3 rc = cr.c - Q; float cd = dot( rc, nr );
+				if( cd + cr.rad < ep || cd - cr.rad > dp ) { continue; }
+				float3 pp = rc - nr * cd; float cR = swR * ( cd + cr.rad ) / dp;
+				if( dot( pp, pp ) > ( cR + cr.rad ) * ( cR + cr.rad ) ) { continue; }
+				for( uint32_t t = 0; t < cr.num / 3; t++ )
+				{
+					const uint32_t j0 = cap.meshIdx[cr.first + t * 3 + 0], j1 = cap.meshIdx[cr.first + t * 3 + 1], j2 = cap.meshIdx[cr.first + t * 3 + 2];
+					float3 a( rv[j0 * 3], rv[j0 * 3 + 1], rv[j0 * 3 + 2] ), bb( rv[j1 * 3], rv[j1 * 3 + 1], rv[j1 * 3 + 2] ), cc( rv[j2 * 3], rv[j2 * 3 + 1], rv[j2 * 3 + 2] );
+					float3 tc = ( a + bb + cc ) * ( 1.0f / 3.0f ); float trd = std::fmax( length( a - tc ), std::fmax( length( bb - tc ), length( cc - tc ) ) );
+					float3 r2 = tc - Q; float cd2 = dot( r2, nr );
+					if( cd2 + trd < ep || cd2 - trd > dp ) { continue; }
+					float3 p2 = r2 - nr * cd2; float cr2 = swR * ( cd2 + trd ) / dp;
+					if( dot( p2, p2 ) > ( cr2 + trd ) * ( cr2 + trd ) ) { continue; }
+					out.push_back( cr.first + t * 3 );		// triangle id
+				}
+			}
+			std::sort( out.begin(), out.end() );
+		};
+		std::vector<uint32_t> cohA, cohB;		// reused for the coherence probes
+		// SURFACE-cache texel coverage, memoized by quantized world position (adjacent samples share texels).
+		std::unordered_map<uint64_t, float> surfMemo;
+		auto surfCov = [&]( float3 Q ) -> float {
+			const int64_t qx = ( int64_t )std::floor( Q.x * 2.0f ), qy = ( int64_t )std::floor( Q.y * 2.0f ), qz = ( int64_t )std::floor( Q.z * 2.0f );	// 0.5u grid
+			const uint64_t k = ( uint64_t )( qx * 73856093 ) ^ ( uint64_t )( qy * 19349663 ) ^ ( uint64_t )( qz * 83492791 );
+			auto it = surfMemo.find( k );
+			if( it != surfMemo.end() ) { return it->second; }
+			const float c = coverageAt( Q );
+			surfMemo[k] = c; return c;
+		};
+
+		for( size_t pi = 0; pi < pts.size(); pi += stride )
+		{
+			const float3 P = pts[pi];
+			float3 toL = Lp - P;
+			float  distPL = std::fmax( length( toL ), 1e-4f );
+			float3 nrm = toL * ( 1.0f / distPL );
+			const float eps = 1e-3f;
+
+			// shader-mirror cull: caster sphere, then per-triangle centroid cone. survivors = walk work.
+			surv.clear();
+			survT[0].clear(); survT[1].clear(); survT[2].clear();
+			int noEvSurv = 0;
+			for( size_t ci = 0; ci < cast.size(); ci++ )
+			{
+				const CasterRef& cr = cast[ci];
+				float3 rc = cr.c - P;
+				float  cd = dot( rc, nrm );
+				if( cd + cr.rad < eps || cd - cr.rad > distPL ) { continue; }
+				float3 perp = rc - nrm * cd;
+				float  coneR = swR * ( cd + cr.rad ) / distPL;
+				if( dot( perp, perp ) > ( coneR + cr.rad ) * ( coneR + cr.rad ) ) { continue; }
+				for( uint32_t t = 0; t < cr.num / 3; t++ )
+				{
+					const uint32_t j0 = cap.meshIdx[cr.first + t * 3 + 0], j1 = cap.meshIdx[cr.first + t * 3 + 1], j2 = cap.meshIdx[cr.first + t * 3 + 2];
+					float3 a( rv[j0 * 3], rv[j0 * 3 + 1], rv[j0 * 3 + 2] ), bb( rv[j1 * 3], rv[j1 * 3 + 1], rv[j1 * 3 + 2] ), cc( rv[j2 * 3], rv[j2 * 3 + 1], rv[j2 * 3 + 2] );
+					float3 tcen = ( a + bb + cc ) * ( 1.0f / 3.0f );
+					float  triRad = std::fmax( length( a - tcen ), std::fmax( length( bb - tcen ), length( cc - tcen ) ) );
+					float3 rc2 = tcen - P;
+					float  cd2 = dot( rc2, nrm );
+					if( cd2 + triRad < eps || cd2 - triRad > distPL ) { continue; }
+					float3 pp2 = rc2 - nrm * cd2;
+					float  cr2 = swR * ( cd2 + triRad ) / distPL;
+					if( dot( pp2, pp2 ) > ( cr2 + triRad ) * ( cr2 + triRad ) ) { continue; }
+					surv.push_back( j0 ); surv.push_back( j1 ); surv.push_back( j2 );
+					if( noEv[ci] ) { noEvSurv++; }
+				}
+			}
+			const double work = ( double )( surv.size() / 3 );		// survivors reaching MT = the per-fragment cost
+			// classify by disk coverage over the survivors only (bit-identical occlusion to the full set).
+			float cov = surv.empty() ? 0.0f : MeshTruthShadowSoup( rv, surv.data(), ( uint32_t )surv.size(), P, Lp, swR, N );
+			const int cls = ( cov < 1e-4f ) ? 0 : ( ( cov > 1.0f - 1e-4f ) ? 2 : 1 );	// 0 lit, 1 penumbra, 2 umbra
+
+			// SLIVER approximation (by ACTUAL disk-overlap): project each survivor onto the light disk; a
+			// survivor whose projection only grazes the RIM (dist-to-centre near swR) clips a thin sliver.
+			// Drop survivors reaching less than (1-FRAC)*swR into the disk. saved = survivors dropped (walk-
+			// work removed); err = coverage change (the real visual cost). Straddlers kept (conservative).
+			{
+				const float3 su = normalize( cross( nrm, ( std::fabs( nrm.z ) < 0.9f ) ? float3( 0, 0, 1 ) : float3( 1, 0, 0 ) ) );
+				const float3 sv = cross( nrm, su );
+				survT[0].clear(); survT[1].clear(); survT[2].clear();
+				for( size_t s = 0; s < surv.size(); s += 3 )
+				{
+					v2 q[3]; bool ok = true;
+					for( int m = 0; m < 3; m++ )
+					{
+						const uint32_t jj = surv[s + m]; float3 vv( rv[jj * 3], rv[jj * 3 + 1], rv[jj * 3 + 2] );
+						float3 d = vv - P; float dn = dot( d, nrm );
+						if( dn <= 1e-3f ) { ok = false; break; }
+						float3 q3 = P + d * ( distPL / dn ); q[m] = { dot( q3 - Lp, su ), dot( q3 - Lp, sv ) };
+					}
+					const float dd = ok ? ptTriD( { 0, 0 }, q[0], q[1], q[2] ) : 0.0f;	// dist disk-centre->tri
+					for( int k = 0; k < 3; k++ )
+					{
+						if( dd <= swR * ( 1.0f - SLIVFRAC[k] ) ) { survT[k].push_back( surv[s] ); survT[k].push_back( surv[s + 1] ); survT[k].push_back( surv[s + 2] ); }
+					}
+				}
+				for( int k = 0; k < 3; k++ )
+				{
+					const float covT = survT[k].empty() ? 0.0f : MeshTruthShadowSoup( rv, survT[k].data(), ( uint32_t )survT[k].size(), P, Lp, swR, N );
+					slivSaved[k] += ( double )( ( surv.size() - survT[k].size() ) / 3 );
+					const double err = std::fabs( ( double )cov - covT );
+					slivErr[k] += err * work;
+					if( err > 0.10 ) { slivErr10[k] += work; }
+				}
+			}
+
+			// NORMAL-AWARE cheap classify (measure-first for the surface classifier): drop survivors whose
+			// whole tri sits at/below the receiver tangent plane; if none rise above, provably lit (sound).
+			{
+				const float3 sfN = lightNrm[L][pi];
+				bool anyAbove = false;
+				for( size_t s = 0; s < surv.size() && !anyAbove; s += 3 )
+				{
+					float mx = -1e30f;
+					for( int m = 0; m < 3; m++ ) { const uint32_t jj = surv[s + m]; float3 vv( rv[jj * 3], rv[jj * 3 + 1], rv[jj * 3 + 2] ); mx = std::fmax( mx, dot( vv - P, sfN ) ); }
+					if( mx > 0.05f ) { anyAbove = true; }
+				}
+				if( !anyAbove ) { naLit++; naLitWork += work; if( cls != 0 ) { naLitWrong++; } }
+			}
+
+			totWork += work;
+			if( cls == 0 ) { litWork += work; nLit++; }
+			else if( cls == 1 ) { penWork += work; nPen++; }
+			else { umbWork += work; nUmb++; }
+			nSamp++;
+
+			// ---- ELIMINATION targets + REUSE model ----
+			noEvWork += noEvSurv;								// survivor-work on occluders that shadow nothing
+			if( work > 0 )										// continuous (64-ray) class of this WALKING fragment
+			{
+				const float covHi = MeshTruthShadowSoup( rv, surv.data(), ( uint32_t )surv.size(), P, Lp, swR, 8 );
+				if( covHi < 1e-3f ) { contLitWork += work; }			// truly lit yet walked = cull blunder
+				else if( covHi > 1.0f - 1e-3f ) { contUmbWork += work; }
+				else { contPenWork += work; }							// genuine penumbra work
+			}
+			if( cls == 1 )										// occluder-SET coherence at a penumbra fragment
+			{
+				const float3 uax = normalize( cross( nrm, ( std::fabs( nrm.z ) < 0.9f ) ? float3( 0, 0, 1 ) : float3( 1, 0, 0 ) ) );
+				survAt( P, cohA );
+				if( !cohA.empty() )
+				{
+					for( int k = 0; k < 5; k++ )
+					{
+						survAt( P + uax * COHD[k], cohB );
+						size_t i = 0, j = 0, inter = 0;
+						while( i < cohA.size() && j < cohB.size() )
+						{
+							if( cohA[i] == cohB[j] ) { inter++; i++; j++; }
+							else if( cohA[i] < cohB[j] ) { i++; }
+							else { j++; }
+						}
+						const size_t uni = cohA.size() + cohB.size() - inter;
+						if( uni > 0 ) { cohSum[k] += ( double )inter / uni; cohN[k]++; }
+
+						if( k == COMMON_K )		// COMMON-CHUNK: does the common set's contribution stay constant?
+						{
+							std::vector<uint32_t> commonTid;
+							{
+								size_t a = 0, b = 0;
+								while( a < cohA.size() && b < cohB.size() )
+								{
+									if( cohA[a] == cohB[b] ) { commonTid.push_back( cohA[a] ); a++; b++; }
+									else if( cohA[a] < cohB[b] ) { a++; }
+									else { b++; }
+								}
+							}
+							if( !commonTid.empty() && !cohA.empty() )
+							{
+								std::vector<uint32_t> cidx; cidx.reserve( commonTid.size() * 3 );
+								for( uint32_t tid : commonTid )
+								{
+									cidx.push_back( cap.meshIdx[tid] ); cidx.push_back( cap.meshIdx[tid + 1] ); cidx.push_back( cap.meshIdx[tid + 2] );
+								}
+								const float ccP = MeshTruthShadowSoup( rv, cidx.data(), ( uint32_t )cidx.size(), P, Lp, swR, N );
+								const float ccN = MeshTruthShadowSoup( rv, cidx.data(), ( uint32_t )cidx.size(), P + uax * COHD[k], Lp, swR, N );
+								const double var = std::fabs( ( double )ccP - ccN );
+								commonSkip += ( double )commonTid.size() / cohA.size();
+								commonVar += var * work; commonWsum += work;
+								if( var > 0.01 ) { commonVar01 += work; }
+								if( var > 0.10 ) { commonVar10 += work; }
+								commonN++;
+							}
+						}
+					}
+				}
+			}
+
+			// ---- PER-OCCLUDER FREEZE: how many survivors have a STABLE blocked-SAMPLE set across a texel ----
+			// (solo COVERAGE can be constant while the blocked samples SHIFT - the shift is what builds the
+			// union gradient. So the honest metric is the solo MASK's Hamming change, not the coverage change.)
+			if( cls == 1 && ( pi % 8 == 0 ) )		// strided: per-survivor solo masks are costly
+			{
+				const float3 dua = normalize( cross( nrm, ( std::fabs( nrm.z ) < 0.9f ) ? float3( 0, 0, 1 ) : float3( 1, 0, 0 ) ) );
+				const int NM = 8;
+				auto soloMask = [&]( const uint32_t * tri, float3 Q ) -> uint64_t {
+					float3 tL = Lp - Q; float d = std::sqrt( dot( tL, tL ) ); if( d < 1e-6f ) { return 0; }
+					float3 nr = tL * ( 1.0f / d );
+					float3 up = ( std::fabs( nr.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+					float3 mu = normalize( cross( up, nr ) ), mv = cross( nr, mu );
+					uint64_t m = 0;
+					for( int iy = 0; iy < NM; iy++ )
+						for( int ix = 0; ix < NM; ix++ )
+						{
+							float du = ( ix + 0.5f ) / NM * 2 - 1, dv = ( iy + 0.5f ) / NM * 2 - 1;
+							if( du * du + dv * dv > 1.0f ) { continue; }
+							float3 Dp = Lp + mu * ( du * swR ) + mv * ( dv * swR );
+							if( RayHitsMesh( Q, Dp - Q, rv, tri, 3 ) ) { m |= ( uint64_t )1 << ( iy * NM + ix ); }
+						}
+					return m;
+				};
+				for( int tx = 0; tx < 3; tx++ )
+				{
+					const float3 Q = P + dua * DERIV_TEX[tx];
+					for( size_t s = 0; s + 2 < surv.size(); s += 3 )
+					{
+						uint32_t tri[3] = { surv[s], surv[s + 1], surv[s + 2] };
+						const uint64_t mP = soloMask( tri, P ), mQ = soloMask( tri, Q );
+						const int ham = __builtin_popcountll( mP ^ mQ );		// samples that changed
+						derivOccTot[tx]++;
+						if( ham == 0 ) { derivSkip[tx][0] += 1.0; }			// mask IDENTICAL -> freeze losslessly
+						if( ham <= 1 ) { derivSkip[tx][1] += 1.0; }			// <=1 sample shifted
+						if( ham <= 3 ) { derivSkip[tx][2] += 1.0; }			// <=3 shifted
+					}
+				}
+				for( int tx = 0; tx < 3; tx++ )		// LINEAR-PLANE: per-occluder 2nd derivative (curvature) of solo coverage
+				{
+					const float3 Qm = P - dua * ( DERIV_TEX[tx] * 0.5f ), Qp = P + dua * ( DERIV_TEX[tx] * 0.5f );
+					for( size_t s = 0; s + 2 < surv.size(); s += 3 )
+					{
+						uint32_t tri[3] = { surv[s], surv[s + 1], surv[s + 2] };
+						const float cm = MeshTruthShadowSoup( rv, tri, 3, Qm, Lp, swR, 8 );
+						const float c0 = MeshTruthShadowSoup( rv, tri, 3, P, Lp, swR, 8 );
+						const float cp = MeshTruthShadowSoup( rv, tri, 3, Qp, Lp, swR, 8 );
+						const float d2 = std::fabs( cm - 2.0f * c0 + cp );		// discrete 2nd derivative -> foldable if small
+						secondTot[tx]++;
+						for( int th = 0; th < 3; th++ ) { if( d2 < SECOND_THR[th] ) { secondFold[tx][th] += 1.0; } }
+					}
+				}
+			}
+
+			// ---- OPTION 3' : trilinear TERM-cache error at this fragment (feasible cell sizes) ----
+			for( int g = TRI_LO; g <= TRI_HI; g++ )
+			{
+				const float G = CELLS[g];
+				const int ix = ( int )std::floor( P.x / G ), iy = ( int )std::floor( P.y / G ), iz = ( int )std::floor( P.z / G );
+				const float fx = P.x / G - ix, fy = P.y / G - iy, fz = P.z / G - iz;
+				const float c000 = getVCov( g, ix, iy, iz ),       c100 = getVCov( g, ix + 1, iy, iz );
+				const float c010 = getVCov( g, ix, iy + 1, iz ),   c110 = getVCov( g, ix + 1, iy + 1, iz );
+				const float c001 = getVCov( g, ix, iy, iz + 1 ),   c101 = getVCov( g, ix + 1, iy, iz + 1 );
+				const float c011 = getVCov( g, ix, iy + 1, iz + 1 ), c111 = getVCov( g, ix + 1, iy + 1, iz + 1 );
+				const float c00 = c000 * ( 1 - fx ) + c100 * fx, c10 = c010 * ( 1 - fx ) + c110 * fx;
+				const float c01 = c001 * ( 1 - fx ) + c101 * fx, c11 = c011 * ( 1 - fx ) + c111 * fx;
+				const float c0 = c00 * ( 1 - fy ) + c10 * fy, c1 = c01 * ( 1 - fy ) + c11 * fy;
+				const float ci = c0 * ( 1 - fz ) + c1 * fz;
+				const double err = std::fabs( ( double )cov - ci );
+				triW[g] += work; triErr[g] += err * work;
+				if( err > 0.01 ) { triDeg01[g] += work; }
+				if( err > 0.10 ) { triDeg10[g] += work; }
+			}
+
+			// ---- SURFACE cache (planar projection + BILINEAR) error at this fragment ----
+			{
+				const float3 nR = lightNrm[L][pi];
+				const float3 st1 = normalize( cross( nR, ( std::fabs( nR.z ) < 0.9f ) ? float3( 0, 0, 1 ) : float3( 1, 0, 0 ) ) );
+				const float3 st2 = cross( nR, st1 );
+				const float su0 = dot( P, st1 ), sv0 = dot( P, st2 );
+				for( int g = TRI_LO; g <= TRI_HI; g++ )
+				{
+					const float G = CELLS[g];
+					const int iu = ( int )std::floor( su0 / G ), iv = ( int )std::floor( sv0 / G );
+					const float fu = su0 / G - iu, fv = sv0 / G - iv;
+					auto corner = [&]( int cu, int cv ) -> float3 { return P + st1 * ( cu * G - su0 ) + st2 * ( cv * G - sv0 ); };
+					const float c00 = surfCov( corner( iu, iv ) ),     c10 = surfCov( corner( iu + 1, iv ) );
+					const float c01 = surfCov( corner( iu, iv + 1 ) ), c11 = surfCov( corner( iu + 1, iv + 1 ) );
+					const float ci = ( c00 * ( 1 - fu ) + c10 * fu ) * ( 1 - fv ) + ( c01 * ( 1 - fu ) + c11 * fu ) * fv;
+					const double err = std::fabs( ( double )cov - ci );
+					surfW[g] += work; surfErr[g] += err * work;
+					if( err > 0.01 ) { surfErr01[g] += work; }
+					if( err > 0.10 ) { surfErr10[g] += work; }
+				}
+			}
+
+			// ---- candidate conservative tests over the survivors (disk basis perpendicular to nrm) ----
+			const float3 uax = normalize( cross( nrm, ( std::fabs( nrm.z ) < 0.9f ) ? float3( 0, 0, 1 ) : float3( 1, 0, 0 ) ) );
+			const float3 vax = cross( nrm, uax );
+			// project a survivor tri onto the disk plane (through P), returning its 2D coords + min depth;
+			// bad = a vertex not strictly toward the light (tri may straddle P) -> caller treats as blocking.
+			auto projTri = [&]( size_t s, v2 q[3], float& mindn ) -> bool {
+				mindn = 1e30f;
+				for( int k = 0; k < 3; k++ )
+				{
+					const uint32_t j = surv[s + k];
+					const float3 vv( rv[j * 3], rv[j * 3 + 1], rv[j * 3 + 2] );
+					const float3 d = vv - P; const float dn = dot( d, nrm );
+					if( dn <= 1e-3f ) { return false; }
+					const float3 q3 = P + d * ( distPL / dn );
+					q[k] = { dot( q3 - Lp, uax ), dot( q3 - Lp, vax ) };
+					mindn = std::fmin( mindn, dn );
+				}
+				return true;
+			};
+			const bool straddleSkip = envI( "LIT_STRADDLE_SKIP", 0 ) != 0;	// diagnostic: skip straddlers (UNSAFE, ceiling only)
+			auto diskLit = [&]( float m ) -> bool {
+				for( size_t s = 0; s < surv.size(); s += 3 )
+				{
+					v2 q[3]; float mindn;
+					if( !projTri( s, q, mindn ) ) { if( straddleSkip ) { continue; } return false; }	// straddles P -> conservatively blocks
+					const float mm = m * distPL / std::fmax( mindn, 1e-3f );	// cell radius projected onto the disk
+					if( ptTriD( { 0, 0 }, q[0], q[1], q[2] ) < swR + mm ) { return false; }	// tri reaches the disk
+				}
+				return true;
+			};
+			auto diskUmb = [&]( float m ) -> bool {
+				for( size_t s = 0; s < surv.size(); s += 3 )
+				{
+					v2 q[3]; float mindn;
+					if( !projTri( s, q, mindn ) ) { continue; }
+					const float mm = m * distPL / std::fmax( mindn, 1e-3f );
+					if( inTri( { 0, 0 }, q[0], q[1], q[2] ) && ptTriD( { 0, 0 }, q[0], q[1], q[2] ) >= swR + mm ) { return true; }
+				}
+				return false;
+			};
+			const bool coneLit = surv.empty();
+			const bool dLit0 = coneLit || diskLit( 0.0f );
+			const bool dLitC = coneLit || diskLit( testTR );
+			const bool uUmbC = diskUmb( testTR );
+			if( cls == 0 )		// ray-truth LIT: capture
+			{
+				if( coneLit ) { coneLitCap += work; }
+				if( dLit0 )   { diskLitCap0 += work; }
+				if( dLitC )   { diskLitCapC += work; }
+			}
+			else				// not lit: a firing lit test is a FALSE POSITIVE
+			{
+				if( dLit0 ) { diskLitFP0 += work; }
+				if( dLitC ) { diskLitFPC += work; }
+			}
+			if( cls == 2 ) { if( uUmbC ) { umbCapC += work; } }		// ray-truth UMBRA: capture
+			else { if( uUmbC ) { umbFPC += work; } }				// not umbra: FALSE POSITIVE
+
+			for( int g = 0; g < NC; g++ )
+			{
+				const float G = CELLS[g];
+				const int64_t cx = ( int64_t )std::floor( P.x / G ), cy = ( int64_t )std::floor( P.y / G ), cz = ( int64_t )std::floor( P.z / G );
+				uint64_t key = ( uint64_t )( cx * 73856093 ) ^ ( uint64_t )( cy * 19349663 ) ^ ( uint64_t )( cz * 83492791 ) ^ ( ( uint64_t )L << 1 );
+				auto& e = cellMap[g][key];
+				if( cls == 0 ) { e.litWork += work; }
+				else { e.shadow = 1; }			// this cell touches penumbra/umbra -> NOT purely lit
+				if( ( int )work > e.maxSurv ) { e.maxSurv = ( int )work; }
+				e.covMin = std::fmin( e.covMin, cov );
+				e.covMax = std::fmax( e.covMax, cov );
+				e.workAll += work;
+			}
+		}
+	}
+
+	std::printf( "    [litclass] %s: %ld samples (%ld lit / %ld pen / %ld umb) | work-share lit/pen/umb %.0f%%/%.0f%%/%.0f%% (spacing %.0f, N=%d)\n",
+				 cap.mapName.empty() ? path : cap.mapName.c_str(), nSamp, nLit, nPen, nUmb,
+				 totWork > 0 ? 100.0 * litWork / totWork : 0.0, totWork > 0 ? 100.0 * penWork / totWork : 0.0, totWork > 0 ? 100.0 * umbWork / totWork : 0.0,
+				 ( double )SPACING, N );
+	std::printf( "    [litclass] NORMAL-AWARE surface classify (no ray test, sound): lit %ld/%ld samples (%.0f%% of lit-truth captured) | removes %.0f%% of WHOLE walk | UNSOUND(classed-lit-but-shadowed) %ld <- MUST be 0\n",
+				 naLit, nLit, nLit > 0 ? 100.0 * ( naLit - naLitWrong ) / nLit : 0.0,
+				 totWork > 0 ? 100.0 * naLitWork / totWork : 0.0, naLitWrong );
+	std::printf( "    [litclass] WORLD-CELL lit short-circuit ceiling (purely-lit cells; conservative classifier at that grain):\n" );
+	for( int g = 0; g < NC; g++ )
+	{
+		double skip = 0;
+		for( auto& kv : cellMap[g] ) { if( kv.second.shadow == 0 ) { skip += kv.second.litWork; } }
+		std::printf( "      cell %4.0fu:  captures %.0f%% of lit-work  =>  %.0f%% of the WHOLE walk removed  (umbra short-circuit adds %.0f%%)\n",
+					 ( double )CELLS[g],
+					 litWork > 0 ? 100.0 * skip / litWork : 0.0,
+					 totWork > 0 ? 100.0 * skip / totWork : 0.0,
+					 totWork > 0 ? 100.0 * umbWork / totWork : 0.0 );
+	}
+	// DENSE-GRID MEMORY (the dense-vs-hash decision): class-byte array over each light's receiver-AABB +
+	// penumbra cells' cached static lists (~maxSurv tris x 4B/index). Reports total across all lights.
+	std::printf( "    [litclass] DENSE-GRID memory (class byte/cell over receiver-AABB + penumbra list ~maxSurv*4B):\n" );
+	for( int g = 0; g < NC; g++ )
+	{
+		const float G = CELLS[g];
+		double denseCells = 0;
+		for( size_t L = 0; L < cap.lights.size(); L++ )
+		{
+			if( lightPts[L].empty() ) { continue; }
+			double nx = std::floor( ( aabbMax[L].x - aabbMin[L].x ) / G ) + 1, ny = std::floor( ( aabbMax[L].y - aabbMin[L].y ) / G ) + 1, nz = std::floor( ( aabbMax[L].z - aabbMin[L].z ) / G ) + 1;
+			denseCells += nx * ny * nz;
+		}
+		long occ = 0, pen = 0; double listBytes = 0;
+		for( auto& kv : cellMap[g] ) { occ++; if( kv.second.shadow ) { pen++; listBytes += ( double )kv.second.maxSurv * 3.0 * 4.0; } }
+		std::printf( "      cell %4.0fu:  dense %.1fM cells (%.1f MB class) | occupied %ld, penumbra %ld (%.1f MB lists) | TOTAL %.1f MB\n",
+					 ( double )G, denseCells / 1e6, denseCells / 1e6, occ, pen, listBytes / 1e6, denseCells / 1e6 + listBytes / 1e6 );
+	}
+	std::printf( "    [litclass] MASK/TERM CACHE (option 3) resolution error - the cache stores one term/cell,\n"
+				 "               so a fragment's worst error is (covMax-covMin)/2 in its cell. Work-fraction it degrades:\n" );
+	for( int g = 0; g < NC; g++ )
+	{
+		double wTot = 0, w01 = 0, w10 = 0, spreadW = 0;
+		for( auto& kv : cellMap[g] )
+		{
+			if( kv.second.covMax < kv.second.covMin ) { continue; }
+			const double half = 0.5 * ( kv.second.covMax - kv.second.covMin );
+			wTot += kv.second.workAll;
+			spreadW += half * kv.second.workAll;
+			if( half > 0.01 ) { w01 += kv.second.workAll; }
+			if( half > 0.10 ) { w10 += kv.second.workAll; }
+		}
+		std::printf( "      cell %4.0fu:  %5.1f%% of walk-work degrades >0.01, %5.1f%% >0.1 | mean cache error %.3f\n",
+					 ( double )CELLS[g], wTot > 0 ? 100.0 * w01 / wTot : 0.0, wTot > 0 ? 100.0 * w10 / wTot : 0.0,
+					 wTot > 0 ? spreadW / wTot : 0.0 );
+	}
+	std::printf( "    [litclass] TERM CACHE + TRILINEAR (option 3') error - store true coverage at grid vertices,\n"
+				 "               interpolate at the fragment. Work-fraction degraded (vs the nearest-neighbour table above):\n" );
+	for( int g = TRI_LO; g <= TRI_HI; g++ )
+	{
+		std::printf( "      cell %4.0fu:  %5.1f%% of walk-work degrades >0.01, %5.1f%% >0.1 | mean error %.4f\n",
+					 ( double )CELLS[g], triW[g] > 0 ? 100.0 * triDeg01[g] / triW[g] : 0.0,
+					 triW[g] > 0 ? 100.0 * triDeg10[g] / triW[g] : 0.0, triW[g] > 0 ? triErr[g] / triW[g] : 0.0 );
+	}
+	std::printf( "    [litclass] ELIMINATION targets (lossless, no cache):\n" );
+	std::printf( "      no-evidence occluders : %5.1f%% of walk-work (survivors from casters that shadow NO receiver)\n",
+				 totWork > 0 ? 100.0 * noEvWork / totWork : 0.0 );
+	std::printf( "      continuous(64-ray) class of WALKING work: truly-lit %5.1f%% | penumbra %5.1f%% | umbra %5.1f%%\n",
+				 totWork > 0 ? 100.0 * contLitWork / totWork : 0.0, totWork > 0 ? 100.0 * contPenWork / totWork : 0.0,
+				 totWork > 0 ? 100.0 * contUmbWork / totWork : 0.0 );
+	std::printf( "    [litclass] OCCLUDER-SET COHERENCE between penumbra neighbours (Jaccard of survivor sets = reuse radius):\n" );
+	for( int k = 0; k < 5; k++ )
+	{
+		std::printf( "      offset %3.0fu:  %.2f mean overlap  (%ld pairs)\n",
+					 ( double )COHD[k], cohN[k] > 0 ? cohSum[k] / cohN[k] : 0.0, cohN[k] );
+	}
+	std::printf( "    [litclass] COMMON-CHUNK @%.0fu texel (skip K common occluders + add constant C, walk the variable rest):\n",
+				 ( double )COHD[COMMON_K] );
+	std::printf( "      common = %.0f%% of occluders (the SKIP fraction) | C variation across texel: mean %.4f | %.1f%% work >0.01, %.1f%% >0.1\n",
+				 commonN > 0 ? 100.0 * commonSkip / commonN : 0.0, commonWsum > 0 ? commonVar / commonWsum : 0.0,
+				 commonWsum > 0 ? 100.0 * commonVar01 / commonWsum : 0.0, commonWsum > 0 ? 100.0 * commonVar10 / commonWsum : 0.0 );
+	std::printf( "    [litclass] PER-OCCLUDER FREEZE (%% of survivors whose solo blocked-SAMPLE mask stays stable across the texel):\n" );
+	for( int tx = 0; tx < 3; tx++ )
+	{
+		std::printf( "      texel %2.0fu:  mask IDENTICAL %.0f%% | <=1 sample shifted %.0f%% | <=3 shifted %.0f%%\n",
+					 ( double )DERIV_TEX[tx],
+					 derivOccTot[tx] > 0 ? 100.0 * derivSkip[tx][0] / derivOccTot[tx] : 0.0,
+					 derivOccTot[tx] > 0 ? 100.0 * derivSkip[tx][1] / derivOccTot[tx] : 0.0,
+					 derivOccTot[tx] > 0 ? 100.0 * derivSkip[tx][2] / derivOccTot[tx] : 0.0 );
+	}
+	std::printf( "    [litclass] LINEAR-PLANE FOLD (%% of survivors LINEAR enough to fold into the per-texel plane; walk only the rest):\n" );
+	for( int tx = 0; tx < 3; tx++ )
+	{
+		std::printf( "      texel %2.0fu:  foldable @2nd<0.01 %.0f%% | <0.03 %.0f%% | <0.06 %.0f%%\n",
+					 ( double )DERIV_TEX[tx],
+					 secondTot[tx] > 0 ? 100.0 * secondFold[tx][0] / secondTot[tx] : 0.0,
+					 secondTot[tx] > 0 ? 100.0 * secondFold[tx][1] / secondTot[tx] : 0.0,
+					 secondTot[tx] > 0 ? 100.0 * secondFold[tx][2] / secondTot[tx] : 0.0 );
+	}
+	std::printf( "    [litclass] SURFACE CACHE (planar projection + bilinear) error - the CHOSEN substrate; error vs texel size:\n" );
+	for( int g = TRI_LO; g <= TRI_HI; g++ )
+	{
+		std::printf( "      texel %4.0fu:  %5.1f%% of work degrades >0.01, %5.1f%% >0.1 | mean error %.4f\n",
+					 ( double )CELLS[g], surfW[g] > 0 ? 100.0 * surfErr01[g] / surfW[g] : 0.0,
+					 surfW[g] > 0 ? 100.0 * surfErr10[g] / surfW[g] : 0.0, surfW[g] > 0 ? surfErr[g] / surfW[g] : 0.0 );
+	}
+	std::printf( "    [litclass] SLIVER approximation (drop survivors reaching <(1-x)*swR into the disk = rim grazers):\n" );
+	for( int k = 0; k < 3; k++ )
+	{
+		std::printf( "      drop rim %2.0f%%:  walk-work saved %5.1f%% | mean coverage err %.4f | %5.1f%% of work errs >0.1\n",
+					 100.0 * SLIVFRAC[k], totWork > 0 ? 100.0 * slivSaved[k] / totWork : 0.0,
+					 totWork > 0 ? slivErr[k] / totWork : 0.0, totWork > 0 ? 100.0 * slivErr10[k] / totWork : 0.0 );
+	}
+	std::printf( "    [litclass] CONSERVATIVE TEST tightness (capture of ray-truth WORK; FP must be ~0):\n" );
+	std::printf( "      cone (tile-bin cull)    : %5.1f%% of lit-work  (the shipped cull - upper bound of a cone classifier)\n",
+				 litWork > 0 ? 100.0 * coneLitCap / litWork : 0.0 );
+	std::printf( "      disk-proj m=0 (ceiling) : %5.1f%% of lit-work | FP %.2f%% of walk\n",
+				 litWork > 0 ? 100.0 * diskLitCap0 / litWork : 0.0, totWork > 0 ? 100.0 * diskLitFP0 / totWork : 0.0 );
+	std::printf( "      disk-proj cell %-3d      : %5.1f%% of lit-work | FP %.2f%% of walk\n",
+				 ( int )( 2 * testTR ), litWork > 0 ? 100.0 * diskLitCapC / litWork : 0.0, totWork > 0 ? 100.0 * diskLitFPC / totWork : 0.0 );
+	std::printf( "      umbra 1-tri cell %-3d    : %5.1f%% of umbra-work | FP %.2f%% of walk\n",
+				 ( int )( 2 * testTR ), umbWork > 0 ? 100.0 * umbCapC / umbWork : 0.0, totWork > 0 ? 100.0 * umbFPC / totWork : 0.0 );
+	std::printf( "      COMBINED (disk-lit cell + umbra) removes %.0f%% of the WHOLE walk\n",
+				 totWork > 0 ? 100.0 * ( diskLitCapC + umbCapC ) / totWork : 0.0 );
 	CHECK( true );
 }
 
@@ -2050,5 +2781,327 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 				 fpSev[0], fpSev[1], fpSev[2], fpSev[3], fpUnblockedMax );
 	std::printf( "      FN split: %ld of %ld redundant-but-kept would pass the cull test NOW (real residual); the rest is structural tax (mutual redundancy + dilation safety)\n",
 				 fnAchievable, fnRedundant );
+	CHECK( true );
+}
+
+// ============================================================================================================
+// FAR-BAND EXTENT DISCRIMINATOR  (plan noble-sniffing-rose, Phase 0)
+// The gate's 2 EXTENT defects (erebus1_05 L0, far thin strips) read anaPen=0 vs truthPen>0: the analytic
+// penumbra band is ENTIRELY ABSENT. Two candidate mechanisms:
+//   A - 16-sample disk floor: a far caster subtending < 1/16 of the light disk is missed by all 16 golden-
+//       angle rays; coverage quantizes to 0 and the band vanishes.
+//   B - caster missing from the consumed stream (would need truth and analytic to see DIFFERENT geometry).
+// The capture stores the truth caster meshes FROM vLight->softShadowWedges (RenderCapture.cpp:466) - the SAME
+// list the shipped GPU walk consumes - so truth and analytic share geometry by construction and B cannot
+// produce a truth-only band in the gate. This study PROVES A directly: at the defect-region receiver points
+// it compares the shipped 16-ray golden-angle sampler (cov16) against a dense N=32 ray truth (covDense) over
+// L0's exact caster soup. A confirmed where covDense is in-band (0<cov<1) while cov16 pins to fully-lit.
+//   env: FARBAND_LIGHT (default 0) | FARBAND_BBOX ("x0,y0,x1,y1;x0,y0,x1,y1" screen-space, default the two
+//        erebus1_05 defect strips) | FARBAND_DENSE (dense samples/side, default 32)
+STUDY_TEST( SoftShadowFarBand, discriminate )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL ) { std::printf( "    [farband] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [farband] cannot load %s\n", path ); CHECK( false ); return; }
+
+	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
+	const uint32_t LI    = ( uint32_t )envI( "FARBAND_LIGHT", 0 );
+	const int      DENSE = envI( "FARBAND_DENSE", 32 );
+	if( LI >= cap.lights.size() ) { std::printf( "    [farband] light %u absent (have %zu)\n", LI, cap.lights.size() ); CHECK( true ); return; }
+
+	// defect bboxes (screen space); default = the two erebus1_05 L0 EXTENT strips from the gate direction print
+	struct Box { int x0, y0, x1, y1; };
+	std::vector<Box> boxes;
+	if( const char* bs = std::getenv( "FARBAND_BBOX" ) )
+	{
+		int x0, y0, x1, y1; const char* p = bs;
+		while( std::sscanf( p, "%d,%d,%d,%d", &x0, &y0, &x1, &y1 ) == 4 )
+		{
+			boxes.push_back( { x0, y0, x1, y1 } );
+			const char* semi = std::strchr( p, ';' ); if( !semi ) { break; } p = semi + 1;
+		}
+	}
+	if( boxes.empty() ) { boxes = { { 594, 133, 726, 152 }, { 440, 145, 528, 157 } }; }
+
+	// L0's exact caster soup (the truth==analytic geometry): idx global into cap.meshVerts.
+	std::vector<uint32_t> soup;
+	for( const softcapCaster_t& cs : cap.casters )
+	{
+		if( cs.lightIndex != LI ) { continue; }
+		for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < cap.meshIdx.size(); k++ ) { soup.push_back( cap.meshIdx[k] ); }
+	}
+	if( soup.empty() ) { std::printf( "    [farband] no casters for light %u\n", LI ); CHECK( true ); return; }
+
+	// CONSUMED STREAM soup: cap.edges for this light is what the GPU walk actually consumes. The ON-DISK
+	// encoding is VERSION-dependent: v5 = pure V2 tri triples (v0,triRad)(v1,0)(v2,0); pre-v5 (v1/v4) =
+	// inline caster headers (e0.w<0) + triangle PAIRS ( recA.e0=v0, recA.e1=v1, recB.e1=v2 ). Parse per
+	// version so we trace exactly the GPU's geometry vs the truth mesh (RenderCapture.h SOFTCAP_VERSION note;
+	// mirrors FaceStreamFromV1Records in SoftShadowBox.h).
+	std::vector<float>    consV;
+	std::vector<uint32_t> consIdx;
+	{
+		const softcapLight_t& L = cap.lights[LI];
+		auto pushTri = [&]( const float* a, const float* b, const float* c )
+		{
+			uint32_t base = ( uint32_t )( consV.size() / 3 );
+			consV.insert( consV.end(), { a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2] } );
+			consIdx.push_back( base ); consIdx.push_back( base + 1 ); consIdx.push_back( base + 2 );
+		};
+		if( cap.hdr.version >= 5u )
+		{
+			const uint32_t f4count = L.edgeCount * 2;			// float4 elements, 3 per tri
+			for( uint32_t g = 0; g + 2 < f4count; g += 3 )
+			{
+				const float* v[3];
+				for( int e = 0; e < 3; e++ )
+				{
+					uint32_t rec = L.firstEdge + ( g + e ) / 2;
+					v[e] = ( ( g + e ) & 1 ) ? cap.edges[rec].e1 : cap.edges[rec].e0;
+				}
+				pushTri( v[0], v[1], v[2] );
+			}
+		}
+		else												// v1/v4: headers (e0.w<0) + triangle pairs
+		{
+			for( uint32_t i = 0; i < L.edgeCount; i++ )
+			{
+				const softcapEdge_t& rA = cap.edges[L.firstEdge + i];
+				if( rA.e0[3] < 0.0f ) { continue; }			// caster header
+				if( i + 1 >= L.edgeCount ) { break; }
+				const softcapEdge_t& rB = cap.edges[L.firstEdge + i + 1];
+				pushTri( rA.e0, rA.e1, rB.e1 );				// v0=recA.e0, v1=recA.e1, v2=recB.e1
+				i++;										// consumed recB
+			}
+		}
+	}
+	std::printf( "    [farband] L%u (v%u) truth-soup %zu tris vs consumed-stream %zu tris\n",
+				 LI, cap.hdr.version, soup.size() / 3, consIdx.size() / 3 );
+
+	const float3 Lp( cap.lights[LI].origin[0], cap.lights[LI].origin[1], cap.lights[LI].origin[2] );
+	const float  swR = std::fmax( cap.lights[LI].penumbraSize, 1e-2f );
+
+	// precompute soup tri centroid+radius for a per-point cone precull (the whole 6878-tri soup per ray is
+	// intractable; only tris near the P->L axis can shadow P's disk).
+	const size_t nTri = soup.size() / 3;
+	std::vector<float3> triC( nTri ); std::vector<float> triR( nTri );
+	for( size_t ti = 0; ti < nTri; ti++ )
+	{
+		float3 A( cap.meshVerts[soup[ti * 3] * 3], cap.meshVerts[soup[ti * 3] * 3 + 1], cap.meshVerts[soup[ti * 3] * 3 + 2] );
+		float3 B( cap.meshVerts[soup[ti * 3 + 1] * 3], cap.meshVerts[soup[ti * 3 + 1] * 3 + 1], cap.meshVerts[soup[ti * 3 + 1] * 3 + 2] );
+		float3 C( cap.meshVerts[soup[ti * 3 + 2] * 3], cap.meshVerts[soup[ti * 3 + 2] * 3 + 1], cap.meshVerts[soup[ti * 3 + 2] * 3 + 2] );
+		float3 ctr = ( A + B + C ) * ( 1.0f / 3.0f );
+		triC[ti] = ctr;
+		triR[ti] = std::fmax( length( A - ctr ), std::fmax( length( B - ctr ), length( C - ctr ) ) );
+	}
+	std::vector<uint32_t> culled; culled.reserve( 512 );
+	auto CulledSoup = [&]( float3 P ) -> const std::vector<uint32_t>&
+	{
+		culled.clear();
+		float3 seg = Lp - P; float segLen2 = dot( seg, seg );
+		for( size_t ti = 0; ti < nTri; ti++ )
+		{
+			float3 w = triC[ti] - P;
+			float tproj = segLen2 > 1e-9f ? dot( w, seg ) / segLen2 : 0.0f;
+			tproj = std::fmax( 0.0f, std::fmin( 1.0f, tproj ) );
+			float3 closest = P + seg * tproj;
+			float3 d = triC[ti] - closest;
+			if( dot( d, d ) < ( triR[ti] + swR ) * ( triR[ti] + swR ) )
+			{
+				culled.push_back( soup[ti * 3] ); culled.push_back( soup[ti * 3 + 1] ); culled.push_back( soup[ti * 3 + 2] );
+			}
+		}
+		return culled;
+	};
+	// The gate re-renders at >=1920x1080 (RenderCapture.cpp:2204) and its EXTENT bboxes are in THAT space,
+	// projected via cap.hdr.worldMVP (GateProject, W=1920 H=1080) - NOT the capture's downscaled screenW/H.
+	const int SW = envI( "FARBAND_W", 1920 ), SH = envI( "FARBAND_H", 1080 );
+	const float* MVP = cap.hdr.worldMVP;
+	auto ProjPx = [&]( float3 p, float& px, float& py ) -> bool
+	{
+		float x = MVP[0] * p.x + MVP[1] * p.y + MVP[2] * p.z + MVP[3];
+		float y = MVP[4] * p.x + MVP[5] * p.y + MVP[6] * p.z + MVP[7];
+		float w = MVP[12] * p.x + MVP[13] * p.y + MVP[14] * p.z + MVP[15];
+		if( w <= 1e-6f ) { return false; }
+		px = ( x / w * 0.5f + 0.5f ) * SW; py = ( 1.0f - ( y / w * 0.5f + 0.5f ) ) * SH;
+		return px >= 0 && px < SW && py >= 0 && py < SH;
+	};
+
+	// SHIPPED 16-sample golden-angle sampler: fraction of the light disk NOT blocked (1=lit, 0=occluded).
+	// Same swDisk coords + same L + (u*dx+v*dy)*swR mapping as SoftShadow_FaceCoverage.
+	static const float SW_DISK16[16][2] =
+	{
+		{ 0.176777f, 0.000000f}, {-0.225772f, 0.206826f}, { 0.034558f,-0.393771f}, { 0.284571f, 0.371173f},
+		{-0.522223f,-0.092374f}, { 0.494695f,-0.314685f}, {-0.165466f, 0.615525f}, {-0.315561f,-0.607594f},
+		{ 0.684642f, 0.250030f}, {-0.712256f, 0.294009f}, { 0.343354f,-0.733729f}, { 0.253730f, 0.808932f},
+		{-0.764746f,-0.443186f}, { 0.897134f,-0.197232f}, {-0.547507f, 0.778772f}, {-0.126487f,-0.976090f},
+	};
+	auto Cover16 = [&]( float3 P, const std::vector<uint32_t>& idx ) -> float
+	{
+		float3 toL = Lp - P; float dist = std::sqrt( dot( toL, toL ) ); if( dist < 1e-6f ) { return 1.0f; }
+		float3 nrm = toL * ( 1.0f / dist );
+		float3 up = ( std::fabs( nrm.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+		float3 u = normalize( cross( up, nrm ) ), v = cross( nrm, u );
+		int blocked = 0;
+		for( int s = 0; s < 16; s++ )
+		{
+			float3 Dp = Lp + u * ( SW_DISK16[s][0] * swR ) + v * ( SW_DISK16[s][1] * swR );
+			if( RayHitsMesh( P, Dp - P, cap.meshVerts.data(), idx.data(), ( uint32_t )idx.size() ) ) { blocked++; }
+		}
+		return 1.0f - blocked / 16.0f;
+	};
+	// 16-ray coverage, but each triangle first passes the SHIPPED per-triangle cone/slab reject
+	// (SoftShadow_FaceCoverage :999-1008) - so if this zeroes a band that Cover16 (no cull) sees, the GPU cone
+	// cull is the mechanism, not the sampler. swEps = SW_NEAR_EPS.
+	const float SW_NEAR_EPS_T = 0.05f;
+	auto Cover16Culled = [&]( float3 P, const std::vector<uint32_t>& idx ) -> float
+	{
+		float3 toL = Lp - P; float distPL = std::sqrt( dot( toL, toL ) ); if( distPL < 1e-6f ) { return 1.0f; }
+		float3 nrm = toL * ( 1.0f / distPL );
+		float3 up = ( std::fabs( nrm.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+		float3 u = normalize( cross( up, nrm ) ), v = cross( nrm, u );
+		// keep only survivors of the per-triangle cone/slab reject
+		std::vector<uint32_t> surv;
+		for( size_t t = 0; t + 2 < idx.size(); t += 3 )
+		{
+			float3 v0( cap.meshVerts[idx[t] * 3], cap.meshVerts[idx[t] * 3 + 1], cap.meshVerts[idx[t] * 3 + 2] );
+			float3 v1( cap.meshVerts[idx[t + 1] * 3], cap.meshVerts[idx[t + 1] * 3 + 1], cap.meshVerts[idx[t + 1] * 3 + 2] );
+			float3 v2( cap.meshVerts[idx[t + 2] * 3], cap.meshVerts[idx[t + 2] * 3 + 1], cap.meshVerts[idx[t + 2] * 3 + 2] );
+			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+			float3 rc = tcen - P; float cd = dot( rc, nrm );
+			float triRad = std::fmax( length( v0 - tcen ), std::fmax( length( v1 - tcen ), length( v2 - tcen ) ) );
+			if( cd + triRad < SW_NEAR_EPS_T ) { continue; }
+			if( cd - triRad > distPL ) { continue; }
+			float3 perp = rc - cd * nrm;
+			float coneR = swR * ( cd + triRad ) / distPL;
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+			surv.push_back( idx[t] ); surv.push_back( idx[t + 1] ); surv.push_back( idx[t + 2] );
+		}
+		int blocked = 0;
+		for( int s = 0; s < 16; s++ )
+		{
+			float3 Dp = Lp + u * ( SW_DISK16[s][0] * swR ) + v * ( SW_DISK16[s][1] * swR );
+			if( RayHitsMesh( P, Dp - P, cap.meshVerts.data(), surv.data(), ( uint32_t )surv.size() ) ) { blocked++; }
+		}
+		return 1.0f - blocked / 16.0f;
+	};
+
+	std::printf( "    [farband] light %u  penumbra r=%.3f  casters-soup %zu tris  screen %dx%d  L0org=(%.1f %.1f %.1f)\n",
+				 LI, swR, soup.size() / 3, SW, SH, Lp.x, Lp.y, Lp.z );
+
+	// POINT mode: query one explicit world point (the fardump world pos) at rising dense-truth N + golden-16.
+	// Converging to ~truth => real shallow penumbra (fix the analytic); converging to ~1.0 => the gate's
+	// 16-sample truth is quantization noise (fix the arbiter).
+	if( const char* pt = std::getenv( "FARBAND_POINT" ) )
+	{
+		float qx, qy, qz;
+		if( std::sscanf( pt, "%f,%f,%f", &qx, &qy, &qz ) == 3 )
+		{
+			float3 P( qx, qy, qz );
+			const std::vector<uint32_t>& cs = CulledSoup( P );
+			std::printf( "      [point] P=(%.1f %.1f %.1f)  culled-soup %zu tris\n", qx, qy, qz, cs.size() / 3 );
+			for( int N : { 4, 8, 16, 32, 64, 128 } )
+			{
+				float cv = cs.empty() ? 1.0f : MeshTruthShadowSoup( cap.meshVerts.data(), cs.data(), ( uint32_t )cs.size(), P, Lp, swR, N );
+				std::printf( "        dense N=%-4d (~%d rays)  cover=%.4f\n", N, N * N * 785 / 1000, cv );
+			}
+			std::printf( "        golden-16 (shipped sampler, no rot) cover=%.4f\n", cs.empty() ? 1.0f : Cover16( P, cs ) );
+			// consumed-stream trace (what the GPU walk actually sees): if this is ~1.0 while truth-mesh
+			// dense is in-band, the flatten dropped the occluder tris from the consumed stream.
+			if( !consIdx.empty() )
+			{
+				float ccD = MeshTruthShadowSoup( consV.data(), consIdx.data(), ( uint32_t )consIdx.size(), P, Lp, swR, 64 );
+				std::printf( "        CONSUMED-stream dense N=64 cover=%.4f\n", ccD );
+			}
+			// IDENTIFY THE BLOCKER: which L0 caster shadows this point? Trace the P->L centre ray per caster,
+			// print the blocking caster's index, tri count and AABB extent (small AABB = a prop/dynamic caster
+			// the gate's static scene omits; large = world structure).
+			float3 toLb = Lp - P; float db = std::sqrt( dot( toLb, toLb ) );
+			float3 nb = toLb * ( 1.0f / db );
+			float3 upb = ( std::fabs( nb.z ) > 0.9f ) ? float3( 0, 1, 0 ) : float3( 0, 0, 1 );
+			float3 ub = normalize( cross( upb, nb ) ), vb = cross( nb, ub );
+			for( size_t ci = 0; ci < cap.casters.size(); ci++ )
+			{
+				const softcapCaster_t& C = cap.casters[ci];
+				if( C.lightIndex != LI ) { continue; }
+				std::vector<uint32_t> one;
+				for( uint32_t k = C.firstIndex; k < C.firstIndex + C.numIndex && k < cap.meshIdx.size(); k++ ) { one.push_back( cap.meshIdx[k] ); }
+				if( one.empty() ) { continue; }
+				int nHit = 0;
+				for( int s = 0; s < 16; s++ )
+				{
+					float3 Dp = Lp + ub * ( SW_DISK16[s][0] * swR ) + vb * ( SW_DISK16[s][1] * swR );
+					if( RayHitsMesh( P, Dp - P, cap.meshVerts.data(), one.data(), ( uint32_t )one.size() ) ) { nHit++; }
+				}
+				if( nHit == 0 ) { continue; }
+				float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+				for( uint32_t vi = C.firstVert; vi < C.firstVert + C.numVerts; vi++ )
+				{
+					float3 p( cap.meshVerts[vi * 3], cap.meshVerts[vi * 3 + 1], cap.meshVerts[vi * 3 + 2] );
+					mn = float3( std::fmin( mn.x, p.x ), std::fmin( mn.y, p.y ), std::fmin( mn.z, p.z ) );
+					mx = float3( std::fmax( mx.x, p.x ), std::fmax( mx.y, p.y ), std::fmax( mx.z, p.z ) );
+				}
+				float3 ext = mx - mn;
+				std::printf( "        BLOCKER caster[%zu] hits=%d/16 tris=%u verts=%u AABB ext=(%.1f %.1f %.1f) ctr=(%.0f %.0f %.0f)\n",
+							 ci, nHit, C.numIndex / 3, C.numVerts, ext.x, ext.y, ext.z,
+							 ( mn.x + mx.x ) * 0.5f, ( mn.y + mx.y ) * 0.5f, ( mn.z + mx.z ) * 0.5f );
+			}
+		}
+	}
+	std::printf( "      region        pts | dense-band 16-band both  | A-EVIDENCE(dense in-band & 16 fully-lit)  meanDense meanCov16\n" );
+
+	for( size_t b = 0; b < boxes.size(); b++ )
+	{
+		const Box& bb = boxes[b];
+		int nPts = 0, denseBand = 0, cov16Band = 0, bothBand = 0, aEvidence = 0, cullEvidence = 0;
+		double sumDense = 0, sum16 = 0, sumCull = 0, sumCons = 0;
+		// GRID-sample each L0 receiver triangle finely in world space (the penumbra strip is a few units wide
+		// and falls BETWEEN sparse mesh verts - vertex sampling misses it). ~0.5-unit spacing.
+		const float SPACING = 0.5f;
+		for( const softcapReceiver_t& r : cap.receivers )
+		{
+			if( r.lightIndex != LI ) { continue; }
+			for( uint32_t t = r.firstIndex; t + 2 < r.firstIndex + r.numIndex && t + 2 < cap.recvIdx.size(); t += 3 )
+			{
+				uint32_t ia = cap.recvIdx[t], ib = cap.recvIdx[t + 1], ic = cap.recvIdx[t + 2];
+				float3 A( cap.recvVerts[ia * 3], cap.recvVerts[ia * 3 + 1], cap.recvVerts[ia * 3 + 2] );
+				float3 B( cap.recvVerts[ib * 3], cap.recvVerts[ib * 3 + 1], cap.recvVerts[ib * 3 + 2] );
+				float3 C( cap.recvVerts[ic * 3], cap.recvVerts[ic * 3 + 1], cap.recvVerts[ic * 3 + 2] );
+				int su = ( int )std::fmax( 1.0f, std::ceil( length( B - A ) / SPACING ) );
+				int sv = ( int )std::fmax( 1.0f, std::ceil( length( C - A ) / SPACING ) );
+				for( int iu = 0; iu <= su; iu++ )
+				for( int iv = 0; iv <= sv - iu * sv / su; iv++ )
+			{
+				float fu = ( float )iu / su, fv = ( float )iv / sv;
+				if( fu + fv > 1.0f ) { continue; }
+				float3 P = A + ( B - A ) * fu + ( C - A ) * fv;
+				float px, py; if( !ProjPx( P, px, py ) ) { continue; }
+				if( px < bb.x0 || px > bb.x1 || py < bb.y0 || py > bb.y1 ) { continue; }
+				const std::vector<uint32_t>& cs = CulledSoup( P );
+				if( cs.empty() ) { nPts++; sumDense += 1.0; sum16 += 1.0; sumCull += 1.0; continue; }	// nothing can shadow: fully lit
+				float cd = MeshTruthShadowSoup( cap.meshVerts.data(), cs.data(), ( uint32_t )cs.size(), P, Lp, swR, DENSE );
+				float c16 = Cover16( P, cs );
+				if( !consIdx.empty() ) { sumCons += MeshTruthShadowSoup( consV.data(), consIdx.data(), ( uint32_t )consIdx.size(), P, Lp, swR, 8 ); }
+				float c16c = Cover16Culled( P, cs );
+				nPts++; sumDense += cd; sum16 += c16; sumCull += c16c;
+				bool dBand = cd > 1e-3f && cd < 1.0f - 1e-3f;
+				bool sBand = c16 > 1e-3f && c16 < 1.0f - 1e-3f;
+				if( dBand ) { denseBand++; }
+				if( sBand ) { cov16Band++; }
+				if( dBand && sBand ) { bothBand++; }
+				if( dBand && c16 > 1.0f - 1e-3f ) { aEvidence++; }		// dense sees a band, 16 sees fully lit -> A
+				if( dBand && c16c > 1.0f - 1e-3f ) { cullEvidence++; }	// dense sees a band, 16+shipped-cull fully lit -> CULL is the mechanism
+			}
+		}
+		}
+		std::printf( "      [%3d,%3d]-[%3d,%3d] %4d | dBand=%d 16Band=%d | A-EVID(no-cull)=%d (%.0f%%) CULL-EVID=%d (%.0f%%) | mDense=%.3f m16=%.3f m16cull=%.3f\n",
+					 bb.x0, bb.y0, bb.x1, bb.y1, nPts, denseBand, cov16Band,
+					 aEvidence, denseBand ? 100.0 * aEvidence / denseBand : 0.0,
+					 cullEvidence, denseBand ? 100.0 * cullEvidence / denseBand : 0.0,
+					 nPts ? sumDense / nPts : 1.0, nPts ? sum16 / nPts : 1.0, nPts ? sumCull / nPts : 1.0 );
+		std::printf( "                   -> mCons(consumed-stream, N=8)=%.3f  (truth mDense=%.3f: gap = tris dropped from stream)\n",
+					 nPts ? sumCons / nPts : 1.0, nPts ? sumDense / nPts : 1.0 );
+	}
+	std::printf( "      VERDICT: A (16-sample floor) if A-EVIDENCE dominant; B ruled out by construction (shared geometry).\n" );
 	CHECK( true );
 }
