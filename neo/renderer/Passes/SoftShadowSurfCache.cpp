@@ -35,6 +35,17 @@ struct SoftSurfBuildCB
 // curved to be worth caching (WALK-ALWAYS, exact) and would bloat the pool.
 static const int SW_SURF_MAX_RESIDUAL = 1024;
 
+// RUNTIME (post-burst) drain diagnostics: rebuilds dispatched + GC table-wipes since the last read.
+// Read+reset by the com_softShadowFrameProbe summary to confirm whether a cutscene re-warm storm exists.
+static int s_runtimeBuilds = 0, s_gcClears = 0;
+void R_SoftCacheWarmDebugCounters( int& builds, int& clears )
+{
+	builds = s_runtimeBuilds;
+	clears = s_gcClears;
+	s_runtimeBuilds = 0;
+	s_gcClears = 0;
+}
+
 SoftShadowSurfCache::SoftShadowSurfCache( nvrhi::IDevice* device )
 	: m_Device( device )
 {
@@ -193,6 +204,7 @@ void SoftShadowSurfCache::DoClearIfNeeded( nvrhi::ICommandList* commandList )
 	commandList->clearBufferUInt( m_Pool, 0 );
 	commandList->clearBufferUInt( m_Queue, 0 );
 	m_NeedClear = false;
+	s_gcClears++;
 	m_ScanCursor = m_TableCap;
 	std::lock_guard<std::mutex> lock( m_WarmMutex );
 	for( auto& kv : m_LightHash )
@@ -598,17 +610,18 @@ void SoftShadowSurfCache::DrainWarmQueue( nvrhi::ICommandList* commandList, int 
 		inval.swap( m_InvalidateQueue );
 		world = m_WarmWorld;
 	}
-	// Whole-map warm is CAMERA-INDEPENDENT and must run EVERY frame, even with both queues empty: the
-	// cheap-skip scan below sweeps all lights one-per-frame off the primary world. The old empty-queue
-	// early-return made that scan dead code - EnqueueWarm has no engine caller, so the ONLY thing that
-	// ever kicked a build was an invalidation (geometry teardown). Static maps therefore NEVER warmed,
-	// which is why the cache showed ~0% hits and no gain. Fall back to the primary world when no
-	// enqueue has pinned m_WarmWorld yet.
+	// EVENT-DRIVEN runtime drain: the whole map is warmed ONCE at load by WarmMapBurst (behind the load
+	// fade), so this per-frame path only re-warms lights whose STATIC geometry actually changed (the
+	// invalidate queue) plus any explicit enqueues. It used to also cheap-skip-scan the ENTIRE map every
+	// frame - but R_LightStaticChainSig walks each light's whole interaction chain with a per-surface
+	// shadow-cast + light-bounds test (world-model lights = thousands of surfaces), 48 lights/frame,
+	// forever: that scan was the dominant runtime cost (measured 37->12 fps in the erebus1 cutscene) and
+	// is fully redundant after the load burst. Nothing queued => nothing to do.
 	if( world == NULL )
 	{
 		world = tr.primaryWorld;
 	}
-	if( world == NULL || !EnsureResources() )
+	if( world == NULL || ( warm.empty() && inval.empty() ) || !EnsureResources() )
 	{
 		return;
 	}
@@ -645,6 +658,7 @@ void SoftShadowSurfCache::DrainWarmQueue( nvrhi::ICommandList* commandList, int 
 			if( light != NULL && WarmLight( commandList, light ) )
 			{
 				builtOne = true;
+				s_runtimeBuilds++;
 			}
 		}
 	}
@@ -655,31 +669,6 @@ void SoftShadowSurfCache::DrainWarmQueue( nvrhi::ICommandList* commandList, int 
 		for( ; qi < warm.size(); qi++ )
 		{
 			m_WarmQueue.push_back( warm[qi] );
-		}
-	}
-
-	// CAMERA-INDEPENDENT whole-map warm: cheap-skip-scan the primary world's lightDefs until ONE light
-	// needs building (bounded probes/frame). Sweeps ALL lights regardless of the camera, so nothing a
-	// hard cut jumps to is ever cold-built in view. Independent of the cache existing at load time.
-	idRenderWorldLocal* scanWorld = ( world != NULL ) ? world : tr.primaryWorld;
-	if( scanWorld != NULL )
-	{
-		const int n = scanWorld->lightDefs.Num();
-		int probes = 0;
-		const int SCAN_MAX = 48;		// cap cheap-skip chain-walk probes per frame
-		while( !builtOne && n > 0 && probes < SCAN_MAX )
-		{
-			if( m_WarmScanCursor >= n )
-			{
-				m_WarmScanCursor = 0;
-			}
-			const idRenderLightLocal* light = scanWorld->lightDefs[m_WarmScanCursor];
-			m_WarmScanCursor++;
-			probes++;
-			if( light != NULL && WarmLight( commandList, light ) )
-			{
-				builtOne = true;
-			}
 		}
 	}
 }

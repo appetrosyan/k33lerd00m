@@ -982,8 +982,11 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 		{
 			continue;
 		}
-		// camera-independent static gate (no lastModifiedFrameNum - this is a build event)
-		if( !model->IsStaticWorldModel() && model->IsDynamicModel() != DM_STATIC )
+		// WORLD-MODEL ONLY. DM_STATIC entities include MOVEABLES (crates, physics debris) that move
+		// every frame in a cutscene - caching them meant a per-frame invalidate+re-warm storm (measured:
+		// 531 post-warm hitches, 37->15 fps in the erebus1 cutscene). The worldspawn never moves, is the
+		// dominant static receiver/caster, and so never invalidates. Non-world static props are walked.
+		if( !model->IsStaticWorldModel() )
 		{
 			continue;
 		}
@@ -1145,7 +1148,7 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 		{
 			continue;
 		}
-		if( !model->IsStaticWorldModel() && model->IsDynamicModel() != DM_STATIC )
+		if( !model->IsStaticWorldModel() )		// WORLD-MODEL ONLY - see R_BuildLightStaticSoftStream
 		{
 			continue;
 		}

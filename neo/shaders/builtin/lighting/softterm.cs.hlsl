@@ -109,6 +109,23 @@ cbuffer c_Term : register( b0 )
 };
 // *INDENT-ON*
 
+#if SW_SURF_CACHE
+// Wave-aggregated per-frame path counter (see SW_SURF_STAT): sum the active lanes in each class and
+// commit ONE atomic per wave per class, instead of one InterlockedAdd per fragment on a single global
+// word (that serialised the whole term at low hit rate). Global scope - HLSL forbids nested functions.
+void SwSurfStat( uint idx )
+{
+	[unroll] for( uint v = 0u; v < 4u; v++ )
+	{
+		const uint c = WaveActiveCountBits( idx == v );
+		if( c != 0u && WaveIsFirstLane() )
+		{
+			InterlockedAdd( u_SurfTable[ ( uint )g_surfA.x * 8u + v ], c );
+		}
+	}
+}
+#endif
+
 [numthreads( 8, 4, 1 )]
 void main( uint3 tid : SV_DispatchThreadID )
 {
@@ -231,9 +248,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// texel staying on the exact miss path (see the probe plan noble-sniffing-rose).
 	// per-frame path counters ride the 4 words after the table (base = tableCap*8):
 	// 0 = cached-hit, 1 = miss (no/unbuilt record), 2 = walk-always, 3 = anchor-reject.
-	// Cleared by EndBuilds each frame; read by the bench. Cheap enough to keep always-on in the
-	// probe permutation (one InterlockedAdd per fragment).
-#define SW_SURF_STAT( idx ) InterlockedAdd( u_SurfTable[ ( uint )g_surfA.x * 8u + ( idx ) ], 1u )
+	// Cleared by EndBuilds each frame; read by the HUD / bench. Wave-aggregated (SwSurfStat, defined at
+	// global scope): one atomic per wave per class instead of one per fragment - the per-fragment
+	// InterlockedAdd on a single global word serialised the whole term at low hit rate.
+#define SW_SURF_STAT( idx ) SwSurfStat( idx )
 	if( g_surfA.x > 0 && g_surfA.z > 0 && swPos.w != 0.0f )
 	{
 		const float3 swN2 = t_WorldNormal.Load( int3( px, 0 ) ).xyz;
@@ -276,25 +294,12 @@ void main( uint3 tid : SV_DispatchThreadID )
 						const uint code = s2 & 3u;
 						if( ( s2 >> 2u ) != curGen )
 						{
-							// STALE generation: this light's static set changed, so any record under this
-							// key is from a prior generation. Reclaim in place (same cell+light, never
-							// another cell's slot). Winner re-requests + re-anchors; a lost anchor race at
-							// worst yields ANCHOR-REJECT -> exact walk, never a wrong shadow.
-							uint prevS;
-							InterlockedCompareExchange( u_SurfTable[ sBase + 2 ], s2, ( curGen << 2 ) | 1u, prevS );
-							if( prevS == s2 )
-							{
-								u_SurfTable[ sBase + 7 ] = SwSurfFlipF( pw );
-								uint rqi;
-								InterlockedAdd( u_SurfQueue[ 0 ], 1u, rqi );
-								if( rqi + 1u >= ( uint )g_surfA.y ) { u_SurfTable[ sBase + 2 ] = ( curGen << 2 ) | 3u; }
-								else { u_SurfQueue[ 1u + rqi ] = slot; }
-							}
-							else
-							{
-								InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( pw ) );
-							}
-							break;		// exact miss this frame; rebuilt next
+							// STALE generation (the light's static set changed). READ-ONLY runtime: do NOT
+							// reclaim/re-request here - that was a per-fragment atomic storm on every un-warm
+							// texel (the dominant cache overhead). The camera-independent invalidation hook
+							// re-warms this light off the burst path; this frame just takes the exact walk.
+							swStatIdx = 1u;
+							break;
 						}
 						if( code == 2u )	// BUILT: consume
 						{
@@ -338,22 +343,17 @@ void main( uint3 tid : SV_DispatchThreadID )
 							u_Term[ uint2( px + g_tile.zw ) ] = swTermC;
 							return;
 						}
-						if( code == 1u )
-						{
-							// REQUESTED, not yet built: contribute this fragment's height to the
-							// deterministic min-anchor (order-independent over the texel's fragments)
-							InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( pw ) );
-						}
-						else if( code == 3u )
+						if( code == 3u )
 						{
 							swStatIdx = 2u;			// WALK-ALWAYS (self-gate / overflow rejected the texel)
 						}
+						// code 1 (REQUESTED, not yet built by the burst) -> miss. READ-ONLY: no anchor write.
 						break;						// requested / walk-always: exact miss path
 					}
 					if( w0 == 0xFFFFFFFFu )
 					{
 						uint prev;
-						InterlockedCompareExchange( u_SurfTable[ sBase ], 0xFFFFFFFFu, keyLo, prev );
+						prev = 0u;	// READ-ONLY runtime: never CLAIM an empty texel (the per-fragment claim/enqueue atomics were the dominant low-hit-rate cost); prev=0 skips the claim body -> exact walk. Seeding happens once at load in softsurf_seed (the burst).
 						if( prev == 0xFFFFFFFFu )
 						{
 							u_SurfTable[ sBase + 1 ] = keyHi;

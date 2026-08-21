@@ -68,13 +68,24 @@ Does not actually free the entityDef.
 */
 void R_FreeEntityDefDerivedData( idRenderEntityLocal* def, bool keepDecals, bool keepCachedDynamicModel )
 {
+	// only entities that could be IN the STATIC soft cache should invalidate it on move/free. A
+	// DM_DYNAMIC / animated caster (monsters, cinematic actors, gibs) is NEVER statically cached, so
+	// invalidating its lights on every UpdateEntityDef just forced a full per-frame re-warm of those
+	// lights - the cutscene rebuild storm (measured: 411 post-warm hitches, 37->12 fps). Gate to
+	// static-world / DM_STATIC geometry, matching R_BuildLightStaticSoftStream's collection predicate.
+	const idRenderModel* softM = def->parms.hModel;
+	const bool softStaticGeo = ( softM != NULL ) && softM->IsStaticWorldModel();	// world-model only (see R_BuildLightStaticSoftStream)
+
 	// free all the interactions
 	while( def->firstInteraction != NULL )
 	{
 		// this caster's geometry is going away (move/free): invalidate the soft cache for every light
 		// it interacted with so the cache re-warms WITHOUT it (immediate stale-shadow clear, then the
-		// camera-independent scan rebuilds). Plan noble-sniffing-rose.
-		R_SoftCacheInvalidateLight( def->firstInteraction->lightDef );
+		// camera-independent scan rebuilds). Plan noble-sniffing-rose. Static geometry only.
+		if( softStaticGeo )
+		{
+			R_SoftCacheInvalidateLight( def->firstInteraction->lightDef );
+		}
 		def->firstInteraction->UnlinkAndFree();
 	}
 	def->dynamicModelFrameCount = 0;
@@ -481,9 +492,15 @@ Frees all references and lit surfaces from the light
 */
 void R_FreeLightDefDerivedData( idRenderLightLocal* ldef )
 {
-	// light moved / changed / freed: its cached soft-shadow term is stale. Bump its generation so the
-	// stale GPU slots orphan immediately; the camera-independent scan re-warms it. Plan noble-sniffing-rose.
-	R_SoftCacheInvalidateLight( ldef );
+	// Only invalidate the soft cache for lights that could be IN it. A MOVED light (lightHasMoved,
+	// sticky) is never statically cached and the term's read-gate is closed for it (softStaticCasterCount
+	// 0), so its old slots are never read - invalidating it just bumps generations toward the periodic GC
+	// table-wipe, which re-warms all 149 lights: the cutscene light-animation storm (measured). Skip it;
+	// the dead slots are harmless and reclaimed on the next real clear.
+	if( ldef != NULL && !ldef->lightHasMoved )
+	{
+		R_SoftCacheInvalidateLight( ldef );
+	}
 
 	// remove any portal fog references
 	for( doublePortal_t* dp = ldef->foggedPortals; dp != NULL; dp = dp->nextFoggedPortal )
