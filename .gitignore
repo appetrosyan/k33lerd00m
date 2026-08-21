@@ -89,4 +89,20 @@ neo/tests/data/*.softcap
 neo/tests/data/*.png
 neo/tests/data/*.ppm
 neo/tests/data/*.bin
+neo/tests/data/attic/
 base/softcap/
+
+# soft-shadow gate / capture dump artifacts (regenerated locally; never committed)
+softgate*.ppm
+softgate*.png
+softgate*.lock
+softgate.lock
+base/ab_analytic
+base/ingame61
+base/m1_ref_fullres
+base/vrs_ref
+base/softgate_*
+
+# python tooling caches
+__pycache__/
+*.pyc
