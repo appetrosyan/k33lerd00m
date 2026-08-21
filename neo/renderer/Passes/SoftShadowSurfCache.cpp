@@ -716,8 +716,14 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 	s_warmStreamedLights = 0;
 	const int n = world->lightDefs.Num();
 	int warmed = 0;
+	// drive the LOADING BAR: this burst runs from ExecuteMapChange (behind the load screen), so report
+	// its progress like any other load step. Increment per light advances the bar AND renders the load
+	// GUI (LoadPacifierProgressIncrement -> UpdateLevelLoadPacifier), which self-guards to a no-op when
+	// not inside a map change (the view-path fallback), so this is safe from either caller.
+	common->LoadPacifierProgressTotal( n );
 	for( int i = 0; i < n; i++ )
 	{
+		common->LoadPacifierProgressIncrement( 1 );
 		const idRenderLightLocal* light = world->lightDefs[i];
 		if( light == NULL )
 		{

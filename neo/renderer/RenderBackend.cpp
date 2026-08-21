@@ -60,6 +60,27 @@ void R_SoftCacheInvalidateLight( const idRenderLightLocal* light )
 	}
 }
 
+// LOAD-TIME warm: called from ExecuteMapChange AFTER GenerateAllInteractions but BEFORE the loading
+// screen (loadGUI) is dismissed, so the whole-map warm burst runs behind the load fade instead of on
+// the first gameplay frame. Main thread, but GPU work is valid here (GenerateAllInteractions above did
+// GPU work too); WarmMapBurst self-manages its command lists (submit+wait), and there is no open frame
+// command list during the load path. No-op if the cache is not constructed yet - the per-view fallback
+// (TakeLoadWarm in the soft path) then warms on the first frame as before.
+void R_SoftCacheWarmMapNow( idRenderWorld* world )
+{
+	extern idCVar r_softShadowSurfCache;
+	SoftShadowSurfCache* sc = backEnd.GetSoftShadowSurfCache();
+	if( sc == NULL || world == NULL || !r_softShadowSurfCache.GetBool() )
+	{
+		return;
+	}
+	idRenderWorldLocal* rwl = static_cast<idRenderWorldLocal*>( world );
+	if( sc->TakeLoadWarm( rwl ) )
+	{
+		sc->WarmMapBurst( deviceManager->GetDevice(), rwl );
+	}
+}
+
 // NON-BLOCKING surf-cache hit/miss counters for the com_showFPS HUD line. Returns false (no line
 // drawn) when the cache is not up or disabled. Plain memory read - safe from the main/HUD thread.
 bool R_SoftCacheHudStats( uint32_t out[4] )

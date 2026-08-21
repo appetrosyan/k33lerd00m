@@ -628,6 +628,12 @@ void idCommonLocal::ExecuteMapChange()
 	// let the renderSystem generate interactions now that everything is spawned
 	renderWorld->GenerateAllInteractions();
 
+	// warm the soft-shadow surface cache HERE - everything is loaded (interactions built above) and the
+	// loading screen (loadGUI) is still up (it is deleted below), so the whole-map warm burst runs behind
+	// the load fade instead of hitching the first gameplay frame.
+	extern void R_SoftCacheWarmMapNow( idRenderWorld * world );
+	R_SoftCacheWarmMapNow( renderWorld );
+
 	{
 		int vertexMemUsedKB = vertexCache.staticData.vertexMemUsed.GetValue() / 1024;
 		int indexMemUsedKB = vertexCache.staticData.indexMemUsed.GetValue() / 1024;
