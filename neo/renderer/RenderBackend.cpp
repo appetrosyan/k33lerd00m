@@ -60,6 +60,20 @@ void R_SoftCacheInvalidateLight( const idRenderLightLocal* light )
 	}
 }
 
+// NON-BLOCKING surf-cache hit/miss counters for the com_showFPS HUD line. Returns false (no line
+// drawn) when the cache is not up or disabled. Plain memory read - safe from the main/HUD thread.
+bool R_SoftCacheHudStats( uint32_t out[4] )
+{
+	extern idCVar r_softShadowSurfCache;
+	SoftShadowSurfCache* sc = backEnd.GetSoftShadowSurfCache();
+	if( sc == NULL || !sc->IsActive() || !r_softShadowSurfCache.GetBool() )
+	{
+		return false;
+	}
+	sc->GetHudStats( out );
+	return true;
+}
+
 idCVar r_drawEyeColor( "r_drawEyeColor", "0", CVAR_RENDERER | CVAR_BOOL, "Draw a colored box, red = left eye, blue = right eye, grey = non-stereo" );
 idCVar r_motionBlur( "r_motionBlur", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "1 - 5, log2 of the number of motion blur samples" );
 idCVar r_forceZPassStencilShadows( "r_forceZPassStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL, "force Z-pass rendering for performance testing" );

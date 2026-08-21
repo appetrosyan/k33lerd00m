@@ -77,6 +77,16 @@ public:
 	// 3 anchor-reject) - LAST rendered frame's sample (EndBuilds clears them each frame).
 	// Bench/diagnostic only (waitForIdle).
 	bool GetStats( uint32_t out[4] );
+	// NON-BLOCKING per-frame counters for the HUD (com_showFPS): [hit, miss, walkalways, anchor-rej],
+	// read back from a staging ring several frames deep so the GPU is already done - no waitForIdle,
+	// no pipe stall. Plain memory copy; safe to call from the main thread.
+	void GetHudStats( uint32_t out[4] ) const
+	{
+		out[0] = m_HudStats[0];
+		out[1] = m_HudStats[1];
+		out[2] = m_HudStats[2];
+		out[3] = m_HudStats[3];
+	}
 	// prewarm-state snapshot for the bench line: scan cursor (>= cap = idle), table cap, and how
 	// many known lights still have seedPending/needSweep - diagnoses a starved lazy-build ratchet
 	void GetPrewarmState( int& cursor, int& cap, int& pending ) const
@@ -184,6 +194,10 @@ private:
 	int								m_WarmStreamF4 = 0;	// its capacity in float4 elements
 	nvrhi::BufferHandle				m_WarmRecvStream;	// reused receiver-tri stream (seed rasterises, keys the reads)
 	int								m_WarmRecvStreamF4 = 0;
+	static const int				SW_STATS_RING = 4;	// staging depth so the readback is always past its frame
+	nvrhi::BufferHandle				m_StatsRing[SW_STATS_RING];	// per-frame counter snapshots (non-blocking HUD readback)
+	int								m_StatsRingWrite = 0;
+	uint32_t						m_HudStats[4] = { 0, 0, 0, 0 };	// last read-back [hit, miss, walkalways, anchor-rej]
 	// Queues are written by the GAME/LOAD thread (interaction/spawn hooks) and drained by the RENDER
 	// thread (GL_StartFrame), so they are mutex-guarded. All m_LightHash / GPU work stays render-thread
 	// only (inside DrainWarmQueue -> WarmLight); the game thread only pushes light indices here.

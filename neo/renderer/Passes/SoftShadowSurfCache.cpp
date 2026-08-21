@@ -163,6 +163,17 @@ bool SoftShadowSurfCache::EnsureResources()
 		bd.debugName = "SoftShadowSurfCache/Queue";
 		m_Queue = m_Device->createBuffer( bd );
 
+		// HUD counter readback ring (non-blocking): CPU-readable staging, one per in-flight frame
+		nvrhi::BufferDesc rbd;
+		rbd.byteSize = 4 * sizeof( uint32_t );
+		rbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+		for( int i = 0; i < SW_STATS_RING; i++ )
+		{
+			rbd.debugName = "SoftShadowSurfCache/StatsRing";
+			m_StatsRing[i] = m_Device->createBuffer( rbd );
+		}
+		m_StatsRingWrite = 0;
+
 		m_NeedClear = true;
 		m_LightHash.clear();
 		m_ScanCursor = m_TableCap;
@@ -479,10 +490,26 @@ void SoftShadowSurfCache::EndBuilds( nvrhi::ICommandList* commandList )
 	// Claims that found the queue full reverted their slot to empty, so nothing is ever lost - the
 	// texel just re-claims on a later frame.
 	commandList->clearBufferUInt( m_Queue, 0 );
+	// HUD readback (non-blocking): snapshot THIS frame's counters into the ring, then map back the
+	// OLDEST ring entry - copied SW_STATS_RING-1 frames ago, so the GPU is long done and mapBuffer
+	// never stalls the pipe (unlike GetStats, which waitForIdle's). Feeds com_showFPS's cache line.
+	const uint64_t swCounterOff = ( uint64_t )m_TableCap * 8 * sizeof( uint32_t );
+	if( m_StatsRing[0] != nullptr )
+	{
+		commandList->copyBuffer( m_StatsRing[m_StatsRingWrite], 0, m_Table, swCounterOff, 4 * sizeof( uint32_t ) );
+		const int oldest = ( m_StatsRingWrite + 1 ) % SW_STATS_RING;
+		void* p = m_Device->mapBuffer( m_StatsRing[oldest], nvrhi::CpuAccessMode::Read );
+		if( p != nullptr )
+		{
+			memcpy( m_HudStats, p, 4 * sizeof( uint32_t ) );
+			m_Device->unmapBuffer( m_StatsRing[oldest] );
+		}
+		m_StatsRingWrite = ( m_StatsRingWrite + 1 ) % SW_STATS_RING;
+	}
 	// reset the per-frame path counters (the 4 words after the table) so each frame's term
 	// dispatches accumulate a fresh hit/miss/walkalways/anchor-reject sample
 	const uint32_t swZero[4] = { 0, 0, 0, 0 };
-	commandList->writeBuffer( m_Table, swZero, sizeof( swZero ), ( uint64_t )m_TableCap * 8 * sizeof( uint32_t ) );
+	commandList->writeBuffer( m_Table, swZero, sizeof( swZero ), swCounterOff );
 
 	// prewarm sweep bookkeeping: a fresh seed (or an in-view light that missed the last sweep)
 	// restarts the table scan from slot 0 next frame; otherwise the cursor advances one budget

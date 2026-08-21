@@ -288,6 +288,23 @@ float idConsoleLocal::DrawFPS( float y )
 	// DG: "com_showFPS 1" means: show FPS only, like in classic doom3
 	if( com_showFPS.GetInteger() == 1 )
 	{
+		// surf-cache hit rate as its own HUD category, under the fps number (its own line). Fed by a
+		// NON-BLOCKING readback (R_SoftCacheHudStats) so reading it never stalls the frame it measures.
+		extern bool R_SoftCacheHudStats( uint32_t out[4] );
+		uint32_t sc[4];
+		if( R_SoftCacheHudStats( sc ) )
+		{
+			const double tot = ( double )sc[0] + sc[1] + sc[2] + sc[3];
+			if( tot > 0.0 )
+			{
+				const int hitPct = ( int )( 100.0 * sc[0] / tot + 0.5 );
+				const unsigned walkK = ( unsigned )( ( sc[1] + sc[2] ) / 1000u );	// miss + walk-always
+				idStr cs = va( "surf %d%% hit  %uk walk", hitPct, walkK );
+				int cw = cs.Length() * BIGCHAR_WIDTH;
+				renderSystem->DrawBigStringExt( LOCALSAFE_RIGHT - cw, idMath::Ftoi( y ) + 2, cs, colorWhite, true );
+				y += BIGCHAR_HEIGHT + 4;
+			}
+		}
 		return y;
 	}
 	// DG end
