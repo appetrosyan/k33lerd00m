@@ -5038,6 +5038,14 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 			}
 			swEarly = swEarly && ( swProjImg != NULL );
 
+			// PER-LIGHT cache gate: only a WARM light uses the SW_SURF_CACHE term permutation (the
+			// per-fragment table probe). A cold light (moved, dynamic, or not yet warmed - e.g. ~100 of
+			// erebus1's 247 lights) would probe every fragment and miss, paying the probe cost for zero
+			// hits - strictly worse than off. Give it NULL so it runs the plain term. This makes the
+			// cache never-worse-than-off per light: overhead only where there is a chance of a hit.
+			SoftShadowSurfCache* lightSurf = ( swSurf != NULL && vLight->lightDef != NULL
+					&& swSurf->IsWarmLight( vLight->lightDef->index ) ) ? swSurf : NULL;
+
 			softTermResult_t t;
 			t.vLight = vLight;
 			t.ofsX = t.ofsY = -1;
@@ -5054,7 +5062,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 						swEarly ? ( nvrhi::ITexture* )swProjImg->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
 						swEarly ? ( nvrhi::ISampler* )swProjImg->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
 						swEarly,
-						swSurf,
+						lightSurf,
 						t.ofsX, t.ofsY ) )
 			{
 				softTerms.Append( t );
