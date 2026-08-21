@@ -288,23 +288,6 @@ float idConsoleLocal::DrawFPS( float y )
 	// DG: "com_showFPS 1" means: show FPS only, like in classic doom3
 	if( com_showFPS.GetInteger() == 1 )
 	{
-		// surf-cache hit rate as its own HUD category, under the fps number (its own line). Fed by a
-		// NON-BLOCKING readback (R_SoftCacheHudStats) so reading it never stalls the frame it measures.
-		extern bool R_SoftCacheHudStats( uint32_t out[4] );
-		uint32_t sc[4];
-		if( R_SoftCacheHudStats( sc ) )
-		{
-			const double tot = ( double )sc[0] + sc[1] + sc[2] + sc[3];
-			if( tot > 0.0 )
-			{
-				const int hitPct = ( int )( 100.0 * sc[0] / tot + 0.5 );
-				const unsigned walkK = ( unsigned )( ( sc[1] + sc[2] ) / 1000u );	// miss + walk-always
-				idStr cs = va( "surf %d%% hit  %uk walk", hitPct, walkK );
-				int cw = cs.Length() * BIGCHAR_WIDTH;
-				renderSystem->DrawBigStringExt( LOCALSAFE_RIGHT - cw, idMath::Ftoi( y ) + 2, cs, colorWhite, true );
-				y += BIGCHAR_HEIGHT + 4;
-			}
-		}
 		return y;
 	}
 	// DG end
@@ -615,7 +598,24 @@ float idConsoleLocal::DrawFPS( float y )
 									paShown[PA_SW_EPC], paShown[PA_SW_DROPPED] );
 			}
 
-			ImGui::TextColored( colorLtGrey, "viewEntities:%-3i  shadowEntities:%-3i  viewLights:%i\n",	commonLocal.stats_frontend.c_visibleViewEntities,
+			// surf-fold cache (r_softShadowSurfCache) fragment split. hit% is FRAGMENTS, not work saved -
+				// the real verdict is the SOFT SHADOWS GPU-draw ms above, cache ON vs OFF. Setting-specific
+				// diagnostics belong in showFPS >= 2 ONLY, never in showFPS 1.
+				{
+					extern bool R_SoftCacheHudStats( uint32_t out[4] );
+					uint32_t scHud[4];
+					if( R_SoftCacheHudStats( scHud ) )
+					{
+						const double sTot = ( double )scHud[0] + scHud[1] + scHud[2] + scHud[3];
+						if( sTot > 0.0 )
+						{
+							ImGui::TextColored( colorOrange, "   surf cache: hit %.0f%% miss %.0f%% walk-always %.0f%% anchor-rej %.0f%%  (hit%% = fragments, watch GPU draw ms)",
+												100.0 * scHud[0] / sTot, 100.0 * scHud[1] / sTot, 100.0 * scHud[2] / sTot, 100.0 * scHud[3] / sTot );
+						}
+					}
+				}
+
+				ImGui::TextColored( colorLtGrey, "viewEntities:%-3i  shadowEntities:%-3i  viewLights:%i\n",	commonLocal.stats_frontend.c_visibleViewEntities,
 								commonLocal.stats_frontend.c_shadowViewEntities,
 								commonLocal.stats_frontend.c_viewLights );
 

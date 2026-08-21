@@ -1076,6 +1076,7 @@ void idCommonLocal::Frame()
 				static int s_probeFrame = 0;
 				static int s_probeBuilds = 0, s_probeClears = 0;
 				static double s_probeH = 0, s_probeM = 0, s_probeW = 0, s_probeA = 0;
+				static idList<float> s_probeSoft;	// SOFT-SHADOW term GPU ms per frame - the number the cache actually moves
 				{
 					extern void R_SoftCacheWarmDebugCounters( int& builds, int& clears );
 					int b = 0, c = 0;
@@ -1088,6 +1089,7 @@ void idCommonLocal::Frame()
 				if( s_probeFrame > 1 && gpuMs > 0.0 )
 				{
 					s_probeMs.Append( ( float )gpuMs );
+						s_probeSoft.Append( ( float )( GetRendererGpuSoftShadowMicroseconds() / 1000.0 ) );
 					extern bool R_SoftCacheHudStats( uint32_t out[4] );
 					uint32_t sc[4];
 					int hp = -1;
@@ -1134,6 +1136,21 @@ void idCommonLocal::Frame()
 						if( stot > 0.0 )
 							common->Printf( "[softprobe] cache-eligible fragments: hit %.0f%% | miss(unbuilt) %.0f%% | walk-always %.0f%% | anchor-rej %.0f%%\n",
 											100.0 * s_probeH / stot, 100.0 * s_probeM / stot, 100.0 * s_probeW / stot, 100.0 * s_probeA / stot );
+					}
+					// TIME ACTUALLY SAVED: the SOFT-SHADOW term GPU ms is the only thing the cache moves
+					// (hit% is fragments, not work). Compare this line cache-ON vs cache-OFF for the real
+					// verdict - a cache that folds cheap texels and still walks the complex residual shows
+					// ~no soft-ms drop even at high hit%.
+					if( s_probeSoft.Num() > 0 )
+					{
+						const int sn = s_probeSoft.Num();
+						idList<float> ss = s_probeSoft;
+						std::sort( ss.Ptr(), ss.Ptr() + sn );
+						double ssum = 0.0;
+						for( int i = 0; i < sn; i++ ) { ssum += s_probeSoft[i]; }
+						common->Printf( "[softprobe] SOFT-SHADOW term GPU: mean %.2f med %.2f p99 %.2f max %.2f ms (this is the number the cache moves - compare ON vs OFF)\n",
+										ssum / sn, ss[sn / 2], ss[Min( sn - 1, ( sn * 99 ) / 100 )], ss[sn - 1] );
+						s_probeSoft.Clear();
 					}
 					com_softShadowFrameProbe.SetInteger( 0 );
 					s_probeFrame = 0;
