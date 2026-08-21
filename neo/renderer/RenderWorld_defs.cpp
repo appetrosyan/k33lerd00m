@@ -71,6 +71,10 @@ void R_FreeEntityDefDerivedData( idRenderEntityLocal* def, bool keepDecals, bool
 	// free all the interactions
 	while( def->firstInteraction != NULL )
 	{
+		// this caster's geometry is going away (move/free): invalidate the soft cache for every light
+		// it interacted with so the cache re-warms WITHOUT it (immediate stale-shadow clear, then the
+		// camera-independent scan rebuilds). Plan noble-sniffing-rose.
+		R_SoftCacheInvalidateLight( def->firstInteraction->lightDef );
 		def->firstInteraction->UnlinkAndFree();
 	}
 	def->dynamicModelFrameCount = 0;
@@ -477,6 +481,10 @@ Frees all references and lit surfaces from the light
 */
 void R_FreeLightDefDerivedData( idRenderLightLocal* ldef )
 {
+	// light moved / changed / freed: its cached soft-shadow term is stale. Bump its generation so the
+	// stale GPU slots orphan immediately; the camera-independent scan re-warms it. Plan noble-sniffing-rose.
+	R_SoftCacheInvalidateLight( ldef );
+
 	// remove any portal fog references
 	for( doublePortal_t* dp = ldef->foggedPortals; dp != NULL; dp = dp->nextFoggedPortal )
 	{

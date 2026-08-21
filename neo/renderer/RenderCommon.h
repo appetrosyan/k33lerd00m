@@ -409,6 +409,16 @@ struct viewLight_t
 	int						softEdgeCount;				// analytic soft shadows: number of edges in softEdgeCache
 	vertCacheHandle_t		softCasterCache;			// FACE stream v2: per-caster table, 2 float4 each - ( centre.xyz, radius ) ( firstTri, numTris, 0, 0 )
 	int						softCasterCount;			// FACE stream v2: casters in the table
+	vertCacheHandle_t		softClassifyCache;			// world-cell lit/penumbra classifier grid (packed 16 class bytes/float4), rides the joint buffer
+	float					softClassifyAabbCell[4];	// grid origin xyz + cellSize
+	int						softClassifyDims[4];		// cells per axis xyz + valid (0 = no classifier -> full walk)
+	// surface-fold cache PROBE (r_softShadowSurfCache): the flatten orders STATIC casters first, so
+	// [0, softStaticCasterCount) of the caster table / [0, softStaticTriCount) of the tri stream are the
+	// frame-invariant static set the cache folds; the remainder is walked exactly every frame. The hash
+	// fingerprints the static set + cache params - any change drops the whole cache (lazy rebuild).
+	int						softStaticCasterCount;		// static casters at the FRONT of the caster table (0 = cache off for this light)
+	int						softStaticTriCount;			// static triangles at the front of the tri stream
+	uint64					softSurfHash;				// static-set + params fingerprint (0 = none)
 
 	bool					ImageAtlasPlaced() const
 	{
@@ -1142,6 +1152,9 @@ private:
 
 extern idRenderSystemLocal	tr;
 extern idRenderBackend		backEnd;
+// soft-shadow surface-fold cache invalidation, called from the interaction/light lifecycle when a
+// caster or light's GEOMETRY changes (plan noble-sniffing-rose). Safe no-op if the cache is absent.
+void R_SoftCacheInvalidateLight( const idRenderLightLocal* light );
 extern glconfig_t			glConfig;		// outside of TR since it shouldn't be cleared during ref re-init
 
 //
