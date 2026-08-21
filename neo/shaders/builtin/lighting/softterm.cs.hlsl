@@ -56,7 +56,9 @@ RWStructuredBuffer<uint>	u_WalkCnt	: register( u1 );
 // height along the texel's normal axis, asuint). Queue: [0] = count, then claimed slot indices for
 // the build CS. Pool: [0] = alloc counter, then residual triangle indices (static-prefix stream).
 RWStructuredBuffer<uint>	u_SurfTable	: register( u2 );
-RWStructuredBuffer<uint>	u_SurfQueue	: register( u3 );
+// u_SurfQueue removed: the READ-ONLY runtime term never claims/enqueues (the burst seeds via
+// softsurf_seed), so it binds NO request queue. This also keeps the reflected binding layout stable
+// across sample-count permutations (a stripped-but-declared u3 desynced the layout and crashed at s32).
 StructuredBuffer<uint>		t_SurfPool	: register( t6 );	// read before the include: the residual walk consumes it
 
 // order-preserving float->uint encoding for the texel anchor (word 7): anchors accumulate via
@@ -365,10 +367,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// MIN height over the contributing fragments - claim-race-independent.
 							InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( pw ) );
 							uint qi;
-							InterlockedAdd( u_SurfQueue[ 0 ], 1u, qi );
+							qi = 0u;	// read-only term: no request queue (dead claim path, kept for reference)
 							if( qi + 1u < ( uint )g_surfA.y )
 							{
-								u_SurfQueue[ 1u + qi ] = slot;
+								qi = qi;	// read-only term: no request queue write (dead path)
 								u_SurfTable[ sBase + 2 ] = ( curGen << 2 ) | 1u;	// REQUESTED (gen-tagged)
 							}
 							else

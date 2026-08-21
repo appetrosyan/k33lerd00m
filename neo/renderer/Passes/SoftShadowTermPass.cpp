@@ -153,8 +153,9 @@ void SoftShadowTermPass::EnsurePipeline()
 		{
 			nvrhi::BindingLayoutDesc ls = ld;
 			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 2 ) );	// u2 : texel table
-			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 3 ) );	// u3 : request queue
 			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 6 ) );	// t6 : residual pool
+			// NOTE: no u3 request-queue - the read-only term never enqueues (the burst seeds), and a
+			// declared-but-stripped u3 desynced the reflected layout and crashed at r_softShadowSamples 32.
 			m_LayoutSurf = m_Device->createBindingLayout( ls );
 			nvrhi::ComputePipelineDesc ps;
 			ps.bindingLayouts = { m_LayoutSurf };
@@ -491,7 +492,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	else if( surf )
 	{
 		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, surfCache->GetTable() ) );
-		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 3, surfCache->GetQueue() ) );
+		/* u3 request-queue binding removed: the read-only term never enqueues (the burst seeds it) */;
 		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_SRV( 6, surfCache->GetPool() ) );
 	}
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, cnt ? m_LayoutCnt : ( surf ? m_LayoutSurf : m_Layout ) );
