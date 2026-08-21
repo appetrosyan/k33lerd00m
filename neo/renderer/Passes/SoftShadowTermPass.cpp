@@ -19,6 +19,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 #include "renderer/RenderCommon.h"
 #include "SoftShadowTermPass.h"
+#include "SoftShadowSurfCache.h"
 
 // mirrors c_Term in softterm.cs.hlsl
 struct SoftTermCB
@@ -32,6 +33,18 @@ struct SoftTermCB
 	float	projT[4];
 	float	projQ[4];
 	int		flags[4];		// x: coverage early-outs enabled
+	float	classAabbCell[4];	// lit classifier grid: origin xyz + cellSize
+	int		classDims[4];		// dims xyz + BASE (float4 elem offset into the joint buffer); base < 0 = disabled
+	float	surfParams[4];	// surface-fold cache: texel G, viz mode, unused, unused
+	int		surfA[4];		// surface-fold cache: table cap (slots), queue cap (uints), static caster count, light key
+	float	aa[4];			// x = r_softShadowAA per-sample analytic-AA half-width (0 = off); y/z/w unused
+};
+
+// mirrors c_Blur in softblur.cs.hlsl
+struct SoftBlurCB
+{
+	int		rect[4];	// this light's atlas rect: origin x, y + width, height
+	float	blur[4];	// max radius (px), width->radius scale, penumbra lo, penumbra hi
 };
 
 // conservative common limit; RDNA3 reports 16384. Exceeding it just disables the pass for the view.
@@ -50,9 +63,21 @@ void SoftShadowTermPass::EnsurePipeline()
 	}
 	m_PipelineTried = true;
 
+	// SW_FACE_SAMPLES permutation (r_softShadowSamples): the disk ray count is compiled into the walk
+	// (fp16-packed at whatever count), so 8/16/32 stay the fast path and cost is monotonic. 0 disables
+	// in-shader (built as 16). FindShader dedups by name+suffix and IGNORES macros, so each count needs
+	// a DISTINCT nameOutSuffix ("s8"/"s16"/"s32") or it returns the first-built entry.
+	extern idCVar r_softShadowSamples;
+	const int sv = r_softShadowSamples.GetInteger();
+	m_BuiltSamples = ( sv == 8 || sv == 32 ) ? sv : 16;
+	const char* samplesStr = ( m_BuiltSamples == 8 ) ? "8" : ( ( m_BuiltSamples == 32 ) ? "32" : "16" );
+	const idStr sfx = idStr( "s" ) + samplesStr;
+
 	idList<shaderMacro_t> macros;
 	macros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// shipped permutation (must be explicit now the cfg declares {0,1})
-	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT ) );
+	macros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );			// same rule for the surf-cache axis
+	macros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, sfx.c_str(), macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
 	{
 		common->Warning( "SoftShadowTermPass: compute shader failed to load - compute soft-shadow term disabled." );
@@ -87,11 +112,13 @@ void SoftShadowTermPass::EnsurePipeline()
 	{
 		idList<shaderMacro_t> cntMacros;
 		cntMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "1" ) );
+		cntMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+		cntMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
 		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
 		// blob path (LoadShader keys the .bin on shader.name only) - it forces a separate entry whose
 		// macros make FindPermutationInBlob select the =1 variant.
-		m_ShaderCnt = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, "walkcnt", cntMacros, true, LAYOUT_DRAW_VERT ) );
+		m_ShaderCnt = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "walkcnt" ) + sfx ).c_str(), cntMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderCnt != nullptr )
 		{
 			nvrhi::BindingLayoutDesc lc = ld;
@@ -103,13 +130,36 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineCnt = m_Device->createComputePipeline( pc );
 
 			nvrhi::BufferDesc wc;
-			wc.byteSize = 8 * sizeof( uint32_t );
+			wc.byteSize = 16 * sizeof( uint32_t );
 			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
 			wc.canHaveUAVs = true;
 			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;
 			wc.keepInitialState = true;
 			wc.debugName = "SoftShadowTerm/WalkCounters";
 			m_WalkCntBuffer = m_Device->createBuffer( wc );
+		}
+	}
+
+	// SURFACE-FOLD CACHE permutation (SW_SURF_CACHE=1, r_softShadowSurfCache): adds the texel-table +
+	// request-queue UAVs and the residual-pool SRV. Separate layout/pipeline (same isolation reasoning
+	// as the counting permutation); failure is non-fatal (the probe just stays off).
+	{
+		idList<shaderMacro_t> surfMacros;
+		surfMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// blob keys carry BOTH axes
+		surfMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "1" ) );
+		surfMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		m_ShaderSurf = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfcache" ) + sfx ).c_str(), surfMacros, true, LAYOUT_DRAW_VERT ) );
+		if( m_ShaderSurf != nullptr )
+		{
+			nvrhi::BindingLayoutDesc ls = ld;
+			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 2 ) );	// u2 : texel table
+			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 3 ) );	// u3 : request queue
+			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 6 ) );	// t6 : residual pool
+			m_LayoutSurf = m_Device->createBindingLayout( ls );
+			nvrhi::ComputePipelineDesc ps;
+			ps.bindingLayouts = { m_LayoutSurf };
+			ps.CS = m_ShaderSurf;
+			m_PipelineSurf = m_Device->createComputePipeline( ps );
 		}
 	}
 
@@ -120,6 +170,36 @@ void SoftShadowTermPass::EnsurePipeline()
 	cb.maxVersions = 1024;					// dispatches per frame x frames in flight
 	cb.debugName = "SoftShadowTerm/CB";
 	m_ConstantBuffer = m_Device->createBuffer( cb );
+
+	// TEMPORAL-STABILITY BLUR pipeline (softblur.cs.hlsl): reads the term atlas (t0), writes the blur
+	// atlas (u0), one dispatch per packed light rect. No macros. Failure is non-fatal (blur stays off).
+	{
+		m_BlurShader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softblur", SHADER_STAGE_COMPUTE, "", idList<shaderMacro_t>(), true, LAYOUT_DRAW_VERT ) );
+		if( m_BlurShader != nullptr )
+		{
+			nvrhi::BindingLayoutDesc lb;
+			lb.visibility = nvrhi::ShaderType::Compute;
+			lb.bindings =
+			{
+				nvrhi::BindingLayoutItem::VolatileConstantBuffer( 0 ),	// b0 : blur constants
+				nvrhi::BindingLayoutItem::Texture_SRV( 0 ),				// t0 : term atlas (read)
+				nvrhi::BindingLayoutItem::Texture_UAV( 0 ),				// u0 : blur atlas (write)
+			};
+			m_BlurLayout = m_Device->createBindingLayout( lb );
+			nvrhi::ComputePipelineDesc pb;
+			pb.bindingLayouts = { m_BlurLayout };
+			pb.CS = m_BlurShader;
+			m_BlurPipeline = m_Device->createComputePipeline( pb );
+
+			nvrhi::BufferDesc bc;
+			bc.byteSize = sizeof( SoftBlurCB );
+			bc.isConstantBuffer = true;
+			bc.isVolatile = true;
+			bc.maxVersions = 1024;
+			bc.debugName = "SoftShadowTerm/BlurCB";
+			m_BlurCB = m_Device->createBuffer( bc );
+		}
+	}
 }
 
 bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, nvrhi::ITexture* worldPosTexture, nvrhi::ITexture* worldNormalTexture )
@@ -137,6 +217,19 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 		commandList->clearBufferUInt( m_WalkCntBuffer, 0 );		// same as the spill counter's proven clear
 	}
 	m_WorldNormal = worldNormalTexture;
+	// r_softShadowSamples changed -> rebuild the pipelines at the new SW_FACE_SAMPLES count (rare; a tuning
+	// toggle). Nulling the handles + m_PipelineTried forces EnsurePipeline to recompile the count variant.
+	{
+		extern idCVar r_softShadowSamples;
+		const int sv = r_softShadowSamples.GetInteger();
+		const int want = ( sv == 8 || sv == 32 ) ? sv : 16;
+		if( m_BuiltSamples != 0 && m_BuiltSamples != want )
+		{
+			m_PipelineTried = false;
+			m_Pipeline = m_PipelineCnt = m_PipelineSurf = nullptr;
+			m_Shader = m_ShaderCnt = m_ShaderSurf = nullptr;
+		}
+	}
 	EnsurePipeline();
 	if( m_Pipeline == nullptr || worldPosTexture == nullptr )
 	{
@@ -172,6 +265,26 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 		m_TermTexture = m_Device->createTexture( td );
 		m_SlotW = newW;
 		m_SlotH = newH;
+		m_BlurTexture = nullptr;		// term atlas resized -> the blur atlas must match; rebuilt below
+	}
+
+	// TEMPORAL-STABILITY BLUR: snapshot the cvar for this view and (re)create the blur atlas to match
+	// the term atlas. m_BlurActive gates GetTermTexture() and BlurView(); m_BlurRects collects the
+	// packed light rects as AddLight places them.
+	extern idCVar r_softShadowTermBlur;
+	m_BlurActive = ( r_softShadowTermBlur.GetFloat() > 0.0f ) && ( m_BlurPipeline != nullptr );
+	m_BlurRects.SetNum( 0 );
+	if( m_BlurActive && m_BlurTexture == nullptr )
+	{
+		nvrhi::TextureDesc td;
+		td.width = m_SlotW * SLOT_COLS;
+		td.height = m_SlotH * SLOT_ROWS;
+		td.format = nvrhi::Format::R16_FLOAT;
+		td.isUAV = true;
+		td.initialState = nvrhi::ResourceStates::UnorderedAccess;
+		td.keepInitialState = true;
+		td.debugName = "SoftShadowTerm/BlurAtlas";
+		m_BlurTexture = m_Device->createTexture( td );
 	}
 
 	// The softpos raster pass wrote this texture earlier in the frame; force it through
@@ -196,6 +309,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 								   nvrhi::ITexture* falloffTex, nvrhi::ISampler* falloffSamp,
 								   nvrhi::ITexture* projTex, nvrhi::ISampler* projSamp,
 								   bool coverageEarlyOut,
+								   SoftShadowSurfCache* surfCache,
 								   int& outOfsX, int& outOfsY )
 {
 	if( !m_Valid || casterCount <= 0 )
@@ -251,6 +365,11 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		m_ShelfH = rh;
 	}
 	m_Cursor++;
+	if( m_BlurActive )		// record the packed rect for BlurView (atlas-local coords)
+	{
+		BlurRect br = { atlasX, atlasY, rw, rh };
+		m_BlurRects.Append( br );
+	}
 	// the CS writes u_Term[px + offset] and the interaction PS reads term.Load(SV_Position + offset);
 	// px == SV_Position == absolute screen pixel, so offset = atlasOrigin - scissorOrigin lands both
 	// at packed-local coords. Both consumers are UNCHANGED - only the offset value differs.
@@ -290,6 +409,49 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	extern idCVar r_softShadowTileK;
 	cb.flags[3] = idMath::ClampInt( 1, 512, r_softShadowTileK.GetInteger() );	// tile-buffer stride (must match bin CS)
 
+	// surface-fold cache probe (r_softShadowSurfCache): the SW_SURF_CACHE permutation is selected only
+	// when the probe is active AND the counting permutation is not (counters = measurement mode, wins).
+	// surfA[0] <= 0 keeps the cache block dead even on the surf pipeline (light with no static prefix).
+	const bool surf = ( surfCache != NULL ) && surfCache->IsActive() && m_PipelineSurf != nullptr && !m_WalkCntEnabled;
+	extern idCVar r_softShadowLitEarlyOut, r_softShadowRotGrid;
+	cb.surfParams[0] = 0.0f;
+	cb.surfParams[1] = 0.0f;
+	// z = intensity lit early-out threshold: skip the walk where the light's falloff*projection is
+	// below this (-> term 1.0), cutting the far penumbra the light barely reaches. 0 = exact.
+	cb.surfParams[2] = r_softShadowLitEarlyOut.GetFloat();
+	// w = rotation-hash world grid: snap swP to this grid before the sample-rotation hash so TAA
+	// jitter can't flip the 1/16 quantum per frame (temporal-stability fix). 0 = exact per-position.
+	cb.surfParams[3] = r_softShadowRotGrid.GetFloat();
+	extern idCVar r_softShadowSamples;
+	cb.aa[0] = ( float )r_softShadowSamples.GetInteger();	// disk ray count (0 = off, 16 = shipped, else runtime-N)
+	cb.aa[1] = cb.aa[2] = cb.aa[3] = 0.0f;
+	cb.surfA[0] = 0;
+	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
+	if( surf )
+	{
+		extern idCVar r_softShadowSurfCacheViz;
+		cb.surfParams[0] = surfCache->GetTexel();
+		cb.surfParams[1] = ( float )r_softShadowSurfCacheViz.GetInteger();
+		cb.surfA[0] = ( vLight->softStaticCasterCount > 0 && vLight->softSurfHash != 0 ) ? surfCache->GetTableCap() : 0;
+		cb.surfA[1] = surfCache->GetQueueWords();
+		cb.surfA[2] = vLight->softStaticCasterCount;
+		cb.surfA[3] = ( vLight->lightDef != NULL ) ? ( vLight->lightDef->index & 0x1FFF ) : 0;
+		// per-light generation: the term CS treats a slot whose stored generation != this as stale and
+		// reclaims it (a set change bumped the generation instead of wiping the whole table)
+		cb.aa[1] = ( vLight->lightDef != NULL ) ? ( float )surfCache->GetLightGeneration( vLight->lightDef->index ) : 0.0f;
+	}
+
+	// lit classifier grid (r_softShadowClassify): built at flatten into the joint buffer. base < 0 = none.
+	cb.classDims[3] = -1;
+	if( vLight->softClassifyDims[3] != 0 && vLight->softClassifyCache != 0 )
+	{
+		const uint clsOfs = ( uint )( ( vLight->softClassifyCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+		cb.classAabbCell[0] = vLight->softClassifyAabbCell[0];	cb.classAabbCell[1] = vLight->softClassifyAabbCell[1];
+		cb.classAabbCell[2] = vLight->softClassifyAabbCell[2];	cb.classAabbCell[3] = vLight->softClassifyAabbCell[3];
+		cb.classDims[0] = vLight->softClassifyDims[0];	cb.classDims[1] = vLight->softClassifyDims[1];
+		cb.classDims[2] = vLight->softClassifyDims[2];	cb.classDims[3] = ( int )( clsOfs / 16u );	// float4 element base
+	}
+
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.
 	nvrhi::IBuffer* tiles = ( tileBuffer != nullptr ) ? tileBuffer : edgeBuffer;
@@ -319,17 +481,24 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		nvrhi::BindingSetItem::Texture_UAV( 0, m_TermTexture ),
 	};
 	// WALK-COUNTERS: the counting permutation needs u1 in its binding set + layout; the shipped path
-	// uses neither. Everything else is identical.
+	// uses neither. Everything else is identical. The SURF permutation instead adds the cache
+	// table/queue UAVs + residual pool SRV (counters and surf are mutually exclusive, counters win).
 	const bool cnt = m_WalkCntEnabled;
 	if( cnt )
 	{
 		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_WalkCntBuffer ) );
 	}
-	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, cnt ? m_LayoutCnt : m_Layout );
+	else if( surf )
+	{
+		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, surfCache->GetTable() ) );
+		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 3, surfCache->GetQueue() ) );
+		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_SRV( 6, surfCache->GetPool() ) );
+	}
+	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, cnt ? m_LayoutCnt : ( surf ? m_LayoutSurf : m_Layout ) );
 
 	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;
-	cs.pipeline = cnt ? m_PipelineCnt : m_Pipeline;
+	cs.pipeline = cnt ? m_PipelineCnt : ( surf ? m_PipelineSurf : m_Pipeline );
 	cs.bindings = { set };
 	commandList->setComputeState( cs );
 	commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
@@ -339,20 +508,63 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	return true;
 }
 
-bool SoftShadowTermPass::GetWalkStats( uint32_t out[8] )
+void SoftShadowTermPass::BlurView( nvrhi::ICommandList* commandList )
+{
+	if( !m_Valid || !m_BlurActive || m_BlurTexture == nullptr || m_BlurPipeline == nullptr || m_BlurRects.Num() == 0 )
+	{
+		return;
+	}
+	extern idCVar r_softShadowTermBlur, r_softShadowTermBlurScale;
+	// the term dispatches wrote m_TermTexture as UAV; read it as SRV for the blur, write the blur atlas.
+	commandList->setTextureState( m_TermTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+	commandList->setTextureState( m_BlurTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::UnorderedAccess );
+	commandList->commitBarriers();
+
+	for( int i = 0; i < m_BlurRects.Num(); i++ )
+	{
+		const BlurRect& r = m_BlurRects[i];
+		SoftBlurCB cb;
+		cb.rect[0] = r.x; cb.rect[1] = r.y; cb.rect[2] = r.w; cb.rect[3] = r.h;
+		cb.blur[0] = r_softShadowTermBlur.GetFloat();		// max radius (pixels)
+		cb.blur[1] = r_softShadowTermBlurScale.GetFloat();	// penumbra-width -> radius scale
+		cb.blur[2] = 0.02f;									// penumbra band lo (skip deep umbra)
+		cb.blur[3] = 0.98f;									// penumbra band hi (skip full lit)
+		commandList->writeBuffer( m_BlurCB, &cb, sizeof( cb ) );
+
+		nvrhi::BindingSetDesc bsd;
+		bsd.bindings =
+		{
+			nvrhi::BindingSetItem::ConstantBuffer( 0, m_BlurCB ),
+			nvrhi::BindingSetItem::Texture_SRV( 0, m_TermTexture ),
+			nvrhi::BindingSetItem::Texture_UAV( 0, m_BlurTexture ),
+		};
+		nvrhi::BindingSetHandle bs = m_Device->createBindingSet( bsd, m_BlurLayout );
+
+		nvrhi::ComputeState st;
+		st.pipeline = m_BlurPipeline;
+		st.bindings = { bs };
+		commandList->setComputeState( st );
+		commandList->dispatch( ( r.w + 7 ) / 8, ( r.h + 7 ) / 8, 1 );
+	}
+	// hand the blur atlas to the interaction pass as an SRV.
+	commandList->setTextureState( m_BlurTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+	commandList->commitBarriers();
+}
+
+bool SoftShadowTermPass::GetWalkStats( uint32_t out[16] )
 {
 	if( !m_WalkCntEnabled || m_WalkCntBuffer == nullptr )
 	{
 		return false;
 	}
 	nvrhi::BufferDesc sbd;
-	sbd.byteSize = 8 * sizeof( uint32_t );
+	sbd.byteSize = 16 * sizeof( uint32_t );
 	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
 	sbd.debugName = "SoftShadowTerm/WalkCountersReadback";
 	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
 	nvrhi::CommandListHandle cl = m_Device->createCommandList();
 	cl->open();
-	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 8 * sizeof( uint32_t ) );
+	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 16 * sizeof( uint32_t ) );
 	cl->close();
 	m_Device->executeCommandList( cl );
 	m_Device->waitForIdle();
@@ -361,7 +573,7 @@ bool SoftShadowTermPass::GetWalkStats( uint32_t out[8] )
 	{
 		return false;
 	}
-	memcpy( out, p, 8 * sizeof( uint32_t ) );
+	memcpy( out, p, 16 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
 	return true;
 }

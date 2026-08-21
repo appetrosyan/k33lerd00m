@@ -21,6 +21,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 struct viewDef_t;
 struct viewLight_t;
+class SoftShadowSurfCache;
 
 // Analytic soft shadows: per-soft-light COMPUTE evaluation of the coverage integral
 // (r_softShadowCompute, softterm.cs.hlsl). One dispatch per light over its scissor rect, reading
@@ -55,6 +56,9 @@ public:
 	// falloffTex/projTex + their samplers drive the coverage early-out (the fix for the measured
 	// 1.8x scissor-overcoverage loss); coverageEarlyOut false (debug shaders active, multi-stage
 	// light shader, stage texture matrix) integrates the full rect - the bit-exact instrument mode.
+	// surfCache non-null + active selects the SW_SURF_CACHE permutation (surface-fold cache probe):
+	// cached texels short-circuit to bilerp + residual walk, misses run the shipped walk and enqueue.
+	// The walk-counters permutation takes precedence (measurement mode); pass NULL for shipped.
 	bool AddLight( nvrhi::ICommandList* commandList, const viewDef_t* viewDef, const viewLight_t* vLight,
 				   nvrhi::IBuffer* edgeBuffer, uint32_t edgeFirstElem,
 				   uint32_t casterFirstElem, int casterCount,
@@ -64,18 +68,26 @@ public:
 				   nvrhi::ITexture* falloffTex, nvrhi::ISampler* falloffSamp,
 				   nvrhi::ITexture* projTex, nvrhi::ISampler* projSamp,
 				   bool coverageEarlyOut,
+				   SoftShadowSurfCache* surfCache,
 				   int& outOfsX, int& outOfsY );
 
 	// Walk-attribution GPU counters (r_softShadowWalkCounters): read the 8-uint counter buffer the
 	// COUNTING permutation accumulated this frame - slots 0..6 = SW_WALKIDX_* (caster/coarse/tight
 	// tests+culls, mtTri), 7 = fragments that ran the walk. Blocking readback (waitForIdle), bench-only.
 	// Returns false when counters were not enabled / buffer absent.
-	bool GetWalkStats( uint32_t out[8] );
+	bool GetWalkStats( uint32_t out[16] );	// 0..7 attrib, 8/9 lit frags/survivors, 10/11 penumbra, 12/13 umbra
 
+	// The atlas the interaction shader should Load: the BLURRED atlas when the temporal-stability blur
+	// ran this view (r_softShadowTermBlur), else the raw term atlas.
 	nvrhi::ITexture* GetTermTexture() const
 	{
-		return m_TermTexture;
+		return ( m_BlurActive && m_BlurTexture != nullptr ) ? m_BlurTexture : m_TermTexture;
 	}
+
+	// After the last AddLight: depth-proportional Gaussian blur of each packed light rect in the term
+	// atlas into the blur atlas (softblur.cs.hlsl), a temporal-stability pass. No-op unless
+	// r_softShadowTermBlur > 0. Call before the interaction pass Loads the term.
+	void BlurView( nvrhi::ICommandList* commandList );
 
 	// Atlas slot grid: SLOT_COLS x SLOT_ROWS screen-size R16F slots. R16F is BIT-EXACT for the
 	// face-coverage term, not merely tolerable: the term is always popcount/SW_FACE_SAMPLES = k/16
@@ -103,10 +115,28 @@ private:
 	nvrhi::ShaderHandle				m_ShaderCnt;
 	nvrhi::BindingLayoutHandle		m_LayoutCnt;
 	nvrhi::ComputePipelineHandle	m_PipelineCnt;
+	// SURFACE-FOLD CACHE permutation (SW_SURF_CACHE=1, r_softShadowSurfCache): adds the texel table
+	// (u2) + request queue (u3) UAVs and the residual pool SRV (t6). Separate pipeline so the shipped
+	// shader stays byte-identical; used only when the probe is active.
+	nvrhi::ShaderHandle				m_ShaderSurf;
+	nvrhi::BindingLayoutHandle		m_LayoutSurf;
+	nvrhi::ComputePipelineHandle	m_PipelineSurf;
 	nvrhi::BufferHandle				m_WalkCntBuffer;	// 8 uints, cleared per view, InterlockedAdd'd by the shader
 	bool							m_WalkCntEnabled = false;
 	nvrhi::BufferHandle				m_ConstantBuffer;
 	nvrhi::TextureHandle			m_TermTexture;
+	int								m_BuiltSamples = 0;		// SW_FACE_SAMPLES the pipelines were built for (r_softShadowSamples); rebuild on change
+	// TEMPORAL-STABILITY BLUR (r_softShadowTermBlur, softblur.cs.hlsl): a separate pipeline that
+	// Gaussian-blurs each packed light rect of the term atlas into m_BlurTexture with a radius scaled
+	// by the local penumbra width. Off by default; the interaction reads m_BlurTexture only when it ran.
+	nvrhi::ShaderHandle				m_BlurShader;
+	nvrhi::BindingLayoutHandle		m_BlurLayout;
+	nvrhi::ComputePipelineHandle	m_BlurPipeline;
+	nvrhi::BufferHandle				m_BlurCB;
+	nvrhi::TextureHandle			m_BlurTexture;
+	bool							m_BlurActive = false;	// snapshot per view; drives GetTermTexture
+	struct BlurRect { int x, y, w, h; };
+	idList<BlurRect>				m_BlurRects;			// this view's packed light rects (filled by AddLight)
 	nvrhi::TextureHandle			m_WorldPos;		// this view's position G-buffer (set by BeginView)
 	nvrhi::TextureHandle			m_WorldNormal;	// this view's shading-normal G-buffer (N.L early-out)
 	int								m_SlotW = 0;	// screen-size extent the atlas was built for (atlas = SlotW*COLS x SlotH*ROWS)

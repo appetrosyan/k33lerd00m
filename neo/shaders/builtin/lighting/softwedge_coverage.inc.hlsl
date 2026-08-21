@@ -403,6 +403,9 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	extern swAttrib_t g_swAttrib;
 	extern bool       g_swAttribOn;
 	#define SW_ATTRIB_ADD( field, n ) do { if( g_swAttribOn ) { g_swAttrib.field += ( n ); } } while( 0 )
+	#define SW_BKT_DECL
+	#define SW_BKT_SURV
+	#define SW_BKT_FLUSH( mask, all )
 #elif defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
 	// GPU counting permutation (softterm.cs built with -D SW_GPU_WALK_COUNTERS=1, bound only under
 	// r_softShadowWalkCounters). The counting shader declares u_WalkCnt (register u1) BEFORE this
@@ -416,8 +419,17 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	#define SW_WALKIDX_tightCull	5
 	#define SW_WALKIDX_mtTri		6
 	#define SW_ATTRIB_ADD( field, n ) InterlockedAdd( u_WalkCnt[ SW_WALKIDX_##field ], ( uint )( n ) )
+	// Walk-bucketing by FINAL swMask (lit / penumbra / umbra): count this fragment's MT survivors into a
+	// local, flush to the bucket's slots at the walk's return so the walk WORK splits three ways. Slots
+	// 8/9 lit frags/survivors, 10/11 penumbra, 12/13 umbra (must match SoftShadowTermPass byteSize).
+	#define SW_BKT_DECL   uint swSurvLocal = 0u;
+	#define SW_BKT_SURV   swSurvLocal++;
+	#define SW_BKT_FLUSH( mask, all )  do { uint swBkt = ( ( mask ) == 0u ) ? 8u : ( ( ( mask ) == ( all ) ) ? 12u : 10u ); InterlockedAdd( u_WalkCnt[ swBkt ], 1u ); InterlockedAdd( u_WalkCnt[ swBkt + 1u ], swSurvLocal ); } while( 0 )
 #else
 	#define SW_ATTRIB_ADD( field, n )
+	#define SW_BKT_DECL
+	#define SW_BKT_SURV
+	#define SW_BKT_FLUSH( mask, all )
 #endif
 
 // swCentreLit > 0.5: the caller GUARANTEES the light-disk centre is visible from swP (AAM penumbra-ring
@@ -715,11 +727,28 @@ SW_FUNC int SoftPopcount32( uint x )
 
 #ifndef SW_FACE_SAMPLES
 	#define SW_FACE_SAMPLES 16			// equal-area disk samples (8, 16 or 32); <=32 to pack the occlusion mask in one uint.
-	//									   8 = perf tier, GATE-REJECTED as the default (2026-08-16): 2 EXTENT
-	//									   defects (erebus1_10/11 - the 1/8 coverage quantum shrinks the penumbra
-	//									   body past the 10% tolerance) for only ~12% frame time - the integral is
-	//									   WALK-bound, not sample-bound. 16 = the accuracy set (shipped).
 #endif
+// MEASUREMENT (#3 magnitude): skip the per-fragment cone cull in the tile-list walk and MT every list tri
+// directly. LOSSLESS (MT rejects the same tris the cull would). Tests whether the cull ALU is worth its
+// cost or is free (load-dominated). Set to 1 to measure, 0 = shipped.
+#ifndef SW_SKIP_CULL
+	#define SW_SKIP_CULL 0
+#endif
+// ELIMINATION probe: 99% of survivors reaching MT set no bit (measured). Most lit fragments walk their
+// whole list with the mask stuck at 0. Bail after this many survivors if still fully unblocked (assume
+// lit). 0 = off. Approximate: a fragment blocked ONLY by a late-in-list occluder is wrongly lit.
+#ifndef SW_LIT_EARLYOUT
+	#define SW_LIT_EARLYOUT 0
+#endif
+// SURFACE-FOLD CACHE probe (r_softShadowSurfCache): compiles the cached-texel consume path (bilerp of
+// per-texel corner values + exact residual/dynamic walk) into the term CS. 0 = shipped (the probe
+// permutation is a separate pipeline; the default shader stays byte-identical).
+#ifndef SW_SURF_CACHE
+	#define SW_SURF_CACHE 0
+#endif
+//	8 = perf tier, GATE-REJECTED as the default (2026-08-16): 2 EXTENT defects (erebus1_10/11 - the 1/8
+//	coverage quantum shrinks the penumbra body past the 10% tolerance) for only ~12% frame time - the
+//	integral is WALK-bound, not sample-bound. 16 = the accuracy set (shipped).
 
 #if SW_FP16_LOOP
 // PACKED fp16 Moller-Trumbore for ONE triangle: tests all still-unblocked samples two at a time (one per
@@ -910,6 +939,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 
 	uint swMask = 0u;						// bit i set once sample i's ray is blocked by any triangle (union)
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+	SW_BKT_DECL
 #if SW_FACE_PROFILE
 	// keeps the probed stages LIVE: the accumulator feeds an unprovable branch at the end, so the
 	// compiler cannot dead-code-eliminate the walk/culls the probe is supposed to time (it DID -
@@ -977,6 +1007,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			float  coneR = swR * ( cd + triRad ) / swDistPL;		// max cone radius over the triangle's depth span
 			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }	// outside the sample cone: cannot occlude
 			SW_ATTRIB_ADD( mtTri, 1 );	// survivor: pays the Moller-Trumbore + 16-sample test
+			SW_BKT_SURV
 #if SW_FACE_PROFILE == 2
 			swProbe += cd; continue;		// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
 #endif
@@ -1053,6 +1084,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 #if SW_FACE_PROFILE
 	if( swProbe > 1e30f ) { swMask = swAll; }	// never true; makes the probe accumulator observable
 #endif
+	SW_BKT_FLUSH( swMask, swAll );
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
 
@@ -1106,6 +1138,37 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		0x02b281a3u, 0x00c33824u, 0x1a03bc45u, 0x00e0a0c3u,
 		0x02f124e4u, 0x04350105u, 0x06458526u, 0x08560947u,
 	};
+#elif SW_FACE_SAMPLES == 32
+	const float2 swDisk[32] =
+	{
+		float2( 0.125000f, 0.000000f), float2(-0.159645f, 0.146248f),
+		float2( 0.024436f,-0.278438f), float2( 0.201222f, 0.262459f),
+		float2(-0.369268f,-0.065318f), float2( 0.349802f,-0.222516f),
+		float2(-0.117002f, 0.435242f), float2(-0.223136f,-0.429634f),
+		float2( 0.484115f, 0.176798f), float2(-0.503641f, 0.207896f),
+		float2( 0.242788f,-0.518824f), float2( 0.179414f, 0.572001f),
+		float2(-0.540757f,-0.313380f), float2( 0.634370f,-0.139464f),
+		float2(-0.387146f, 0.550675f), float2(-0.089440f,-0.690200f),
+		float2( 0.549072f, 0.462758f), float2(-0.738878f, 0.030555f),
+		float2( 0.538955f,-0.536332f), float2(-0.036058f, 0.779792f),
+		float2(-0.512818f,-0.614527f), float2( 0.812360f, 0.109302f),
+		float2(-0.688311f, 0.478909f), float2( 0.188086f,-0.836061f),
+		float2( 0.435033f, 0.759191f), float2(-0.850448f,-0.271316f),
+		float2( 0.826102f,-0.381680f), float2(-0.357888f, 0.855156f),
+		float2(-0.319407f,-0.888034f), float2( 0.849909f, 0.446688f),
+		float2(-0.944035f, 0.248845f), float2( 0.536596f,-0.834530f),
+	};
+	const uint swNbr[32] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x20132d00u,
+		0x0478a581u, 0x1121014du, 0x1239adc1u, 0x384a31e2u,
+		0x0a06d470u, 0x3ce0d891u, 0x3ef15cb2u, 0x11036073u,
+		0x1313e684u, 0x01246aa5u, 0x0334db66u, 0x28255f87u,
+		0x2a35e3a8u, 0x2cc267c9u, 0x2ed2ebeau, 0x07871b6bu,
+		0x09979f8cu, 0x0ba8750du, 0x0db8f92eu, 0x0fc97d4fu,
+		0x103ece0bu, 0x13e2522cu, 0x15f2d64du, 0x12bb1a6eu,
+		0x14cb9e8fu, 0x06dc22b0u, 0x08eca6d1u, 0x1e5d2af2u,
+	};
 #else
 	#error SoftShadow_FaceCoverageList supports SW_FACE_SAMPLES 8 or 16
 #endif
@@ -1125,6 +1188,10 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 
 	uint swMask = 0u;
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+	SW_BKT_DECL
+#if SW_LIT_EARLYOUT
+	int swMtCnt = 0;					// survivors reaching MT so far (for the lit early-out)
+#endif
 #if SW_FACE_PROFILE
 	float swProbe = 0.0f;		// keeps probed stages live (see the SW_FACE_PROFILE doc at the top)
 #endif
@@ -1166,16 +1233,204 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		float  cd   = dot( rc, swF.nrm );
 		float  triRad = r1.w;	// centroid radius (tight): exact original bound, so the sample-gated set is bit-exact
 		SW_ATTRIB_ADD( tightTest, 1 );	// tris in this fragment's tile list reaching the cone cull
+#if !SW_SKIP_CULL
 		if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
 		if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
 		float3 perp = rc - cd * swF.nrm;
 		float  coneR = swR * ( cd + triRad ) / swDistPL;
 		if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+#endif
 		SW_ATTRIB_ADD( mtTri, 1 );	// survivor: pays the Moller-Trumbore + 16-sample test (the cull-collapse signal)
+		SW_BKT_SURV
+#if SW_LIT_EARLYOUT
+		swMtCnt++;
+#endif
 #if SW_FACE_PROFILE == 2
 		swProbe += cd;
 		continue;													// TIMING PROBE: + per-triangle cone culls
 #endif
+		float3 edge1 = v1 - v0;
+		float3 edge2 = v2 - v0;
+		float3 sp = swP - v0;
+		float3 qq   = cross( sp, edge1 );
+		float  e2qq = dot( edge2, qq );
+#if defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
+		const uint swOldMask = swMask;		// did THIS survivor contribute, or is it tested-but-blocks-nothing?
+#endif
+#if SW_FP16_LOOP
+		swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+											 swBase, swU2, swV2, swMD, swKD, swDisk );
+#else
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+			float2 s0  = swDisk[i];
+			float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+			float3 dir = swBase + swSu * sc.x + swSv * sc.y;
+			float3 h   = cross( dir, edge2 );
+			float  aa  = dot( edge1, h );
+			if( abs( aa ) < 1e-12f ) { continue; }
+			float  inv = 1.0f / aa;
+			float  u   = inv * dot( sp, h );
+			if( u < 0.0f || u > 1.0f ) { continue; }
+			float  vv  = inv * dot( dir, qq );
+			if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+			float  tt  = inv * e2qq;
+			if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+		}
+#endif	// SW_FP16_LOOP
+#if defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
+		if( swMask != swOldMask ) { InterlockedAdd( u_WalkCnt[ 14 ], 1u ); }	// survivor HIT (set >=1 bit)
+		else { InterlockedAdd( u_WalkCnt[ 15 ], 1u ); }						// survivor tested, blocks NOTHING
+#endif
+#if SW_LIT_EARLYOUT
+		if( swMask == 0u && swMtCnt >= SW_LIT_EARLYOUT ) { break; }	// still fully unblocked after K survivors -> assume lit
+#endif
+		if( swMask == swAll ) { break; }
+	}
+	if( swMask != 0u && swMask != swAll )
+	{
+		uint filled = swMask;
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+			uint nb = swNbr[i];
+			int blocked = 0;
+			for( int k = 0; k < 6; k++ )
+			{
+				int j = ( int )( ( nb >> ( 5 * k ) ) & 31u );
+				if( ( swMask & ( 1u << j ) ) != 0u ) { blocked++; }
+			}
+			if( blocked >= 5 ) { filled |= ( 1u << i ); }
+		}
+		swMask = filled;
+	}
+#if SW_FACE_PROFILE
+	if( swProbe > 1e30f ) { swMask = swAll; }	// never true; makes the probe accumulator observable
+#endif
+	SW_BKT_FLUSH( swMask, swAll );
+	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
+}
+
+#if SW_SURF_CACHE
+// SURFACE-FOLD CACHE probe (r_softShadowSurfCache): the EXACT part of a cached fragment's term.
+// Walks the texel's RESIDUAL static occluders (triangle indices from the persistent pool t_SurfPool,
+// declared by the term CS before this include) plus the frame's DYNAMIC casters (the caster-table
+// suffix after the static prefix) into ONE shared sample mask (union), then the shipped crack-close.
+// Per-fragment rotation, so the exact part keeps the shipped dither. The FOLDED static part arrives
+// as the bilinear of the texel's 4 corner F values; the caller adds the two and saturates. Mirrors
+// SoftShadow_FaceCoverageList / SoftShadow_FaceCoverage in their SHIPPED config (in-loop dirs, fp16
+// MT) - duplication is house style here (the two sibling walks already duplicate; tests hold them).
+SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float swR, int swTriBase,
+		int swResBase, int swResCount, int swCasterBase, int swDynFirst, int swCasterCount, float swRotAng )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float  swDistPL = swF.distPL;
+	float  swSinA = saturate( swR / swDistPL );
+	float  swCosA = sqrt( 1.0f - swSinA * swSinA );
+	const float swEps = SW_NEAR_EPS;
+#if SW_FACE_SAMPLES == 8
+	const float2 swDisk[8] =
+	{
+		float2( 0.250000f, 0.000000f), float2(-0.319290f, 0.292496f),
+		float2( 0.048872f,-0.556877f), float2( 0.402444f, 0.524918f),
+		float2(-0.738535f,-0.130636f), float2( 0.699605f,-0.445031f),
+		float2(-0.234004f, 0.870484f), float2(-0.446271f,-0.859268f),
+	};
+	const uint swNbr[8] =
+	{
+		0x08609443u, 0x0e218086u, 0x06121407u, 0x082284c0u,
+		0x066008e1u, 0x08138c40u, 0x0a220061u, 0x06508082u,
+	};
+#elif SW_FACE_SAMPLES == 16
+	const float2 swDisk[16] =
+	{
+		float2( 0.176777f, 0.000000f), float2(-0.225772f, 0.206826f),
+		float2( 0.034558f,-0.393771f), float2( 0.284571f, 0.371173f),
+		float2(-0.522223f,-0.092374f), float2( 0.494695f,-0.314685f),
+		float2(-0.165466f, 0.615525f), float2(-0.315561f,-0.607594f),
+		float2( 0.684642f, 0.250030f), float2(-0.712256f, 0.294009f),
+		float2( 0.343354f,-0.733729f), float2( 0.253730f, 0.808932f),
+		float2(-0.764746f,-0.443186f), float2( 0.897134f,-0.197232f),
+		float2(-0.547507f, 0.778772f), float2(-0.126487f,-0.976090f),
+	};
+	const uint swNbr[16] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x0a132d00u,
+		0x0023a581u, 0x0681014du, 0x0091adc1u, 0x00a231e2u,
+		0x02b281a3u, 0x00c33824u, 0x1a03bc45u, 0x00e0a0c3u,
+		0x02f124e4u, 0x04350105u, 0x06458526u, 0x08560947u,
+	};
+#elif SW_FACE_SAMPLES == 32
+	const float2 swDisk[32] =
+	{
+		float2( 0.125000f, 0.000000f), float2(-0.159645f, 0.146248f),
+		float2( 0.024436f,-0.278438f), float2( 0.201222f, 0.262459f),
+		float2(-0.369268f,-0.065318f), float2( 0.349802f,-0.222516f),
+		float2(-0.117002f, 0.435242f), float2(-0.223136f,-0.429634f),
+		float2( 0.484115f, 0.176798f), float2(-0.503641f, 0.207896f),
+		float2( 0.242788f,-0.518824f), float2( 0.179414f, 0.572001f),
+		float2(-0.540757f,-0.313380f), float2( 0.634370f,-0.139464f),
+		float2(-0.387146f, 0.550675f), float2(-0.089440f,-0.690200f),
+		float2( 0.549072f, 0.462758f), float2(-0.738878f, 0.030555f),
+		float2( 0.538955f,-0.536332f), float2(-0.036058f, 0.779792f),
+		float2(-0.512818f,-0.614527f), float2( 0.812360f, 0.109302f),
+		float2(-0.688311f, 0.478909f), float2( 0.188086f,-0.836061f),
+		float2( 0.435033f, 0.759191f), float2(-0.850448f,-0.271316f),
+		float2( 0.826102f,-0.381680f), float2(-0.357888f, 0.855156f),
+		float2(-0.319407f,-0.888034f), float2( 0.849909f, 0.446688f),
+		float2(-0.944035f, 0.248845f), float2( 0.536596f,-0.834530f),
+	};
+	const uint swNbr[32] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x20132d00u,
+		0x0478a581u, 0x1121014du, 0x1239adc1u, 0x384a31e2u,
+		0x0a06d470u, 0x3ce0d891u, 0x3ef15cb2u, 0x11036073u,
+		0x1313e684u, 0x01246aa5u, 0x0334db66u, 0x28255f87u,
+		0x2a35e3a8u, 0x2cc267c9u, 0x2ed2ebeau, 0x07871b6bu,
+		0x09979f8cu, 0x0ba8750du, 0x0db8f92eu, 0x0fc97d4fu,
+		0x103ece0bu, 0x13e2522cu, 0x15f2d64du, 0x12bb1a6eu,
+		0x14cb9e8fu, 0x06dc22b0u, 0x08eca6d1u, 0x1e5d2af2u,
+	};
+#else
+	#error SoftShadow_FaceCoverageSurfResidual supports SW_FACE_SAMPLES 8 or 16
+#endif
+	float3 swBase = swL - swP;
+	float3 swSu = swF.u * swR;
+	float3 swSv = swF.v * swR;
+	float  swCa = cos( swRotAng );
+	float  swSa = sin( swRotAng );
+
+#if SW_FP16_LOOP
+	float  swMD = SoftMaxComp3( swBase ) + SoftMaxComp3( swSu ) + SoftMaxComp3( swSv );
+	float  swKD = 1.0f / max( swMD, 1e-19f );
+	float3 swU2 = swSu * swCa + swSv * swSa;
+	float3 swV2 = swSv * swCa - swSu * swSa;
+#endif
+
+	uint swMask = 0u;
+	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+	// ---- residual static occluders: SELF-CONTAINED verts in the pool (12 uints/tri), per-fragment cone
+	// cull + MT (List's body). No static-stream index: a warm texel is independent of the emitted prefix.
+	for( int li = 0; li < swResCount; li++ )
+	{
+		const int po = swResBase + li * 12;
+		float4 r0 = float4( asfloat( t_SurfPool[ po + 0 ] ), asfloat( t_SurfPool[ po + 1 ] ), asfloat( t_SurfPool[ po + 2 ] ), asfloat( t_SurfPool[ po + 3 ] ) );
+		float4 r1 = float4( asfloat( t_SurfPool[ po + 4 ] ), asfloat( t_SurfPool[ po + 5 ] ), asfloat( t_SurfPool[ po + 6 ] ), asfloat( t_SurfPool[ po + 7 ] ) );
+		float4 r2 = float4( asfloat( t_SurfPool[ po + 8 ] ), asfloat( t_SurfPool[ po + 9 ] ), asfloat( t_SurfPool[ po + 10 ] ), asfloat( t_SurfPool[ po + 11 ] ) );
+		float3 v0 = float3( r0.x, r0.y, r0.z );
+		float3 v1 = float3( r1.x, r1.y, r1.z );
+		float3 v2 = float3( r2.x, r2.y, r2.z );
+		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+		float3 rc   = tcen - swP;
+		float  cd   = dot( rc, swF.nrm );
+		float  triRad = r1.w;
+		if( cd + triRad < swEps ) { continue; }
+		if( cd - triRad > swDistPL ) { continue; }
+		float3 perp = rc - cd * swF.nrm;
+		float  coneR = swR * ( cd + triRad ) / swDistPL;
+		if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
 		float3 edge1 = v1 - v0;
 		float3 edge2 = v2 - v0;
 		float3 sp = swP - v0;
@@ -1205,6 +1460,82 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 #endif	// SW_FP16_LOOP
 		if( swMask == swAll ) { break; }
 	}
+	// ---- dynamic casters: the table suffix, sphere cull + contiguous tri spans (FaceCoverage's body) ----
+	if( swMask != swAll )
+	{
+		for( int scc = swDynFirst; scc < swCasterCount; scc++ )
+		{
+			float4 c0 = t_SoftEdges[ swCasterBase + scc * 2 + 0 ];
+			float4 c1 = t_SoftEdges[ swCasterBase + scc * 2 + 1 ];
+			float3 dCv = float3( c0.x, c0.y, c0.z ) - swP;
+			if( SoftShadow_CullCaster( dCv, c0.w, swF, swSinA, swCosA, swEps ) )
+			{
+				continue;
+			}
+			const int swTriFirst = ( int )c1.x;
+			const int swTriEnd   = swTriFirst + ( int )c1.y;
+			for( int t = swTriFirst; t < swTriEnd; t++ )
+			{
+				const int b = swTriBase + t * 3;
+				float4 r0 = t_SoftEdges[ b + 0 ];
+				{
+					float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
+					float  cd0 = dot( rc0, swF.nrm );
+					float  vr0 = r0.w;
+					if( cd0 + vr0 < swEps ) { continue; }
+					if( cd0 - vr0 > swDistPL ) { continue; }
+					float3 pp0 = rc0 - cd0 * swF.nrm;
+					float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
+					if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+				}
+				float4 r1 = t_SoftEdges[ b + 1 ];
+				float4 r2 = t_SoftEdges[ b + 2 ];
+				float3 v0 = float3( r0.x, r0.y, r0.z );
+				float3 v1 = float3( r1.x, r1.y, r1.z );
+				float3 v2 = float3( r2.x, r2.y, r2.z );
+				float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+				float3 rc   = tcen - swP;
+				float  cd   = dot( rc, swF.nrm );
+				float  triRad = r1.w;
+				if( cd + triRad < swEps ) { continue; }
+				if( cd - triRad > swDistPL ) { continue; }
+				float3 perp = rc - cd * swF.nrm;
+				float  coneR = swR * ( cd + triRad ) / swDistPL;
+				if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+				float3 edge1 = v1 - v0;
+				float3 edge2 = v2 - v0;
+				float3 sp = swP - v0;
+				float3 qq   = cross( sp, edge1 );
+				float  e2qq = dot( edge2, qq );
+#if SW_FP16_LOOP
+				swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+													 swBase, swU2, swV2, swMD, swKD, swDisk );
+#else
+				for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+				{
+					if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+					float2 s0  = swDisk[i];
+					float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+					float3 dir = swBase + swSu * sc.x + swSv * sc.y;
+					float3 h   = cross( dir, edge2 );
+					float  aa  = dot( edge1, h );
+					if( abs( aa ) < 1e-12f ) { continue; }
+					float  inv = 1.0f / aa;
+					float  u   = inv * dot( sp, h );
+					if( u < 0.0f || u > 1.0f ) { continue; }
+					float  vv  = inv * dot( dir, qq );
+					if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+					float  tt  = inv * e2qq;
+					if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+				}
+#endif	// SW_FP16_LOOP
+				if( swMask == swAll ) { break; }
+			}
+			if( swMask == swAll ) { break; }
+		}
+	}
+	// shipped morphological crack-close on the EXACT mask only; the folded part is a scalar and gets
+	// none (a playtest observation point - see the probe plan)
 	if( swMask != 0u && swMask != swAll )
 	{
 		uint filled = swMask;
@@ -1222,11 +1553,9 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		}
 		swMask = filled;
 	}
-#if SW_FACE_PROFILE
-	if( swProbe > 1e30f ) { swMask = swAll; }	// never true; makes the probe accumulator observable
-#endif
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
+#endif	// SW_SURF_CACHE
 
 // SPILL-tile walk (STREAM V3 clusters): the list entries are ABSOLUTE float4 element offsets of
 // CLUSTER records - k-d spatial leaves of <=32 triangles built at stream time, 2 float4 each:
@@ -1279,6 +1608,37 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 		0x02b281a3u, 0x00c33824u, 0x1a03bc45u, 0x00e0a0c3u,
 		0x02f124e4u, 0x04350105u, 0x06458526u, 0x08560947u,
 	};
+#elif SW_FACE_SAMPLES == 32
+	const float2 swDisk[32] =
+	{
+		float2( 0.125000f, 0.000000f), float2(-0.159645f, 0.146248f),
+		float2( 0.024436f,-0.278438f), float2( 0.201222f, 0.262459f),
+		float2(-0.369268f,-0.065318f), float2( 0.349802f,-0.222516f),
+		float2(-0.117002f, 0.435242f), float2(-0.223136f,-0.429634f),
+		float2( 0.484115f, 0.176798f), float2(-0.503641f, 0.207896f),
+		float2( 0.242788f,-0.518824f), float2( 0.179414f, 0.572001f),
+		float2(-0.540757f,-0.313380f), float2( 0.634370f,-0.139464f),
+		float2(-0.387146f, 0.550675f), float2(-0.089440f,-0.690200f),
+		float2( 0.549072f, 0.462758f), float2(-0.738878f, 0.030555f),
+		float2( 0.538955f,-0.536332f), float2(-0.036058f, 0.779792f),
+		float2(-0.512818f,-0.614527f), float2( 0.812360f, 0.109302f),
+		float2(-0.688311f, 0.478909f), float2( 0.188086f,-0.836061f),
+		float2( 0.435033f, 0.759191f), float2(-0.850448f,-0.271316f),
+		float2( 0.826102f,-0.381680f), float2(-0.357888f, 0.855156f),
+		float2(-0.319407f,-0.888034f), float2( 0.849909f, 0.446688f),
+		float2(-0.944035f, 0.248845f), float2( 0.536596f,-0.834530f),
+	};
+	const uint swNbr[32] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x20132d00u,
+		0x0478a581u, 0x1121014du, 0x1239adc1u, 0x384a31e2u,
+		0x0a06d470u, 0x3ce0d891u, 0x3ef15cb2u, 0x11036073u,
+		0x1313e684u, 0x01246aa5u, 0x0334db66u, 0x28255f87u,
+		0x2a35e3a8u, 0x2cc267c9u, 0x2ed2ebeau, 0x07871b6bu,
+		0x09979f8cu, 0x0ba8750du, 0x0db8f92eu, 0x0fc97d4fu,
+		0x103ece0bu, 0x13e2522cu, 0x15f2d64du, 0x12bb1a6eu,
+		0x14cb9e8fu, 0x06dc22b0u, 0x08eca6d1u, 0x1e5d2af2u,
+	};
 #else
 	#error SoftShadow_FaceCoverageClusterList supports SW_FACE_SAMPLES 8 or 16
 #endif
@@ -1297,6 +1657,7 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 
 	uint swMask = 0u;
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+	SW_BKT_DECL
 	for( int li = 0; li < swListCount; li++ )
 	{
 		const int se = ( int )t_SoftTiles[ swListBase + li ];		// ABSOLUTE cluster-record offset
@@ -1342,6 +1703,7 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 			float3 perp = rc - cd * swF.nrm;
 			float  coneR = swR * ( cd + triRad ) / swDistPL;
 			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+			SW_BKT_SURV
 			float3 edge1 = v1 - v0;
 			float3 edge2 = v2 - v0;
 			float3 sp = swP - v0;
@@ -1390,6 +1752,7 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 		}
 		swMask = filled;
 	}
+	SW_BKT_FLUSH( swMask, swAll );
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
 }
 
