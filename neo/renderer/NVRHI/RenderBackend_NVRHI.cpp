@@ -207,6 +207,7 @@ void idRenderBackend::Init()
 	softTileBinPass = nullptr;
 	currentSoftTileBase = -1;
 	softShadowTermPass = nullptr;
+	softShadowSurfCache = nullptr;
 	currentSoftTermOfsX = currentSoftTermOfsY = -1;
 	hdrGuiCompositePass = nullptr;
 
@@ -2589,6 +2590,11 @@ void idRenderBackend::GL_StartFrame()
 		softShadowTermPass = new SoftShadowTermPass( deviceManager->GetDevice() );
 	}
 
+	if( !softShadowSurfCache )
+	{
+		softShadowSurfCache = new SoftShadowSurfCache( deviceManager->GetDevice() );
+	}
+
 	if( !hdrGuiCompositePass )
 	{
 		hdrGuiCompositePass = new HdrGuiCompositePass( deviceManager->GetDevice() );
@@ -2987,6 +2993,12 @@ void idRenderBackend::ClearCaches()
 		softShadowTermPass = nullptr;
 	}
 
+	if( softShadowSurfCache )
+	{
+		delete softShadowSurfCache;
+		softShadowSurfCache = nullptr;
+	}
+
 	if( hdrGuiCompositePass )
 	{
 		delete hdrGuiCompositePass;
@@ -3124,6 +3136,7 @@ idRenderBackend::idRenderBackend()
 	softTileBinPass = nullptr;	// also nulled in Init(), but frames can run between ctor and Init -
 	// an uninitialised pointer here passes the != NULL guard in DrawInteractions on garbage (measured
 	// as a boot-order-dependent crash)
+	softShadowSurfCache = nullptr;	// same landmine
 	currentSoftTileBase = -1;
 	currentSoftTileOx = currentSoftTileOy = currentSoftTileTilesX = 0;
 	softShadowTermPass = nullptr;	// same ctor-vs-Init landmine as softTileBinPass above

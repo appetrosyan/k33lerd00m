@@ -43,6 +43,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Passes/EmberPass.h"
 #include "Passes/SoftTileBinPass.h"
 #include "Passes/SoftShadowTermPass.h"
+#include "Passes/SoftShadowSurfCache.h"
 #include "Passes/HdrGuiCompositePass.h"
 #include "Passes/TonemapPass.h"
 #include "Passes/TemporalAntiAliasingPass.h"
@@ -426,6 +427,9 @@ private:
 	int								currentSoftTileOy;
 	int								currentSoftTileTilesX;
 	SoftShadowTermPass*				softShadowTermPass;
+	// surface-fold cache probe (r_softShadowSurfCache): persistent texel table/pool/queue + the
+	// budgeted build pass, consulted by DispatchSoftShadowComputePhases around the term dispatches
+	SoftShadowSurfCache*			softShadowSurfCache;
 	// per-light compute-term result (r_softShadowCompute), set by DrawInteractions before the
 	// light's draws and consumed where rpUser6 is written: ofsX < 0 = no term => in-shader integral
 	int								currentSoftTermOfsX;
@@ -479,6 +483,10 @@ public:
 	SoftTileBinPass*	GetSoftTileBinPass()	// bench/diagnostic access (spill stats readback)
 	{
 		return softTileBinPass;
+	}
+	SoftShadowSurfCache* GetSoftShadowSurfCache()	// bench/diagnostic access (hit/miss stats readback)
+	{
+		return softShadowSurfCache;
 	}
 	SoftShadowTermPass*	GetSoftShadowTermPass()	// bench/diagnostic access (walk-counter readback)
 	{

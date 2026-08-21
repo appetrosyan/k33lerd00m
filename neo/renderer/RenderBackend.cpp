@@ -48,6 +48,18 @@ If you have questions concerning this license or the applicable additional terms
 idCVar r_useNewSsaoPass( "r_useNewSSAOPass", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "use the new SSAO pass from Donut" );
 extern DeviceManager* deviceManager;
 
+// soft-shadow surface-fold cache invalidation (plan noble-sniffing-rose): the interaction/light
+// lifecycle calls this when a caster or light's GEOMETRY changes, so the cache re-warms that light
+// off the camera-independent path (never from camera motion). No-op if the cache is not up yet.
+void R_SoftCacheInvalidateLight( const idRenderLightLocal* light )
+{
+	SoftShadowSurfCache* sc = backEnd.GetSoftShadowSurfCache();
+	if( sc != NULL )
+	{
+		sc->InvalidateLight( light );
+	}
+}
+
 idCVar r_drawEyeColor( "r_drawEyeColor", "0", CVAR_RENDERER | CVAR_BOOL, "Draw a colored box, red = left eye, blue = right eye, grey = non-stereo" );
 idCVar r_motionBlur( "r_motionBlur", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "1 - 5, log2 of the number of motion blur samples" );
 idCVar r_forceZPassStencilShadows( "r_forceZPassStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL, "force Z-pass rendering for performance testing" );
@@ -4812,6 +4824,21 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 	extern idCVar r_softShadowBenchExcludeWorld;
 	const bool swDiag = r_softShadowBenchExcludeWorld.GetBool();
 
+	// WARM-AT-LOAD (plan noble-sniffing-rose, warm-first): on the first soft-frame of a NEW map, burst
+	// the whole map's static cache warm now - behind the load fade - instead of dripping one light per
+	// gameplay frame (the visible startup spikes). The burst submits per-light command lists, so there
+	// must be NO immediate list open: flush + close the frame list, burst, reopen (mirrors the async
+	// split below). Fires once per world; runtime spawns still drip through DrainWarmQueue.
+	extern idCVar r_softShadowSurfCache;
+	if( softShadowSurfCache != NULL && viewDef->renderWorld != NULL
+			&& softShadowSurfCache->TakeLoadWarm( viewDef->renderWorld ) )
+	{
+		commandList->close();
+		dev->executeCommandList( commandList );
+		softShadowSurfCache->WarmMapBurst( dev, viewDef->renderWorld );
+		commandList->open();
+	}
+
 	nvrhi::ICommandList* target = commandList;
 	uint64 gInstance = 0;
 	if( async )
@@ -4834,6 +4861,28 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 		target = softComputeCL;
 	}
 
+	// SURFACE-FOLD CACHE (r_softShadowSurfCache): BeginView runs BEFORE the bin phase so the warm
+	// state can gate the per-light bin dispatches below (r_softShadowSurfCacheSkipBin) - a fully
+	// prewarmed light's cached fragments never read the tile lists, so binning its whole caster
+	// stream every frame (~2.7 ms measured on the heavy capture) is pure waste. The build/seed
+	// dispatches still run in the term phase where the per-light stream bases are at hand.
+	// CAMERA-INDEPENDENT WARM (plan noble-sniffing-rose): drain the interaction/spawn-fed warm queue
+	// on this command list BEFORE the view renders, bounded per frame so a whole-map load spreads over
+	// the load screen's frames and a runtime spawn warms in a frame or two (misses walk exact meanwhile,
+	// never a spike). All building happens here, off the per-view path - camera motion never builds.
+	if( softShadowSurfCache != NULL )
+	{
+		softShadowSurfCache->DrainWarmQueue( target, 8 );
+	}
+	SoftShadowSurfCache* swSurf = NULL;
+	if( wantTerms && softShadowSurfCache != NULL
+			&& softShadowSurfCache->BeginView( target, viewDef, commonLocal.GetRendererGPUMicroseconds() ) )
+	{
+		swSurf = softShadowSurfCache;
+	}
+	extern idCVar r_softShadowSurfCacheSkipBin;
+	const bool swSkipBinWarm = ( swSurf != NULL ) && r_softShadowSurfCacheSkipBin.GetBool();
+
 	// ---- tile binning: one shared depth min/max reduce + N bin dispatches ----
 	if( !async )
 	{
@@ -4852,6 +4901,10 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 			if( vLight->softEdgeCount <= 0 || vLight->softCasterCount <= 0 || softTileBins.Num() >= 256 )
 			{
 				continue;
+			}
+			if( swSkipBinWarm && vLight->lightDef != NULL && swSurf->IsWarmLight( vLight->lightDef->index ) )
+			{
+				continue;	// warm cache: cached fragments skip the tile lists; misses take the bounded full walk
 			}
 			const vertCacheHandle_t eh = vLight->softEdgeCache;
 			const vertCacheHandle_t ch = vLight->softCasterCache;
@@ -4910,6 +4963,27 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 				return ( ra.x2 - ra.x1 + 1 ) * ( ra.y2 - ra.y1 + 1 ) > ( rb.x2 - rb.x1 + 1 ) * ( rb.y2 - rb.y1 + 1 );
 			} );
 		}
+
+		// SURFACE-FOLD CACHE probe (r_softShadowSurfCache; BeginView ran before the bin phase):
+		// (a) run each light's SEED (first sight) + budgeted BUILD dispatch (table-scan while
+		// prewarming, else last frame's lazy requests), (b) reset the queue so this frame's terms
+		// claim a fresh budget. nvrhi's automatic UAV barriers order builds -> clear -> terms.
+		if( swSurf != NULL )
+		{
+			for( int swLi = 0; swLi < swTermOrder.Num(); swLi++ )
+			{
+				const viewLight_t* vLight = swTermOrder[swLi];
+				const vertCacheHandle_t eh = vLight->softEdgeCache;
+				const vertCacheHandle_t ch = vLight->softCasterCache;
+				const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				const uint casOfs = ( uint )( ( ch >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
+				swSurf->BuildLight( target, vLight, joint, edgeOfs / 16u, casOfs / 16u,
+									r_shadowPenumbraSize.GetFloat() );
+			}
+			swSurf->EndBuilds( target );
+		}
+
 		for( int swLi = 0; swLi < swTermOrder.Num(); swLi++ )
 		{
 			const viewLight_t* vLight = swTermOrder[swLi];
@@ -4966,11 +5040,15 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 						swEarly ? ( nvrhi::ITexture* )swProjImg->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
 						swEarly ? ( nvrhi::ISampler* )swProjImg->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
 						swEarly,
+						swSurf,
 						t.ofsX, t.ofsY ) )
 			{
 				softTerms.Append( t );
 			}
 		}
+		// TEMPORAL-STABILITY blur (r_softShadowTermBlur): after every light's term is written, blur each
+		// packed rect into the blur atlas; GetTermTexture() then feeds the interaction the blurred atlas.
+		softShadowTermPass->BlurView( target );
 	}
 
 	if( async )
@@ -5659,6 +5737,21 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 		extern int fe_stencilBuilt, fe_rejSilEdges, fe_rejSurfInter, fe_rejNumIdx, fe_rejIdxStale, fe_rejShadowCache;
 		common->Printf( "StencilGate: built=%d rej[silEdges=%d surfInter=%d numIdx=%d idxStale=%d shadowCacheNotStatic=%d]\n",
 						fe_stencilBuilt, fe_rejSilEdges, fe_rejSurfInter, fe_rejNumIdx, fe_rejIdxStale, fe_rejShadowCache );
+	}
+
+	// Phase 0 attribution: soft-shadow static/dynamic caster+record split (the cacheable-static ceiling).
+	extern idCVar r_softShadowStaticStats;
+	if( r_softShadowStaticStats.GetBool() )
+	{
+		extern int fe_softStaticCasters, fe_softDynCasters, fe_softStaticRecords, fe_softDynRecords,
+				   fe_softDynLightMoved, fe_softDynGeomMoved;
+		const int recs = fe_softStaticRecords + fe_softDynRecords;
+		const int cas  = fe_softStaticCasters + fe_softDynCasters;
+		const float recPct = recs > 0 ? 100.0f * fe_softStaticRecords / recs : 0.0f;
+		const float casPct = cas  > 0 ? 100.0f * fe_softStaticCasters / cas  : 0.0f;
+		common->Printf( "SoftStatic: casters %d/%d static (%.0f%%) | records %d/%d static (%.1f%%) | dyn records: lightMoved=%d geomMoved=%d\n",
+						fe_softStaticCasters, cas, casPct, fe_softStaticRecords, recs, recPct,
+						fe_softDynLightMoved, fe_softDynGeomMoved );
 	}
 
 	// disable stencil shadow test
