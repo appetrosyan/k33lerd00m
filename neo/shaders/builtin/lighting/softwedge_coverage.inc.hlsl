@@ -783,6 +783,16 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 		}
 	}
 	if( qn < 3 ) { return; }
+	// per-edge line params hoisted OUT of the chord loop: the reciprocal 1/(B.y-A.y) is the expensive
+	// term and is chord-invariant, so each chord evaluation is a single FMA x = A.x + slope*(Y - A.y).
+	float eax[4], eay[4], eslope[4], elo[4], ehi[4];
+	for( int e = 0; e < 4; e++ )
+	{
+		if( e >= qn ) { eax[e] = 0; eay[e] = 0; eslope[e] = 0; elo[e] = 1e30f; ehi[e] = -1e30f; continue; }
+		float2 A = q[e], B = q[( e + 1 ) % qn];
+		eax[e] = A.x; eay[e] = A.y; eslope[e] = ( B.x - A.x ) / ( B.y - A.y );
+		elo[e] = min( A.y, B.y ); ehi[e] = max( A.y, B.y );
+	}
 	const float halfC = SW_SCAN_CHORDS * 0.5f;							// chord index m for chord centre Y: m = (Y+1)*halfC - 0.5
 	int mLo = ( int )ceil( ( ymin + 1.0f ) * halfC - 0.5f );
 	int mHi = ( int )floor( ( ymax + 1.0f ) * halfC - 0.5f );
@@ -793,13 +803,9 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 		float xlo = 1e30f, xhi = -1e30f; bool any = false;
 		for( int e2 = 0; e2 < 4; e2++ )
 		{
-			if( e2 >= qn ) { break; }
-			float2 A = q[e2];
-			float2 B = q[( e2 + 1 ) % qn];
-			if( ( A.y <= Y ) != ( B.y <= Y ) )
+			if( Y >= elo[e2] && Y < ehi[e2] )						// chord crosses this edge (half-open = parity-exact)
 			{
-				float tt = ( Y - A.y ) / ( B.y - A.y );
-				float x = A.x + ( B.x - A.x ) * tt;
+				float x = eax[e2] + eslope[e2] * ( Y - eay[e2] );
 				xlo = min( xlo, x ); xhi = max( xhi, x ); any = true;
 			}
 		}
