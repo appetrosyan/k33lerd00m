@@ -36,8 +36,71 @@ version. See <http://www.gnu.org/licenses/>.
 #include <map>
 #include <cstdint>
 #include <utility>
+#include <array>
+#include <algorithm>
 
 using namespace swtest;
+
+// FUBINI / scanline union: area(2D union) = integral over horizontal chords of the EXACT 1D interval union.
+// Project each triangle (near-plane clipped) to the disk plane, intersect with M horizontal chords; on each
+// chord the triangles' x-intervals union EXACTLY by sort+merge - capturing the spatial overlap the scalar
+// estimators cannot, with NO 1/N quantum in the chord direction (banding only in the perpendicular, M chords).
+// Winding-agnostic (a triangle is opaque regardless of facing). This is the untested non-scalar identity.
+static float ScanlineUnionCov( float3 P, float3 L, float swR, const float* rv, const uint32_t* ri, uint32_t numIdx, int M )
+{
+	const softFrame_t f = SoftShadow_Frame( P, L );
+	const float R = swR, eps = SW_NEAR_EPS;
+	std::vector<std::array<float2, 4>> polys; std::vector<int> pn;
+	const int nT = ( int )( numIdx / 3 );
+	for( int t = 0; t < nT; t++ )
+	{
+		float3 v[3]; float3 rel[3]; float dn[3];
+		for( int j = 0; j < 3; j++ ) { uint32_t gi = ri[t * 3 + j]; v[j] = float3( rv[gi * 3], rv[gi * 3 + 1], rv[gi * 3 + 2] ); rel[j] = v[j] - P; dn[j] = dot( rel[j], f.nrm ); }
+		float2 q[4]; int qn = 0;								// clip edges against dn >= eps, project survivors
+		for( int e = 0; e < 3 && qn < 4; e++ )
+		{
+			const int i = e, jj = ( e + 1 ) % 3;
+			const bool ai = dn[i] >= eps, bi = dn[jj] >= eps;
+			if( ai && qn < 4 ) { q[qn++] = SoftShadow_ProjectVert( rel[i], dn[i], f ); }
+			if( ai != bi && qn < 4 ) { float tt = ( eps - dn[i] ) / ( dn[jj] - dn[i] ); float3 rc = rel[i] + ( rel[jj] - rel[i] ) * tt; q[qn++] = SoftShadow_ProjectVert( rc, eps, f ); }
+		}
+		if( qn < 3 ) { continue; }
+		std::array<float2, 4> a{}; for( int k = 0; k < qn; k++ ) { a[k] = q[k]; }
+		polys.push_back( a ); pn.push_back( qn );
+	}
+	double area = 0.0; const double dy = 2.0 * R / M;
+	std::vector<std::pair<float, float>> iv;
+	for( int m = 0; m < M; m++ )
+	{
+		const float Y = -R + ( ( float )m + 0.5f ) / M * 2.0f * R;
+		const float hc = std::sqrt( std::fmax( 0.0f, R * R - Y * Y ) );
+		if( hc <= 0.0f ) { continue; }
+		iv.clear();
+		for( size_t pi = 0; pi < polys.size(); pi++ )
+		{
+			const std::array<float2, 4>& poly = polys[pi]; const int n = pn[pi];
+			float xlo = 1e30f, xhi = -1e30f; bool any = false;
+			for( int e = 0; e < n; e++ )
+			{
+				const float2 A = poly[e], B = poly[( e + 1 ) % n];
+				if( ( A.y <= Y ) != ( B.y <= Y ) ) { const float tt = ( Y - A.y ) / ( B.y - A.y ); const float x = A.x + ( B.x - A.x ) * tt; xlo = std::fmin( xlo, x ); xhi = std::fmax( xhi, x ); any = true; }
+			}
+			if( any ) { const float aa = std::fmax( xlo, -hc ), bb = std::fmin( xhi, hc ); if( bb > aa ) { iv.push_back( { aa, bb } ); } }
+		}
+		std::sort( iv.begin(), iv.end() );
+		double len = 0.0; float curS = 0, curE = 0; bool have = false;
+		for( const auto& I : iv )
+		{
+			if( !have ) { curS = I.first; curE = I.second; have = true; }
+			else if( I.first <= curE ) { if( I.second > curE ) { curE = I.second; } }
+			else { len += curE - curS; curS = I.first; curE = I.second; }
+		}
+		if( have ) { len += curE - curS; }
+		area += len * dy;
+	}
+	const float c = ( float )( area / ( PI * R * R ) );
+	return c > 1.0f ? 1.0f : c;
+}
 
 // mesh -> per-edge (two adjacent face normals + boundary flag), WELDED by position so T-junction
 // duplicate verts do not masquerade as boundaries. Mirrors BuildCasterEdges in SoftShadowPrimitives_test.
@@ -454,12 +517,14 @@ TEST( SilhouetteImpl, box_matches_union )
 	int nb = 0; for( const RAEdge2& e : edges ) { if( e.boundary ) { nb++; } }
 	const std::vector<float4> cand = ProcRecords( edges );		// validate MY ProcCaster path on a known box
 	const float3 L( 0, 0, 30 ); const float R = 5;
-	float maxErr = 0, maxProcErr = 0;
+	float maxErr = 0, maxProcErr = 0, maxScanErr = 0;
 	for( float x = 0; x <= 8.0f; x += 1.0f )
 	{
 		float3 P( x, 0, -10 );
 		float uni = 1.f - MeshTruthShadowSoup( V.data(), I.data(), ( uint32_t )I.size(), P, L, R, 128 );
 		float sil = SilhouetteCov( edges, P, L, R );
+		float scan = ScanlineUnionCov( P, L, R, V.data(), I.data(), ( uint32_t )I.size(), 64 );
+		maxScanErr = std::fmax( maxScanErr, std::fabs( scan - uni ) );
 		bool blocks = RayHitsMesh( P, L - P, V.data(), I.data(), ( uint32_t )I.size() );
 		int nsil = 0; for( const RAEdge2& e : edges ) { bool fa = dot( e.nA, P - e.a ) > 0.f; bool fb = dot( e.nB, P - e.a ) > 0.f; if( e.boundary || ( fa != fb ) ) { nsil++; } }
 		float proc = SoftShadow_ProcCaster( P, L, R, blocks, 0, ( int )edges.size(), SoftEdgeBuffer{ cand.data(), ( int )cand.size() } );
@@ -467,9 +532,10 @@ TEST( SilhouetteImpl, box_matches_union )
 		maxErr = std::fmax( maxErr, std::fabs( sil - uni ) );
 		maxProcErr = std::fmax( maxProcErr, std::fabs( proc - uni ) );
 	}
-	std::printf( "    [silbox] boundary edges=%d (want 0), sil maxErr=%.3f, MY-PATH ProcCaster maxErr=%.3f (want <0.06)\n", nb, maxErr, maxProcErr );
+	std::printf( "    [silbox] boundary edges=%d (want 0), sil maxErr=%.3f, MY-PATH ProcCaster maxErr=%.3f, SCANLINE maxErr=%.3f (want <0.06)\n", nb, maxErr, maxProcErr, maxScanErr );
 	CHECK( nb == 0 );
 	CHECK( maxProcErr < 0.06f );		// if MY BuildEdgesRaw->ProcRecords->ProcCaster path is correct, this matches
+	CHECK( maxScanErr < 0.06f );		// scanline Fubini union must match the ray union on a closed box
 }
 
 // THE DEFINITIVE open-geometry test: feed the SHIPPED SoftShadow_ProcCaster (validated 0.001 on a box,
@@ -600,8 +666,9 @@ STUDY_TEST( SoftShadowIndepProduct, quantify )
 	}
 
 	const int NB = 10;
-	double bUni[NB] = {}, bInd[NB] = {}, bSum[NB] = {}, bIndAbs[NB] = {}, bSumAbs[NB] = {}, bCorAbs[NB] = {}, bMaxAbs[NB] = {}, bMax[NB] = {}; long bN[NB] = {};
-	long nPen = 0, indNear = 0, sumNear = 0, corNear = 0, maxNear = 0, brOK = 0, brInd = 0; int usedC = 0;
+	double bUni[NB] = {}, bInd[NB] = {}, bSum[NB] = {}, bIndAbs[NB] = {}, bSumAbs[NB] = {}, bCorAbs[NB] = {}, bMaxAbs[NB] = {}, bMax[NB] = {}, bScan[NB] = {}, bScanAbs[NB] = {}; long bN[NB] = {};
+	long nPen = 0, indNear = 0, sumNear = 0, corNear = 0, maxNear = 0, scanNear = 0, brOK = 0, brInd = 0; int usedC = 0;
+	const int SCANM = getenv( "UG_M2" ) ? atoi( getenv( "UG_M2" ) ) : 24;		// scanline chord count (perpendicular resolution)
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
 		const softcapCaster_t& cs = cap.casters[c];
@@ -649,14 +716,16 @@ STUDY_TEST( SoftShadowIndepProduct, quantify )
 			double logLitDO = 0.0;						// DEPTH-ORDERED: product ACROSS surfaces of (1 - clusterSum)
 			for( const auto& kv : clu ) { double cs2 = kv.second; if( cs2 > 1.0 - 1e-4 ) { cs2 = 1.0 - 1e-4; } if( cs2 < 0.0 ) { cs2 = 0.0; } logLitDO += std::log( 1.0 - cs2 ); }
 			const float corr = ( float )( 1.0 - std::exp( logLitDO ) );		// depth-ordered (sum-within / product-across)
+			const float scan = ScanlineUnionCov( P, L, swR, rv, ri, cs.numIndex, SCANM );	// FUBINI: exact 1D union per chord
 			int bi = ( int )( uni * NB ); if( bi < 0 ) { bi = 0; } if( bi >= NB ) { bi = NB - 1; }
-			bUni[bi] += uni; bInd[bi] += indep; bSum[bi] += sumC; bMax[bi] += maxSolo;
-			bIndAbs[bi] += std::fabs( indep - uni ); bSumAbs[bi] += std::fabs( sumC - uni ); bCorAbs[bi] += std::fabs( corr - uni ); bMaxAbs[bi] += std::fabs( maxSolo - uni );
+			bUni[bi] += uni; bInd[bi] += indep; bSum[bi] += sumC; bMax[bi] += maxSolo; bScan[bi] += scan;
+			bIndAbs[bi] += std::fabs( indep - uni ); bSumAbs[bi] += std::fabs( sumC - uni ); bCorAbs[bi] += std::fabs( corr - uni ); bMaxAbs[bi] += std::fabs( maxSolo - uni ); bScanAbs[bi] += std::fabs( scan - uni );
 			bN[bi]++; nPen++;
 			if( std::fabs( indep - uni ) <= 0.06f ) { indNear++; }
 			if( std::fabs( sumC - uni ) <= 0.06f ) { sumNear++; }
 			if( std::fabs( corr - uni ) <= 0.06f ) { corNear++; }
 			if( std::fabs( maxSolo - uni ) <= 0.06f ) { maxNear++; }
+			if( std::fabs( scan - uni ) <= 0.06f ) { scanNear++; }
 			if( maxSolo <= uni + 1e-3f && uni <= sumC + 1e-3f ) { brOK++; }		// bracket holds
 			if( indep >= maxSolo - 1e-3f && indep <= sumC + 1e-3f ) { brInd++; }	// indep between the brackets
 		}
@@ -664,14 +733,14 @@ STUDY_TEST( SoftShadowIndepProduct, quantify )
 	}
 	if( nPen == 0 ) { std::printf( "    [indep] no shadowing samples\n" ); CHECK( true ); return; }
 	std::printf( "    [indep] %s | casters %d, samples %ld, N=%d, BETA=%.2f\n", path, usedC, nPen, N, BETA );
-	std::printf( "    [indep] |gap|<=0.06:  MAXSOLO %.1f%%  INDEP %.1f%%  SUM %.1f%%  DEPTH-ORD %.1f%%   | bracket maxSolo<=union<=sum holds %.1f%%, indep-in-bracket %.1f%%\n",
-				 100.0 * maxNear / nPen, 100.0 * indNear / nPen, 100.0 * sumNear / nPen, 100.0 * corNear / nPen, 100.0 * brOK / nPen, 100.0 * brInd / nPen );
-	std::printf( "    [indep] union bin -> n | union | maxSolo(|gap|) | indep(|gap|) | sum(|gap|) | depthOrd(|gap|)\n" );
+	std::printf( "    [indep] |gap|<=0.06:  SCAN(M=%d) %.1f%%  MAXSOLO %.1f%%  INDEP %.1f%%  SUM %.1f%%  DEPTH-ORD %.1f%%   | bracket maxSolo<=union<=sum holds %.1f%%, indep-in-bracket %.1f%%\n",
+				 SCANM, 100.0 * scanNear / nPen, 100.0 * maxNear / nPen, 100.0 * indNear / nPen, 100.0 * sumNear / nPen, 100.0 * corNear / nPen, 100.0 * brOK / nPen, 100.0 * brInd / nPen );
+	std::printf( "    [indep] union bin -> n | union | SCAN(|gap|) | maxSolo(|gap|) | indep(|gap|) | sum(|gap|) | depthOrd(|gap|)\n" );
 	for( int b = 0; b < NB; b++ )
 	{
 		if( bN[b] == 0 ) { continue; }
-		std::printf( "      occ [%.1f,%.1f)  n%6ld  union %.3f  max %.3f (%.4f)  indep %.3f (%.4f)  sum %.3f (%.4f)  depthOrd(%.4f)\n",
-					 b * 0.1, b * 0.1 + 0.1, bN[b], bUni[b] / bN[b], bMax[b] / bN[b], bMaxAbs[b] / bN[b], bInd[b] / bN[b], bIndAbs[b] / bN[b], bSum[b] / bN[b], bSumAbs[b] / bN[b], bCorAbs[b] / bN[b] );
+		std::printf( "      occ [%.1f,%.1f)  n%6ld  union %.3f  scan %.3f (%.4f)  max %.3f (%.4f)  indep %.3f (%.4f)  sum %.3f (%.4f)  depthOrd(%.4f)\n",
+					 b * 0.1, b * 0.1 + 0.1, bN[b], bUni[b] / bN[b], bScan[b] / bN[b], bScanAbs[b] / bN[b], bMax[b] / bN[b], bMaxAbs[b] / bN[b], bInd[b] / bN[b], bIndAbs[b] / bN[b], bSum[b] / bN[b], bSumAbs[b] / bN[b], bCorAbs[b] / bN[b] );
 	}
 	CHECK( true );
 }
