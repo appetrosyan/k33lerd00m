@@ -38,6 +38,7 @@ struct SoftTermCB
 	float	surfParams[4];	// surface-fold cache: texel G, viz mode, unused, unused
 	int		surfA[4];		// surface-fold cache: table cap (slots), queue cap (uints), static caster count, light key
 	float	aa[4];			// x = r_softShadowAA per-sample analytic-AA half-width (0 = off); y/z/w unused
+	int		surfCost[4];	// x = surf-cache cost gate (r_softShadowSurfCacheMinCost): min tile occluders to cache
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -436,7 +437,15 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// surface-fold cache probe (r_softShadowSurfCache): the SW_SURF_CACHE permutation is selected only
 	// when the probe is active AND the counting permutation is not (counters = measurement mode, wins).
 	// surfA[0] <= 0 keeps the cache block dead even on the surf pipeline (light with no static prefix).
-	const bool surf = ( surfCache != NULL ) && surfCache->IsActive() && m_PipelineSurf != nullptr && !m_WalkCntEnabled;
+	// PER-LIGHT pipeline selection (r_softShadowSurfCacheMinLight): the surf permutation carries a fixed
+	// ~0.8ms/frame occupancy tax (extra UAV/SRV bindings lower the wave count) that caching only recoups on
+	// EXPENSIVE lights. A cheap light gains nothing from the cache but still pays the tax, so route it to the
+	// shipped (cheap) pipeline instead - we don't pay the permutation cost where it can't be recouped. Gate on
+	// the light's STATIC caster count (what the cache removes). 0 = off (every warmed light uses surf).
+	extern idCVar r_softShadowSurfCacheMinLight;
+	const int swLightStatic = ( vLight != NULL ) ? vLight->softStaticCasterCount : 0;
+	const bool surf = ( surfCache != NULL ) && surfCache->IsActive() && m_PipelineSurf != nullptr && !m_WalkCntEnabled
+					  && swLightStatic >= r_softShadowSurfCacheMinLight.GetInteger();
 	// FUBINI SCANLINE (r_softShadowScanline): replaces the sampled walk with the interval bit-grid. Loses to
 	// the counting (measurement) and surf-cache permutations; A/B lever against the shipped 16-sample path.
 	extern idCVar r_softShadowScanline;
@@ -454,6 +463,9 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	extern idCVar r_softShadowSamples;
 	cb.aa[0] = ( float )r_softShadowSamples.GetInteger();	// disk ray count (0 = off, 16 = shipped, else runtime-N)
 	cb.aa[1] = cb.aa[2] = cb.aa[3] = 0.0f;
+	extern idCVar r_softShadowSurfCacheMinCost;
+	cb.surfCost[0] = r_softShadowSurfCacheMinCost.GetInteger();	// cost gate: min tile occluders to engage the cache
+	cb.surfCost[1] = cb.surfCost[2] = cb.surfCost[3] = 0;
 	cb.surfA[0] = 0;
 	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
 	if( surf )

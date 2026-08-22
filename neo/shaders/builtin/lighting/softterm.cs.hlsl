@@ -108,6 +108,9 @@ cbuffer c_Term : register( b0 )
 								//   there), w = light key (13 bits). x <= 0 = cache disabled for this light.
 	float4	g_aa;				// x = r_softShadowSamples: disk ray count. 0 = soft coverage off (term 1.0),
 								//   16 = shipped tile-bin walk, else runtime-N walk. y/z/w unused.
+	int4	g_surfCost;			// x = surf-cache COST GATE (r_softShadowSurfCacheMinCost): tiles with fewer
+								//   than x occluders bypass the cache entirely (no probe, no build request) -
+								//   we only pay the lookup where the walk is dear enough to beat it. 0 = gate off.
 };
 // *INDENT-ON*
 
@@ -269,7 +272,24 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// InterlockedAdd on a single global word serialised the whole term at low hit rate.
 #define SW_SURF_STAT( idx ) SwSurfStat( idx )
 	int swVizClass = 1;		// r_softShadowSurfCacheViz 4: path class for the fall-through write (1 miss / 2 walk-always / 3 anchor-reject)
-	if( g_surfA.x > 0 && g_surfA.z > 0 && swPos.w != 0.0f )
+	// COST GATE (attack 1+2, r_softShadowSurfCacheMinCost -> g_surfCost.x): the whole cache machinery (probe,
+	// slot claim, build request, hit) only earns its keep on EXPENSIVE tiles - a hit still walks the residual
+	// + dynamic, so on a cheap tile the lookup + fall-through costs MORE than just walking. Read this tile's
+	// occluder count (the same t_SoftTiles slot the walk uses) and, below the threshold, skip the cache
+	// outright: no probe (kills the 86%-overflow waste), no slot claim -> the build budget spends only on the
+	// costly tiles. A spilled tile is by definition expensive, so it always caches. 0 = gate off (cache all).
+	bool swCostWorth = true;
+	if( g_surfCost.x > 0 && g_range.z >= 0 )
+	{
+		const int swCgTx = px.x / SW_TILE_SIZE - g_tile.x;
+		const int swCgTy = px.y / SW_TILE_SIZE - g_tile.y;
+		if( swCgTx >= 0 && swCgTy >= 0 && swCgTx < g_range.w )
+		{
+			const uint swCgCnt = t_SoftTiles[ g_range.z + ( swCgTy * g_range.w + swCgTx ) * ( g_flags.w + 1 ) ];
+			swCostWorth = ( swCgCnt == SW_TILE_SPILL ) || ( swCgCnt >= ( uint )g_surfCost.x && swCgCnt < SW_TILE_SPILL );
+		}
+	}
+	if( g_surfA.x > 0 && g_surfA.z > 0 && swPos.w != 0.0f && swCostWorth )
 	{
 		const float3 swN2 = t_WorldNormal.Load( int3( px, 0 ) ).xyz;
 		const float3 an = abs( swN2 );
