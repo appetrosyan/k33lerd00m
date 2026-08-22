@@ -565,3 +565,113 @@ STUDY_TEST( SoftShadowProcVsUnion, quantify )
 	}
 	CHECK( true );
 }
+
+// PROTOTYPE the union-algebra identities (plan noble-sniffing-rose). Per receiver sample on real casters,
+// compare candidate estimators to the ray UNION across the penumbra:
+//   union      = ray oracle (truth)
+//   sumClamped = saturate(Sum solo)                    (inclusion-exclusion 1st term; OVERcounts overlap)
+//   indep      = 1 - PROD(1 - solo) = 1 - exp(Sum log(1-solo))   (independence; bounded, saturates to umbra)
+//   maxSolo    = max solo                              (lower bracket: maxSolo <= union <= sumClamped)
+//   corr       = lerp(indep, sumClamped, BETA)         (does one global knob close the tiling undercount?)
+// Winding-agnostic (SurfBuild_SoloCovExact uses |area|), banding-free (continuous solo). Env UG_BETA (0..1).
+STUDY_TEST( SoftShadowIndepProduct, quantify )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL ) { std::printf( "    [indep] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [indep] cannot load %s\n", path ); CHECK( false ); return; }
+	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
+	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
+	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 60 ), MAXC = envI( "UG_CASTERS", 200 ), MAXTRI = envI( "UG_MAXTRI", 1500 );
+	const float BETA = envF( "UG_BETA", 0.5f );
+
+	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
+	for( const softcapReceiver_t& r : cap.receivers )
+	{
+		if( r.lightIndex >= cap.lights.size() ) { continue; }
+		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
+		{
+			const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0], i1 = cap.recvIdx[r.firstIndex + t * 3 + 1], i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+			float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+			float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+			float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
+			lightRecv[r.lightIndex].push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+		}
+	}
+
+	const int NB = 10;
+	double bUni[NB] = {}, bInd[NB] = {}, bSum[NB] = {}, bIndAbs[NB] = {}, bSumAbs[NB] = {}, bCorAbs[NB] = {}, bMaxAbs[NB] = {}, bMax[NB] = {}; long bN[NB] = {};
+	long nPen = 0, indNear = 0, sumNear = 0, corNear = 0, maxNear = 0, brOK = 0, brInd = 0; int usedC = 0;
+	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
+	{
+		const softcapCaster_t& cs = cap.casters[c];
+		const int nT = ( int )( cs.numIndex / 3 );
+		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
+		const std::vector<float3>& recv = lightRecv[cs.lightIndex];
+		if( recv.empty() ) { continue; }
+		const float3 L( cap.lights[cs.lightIndex].origin[0], cap.lights[cs.lightIndex].origin[1], cap.lights[cs.lightIndex].origin[2] );
+		const float  swR = std::fmax( cap.lights[cs.lightIndex].penumbraSize, 1e-2f );
+		const float  swR2 = swR * swR;
+		const float* rv = cap.meshVerts.data();
+		const uint32_t* ri = &cap.meshIdx[cs.firstIndex];
+		const size_t stride = std::max( ( size_t )1, recv.size() / ( size_t )SAMP );
+		bool anyPen = false;
+		for( size_t s = 0; s < recv.size(); s += stride )
+		{
+			const float3 P = recv[s];
+			const float uni = 1.0f - MeshTruthShadowSoup( rv, ri, cs.numIndex, P, L, swR, N );
+			if( uni < 0.002f ) { continue; }
+			anyPen = true;
+			const softFrame_t f = SoftShadow_Frame( P, L );
+			float rawSum = 0.0f, logLit = 0.0f, maxSolo = 0.0f;
+			std::unordered_map<uint64_t, double> clu;		// DEPTH-ORDERED: sum solo WITHIN a coplanar surface
+			for( int t = 0; t < nT; t++ )
+			{
+				const uint32_t a = cap.meshIdx[cs.firstIndex + t * 3 + 0], b = cap.meshIdx[cs.firstIndex + t * 3 + 1], d = cap.meshIdx[cs.firstIndex + t * 3 + 2];
+				float3 v0( rv[a * 3], rv[a * 3 + 1], rv[a * 3 + 2] ), v1( rv[b * 3], rv[b * 3 + 1], rv[b * 3 + 2] ), v2( rv[d * 3], rv[d * 3 + 1], rv[d * 3 + 2] );
+				const float solo = SurfBuild_SoloCovExact( P, v0, v1, v2, f, swR2 );
+				rawSum += solo;
+				const float sc = solo > ( 1.0f - 1e-4f ) ? ( 1.0f - 1e-4f ) : ( solo < 0.0f ? 0.0f : solo );
+				logLit += std::log( 1.0f - sc );
+				if( solo > maxSolo ) { maxSolo = solo; }
+				// plane key: UNORIENTED plane (canonical normal sign) + offset, so a wall's coplanar triangles
+				// (and its front/back if two-sided) land in ONE cluster; different surfaces are separate clusters.
+				float3 gn = cross( v1 - v0, v2 - v0 ); float gl = std::sqrt( dot( gn, gn ) );
+				if( gl > 1e-9f ) { gn = gn * ( 1.0f / gl ); }
+				if( gn.x < 0.0f || ( gn.x == 0.0f && ( gn.y < 0.0f || ( gn.y == 0.0f && gn.z < 0.0f ) ) ) ) { gn = gn * -1.0f; }
+				int nx = ( int )std::lround( gn.x * 64.0f ) + 128, ny = ( int )std::lround( gn.y * 64.0f ) + 128, nz = ( int )std::lround( gn.z * 64.0f ) + 128;
+				int of = ( int )std::lround( dot( gn, v0 ) ); if( of < -8191 ) { of = -8191; } if( of > 8191 ) { of = 8191; }
+				uint64_t pk = ( ( uint64_t )( uint32_t )nx ) | ( ( uint64_t )( uint32_t )ny << 9 ) | ( ( uint64_t )( uint32_t )nz << 18 ) | ( ( uint64_t )( uint32_t )( of + 8192 ) << 27 );
+				clu[pk] += solo;
+			}
+			const float sumC = rawSum > 1.0f ? 1.0f : rawSum;
+			const float indep = 1.0f - std::exp( logLit );
+			double logLitDO = 0.0;						// DEPTH-ORDERED: product ACROSS surfaces of (1 - clusterSum)
+			for( const auto& kv : clu ) { double cs2 = kv.second; if( cs2 > 1.0 - 1e-4 ) { cs2 = 1.0 - 1e-4; } if( cs2 < 0.0 ) { cs2 = 0.0; } logLitDO += std::log( 1.0 - cs2 ); }
+			const float corr = ( float )( 1.0 - std::exp( logLitDO ) );		// depth-ordered (sum-within / product-across)
+			int bi = ( int )( uni * NB ); if( bi < 0 ) { bi = 0; } if( bi >= NB ) { bi = NB - 1; }
+			bUni[bi] += uni; bInd[bi] += indep; bSum[bi] += sumC; bMax[bi] += maxSolo;
+			bIndAbs[bi] += std::fabs( indep - uni ); bSumAbs[bi] += std::fabs( sumC - uni ); bCorAbs[bi] += std::fabs( corr - uni ); bMaxAbs[bi] += std::fabs( maxSolo - uni );
+			bN[bi]++; nPen++;
+			if( std::fabs( indep - uni ) <= 0.06f ) { indNear++; }
+			if( std::fabs( sumC - uni ) <= 0.06f ) { sumNear++; }
+			if( std::fabs( corr - uni ) <= 0.06f ) { corNear++; }
+			if( std::fabs( maxSolo - uni ) <= 0.06f ) { maxNear++; }
+			if( maxSolo <= uni + 1e-3f && uni <= sumC + 1e-3f ) { brOK++; }		// bracket holds
+			if( indep >= maxSolo - 1e-3f && indep <= sumC + 1e-3f ) { brInd++; }	// indep between the brackets
+		}
+		if( anyPen ) { usedC++; }
+	}
+	if( nPen == 0 ) { std::printf( "    [indep] no shadowing samples\n" ); CHECK( true ); return; }
+	std::printf( "    [indep] %s | casters %d, samples %ld, N=%d, BETA=%.2f\n", path, usedC, nPen, N, BETA );
+	std::printf( "    [indep] |gap|<=0.06:  MAXSOLO %.1f%%  INDEP %.1f%%  SUM %.1f%%  DEPTH-ORD %.1f%%   | bracket maxSolo<=union<=sum holds %.1f%%, indep-in-bracket %.1f%%\n",
+				 100.0 * maxNear / nPen, 100.0 * indNear / nPen, 100.0 * sumNear / nPen, 100.0 * corNear / nPen, 100.0 * brOK / nPen, 100.0 * brInd / nPen );
+	std::printf( "    [indep] union bin -> n | union | maxSolo(|gap|) | indep(|gap|) | sum(|gap|) | depthOrd(|gap|)\n" );
+	for( int b = 0; b < NB; b++ )
+	{
+		if( bN[b] == 0 ) { continue; }
+		std::printf( "      occ [%.1f,%.1f)  n%6ld  union %.3f  max %.3f (%.4f)  indep %.3f (%.4f)  sum %.3f (%.4f)  depthOrd(%.4f)\n",
+					 b * 0.1, b * 0.1 + 0.1, bN[b], bUni[b] / bN[b], bMax[b] / bN[b], bMaxAbs[b] / bN[b], bInd[b] / bN[b], bIndAbs[b] / bN[b], bSum[b] / bN[b], bSumAbs[b] / bN[b], bCorAbs[b] / bN[b] );
+	}
+	CHECK( true );
+}
