@@ -95,6 +95,19 @@ bool R_SoftCacheHudStats( uint32_t out[4] )
 	return true;
 }
 
+// blocking one-shot: split the surf-cache miss% by cause (0 stale-gen, 1 requested-unbuilt, 2 empty-slot,
+// 3 probe-overflow). For the frame-probe summary diagnostic only (waitForIdle). False if the cache is off.
+bool R_SoftCacheMissReasons( uint32_t out[4] )
+{
+	extern idCVar r_softShadowSurfCache;
+	SoftShadowSurfCache* sc = backEnd.GetSoftShadowSurfCache();
+	if( sc == NULL || !sc->IsActive() || !r_softShadowSurfCache.GetBool() )
+	{
+		return false;
+	}
+	return sc->GetMissReasons( out );
+}
+
 idCVar r_drawEyeColor( "r_drawEyeColor", "0", CVAR_RENDERER | CVAR_BOOL, "Draw a colored box, red = left eye, blue = right eye, grey = non-stereo" );
 idCVar r_motionBlur( "r_motionBlur", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "1 - 5, log2 of the number of motion blur samples" );
 idCVar r_forceZPassStencilShadows( "r_forceZPassStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL, "force Z-pass rendering for performance testing" );

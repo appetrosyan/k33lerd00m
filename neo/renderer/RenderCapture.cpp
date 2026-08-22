@@ -1828,6 +1828,7 @@ int R_SoftShadowGate( const char* arg )
 		"r_skipAmbient", "r_skipShadows", "r_shadowPenumbraSize", "r_rtShadowSoftRadius", "r_rtShadowRays",
 		"r_rtShadowDenoise", "r_rtShadowAnalyticPenumbra", "r_rtShadowBias",
 		"r_useMaskedOcclusionCulling", "r_useDDGI",
+		"r_softShadowCompute", "r_softShadowFaceCoverage", "r_softShadowSurfCache",
 	};
 	const int nTouched = ( int )( sizeof( touched ) / sizeof( touched[0] ) );
 	idStrList prev;
@@ -1846,6 +1847,19 @@ int R_SoftShadowGate( const char* arg )
 	// churn hammers). The RT shadow ORACLE owns its own DdgiAccelStructures instance and is
 	// unaffected. Pure waste removal + corruption-surface removal; restored after the run.
 	cvarSystem->SetCVarInteger( "r_useDDGI", 0 );
+
+	// SURF-FOLD CACHE: force ON for the whole DEFECT gate so the cache is TESTED, not opt-in - a cache
+	// that erodes umbra (or introduces any turd/ant/step/extent defect) is now a GATE defect vs the RT
+	// oracle, not a silent green. The cache lives in the compute term path (r_softShadowCompute 1) on the
+	// face-coverage walk (r_softShadowFaceCoverage 1); each probe light is warmed through the shipped
+	// WarmLight driver just before its analytic still, so anaA IS the cached frame the detectors score.
+	// The cache-OFF exact walk is still rendered per light (the R4 seam probe) and compared. Restored
+	// after the run via the `touched` list.
+	extern idCVar com_softShadowGateSurfCache;
+	const int swGateCache = com_softShadowGateSurfCache.GetInteger();
+	cvarSystem->SetCVarInteger( "r_softShadowCompute", 1 );
+	cvarSystem->SetCVarInteger( "r_softShadowFaceCoverage", 1 );
+	cvarSystem->SetCVarInteger( "r_softShadowSurfCache", swGateCache );
 
 	GateCfg cfg;
 	std::vector<GateDefect> all;
@@ -2134,27 +2148,28 @@ int R_SoftShadowGate( const char* arg )
 			cvarSystem->SetCVarInteger( "r_useSoftShadowVolumes", 1 );
 			cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 8 );
 
-			// surface-fold cache: WARM the cache before the probe stills, so the probes measure the
-			// steady state (SEAM = spatial texel-border disagreement; TEMPORAL = genuine per-frame
-			// instability) instead of the miss->built transition. Each gate light is a fresh
-			// fingerprint (recycled index, new content) => full reseed + table sweep; the sweep takes
-			// tableCap/prewarmBudget frames at the prewarm rate, +2 slack for the seed/restart lag.
-			if( cvarSystem->GetCVarInteger( "r_softShadowSurfCache" ) != 0 )
+			// SURF-FOLD CACHE: warm this light so the analytic stills below render the CACHED term and the
+			// defect probes score the cache (steady state, not the miss->built transition) against the RT
+			// oracle. The cache is forced ON for the whole defect gate (see the run-level force above).
 			{
-				const int swWarmCap = cvarSystem->GetCVarInteger( "r_softShadowSurfCacheCap" );
-				const int swWarmBud = Max( 4096, cvarSystem->GetCVarInteger( "r_softShadowSurfCachePrewarmBudget" ) );
-				const int swWarmFrames = 2 * ( swWarmCap / swWarmBud ) + 8;	// 2x + slack: the sweep must FINISH every run
-				// FORCE headroom for the warm loop: the build frames themselves blow any realistic
-				// frame budget, which would throttle the sweep mid-warm - and a partially-swept cache
-				// makes the gate's warm population (and so its defect counts) run-dependent (measured:
-				// 454 vs 225 on identical runs before this)
-				const int swPrevGpuBudget = cvarSystem->GetCVarInteger( "r_softShadowSurfCacheGpuBudgetUs" );
-				cvarSystem->SetCVarInteger( "r_softShadowSurfCacheGpuBudgetUs", 999999 );
-				for( int wf = 0; wf < swWarmFrames; wf++ )
+				SoftShadowSurfCache* swSurf = backEnd.GetSoftShadowSurfCache();
+				idRenderWorldLocal* rwlWarm = static_cast<idRenderWorldLocal*>( rw );
+				if( cvarSystem->GetCVarInteger( "r_softShadowSurfCache" ) != 0 && swSurf != NULL
+						&& lh >= 0 && lh < rwlWarm->lightDefs.Num() && rwlWarm->lightDefs[lh] != NULL )
 				{
-					GateRenderFrame( rw, &rv );
+					// warm THIS light through the SHIPPED WarmLight driver: one command-list submit +
+					// waitForIdle, watchdog-safe, exactly like WarmMapBurst does per light. The runtime is
+					// read-only now (the old per-frame GateRenderFrame build loop is DEAD - the cache builds
+					// ONLY here), so the warm must be explicit. A fresh gate light is a new fingerprint =>
+					// full reseed + build-to-completion inside WarmLight.
+					nvrhi::IDevice* wdev = deviceManager->GetDevice();
+					nvrhi::CommandListHandle wcl = wdev->createCommandList();
+					wcl->open();
+					swSurf->WarmLight( wcl, rwlWarm->lightDefs[lh] );
+					wcl->close();
+					wdev->executeCommandList( wcl );
+					wdev->waitForIdle();
 				}
-				cvarSystem->SetCVarInteger( "r_softShadowSurfCacheGpuBudgetUs", swPrevGpuBudget );
 			}
 			// ALWAYS retain this render's edge records (the exact caster triangles the shader consumed)
 			// via the capture hook - the defect arbiter float64-traces against them. Diagnostic mode

@@ -1322,7 +1322,8 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 // SoftShadow_FaceCoverageList / SoftShadow_FaceCoverage in their SHIPPED config (in-loop dirs, fp16
 // MT) - duplication is house style here (the two sibling walks already duplicate; tests hold them).
 SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float swR, int swTriBase,
-		int swResBase, int swResCount, int swCasterBase, int swDynFirst, int swCasterCount, float swRotAng )
+		int swResBase, int swResCount, int swCasterBase, int swDynFirst, int swCasterCount,
+		int swListBase, int swListCount, int swDynFirstTri, float swRotAng )
 {
 	swR = max( swR, 1e-2f );
 	softFrame_t swF = SoftShadow_Frame( swP, swL );
@@ -1460,8 +1461,75 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 #endif	// SW_FP16_LOOP
 		if( swMask == swAll ) { break; }
 	}
-	// ---- dynamic casters: the table suffix, sphere cull + contiguous tri spans (FaceCoverage's body) ----
-	if( swMask != swAll )
+	// ---- dynamic casters ----
+	// TILED (swListCount >= 0): walk THIS fragment's tile list, DYNAMIC tris only (se >= swDynFirstTri;
+	// static tris are folded into F or sit in the residual pool, handled above). Measured 2026-08-22: the
+	// old untiled all-caster loop (the else branch) cost a cache HIT more than a tiled MISS when dynamic
+	// casters are many (the RoE intro cinematic) - it re-walked the whole dynamic suffix per fragment.
+	// Fallback (swListCount < 0: spill/corrupt/untiled tile) keeps the exact all-caster walk.
+	if( swMask != swAll && swListCount >= 0 )
+	{
+		for( int ld = 0; ld < swListCount; ld++ )
+		{
+			const int se = ( int )t_SoftTiles[ swListBase + ld ];
+			if( se < swDynFirstTri ) { continue; }			// static tri: in F or the residual pool, not here
+			const int bb = swTriBase + se * 3;
+			float4 r0 = t_SoftEdges[ bb + 0 ];
+			{
+				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
+				float  cd0 = dot( rc0, swF.nrm );
+				float  vr0 = r0.w;
+				if( cd0 + vr0 < swEps ) { continue; }
+				if( cd0 - vr0 > swDistPL ) { continue; }
+				float3 pp0 = rc0 - cd0 * swF.nrm;
+				float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
+				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+			}
+			float4 r1 = t_SoftEdges[ bb + 1 ];
+			float4 r2 = t_SoftEdges[ bb + 2 ];
+			float3 v0 = float3( r0.x, r0.y, r0.z );
+			float3 v1 = float3( r1.x, r1.y, r1.z );
+			float3 v2 = float3( r2.x, r2.y, r2.z );
+			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+			float3 rc   = tcen - swP;
+			float  cd   = dot( rc, swF.nrm );
+			float  triRad = r1.w;
+			if( cd + triRad < swEps ) { continue; }
+			if( cd - triRad > swDistPL ) { continue; }
+			float3 perp = rc - cd * swF.nrm;
+			float  coneR = swR * ( cd + triRad ) / swDistPL;
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+			float3 edge1 = v1 - v0;
+			float3 edge2 = v2 - v0;
+			float3 sp = swP - v0;
+			float3 qq   = cross( sp, edge1 );
+			float  e2qq = dot( edge2, qq );
+#if SW_FP16_LOOP
+			swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+												 swBase, swU2, swV2, swMD, swKD, swDisk );
+#else
+			for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+			{
+				if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+				float2 s0  = swDisk[i];
+				float2 sc  = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+				float3 dir = swBase + swSu * sc.x + swSv * sc.y;
+				float3 h   = cross( dir, edge2 );
+				float  aa  = dot( edge1, h );
+				if( abs( aa ) < 1e-12f ) { continue; }
+				float  inv = 1.0f / aa;
+				float  u   = inv * dot( sp, h );
+				if( u < 0.0f || u > 1.0f ) { continue; }
+				float  vv  = inv * dot( dir, qq );
+				if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+				float  tt  = inv * e2qq;
+				if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+			}
+#endif	// SW_FP16_LOOP
+			if( swMask == swAll ) { break; }
+		}
+	}
+	else if( swMask != swAll )
 	{
 		for( int scc = swDynFirst; scc < swCasterCount; scc++ )
 		{

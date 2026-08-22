@@ -77,6 +77,13 @@ public:
 	// 3 anchor-reject) - LAST rendered frame's sample (EndBuilds clears them each frame).
 	// Bench/diagnostic only (waitForIdle).
 	bool GetStats( uint32_t out[4] );
+	// blocking readback of the 4 MISS sub-reason counters (0 stale-gen, 1 requested-unbuilt, 2 empty-slot,
+	// 3 probe-overflow) - splits WHERE the miss% comes from. Diagnostic (waitForIdle).
+	bool GetMissReasons( uint32_t out[4] );
+	// MEASUREMENT one-shot: read the whole warmed table back and print the per-texel saving distribution
+	// (foldedCount histogram, biggest saving + its cell, per-light Sum-folded vs static caster cost).
+	// r_softShadowSurfCacheDump gates the call at the end of WarmMapBurst. Blocking; diagnostic only.
+	void DumpTableHistogram();
 	// NON-BLOCKING per-frame counters for the HUD (com_showFPS): [hit, miss, walkalways, anchor-rej],
 	// read back from a staging ring several frames deep so the GPU is already done - no waitForIdle,
 	// no pipe stall. Plain memory copy; safe to call from the main thread.

@@ -440,6 +440,10 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		// per-light generation: the term CS treats a slot whose stored generation != this as stale and
 		// reclaims it (a set change bumped the generation instead of wiping the whole table)
 		cb.aa[1] = ( vLight->lightDef != NULL ) ? ( float )surfCache->GetLightGeneration( vLight->lightDef->index ) : 0.0f;
+		extern idCVar r_softShadowSurfCacheForceWalk;
+		cb.aa[2] = r_softShadowSurfCacheForceWalk.GetFloat();	// DEBUG probe-tax isolation -> g_aa.z (1 = force-walk, 2 = skip-probe)
+		extern idCVar r_softShadowSurfCacheTileDyn;
+		cb.aa[3] = r_softShadowSurfCacheTileDyn.GetFloat();		// tile the hit-path dynamic walk -> g_aa.w (0 = old untiled)
 	}
 
 	// lit classifier grid (r_softShadowClassify): built at flatten into the joint buffer. base < 0 = none.

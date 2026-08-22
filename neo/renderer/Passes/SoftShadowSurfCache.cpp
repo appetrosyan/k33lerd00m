@@ -15,6 +15,7 @@ the Free Software Foundation, either version 3 of the License, or
 */
 
 #include "precompiled.h"
+#include <algorithm>	// std::sort in DumpTableHistogram
 #pragma hdrstop
 
 #include "renderer/RenderCommon.h"
@@ -162,7 +163,7 @@ bool SoftShadowSurfCache::EnsureResources()
 		bd.initialState = nvrhi::ResourceStates::UnorderedAccess;
 		bd.keepInitialState = true;
 
-		bd.byteSize = ( ( uint64_t )m_TableCap * 8 + 4 ) * sizeof( uint32_t );	// +4: per-frame path counters
+		bd.byteSize = ( ( uint64_t )m_TableCap * 8 + 8 ) * sizeof( uint32_t );	// +8: 4 path counters + 4 miss sub-reason counters
 		bd.debugName = "SoftShadowSurfCache/Table";
 		m_Table = m_Device->createBuffer( bd );
 
@@ -492,6 +493,164 @@ bool SoftShadowSurfCache::GetStats( uint32_t out[4] )
 	return true;
 }
 
+// blocking readback of the 4 MISS sub-reason counters (0 stale-gen, 1 requested-unbuilt, 2 empty-slot,
+// 3 probe-overflow) that ride the 4 words after the class counters (base = tableCap*8 + 4). Diagnostic:
+// splits WHERE the miss% comes from - a warm/key defect (empty/overflow) vs a build-budget lag (requested)
+// vs invalidation churn (stale-gen). LAST rendered frame's sample.
+bool SoftShadowSurfCache::GetMissReasons( uint32_t out[4] )
+{
+	if( m_Table == nullptr || m_TableCap <= 0 )
+	{
+		return false;
+	}
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = 4 * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowSurfCache/MissReasonReadback";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_Table, ( uint64_t )( m_TableCap * 8 + 4 ) * sizeof( uint32_t ), 4 * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	void* p = m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( p == nullptr )
+	{
+		return false;
+	}
+	memcpy( out, p, 4 * sizeof( uint32_t ) );
+	m_Device->unmapBuffer( staging );
+	return true;
+}
+
+// MEASUREMENT one-shot (r_softShadowSurfCacheDump, called at the end of WarmMapBurst): read the whole
+// warmed table back to the CPU and print the per-texel SAVING distribution - the answer to "how much
+// would be saved if all that can be cached were cached, and where". Per BUILT slot the saving is word 4
+// hi = foldedCount (static occluders removed from the runtime walk); residual = word 4 lo (still walked).
+// Attributes Sum(foldedCount) per light (owning light key = word 1 bits 19..31) and cross-references each
+// light's static caster/tri counts (m_WarmEntries) so a light warmed for little return (many casters,
+// low folded) is visible. Blocking waitForIdle - fine for a one-shot offline dump.
+void SoftShadowSurfCache::DumpTableHistogram()
+{
+	if( m_Table == nullptr || m_TableCap <= 0 )
+	{
+		return;
+	}
+	const uint64_t words = ( uint64_t )m_TableCap * 8;
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = words * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowSurfCache/TableDump";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_Table, 0, words * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	const uint32_t* t = ( const uint32_t* )m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( t == nullptr )
+	{
+		return;
+	}
+
+	// per-light accumulation keyed by the 13-bit light key stored in the slot
+	struct lightAgg_t { uint64_t fold = 0; int built = 0; int walk = 0; uint32_t maxFold = 0; };
+	std::unordered_map<uint32_t, lightAgg_t> perLight;
+	// foldedCount histogram buckets: 0, 1-2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+
+	const uint32_t bEdge[8] = { 0, 2, 4, 8, 16, 32, 64, 0xFFFFFFFFu };
+	uint64_t hist[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	uint64_t builtSlots = 0, walkSlots = 0, reqSlots = 0, emptySlots = 0;
+	uint64_t totalFold = 0, totalRes = 0;
+	uint32_t maxFold = 0, maxFoldKeyLo = 0, maxFoldKeyHi = 0;
+	for( uint64_t s = 0; s < ( uint64_t )m_TableCap; s++ )
+	{
+		const uint32_t w0 = t[s * 8 + 0];
+		if( w0 == 0xFFFFFFFFu )
+		{
+			emptySlots++;
+			continue;
+		}
+		const uint32_t w1 = t[s * 8 + 1];
+		const uint32_t code = t[s * 8 + 2] & 3u;
+		const uint32_t key = ( w1 >> 19 ) & 0x1FFFu;
+		if( code == 2u )		// BUILT
+		{
+			builtSlots++;
+			const uint32_t w4 = t[s * 8 + 4];
+			const uint32_t folded = w4 >> 16;
+			totalFold += folded;
+			totalRes  += ( w4 & 0xFFFFu );
+			int bk = 0;
+			while( bk < 7 && folded > bEdge[bk] ) { bk++; }
+			hist[bk]++;
+			lightAgg_t& a = perLight[key];
+			a.fold += folded; a.built++;
+			if( folded > a.maxFold ) { a.maxFold = folded; }
+			if( folded > maxFold ) { maxFold = folded; maxFoldKeyLo = w0; maxFoldKeyHi = w1; }
+		}
+		else if( code == 3u )
+		{
+			walkSlots++;
+			perLight[key].walk++;
+		}
+		else
+		{
+			reqSlots++;		// code 1 = requested-but-unbuilt (seeded, never completed)
+		}
+	}
+	m_Device->unmapBuffer( staging );
+
+	// index&0x1FFF -> static caster/tri counts (usefulness vs warm cost)
+	std::unordered_map<uint32_t, std::pair<int, int>> keyCost;
+	for( const auto& kv : m_WarmEntries )
+	{
+		keyCost[( uint32_t )( kv.first & 0x1FFF )] = { kv.second.nCas, kv.second.nTris };
+	}
+
+	common->Printf( "[softdump] table %d slots: built %llu, walk-always %llu, requested-unbuilt %llu, empty %llu\n",
+					m_TableCap, ( unsigned long long )builtSlots, ( unsigned long long )walkSlots,
+					( unsigned long long )reqSlots, ( unsigned long long )emptySlots );
+	const double meanFold = builtSlots ? ( double )totalFold / ( double )builtSlots : 0.0;
+	common->Printf( "[softdump] SAVING: Sum folded = %llu walk-units over %llu built texels (mean %.2f folded/texel, residual still walked %llu)\n",
+					( unsigned long long )totalFold, ( unsigned long long )builtSlots, meanFold, ( unsigned long long )totalRes );
+	// decode the biggest-saving texel's world cell (mirror softterm.cs.hlsl key derivation)
+	{
+		const int cu = ( int )( maxFoldKeyLo & 0xFFFFu ) - 32768;
+		const int cv = ( int )( maxFoldKeyLo >> 16 ) - 32768;
+		const int cw = ( int )( maxFoldKeyHi & 0xFFFFu ) - 32768;
+		const uint32_t axis = ( maxFoldKeyHi >> 16 ) & 7u;
+		const uint32_t lk = ( maxFoldKeyHi >> 19 ) & 0x1FFFu;
+		common->Printf( "[softdump] biggest saving = %u folded @ cell(%d,%d,%d) axis %u light %u\n",
+						maxFold, cu, cv, cw, axis, lk );
+	}
+	common->Printf( "[softdump] folded histogram: [0]=%llu [1-2]=%llu [3-4]=%llu [5-8]=%llu [9-16]=%llu [17-32]=%llu [33-64]=%llu [65+]=%llu\n",
+					( unsigned long long )hist[0], ( unsigned long long )hist[1], ( unsigned long long )hist[2], ( unsigned long long )hist[3],
+					( unsigned long long )hist[4], ( unsigned long long )hist[5], ( unsigned long long )hist[6], ( unsigned long long )hist[7] );
+
+	// rank lights by Sum folded (warm usefulness); print the top 20 with their static caster/tri cost
+	std::vector<std::pair<uint32_t, lightAgg_t>> ranked( perLight.begin(), perLight.end() );
+	std::sort( ranked.begin(), ranked.end(), []( const std::pair<uint32_t, lightAgg_t>& a, const std::pair<uint32_t, lightAgg_t>& b )
+	{
+		return a.second.fold > b.second.fold;
+	} );
+	common->Printf( "[softdump] %llu lights hold built texels. TOP by Sum-folded (usefulness) | key: builtTexels SumFold meanFold walkAlways | nCas nTris:\n",
+					( unsigned long long )ranked.size() );
+	const int topN = ( int )( ranked.size() < 20 ? ranked.size() : 20 );
+	for( int r = 0; r < topN; r++ )
+	{
+		const uint32_t key = ranked[r].first;
+		const lightAgg_t& a = ranked[r].second;
+		const double mf = a.built ? ( double )a.fold / ( double )a.built : 0.0;
+		auto ci = keyCost.find( key );
+		const int nc = ( ci != keyCost.end() ) ? ci->second.first : -1;
+		const int nt = ( ci != keyCost.end() ) ? ci->second.second : -1;
+		common->Printf( "[softdump]   light %5u: %6d texels  fold %8llu  mean %6.2f  walk %6d | nCas %5d nTris %6d\n",
+						key, a.built, ( unsigned long long )a.fold, mf, a.walk, nc, nt );
+	}
+}
+
 void SoftShadowSurfCache::EndBuilds( nvrhi::ICommandList* commandList )
 {
 	if( !m_Active )
@@ -520,7 +679,7 @@ void SoftShadowSurfCache::EndBuilds( nvrhi::ICommandList* commandList )
 	}
 	// reset the per-frame path counters (the 4 words after the table) so each frame's term
 	// dispatches accumulate a fresh hit/miss/walkalways/anchor-reject sample
-	const uint32_t swZero[4] = { 0, 0, 0, 0 };
+	const uint32_t swZero[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };	// 4 class counters + 4 miss sub-reason counters
 	commandList->writeBuffer( m_Table, swZero, sizeof( swZero ), swCounterOff );
 
 	// prewarm sweep bookkeeping: a fresh seed (or an in-view light that missed the last sweep)
@@ -741,4 +900,9 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 	}
 	common->Printf( "[softsurf] warm-at-load: %d of %d lights warmed | %d recv-tris, %d caster-tris over %d streamed lights\n",
 					warmed, n, s_warmRecvTotal, s_warmCasterTotal, s_warmStreamedLights );
+	extern idCVar r_softShadowSurfCacheDump;
+	if( r_softShadowSurfCacheDump.GetBool() )
+	{
+		DumpTableHistogram();
+	}
 }

@@ -126,6 +126,20 @@ void SwSurfStat( uint idx )
 		}
 	}
 }
+// MISS sub-reason instrument (4 words after the 4 class counters): 0 stale-gen, 1 requested-unbuilt,
+// 2 empty-slot (never seeded), 3 probe-overflow (key not found within the 16-slot chain). Same wave
+// aggregation as SwSurfStat. Only called for miss fragments, so it splits WHERE the 36% miss comes from.
+void SwSurfMissReason( uint r )
+{
+	[unroll] for( uint v = 0u; v < 4u; v++ )
+	{
+		const uint c = WaveActiveCountBits( r == v );
+		if( c != 0u && WaveIsFirstLane() )
+		{
+			InterlockedAdd( u_SurfTable[ ( uint )g_surfA.x * 8u + 4u + v ], c );
+		}
+	}
+}
 #endif
 
 [numthreads( 8, 4, 1 )]
@@ -254,6 +268,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// global scope): one atomic per wave per class instead of one per fragment - the per-fragment
 	// InterlockedAdd on a single global word serialised the whole term at low hit rate.
 #define SW_SURF_STAT( idx ) SwSurfStat( idx )
+	int swVizClass = 1;		// r_softShadowSurfCacheViz 4: path class for the fall-through write (1 miss / 2 walk-always / 3 anchor-reject)
 	if( g_surfA.x > 0 && g_surfA.z > 0 && swPos.w != 0.0f )
 	{
 		const float3 swN2 = t_WorldNormal.Load( int3( px, 0 ) ).xyz;
@@ -281,7 +296,12 @@ void main( uint3 tid : SV_DispatchThreadID )
 			const uint keyLo = ( uint )cu | ( ( uint )cv << 16 );
 			const uint keyHi = ( uint )cw | ( axis << 16 ) | ( ( uint )g_surfA.w << 19 );
 			uint swStatIdx = 1u;		// default: MISS (unbuilt/absent); overridden on the other paths
-			if( keyLo != 0xFFFFFFFFu )	// the far world-corner cell aliases the empty sentinel: never cached
+			uint swMissR = 3u;			// MISS sub-reason (instrument): 0 stale-gen, 1 requested-unbuilt, 2 empty-slot, 3 probe-overflow (key not found in 16 slots) - default 3 (loop fell through)
+			// DEBUG probe-tax isolation (r_softShadowSurfCacheForceWalk -> g_aa.z): 2 = SKIP the probe loop
+			// entirely (gated-fragment SETUP still ran: normal Load + axis + key), fall straight to the walk
+			// -> measures the SETUP tax alone. 1 = run the full probe then force the exact walk (see code==2u
+			// below) -> measures SETUP + probe-loop. Delta of the two isolates the 16-slot table-probe memory.
+			if( keyLo != 0xFFFFFFFFu && g_aa.z < 1.5f )	// the far world-corner cell aliases the empty sentinel: never cached
 			{
 				const uint capM = ( uint )g_surfA.x - 1u;	// capacity is a power of two (CPU-enforced)
 				const uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
@@ -301,25 +321,35 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// texel (the dominant cache overhead). The camera-independent invalidation hook
 							// re-warms this light off the burst path; this frame just takes the exact walk.
 							swStatIdx = 1u;
+							swMissR = 0u;		// stale generation
 							break;
 						}
 						if( code == 2u )	// BUILT: consume
 						{
+							if( g_aa.z != 0.0f ) { swStatIdx = 2u; break; }	// DEBUG force-walk (g_aa.z==1): probe ran, key found -> take the exact walk instead of the cached hit (probe-tax isolation)
 							// ANCHOR-PROXIMITY GUARD: two surfaces inside the same G-height slab share
 							// this key (floor + step, tabletop + crate base) and the record was built
 							// at the LOWER plane (min-anchor). A fragment far from the built plane
 							// consuming it renders the under-geometry shadow onto the surface above -
 							// texel-aligned black rectangles (playtest-observed 2026-08-20). Serve the
 							// cache only near the built plane; everything else takes the exact walk.
+							// The band is 0.0625*G ~= 0.5 world units (G=8): tight enough that surfaces
+							// only ~0.16-2 units apart no longer alias (MEASURED 2026-08-22: the old
+							// 0.25*G = 2u let a grazing floor pair alias -> the cached record UNDER-shadowed
+							// a whole penumbra band, gate EXTENT=7 on erebus1_14 L1), and it also rejects a
+							// receiver whose height varies > ~0.5u across the texel (tilt/curve), where the
+							// flat-plane F is unsound. Flat receivers stay on the plane and still hit.
 							const uint aEnc = u_SurfTable[ sBase + 7 ];
 							const float aH = asfloat( ( aEnc & 0x80000000u ) ? ( aEnc ^ 0x80000000u ) : ~aEnc );
-							if( abs( pw - aH ) > g * 0.25f )
+							if( abs( pw - aH ) > g * 0.0625f )
 							{
 								swStatIdx = 3u;	// ANCHOR-REJECT: wrong surface for this record
 								break;			// exact miss path
 							}
 							const uint resOfs = u_SurfTable[ sBase + 3 ];
-							const uint resCnt = u_SurfTable[ sBase + 4 ];
+							const uint w4 = u_SurfTable[ sBase + 4 ];
+							const uint resCnt = w4 & 0xFFFFu;			// low 16: residual occluders still walked
+							const uint foldedCnt = w4 >> 16;			// high 16: static occluders folded away = the per-texel saving (walk-units)
 							const uint f01 = u_SurfTable[ sBase + 5 ];
 							const uint f23 = u_SurfTable[ sBase + 6 ];
 							const float fu = pu / g - floor( pu / g );
@@ -327,10 +357,46 @@ void main( uint3 tid : SV_DispatchThreadID )
 							const float fLo = lerp( f16tof32( f01 & 0xFFFFu ), f16tof32( f01 >> 16 ), fu );
 							const float fHi = lerp( f16tof32( f23 & 0xFFFFu ), f16tof32( f23 >> 16 ), fu );
 							const float fFold = lerp( fLo, fHi, fv );
+							// TILE the hit-path dynamic-caster walk (g_aa.w = r_softShadowSurfCacheTileDyn). The
+							// untiled all-caster residual walk re-walked the whole dynamic suffix per fragment and
+							// cost a HIT more than a tiled MISS when dynamic casters are many. Pass this fragment's
+							// tile list so the residual fn walks only its DYNAMIC tris. -1 = no dynamic / spill /
+							// corrupt -> exact untiled fallback.
+							int swHitListBase = 0, swHitListCount = -1, swHitDynTri = 0;
+							if( g_surfA.z >= g_range.y )
+							{
+								swHitListCount = 0;		// no dynamic casters: nothing for the dynamic walk
+							}
+							else
+							{
+								swHitDynTri = ( int )t_SoftEdges[ g_flags.y + g_surfA.z * 2 + 1 ].x;	// first dynamic tri
+								if( g_aa.w != 0.0f )
+								{
+									const int hTx = px.x / SW_TILE_SIZE - g_tile.x;
+									const int hTy = px.y / SW_TILE_SIZE - g_tile.y;
+									if( g_range.z >= 0 && hTx >= 0 && hTy >= 0 )
+									{
+										const int  hSlot = g_range.z + ( hTy * g_range.w + hTx ) * ( g_flags.w + 1 );
+										const uint hCnt  = t_SoftTiles[ hSlot ];
+										if( hCnt == SW_TILE_UMBRA )
+										{
+											SW_SURF_STAT( 0u );
+											u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;	// whole tile provably umbra (as the miss path)
+											return;
+										}
+										if( hCnt <= ( uint )g_flags.w )		// normal list (exclude spill/corrupt sentinels)
+										{
+											swHitListBase  = hSlot + 1;
+											swHitListCount = ( int )hCnt;
+										}
+									}
+								}
+							}
 							const float occEx = SoftShadow_FaceCoverageSurfResidual(
 													swP, g_lightR.xyz, max( g_lightR.w, 1e-2 ), g_range.x,
 													( int )resOfs, ( int )resCnt,
-													g_flags.y, g_surfA.z, g_range.y, swRotAng );
+													g_flags.y, g_surfA.z, g_range.y,
+													swHitListBase, swHitListCount, swHitDynTri, swRotAng );
 							float swTermC = 1.0 - saturate( fFold + occEx );
 							const int viz = ( int )g_surfParams.y;
 							if( viz == 1 && ( ( ( cu ^ cv ^ cw ) & 1 ) != 0 ) )
@@ -341,6 +407,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 							{
 								swTermC *= 0.75;	// uniform: which pixels the cache serves
 							}
+							else if( viz == 3 )
+							{
+								// SAVING heatmap: brightness = folded static occluders removed from the walk
+								// (per-pixel time saved, in walk-units). 16+ folded -> full bright.
+								swTermC = saturate( ( float )foldedCnt * ( 1.0f / 16.0f ) );
+							}
+							else if( viz == 4 )
+							{
+								swTermC = 1.0f;		// COST-CLASS: hit -> full bright (non-hit classes tinted at the fall-through write)
+							}
 							SW_SURF_STAT( 0u );		// cached HIT
 							u_Term[ uint2( px + g_tile.zw ) ] = swTermC;
 							return;
@@ -348,6 +424,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 						if( code == 3u )
 						{
 							swStatIdx = 2u;			// WALK-ALWAYS (self-gate / overflow rejected the texel)
+						}
+						else
+						{
+							swMissR = 1u;			// code 1 REQUESTED: seeded but the build has not filled it yet
 						}
 						// code 1 (REQUESTED, not yet built by the burst) -> miss. READ-ONLY: no anchor write.
 						break;						// requested / walk-always: exact miss path
@@ -382,12 +462,15 @@ void main( uint3 tid : SV_DispatchThreadID )
 								u_SurfTable[ sBase ] = 0xFFFFFFFFu;
 							}
 						}
+						swMissR = 2u;				// EMPTY slot: this texel was never seeded/claimed
 						break;						// claimed (by us or a racer): exact miss path this frame
 					}
 					slot = ( slot + 1u ) & capM;	// occupied by another key: linear probe
 				}
 			}
 			SW_SURF_STAT( swStatIdx );			// fall-through: miss / walk-always / anchor-reject
+			if( swStatIdx == 1u ) { SwSurfMissReason( swMissR ); }	// instrument: split the 36% miss by cause
+			swVizClass = ( int )swStatIdx;
 		}
 	}
 #endif	// SW_SURF_CACHE
@@ -446,5 +529,15 @@ void main( uint3 tid : SV_DispatchThreadID )
 		swOcc = SoftShadow_Coverage( swP, swL, swR, g_range.x, g_flags.y, g_range.y, 0.0, true, swRotAng );
 	}
 
+#if SW_SURF_CACHE
+	if( ( int )g_surfParams.y == 4 )
+	{
+		// COST-CLASS heatmap, non-hit fragments: miss 0.25, walk-always 0.5, anchor-reject 0.75
+		// (hit is full-bright, tinted on the hit path). Shows WHERE the overhead-payers cluster.
+		const float swClassLvl[4] = { 1.0f, 0.25f, 0.5f, 0.75f };
+		u_Term[ uint2( px + g_tile.zw ) ] = swClassLvl[ min( swVizClass, 3 ) ];
+		return;
+	}
+#endif
 	u_Term[ uint2( px + g_tile.zw ) ] = 1.0 - saturate( swOcc );
 }

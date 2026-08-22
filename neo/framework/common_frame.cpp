@@ -1136,6 +1136,16 @@ void idCommonLocal::Frame()
 						if( stot > 0.0 )
 							common->Printf( "[softprobe] cache-eligible fragments: hit %.0f%% | miss(unbuilt) %.0f%% | walk-always %.0f%% | anchor-rej %.0f%%\n",
 											100.0 * s_probeH / stot, 100.0 * s_probeM / stot, 100.0 * s_probeW / stot, 100.0 * s_probeA / stot );
+						// SPLIT the miss% by cause (last frame's sample): why a static texel missed instead of hitting.
+						extern bool R_SoftCacheMissReasons( uint32_t out[4] );
+						uint32_t mr[4] = { 0, 0, 0, 0 };
+						if( R_SoftCacheMissReasons( mr ) )
+						{
+							const double mtot = ( double )mr[0] + mr[1] + mr[2] + mr[3];
+							if( mtot > 0.0 )
+								common->Printf( "[softprobe] miss breakdown (last frame): stale-gen %.0f%% | requested-unbuilt %.0f%% | empty-slot(never-seeded) %.0f%% | probe-overflow(collision) %.0f%%\n",
+												100.0 * mr[0] / mtot, 100.0 * mr[1] / mtot, 100.0 * mr[2] / mtot, 100.0 * mr[3] / mtot );
+						}
 					}
 					// TIME ACTUALLY SAVED: the SOFT-SHADOW term GPU ms is the only thing the cache moves
 					// (hit% is fragments, not work). Compare this line cache-ON vs cache-OFF for the real
