@@ -102,6 +102,61 @@ static float ScanlineUnionCov( float3 P, float3 L, float swR, const float* rv, c
 	return c > 1.0f ? 1.0f : c;
 }
 
+// GPU-SHAPED scanline: M chords x K bits (K<=32, one uint/chord). Per triangle, fill a CONTIGUOUS bit-run
+// per chord (interval -> [c0,c1] -> mask OR); union across triangles is a free OR (exactly like the shipped
+// SW_FACE_SAMPLES mask); coverage = popcount(grid & diskMask) / popcount(diskMask). NO SORT - this is the
+// form that ports to the term CS. Validates the discretisation cost (K bits/chord) vs the analytic scanline.
+static float ScanlineBitGridCov( float3 P, float3 L, float swR, const float* rv, const uint32_t* ri, uint32_t numIdx, int M, int K )
+{
+	const softFrame_t f = SoftShadow_Frame( P, L );
+	const float R = swR, eps = SW_NEAR_EPS;
+	if( M > 64 ) { M = 64; } if( K > 32 ) { K = 32; }
+	uint32_t grid[64] = {}, diskMask[64] = {};
+	for( int m = 0; m < M; m++ )								// per-chord disk mask (columns whose centre is inside)
+	{
+		const float Y = -R + ( ( float )m + 0.5f ) / M * 2.0f * R;
+		const float hc = std::sqrt( std::fmax( 0.0f, R * R - Y * Y ) );
+		uint32_t dm = 0;
+		for( int c = 0; c < K; c++ ) { const float x = -R + ( ( float )c + 0.5f ) / K * 2.0f * R; if( std::fabs( x ) <= hc ) { dm |= ( 1u << c ); } }
+		diskMask[m] = dm;
+	}
+	const int nT = ( int )( numIdx / 3 );
+	for( int t = 0; t < nT; t++ )
+	{
+		float3 v[3], rel[3]; float dn[3];
+		for( int j = 0; j < 3; j++ ) { uint32_t gi = ri[t * 3 + j]; v[j] = float3( rv[gi * 3], rv[gi * 3 + 1], rv[gi * 3 + 2] ); rel[j] = v[j] - P; dn[j] = dot( rel[j], f.nrm ); }
+		float2 q[4]; int qn = 0;								// near-clip + project (same as ScanlineUnionCov)
+		for( int e = 0; e < 3 && qn < 4; e++ )
+		{
+			const int i = e, jj = ( e + 1 ) % 3;
+			const bool ai = dn[i] >= eps, bi = dn[jj] >= eps;
+			if( ai && qn < 4 ) { q[qn++] = SoftShadow_ProjectVert( rel[i], dn[i], f ); }
+			if( ai != bi && qn < 4 ) { float tt = ( eps - dn[i] ) / ( dn[jj] - dn[i] ); float3 rc = rel[i] + ( rel[jj] - rel[i] ) * tt; q[qn++] = SoftShadow_ProjectVert( rc, eps, f ); }
+		}
+		if( qn < 3 ) { continue; }
+		for( int m = 0; m < M; m++ )							// fill this triangle's bit-run into every crossed chord
+		{
+			const float Y = -R + ( ( float )m + 0.5f ) / M * 2.0f * R;
+			float xlo = 1e30f, xhi = -1e30f; bool any = false;
+			for( int e = 0; e < qn; e++ )
+			{
+				const float2 A = q[e], B = q[( e + 1 ) % qn];
+				if( ( A.y <= Y ) != ( B.y <= Y ) ) { const float tt = ( Y - A.y ) / ( B.y - A.y ); const float x = A.x + ( B.x - A.x ) * tt; xlo = std::fmin( xlo, x ); xhi = std::fmax( xhi, x ); any = true; }
+			}
+			if( !any ) { continue; }
+			int c0 = ( int )std::floor( ( xlo + R ) / ( 2.0f * R ) * K );
+			int c1 = ( int )std::ceil( ( xhi + R ) / ( 2.0f * R ) * K ) - 1;
+			if( c0 < 0 ) { c0 = 0; } if( c1 > K - 1 ) { c1 = K - 1; }
+			if( c1 < c0 ) { continue; }
+			const uint32_t run = ( c1 - c0 + 1 >= 32 ) ? 0xFFFFFFFFu : ( ( ( 1u << ( c1 - c0 + 1 ) ) - 1u ) << c0 );
+			grid[m] |= run;
+		}
+	}
+	int cov = 0, tot = 0;
+	for( int m = 0; m < M; m++ ) { cov += SoftPopcount32( grid[m] & diskMask[m] ); tot += SoftPopcount32( diskMask[m] ); }
+	return tot ? ( float )cov / ( float )tot : 0.0f;
+}
+
 // mesh -> per-edge (two adjacent face normals + boundary flag), WELDED by position so T-junction
 // duplicate verts do not masquerade as boundaries. Mirrors BuildCasterEdges in SoftShadowPrimitives_test.
 struct RAEdge2 { float3 a, b, nA, nB; bool boundary; int va = 0, vb = 0; };
@@ -524,7 +579,8 @@ TEST( SilhouetteImpl, box_matches_union )
 		float uni = 1.f - MeshTruthShadowSoup( V.data(), I.data(), ( uint32_t )I.size(), P, L, R, 128 );
 		float sil = SilhouetteCov( edges, P, L, R );
 		float scan = ScanlineUnionCov( P, L, R, V.data(), I.data(), ( uint32_t )I.size(), 64 );
-		maxScanErr = std::fmax( maxScanErr, std::fabs( scan - uni ) );
+		float grid = ScanlineBitGridCov( P, L, R, V.data(), I.data(), ( uint32_t )I.size(), 16, 32 );
+		maxScanErr = std::fmax( maxScanErr, std::fmax( std::fabs( scan - uni ), std::fabs( grid - uni ) ) );
 		bool blocks = RayHitsMesh( P, L - P, V.data(), I.data(), ( uint32_t )I.size() );
 		int nsil = 0; for( const RAEdge2& e : edges ) { bool fa = dot( e.nA, P - e.a ) > 0.f; bool fb = dot( e.nB, P - e.a ) > 0.f; if( e.boundary || ( fa != fb ) ) { nsil++; } }
 		float proc = SoftShadow_ProcCaster( P, L, R, blocks, 0, ( int )edges.size(), SoftEdgeBuffer{ cand.data(), ( int )cand.size() } );
@@ -666,8 +722,8 @@ STUDY_TEST( SoftShadowIndepProduct, quantify )
 	}
 
 	const int NB = 10;
-	double bUni[NB] = {}, bInd[NB] = {}, bSum[NB] = {}, bIndAbs[NB] = {}, bSumAbs[NB] = {}, bCorAbs[NB] = {}, bMaxAbs[NB] = {}, bMax[NB] = {}, bScan[NB] = {}, bScanAbs[NB] = {}; long bN[NB] = {};
-	long nPen = 0, indNear = 0, sumNear = 0, corNear = 0, maxNear = 0, scanNear = 0, brOK = 0, brInd = 0; int usedC = 0;
+	double bUni[NB] = {}, bInd[NB] = {}, bSum[NB] = {}, bIndAbs[NB] = {}, bSumAbs[NB] = {}, bCorAbs[NB] = {}, bMaxAbs[NB] = {}, bMax[NB] = {}, bScan[NB] = {}, bScanAbs[NB] = {}, bGrid[NB] = {}, bGridAbs[NB] = {}; long bN[NB] = {};
+	long nPen = 0, indNear = 0, sumNear = 0, corNear = 0, maxNear = 0, scanNear = 0, gridNear = 0, brOK = 0, brInd = 0; int usedC = 0;
 	const int SCANM = getenv( "UG_M2" ) ? atoi( getenv( "UG_M2" ) ) : 24;		// scanline chord count (perpendicular resolution)
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
@@ -717,15 +773,17 @@ STUDY_TEST( SoftShadowIndepProduct, quantify )
 			for( const auto& kv : clu ) { double cs2 = kv.second; if( cs2 > 1.0 - 1e-4 ) { cs2 = 1.0 - 1e-4; } if( cs2 < 0.0 ) { cs2 = 0.0; } logLitDO += std::log( 1.0 - cs2 ); }
 			const float corr = ( float )( 1.0 - std::exp( logLitDO ) );		// depth-ordered (sum-within / product-across)
 			const float scan = ScanlineUnionCov( P, L, swR, rv, ri, cs.numIndex, SCANM );	// FUBINI: exact 1D union per chord
+			const float grid = ScanlineBitGridCov( P, L, swR, rv, ri, cs.numIndex, SCANM, 32 );	// GPU-shaped bit-grid (M x 32)
 			int bi = ( int )( uni * NB ); if( bi < 0 ) { bi = 0; } if( bi >= NB ) { bi = NB - 1; }
-			bUni[bi] += uni; bInd[bi] += indep; bSum[bi] += sumC; bMax[bi] += maxSolo; bScan[bi] += scan;
-			bIndAbs[bi] += std::fabs( indep - uni ); bSumAbs[bi] += std::fabs( sumC - uni ); bCorAbs[bi] += std::fabs( corr - uni ); bMaxAbs[bi] += std::fabs( maxSolo - uni ); bScanAbs[bi] += std::fabs( scan - uni );
+			bUni[bi] += uni; bInd[bi] += indep; bSum[bi] += sumC; bMax[bi] += maxSolo; bScan[bi] += scan; bGrid[bi] += grid;
+			bIndAbs[bi] += std::fabs( indep - uni ); bSumAbs[bi] += std::fabs( sumC - uni ); bCorAbs[bi] += std::fabs( corr - uni ); bMaxAbs[bi] += std::fabs( maxSolo - uni ); bScanAbs[bi] += std::fabs( scan - uni ); bGridAbs[bi] += std::fabs( grid - uni );
 			bN[bi]++; nPen++;
 			if( std::fabs( indep - uni ) <= 0.06f ) { indNear++; }
 			if( std::fabs( sumC - uni ) <= 0.06f ) { sumNear++; }
 			if( std::fabs( corr - uni ) <= 0.06f ) { corNear++; }
 			if( std::fabs( maxSolo - uni ) <= 0.06f ) { maxNear++; }
 			if( std::fabs( scan - uni ) <= 0.06f ) { scanNear++; }
+			if( std::fabs( grid - uni ) <= 0.06f ) { gridNear++; }
 			if( maxSolo <= uni + 1e-3f && uni <= sumC + 1e-3f ) { brOK++; }		// bracket holds
 			if( indep >= maxSolo - 1e-3f && indep <= sumC + 1e-3f ) { brInd++; }	// indep between the brackets
 		}
@@ -733,14 +791,14 @@ STUDY_TEST( SoftShadowIndepProduct, quantify )
 	}
 	if( nPen == 0 ) { std::printf( "    [indep] no shadowing samples\n" ); CHECK( true ); return; }
 	std::printf( "    [indep] %s | casters %d, samples %ld, N=%d, BETA=%.2f\n", path, usedC, nPen, N, BETA );
-	std::printf( "    [indep] |gap|<=0.06:  SCAN(M=%d) %.1f%%  MAXSOLO %.1f%%  INDEP %.1f%%  SUM %.1f%%  DEPTH-ORD %.1f%%   | bracket maxSolo<=union<=sum holds %.1f%%, indep-in-bracket %.1f%%\n",
-				 SCANM, 100.0 * scanNear / nPen, 100.0 * maxNear / nPen, 100.0 * indNear / nPen, 100.0 * sumNear / nPen, 100.0 * corNear / nPen, 100.0 * brOK / nPen, 100.0 * brInd / nPen );
-	std::printf( "    [indep] union bin -> n | union | SCAN(|gap|) | maxSolo(|gap|) | indep(|gap|) | sum(|gap|) | depthOrd(|gap|)\n" );
+	std::printf( "    [indep] |gap|<=0.06:  GRID(Mx32) %.1f%%  SCAN(M=%d) %.1f%%  MAXSOLO %.1f%%  INDEP %.1f%%  SUM %.1f%%   | bracket maxSolo<=union<=sum holds %.1f%%\n",
+				 100.0 * gridNear / nPen, SCANM, 100.0 * scanNear / nPen, 100.0 * maxNear / nPen, 100.0 * indNear / nPen, 100.0 * sumNear / nPen, 100.0 * brOK / nPen );
+	std::printf( "    [indep] union bin -> n | union | GRID(|gap|) | SCAN(|gap|) | maxSolo(|gap|) | indep(|gap|) | sum(|gap|)\n" );
 	for( int b = 0; b < NB; b++ )
 	{
 		if( bN[b] == 0 ) { continue; }
-		std::printf( "      occ [%.1f,%.1f)  n%6ld  union %.3f  scan %.3f (%.4f)  max %.3f (%.4f)  indep %.3f (%.4f)  sum %.3f (%.4f)  depthOrd(%.4f)\n",
-					 b * 0.1, b * 0.1 + 0.1, bN[b], bUni[b] / bN[b], bScan[b] / bN[b], bScanAbs[b] / bN[b], bMax[b] / bN[b], bMaxAbs[b] / bN[b], bInd[b] / bN[b], bIndAbs[b] / bN[b], bSum[b] / bN[b], bSumAbs[b] / bN[b], bCorAbs[b] / bN[b] );
+		std::printf( "      occ [%.1f,%.1f)  n%6ld  union %.3f  grid %.3f (%.4f)  scan %.3f (%.4f)  max %.3f (%.4f)  indep %.3f (%.4f)  sum %.3f (%.4f)\n",
+					 b * 0.1, b * 0.1 + 0.1, bN[b], bUni[b] / bN[b], bGrid[b] / bN[b], bGridAbs[b] / bN[b], bScan[b] / bN[b], bScanAbs[b] / bN[b], bMax[b] / bN[b], bMaxAbs[b] / bN[b], bInd[b] / bN[b], bIndAbs[b] / bN[b], bSum[b] / bN[b], bSumAbs[b] / bN[b] );
 	}
 	CHECK( true );
 }
