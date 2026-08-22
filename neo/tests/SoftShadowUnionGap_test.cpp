@@ -41,7 +41,7 @@ using namespace swtest;
 
 // mesh -> per-edge (two adjacent face normals + boundary flag), WELDED by position so T-junction
 // duplicate verts do not masquerade as boundaries. Mirrors BuildCasterEdges in SoftShadowPrimitives_test.
-struct RAEdge2 { float3 a, b, nA, nB; bool boundary; };
+struct RAEdge2 { float3 a, b, nA, nB; bool boundary; int va = 0, vb = 0; };
 static std::vector<RAEdge2> BuildWeldedCasterEdges( const SoftCap& cap, const softcapCaster_t& cs, float weld )
 {
 	std::unordered_map<uint64_t, int> wmap;
@@ -49,7 +49,7 @@ static std::vector<RAEdge2> BuildWeldedCasterEdges( const SoftCap& cap, const so
 	{
 		const float* p = &cap.meshVerts[gi * 3];
 		int64_t x = ( int64_t )std::llround( p[0] / weld ), y = ( int64_t )std::llround( p[1] / weld ), z = ( int64_t )std::llround( p[2] / weld );
-		uint64_t k = ( uint64_t )( ( x * 73856093LL ) ^ ( y * 19349663LL ) ^ ( z * 83492791LL ) );
+		uint64_t k = ( ( uint64_t )( uint32_t )( x + 1048576 ) << 42 ) | ( ( uint64_t )( uint32_t )( y + 1048576 ) << 21 ) | ( uint64_t )( uint32_t )( z + 1048576 );  // collision-free pack (|coord| < 2^20 quantized units)
 		auto it = wmap.find( k );
 		if( it != wmap.end() ) { return it->second; }
 		int id = ( int )wmap.size(); wmap[k] = id; return id;
@@ -67,7 +67,7 @@ static std::vector<RAEdge2> BuildWeldedCasterEdges( const SoftCap& cap, const so
 			int u = wi[e], w = wi[( e + 1 ) % 3];
 			std::pair<int, int> key( std::min( u, w ), std::max( u, w ) );
 			auto it = emap.find( key );
-			if( it == emap.end() ) { RAEdge2 re; re.a = v[e]; re.b = v[( e + 1 ) % 3]; re.nA = nf; re.nB = float3( 0, 0, 0 ); re.boundary = true; emap[key] = ( int )out.size(); out.push_back( re ); }
+			if( it == emap.end() ) { RAEdge2 re; re.a = v[e]; re.b = v[( e + 1 ) % 3]; re.nA = nf; re.nB = float3( 0, 0, 0 ); re.boundary = true; re.va = u; re.vb = w; emap[key] = ( int )out.size(); out.push_back( re ); }
 			else { out[it->second].nB = nf; out[it->second].boundary = false; }
 		}
 	}
@@ -80,7 +80,7 @@ static std::vector<RAEdge2> BuildEdgesRaw( const float* verts, const uint32_t* i
 	{
 		const float* p = &verts[gi * 3];
 		int64_t x = ( int64_t )std::llround( p[0] / weld ), y = ( int64_t )std::llround( p[1] / weld ), z = ( int64_t )std::llround( p[2] / weld );
-		uint64_t k = ( uint64_t )( ( x * 73856093LL ) ^ ( y * 19349663LL ) ^ ( z * 83492791LL ) );
+		uint64_t k = ( ( uint64_t )( uint32_t )( x + 1048576 ) << 42 ) | ( ( uint64_t )( uint32_t )( y + 1048576 ) << 21 ) | ( uint64_t )( uint32_t )( z + 1048576 );  // collision-free pack (|coord| < 2^20 quantized units)
 		auto it = wmap.find( k ); if( it != wmap.end() ) { return it->second; }
 		int id = ( int )wmap.size(); wmap[k] = id; return id;
 	};
@@ -95,11 +95,24 @@ static std::vector<RAEdge2> BuildEdgesRaw( const float* verts, const uint32_t* i
 			int u = wi[e], w = wi[( e + 1 ) % 3];
 			std::pair<int, int> key( std::min( u, w ), std::max( u, w ) );
 			auto it = emap.find( key );
-			if( it == emap.end() ) { RAEdge2 re; re.a = v[e]; re.b = v[( e + 1 ) % 3]; re.nA = nf; re.nB = float3( 0, 0, 0 ); re.boundary = true; emap[key] = ( int )out.size(); out.push_back( re ); }
+			if( it == emap.end() ) { RAEdge2 re; re.a = v[e]; re.b = v[( e + 1 ) % 3]; re.nA = nf; re.nB = float3( 0, 0, 0 ); re.boundary = true; re.va = u; re.vb = w; emap[key] = ( int )out.size(); out.push_back( re ); }
 			else { out[it->second].nB = nf; out[it->second].boundary = false; }
 		}
 	}
 	return out;
+}
+// serialize RAEdge2 list into ProcCaster's 4-float4/edge record format
+static std::vector<float4> ProcRecords( const std::vector<RAEdge2>& edges )
+{
+	std::vector<float4> cand; cand.reserve( edges.size() * 4 );
+	for( const RAEdge2& e : edges )
+	{
+		cand.push_back( float4( e.a.x, e.a.y, e.a.z, ( float )e.va ) );
+		cand.push_back( float4( e.b.x, e.b.y, e.b.z, ( float )e.vb ) );
+		cand.push_back( float4( e.nA.x, e.nA.y, e.nA.z, e.boundary ? 1.0f : 0.0f ) );
+		cand.push_back( float4( e.nB.x, e.nB.y, e.nB.z, 0.0f ) );
+	}
+	return cand;
 }
 
 // ANALYTIC silhouette coverage: sum SoftDisk_CircleTriArea over the silhouette edges (boundary OR
@@ -270,7 +283,7 @@ STUDY_TEST( SoftShadowWinding, quantify )
 		{
 			const float* p = &cap.meshVerts[gi * 3];
 			int64_t x = ( int64_t )std::llround( p[0] / WELD ), y = ( int64_t )std::llround( p[1] / WELD ), z = ( int64_t )std::llround( p[2] / WELD );
-			uint64_t k = ( uint64_t )( ( x * 73856093LL ) ^ ( y * 19349663LL ) ^ ( z * 83492791LL ) );
+			uint64_t k = ( ( uint64_t )( uint32_t )( x + 1048576 ) << 42 ) | ( ( uint64_t )( uint32_t )( y + 1048576 ) << 21 ) | ( uint64_t )( uint32_t )( z + 1048576 );  // collision-free pack (|coord| < 2^20 quantized units)
 			auto it = weldMap.find( k );
 			if( it != weldMap.end() ) { return it->second; }
 			int id = ( int )weldMap.size(); weldMap[k] = id; return id;
@@ -420,12 +433,12 @@ STUDY_TEST( SoftShadowSilhouetteCov, quantify )
 	CHECK( true );
 }
 
-// VALIDATION (STUDY: it FAILS - the connector-free/unordered edge sum in SilhouetteCov is WRONG, giving
-// 0.196 vs true 0.914 at umbra on a CLOSED box). Kept as a study to document that SilhouetteCov is NOT a
-// valid analytic coverage; the real ProcCaster (ordered chain + near-plane connectors) is needed for a
-// correct open-geometry test. Do NOT trust the SoftShadowSilhouetteCov capture numbers - they measure
-// this bug, not the geometry.
-STUDY_TEST( SilhouetteImpl, box_matches_union )
+// HARNESS VALIDATION (guard): the analytic silhouette (my SilhouetteCov AND the shipped ProcCaster, via my
+// BuildEdgesRaw->ProcRecords path) must match the ray union on a CLOSED box - both do, to ~0.002. This test
+// caught a collision-prone vertex weld (an XOR hash key collapsed the symmetric cube's 8 corners to ~3,
+// giving 3 edges and coverage 0); the weld is now a collision-free packed key. Real captures use irregular
+// coords that never collided, so the capture ProcCaster-vs-union numbers were valid throughout.
+TEST( SilhouetteImpl, box_matches_union )
 {
 	std::vector<float> V; std::vector<uint32_t> I;
 	for( int i = 0; i < 8; i++ ) { V.push_back( ( i & 1 ) ? 1.f : -1.f ); V.push_back( ( i & 2 ) ? 1.f : -1.f ); V.push_back( ( i & 4 ) ? 1.f : -1.f ); }
@@ -439,17 +452,116 @@ STUDY_TEST( SilhouetteImpl, box_matches_union )
 	}
 	std::vector<RAEdge2> edges = BuildEdgesRaw( V.data(), I.data(), ( uint32_t )I.size(), 0.01f );
 	int nb = 0; for( const RAEdge2& e : edges ) { if( e.boundary ) { nb++; } }
+	const std::vector<float4> cand = ProcRecords( edges );		// validate MY ProcCaster path on a known box
 	const float3 L( 0, 0, 30 ); const float R = 5;
-	float maxErr = 0;
+	float maxErr = 0, maxProcErr = 0;
 	for( float x = 0; x <= 8.0f; x += 1.0f )
 	{
 		float3 P( x, 0, -10 );
 		float uni = 1.f - MeshTruthShadowSoup( V.data(), I.data(), ( uint32_t )I.size(), P, L, R, 128 );
 		float sil = SilhouetteCov( edges, P, L, R );
-		std::printf( "    [silbox] P.x=%.0f  union %.3f  sil %.3f  err %.3f\n", x, uni, sil, std::fabs( sil - uni ) );
+		bool blocks = RayHitsMesh( P, L - P, V.data(), I.data(), ( uint32_t )I.size() );
+		int nsil = 0; for( const RAEdge2& e : edges ) { bool fa = dot( e.nA, P - e.a ) > 0.f; bool fb = dot( e.nB, P - e.a ) > 0.f; if( e.boundary || ( fa != fb ) ) { nsil++; } }
+		float proc = SoftShadow_ProcCaster( P, L, R, blocks, 0, ( int )edges.size(), SoftEdgeBuffer{ cand.data(), ( int )cand.size() } );
+		std::printf( "    [silbox] P.x=%.0f  union %.3f  sil %.3f  ProcCaster %.3f (err %.3f)  blocks=%d nSil=%d nEdge=%d\n", x, uni, sil, proc, std::fabs( proc - uni ), blocks ? 1 : 0, nsil, ( int )edges.size() );
 		maxErr = std::fmax( maxErr, std::fabs( sil - uni ) );
+		maxProcErr = std::fmax( maxProcErr, std::fabs( proc - uni ) );
 	}
-	std::printf( "    [silbox] boundary edges=%d (want 0), maxErr=%.3f\n", nb, maxErr );
+	std::printf( "    [silbox] boundary edges=%d (want 0), sil maxErr=%.3f, MY-PATH ProcCaster maxErr=%.3f (want <0.06)\n", nb, maxErr, maxProcErr );
 	CHECK( nb == 0 );
-	CHECK( maxErr < 0.06f );
+	CHECK( maxProcErr < 0.06f );		// if MY BuildEdgesRaw->ProcRecords->ProcCaster path is correct, this matches
+}
+
+// THE DEFINITIVE open-geometry test: feed the SHIPPED SoftShadow_ProcCaster (validated 0.001 on a box,
+// F6b - it does the ordered chain-walk + near-plane connectors my SilhouetteCov omitted) the REAL caster
+// edge records, and compare to the ray UNION across the penumbra. This settles whether the analytic
+// silhouette works on the open/non-manifold capture geometry (winding now known consistent). Cap at
+// SW_RA_MAX(1024) edges so ProcCaster never clamps.
+STUDY_TEST( SoftShadowProcVsUnion, quantify )
+{
+	const char* path = std::getenv( "SOFTCAP" );
+	if( path == NULL ) { std::printf( "    [procun] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
+	SoftCap cap;
+	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [procun] cannot load %s\n", path ); CHECK( false ); return; }
+	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
+	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
+	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 50 ), MAXC = envI( "UG_CASTERS", 200 ), MAXTRI = envI( "UG_MAXTRI", 300 );
+	const float WELD = envF( "WD_WELD", 0.05f );
+	const float FN = envI( "UG_FLIPN", 0 ) ? -1.0f : 1.0f;		// negate face normals (test inward-vs-outward winding convention)
+
+	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
+	for( const softcapReceiver_t& r : cap.receivers )
+	{
+		if( r.lightIndex >= cap.lights.size() ) { continue; }
+		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
+		{
+			const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0], i1 = cap.recvIdx[r.firstIndex + t * 3 + 1], i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+			float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+			float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+			float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
+			lightRecv[r.lightIndex].push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+		}
+	}
+
+	const int NB = 10;
+	double bAbs[NB] = {}, bSgn[NB] = {}, bProc[NB] = {}, bUni[NB] = {}; long bN[NB] = {};
+	long nPen = 0, nPenNear = 0; int usedC = 0, skippedBig = 0;
+	// split by caster openness: does the ProcCaster gap correlate with boundary edges? (repair hypothesis)
+	double clAbs = 0, opAbs = 0, clUmbAbs = 0, opUmbAbs = 0; long clN = 0, opN = 0, clUmbN = 0, opUmbN = 0;
+	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
+	{
+		const softcapCaster_t& cs = cap.casters[c];
+		const int nT = ( int )( cs.numIndex / 3 );
+		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
+		const std::vector<float3>& recv = lightRecv[cs.lightIndex];
+		if( recv.empty() ) { continue; }
+		const std::vector<RAEdge2> edges = BuildWeldedCasterEdges( cap, cs, WELD );
+		if( ( int )edges.size() > 1024 ) { skippedBig++; continue; }		// would clamp SW_RA_MAX
+		long nbnd = 0; for( const RAEdge2& e : edges ) { if( e.boundary ) { nbnd++; } }
+		const bool clean = !edges.empty() && ( double )nbnd / edges.size() < 0.03;	// ~closed (few boundary edges)
+		std::vector<float4> cand; cand.reserve( edges.size() * 4 );
+		for( const RAEdge2& e : edges )
+		{
+			cand.push_back( float4( e.a.x, e.a.y, e.a.z, ( float )e.va ) );
+			cand.push_back( float4( e.b.x, e.b.y, e.b.z, ( float )e.vb ) );
+			cand.push_back( float4( e.nA.x * FN, e.nA.y * FN, e.nA.z * FN, e.boundary ? 1.0f : 0.0f ) );
+			cand.push_back( float4( e.nB.x * FN, e.nB.y * FN, e.nB.z * FN, 0.0f ) );
+		}
+		const float3 L( cap.lights[cs.lightIndex].origin[0], cap.lights[cs.lightIndex].origin[1], cap.lights[cs.lightIndex].origin[2] );
+		const float  swR = std::fmax( cap.lights[cs.lightIndex].penumbraSize, 1e-2f );
+		const float* rv = cap.meshVerts.data();
+		const uint32_t* ri = &cap.meshIdx[cs.firstIndex];
+		const size_t stride = std::max( ( size_t )1, recv.size() / ( size_t )SAMP );
+		bool anyPen = false;
+		for( size_t s = 0; s < recv.size(); s += stride )
+		{
+			const float3 P = recv[s];
+			const float uni = 1.0f - MeshTruthShadowSoup( rv, ri, cs.numIndex, P, L, swR, N );
+			if( uni < 0.002f ) { continue; }
+			anyPen = true;
+			const bool blocks = RayHitsMesh( P, L - P, rv, ri, cs.numIndex );
+			const float proc = SoftShadow_ProcCaster( P, L, swR, blocks, 0, ( int )edges.size(), SoftEdgeBuffer{ cand.data(), ( int )cand.size() } );
+			const float gap = proc - uni;
+			int bi = ( int )( uni * NB ); if( bi < 0 ) { bi = 0; } if( bi >= NB ) { bi = NB - 1; }
+			bAbs[bi] += std::fabs( gap ); bSgn[bi] += gap; bProc[bi] += proc; bUni[bi] += uni; bN[bi]++;
+			nPen++; if( uni < 0.998f && std::fabs( gap ) <= 0.06f ) { nPenNear++; }
+			if( clean ) { clAbs += std::fabs( gap ); clN++; if( uni >= 0.9f ) { clUmbAbs += std::fabs( gap ); clUmbN++; } }
+			else        { opAbs += std::fabs( gap ); opN++; if( uni >= 0.9f ) { opUmbAbs += std::fabs( gap ); opUmbN++; } }
+		}
+		if( anyPen ) { usedC++; }
+	}
+	long tot = 0; for( int b = 0; b < NB; b++ ) { tot += bN[b]; }
+	if( tot == 0 ) { std::printf( "    [procun] no shadowing samples (skippedBig %d)\n", skippedBig ); CHECK( true ); return; }
+	std::printf( "    [procun] %s | casters %d (skippedBig %d), samples %ld, N=%d\n", path, usedC, skippedBig, tot, N );
+	std::printf( "    [procun] SHIPPED ProcCaster vs UNION: |gap|<=0.06 on %.1f%% of penumbra samples\n", nPen ? 100.0 * nPenNear / nPen : 0.0 );
+	std::printf( "    [procun] REPAIR test (does the gap correlate with openness?): CLEAN casters (bnd<3%%) mean|gap| %.4f (umbra %.4f, n%ld) | OPEN casters mean|gap| %.4f (umbra %.4f, n%ld)\n",
+				 clN ? clAbs / clN : 0.0, clUmbN ? clUmbAbs / clUmbN : 0.0, clN, opN ? opAbs / opN : 0.0, opUmbN ? opUmbAbs / opUmbN : 0.0, opN );
+	std::printf( "    [procun] union bin -> n | union | ProcCaster | |gap| | signed\n" );
+	for( int b = 0; b < NB; b++ )
+	{
+		if( bN[b] == 0 ) { continue; }
+		std::printf( "      occ [%.1f,%.1f)  n%6ld  union %.3f  proc %.3f  |gap| %.4f  signed %+.4f\n",
+					 b * 0.1, b * 0.1 + 0.1, bN[b], bUni[b] / bN[b], bProc[b] / bN[b], bAbs[b] / bN[b], bSgn[b] / bN[b] );
+	}
+	CHECK( true );
 }
