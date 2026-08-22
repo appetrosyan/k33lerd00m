@@ -76,6 +76,7 @@ void SoftShadowTermPass::EnsurePipeline()
 	idList<shaderMacro_t> macros;
 	macros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// shipped permutation (must be explicit now the cfg declares {0,1})
 	macros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );			// same rule for the surf-cache axis
+	macros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );			// and the scanline axis
 	macros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, sfx.c_str(), macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
@@ -113,6 +114,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		idList<shaderMacro_t> cntMacros;
 		cntMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "1" ) );
 		cntMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+		cntMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
 		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
@@ -145,8 +147,9 @@ void SoftShadowTermPass::EnsurePipeline()
 	// as the counting permutation); failure is non-fatal (the probe just stays off).
 	{
 		idList<shaderMacro_t> surfMacros;
-		surfMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// blob keys carry BOTH axes
+		surfMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// blob keys carry ALL axes
 		surfMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "1" ) );
+		surfMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		m_ShaderSurf = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfcache" ) + sfx ).c_str(), surfMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderSurf != nullptr )
@@ -161,6 +164,26 @@ void SoftShadowTermPass::EnsurePipeline()
 			ps.bindingLayouts = { m_LayoutSurf };
 			ps.CS = m_ShaderSurf;
 			m_PipelineSurf = m_Device->createComputePipeline( ps );
+		}
+	}
+
+	// FUBINI SCANLINE permutation (SW_SCANLINE=1, r_softShadowScanline): the tile-list walk fills an 8x32
+	// interval bit-grid (exact 1D union per chord) instead of the 16-sample mask. Same bindings as the
+	// shipped path (no new buffers), so it reuses ld/m_Layout. Separate pipeline keeps the shipped one
+	// byte-identical; failure is non-fatal (the toggle just stays on the sampled path).
+	{
+		idList<shaderMacro_t> scanMacros;
+		scanMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );
+		scanMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+		scanMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+		scanMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		m_ShaderScan = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "scanline" ) + sfx ).c_str(), scanMacros, true, LAYOUT_DRAW_VERT ) );
+		if( m_ShaderScan != nullptr )
+		{
+			nvrhi::ComputePipelineDesc pn;
+			pn.bindingLayouts = { m_Layout };		// identical bindings to the shipped path
+			pn.CS = m_ShaderScan;
+			m_PipelineScan = m_Device->createComputePipeline( pn );
 		}
 	}
 
@@ -227,8 +250,8 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 		if( m_BuiltSamples != 0 && m_BuiltSamples != want )
 		{
 			m_PipelineTried = false;
-			m_Pipeline = m_PipelineCnt = m_PipelineSurf = nullptr;
-			m_Shader = m_ShaderCnt = m_ShaderSurf = nullptr;
+			m_Pipeline = m_PipelineCnt = m_PipelineSurf = m_PipelineScan = nullptr;
+			m_Shader = m_ShaderCnt = m_ShaderSurf = m_ShaderScan = nullptr;
 		}
 	}
 	EnsurePipeline();
@@ -414,6 +437,11 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// when the probe is active AND the counting permutation is not (counters = measurement mode, wins).
 	// surfA[0] <= 0 keeps the cache block dead even on the surf pipeline (light with no static prefix).
 	const bool surf = ( surfCache != NULL ) && surfCache->IsActive() && m_PipelineSurf != nullptr && !m_WalkCntEnabled;
+	// FUBINI SCANLINE (r_softShadowScanline): replaces the sampled walk with the interval bit-grid. Loses to
+	// the counting (measurement) and surf-cache permutations; A/B lever against the shipped 16-sample path.
+	extern idCVar r_softShadowScanline;
+	extern idCVar r_softShadowScanline;
+	const bool scan = r_softShadowScanline.GetBool() && m_PipelineScan != nullptr && !m_WalkCntEnabled && !surf;
 	extern idCVar r_softShadowLitEarlyOut, r_softShadowRotGrid;
 	cb.surfParams[0] = 0.0f;
 	cb.surfParams[1] = 0.0f;
@@ -503,7 +531,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 
 	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;
-	cs.pipeline = cnt ? m_PipelineCnt : ( surf ? m_PipelineSurf : m_Pipeline );
+	cs.pipeline = cnt ? m_PipelineCnt : ( surf ? m_PipelineSurf : ( scan ? m_PipelineScan : m_Pipeline ) );
 	cs.bindings = { set };
 	commandList->setComputeState( cs );
 	commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );

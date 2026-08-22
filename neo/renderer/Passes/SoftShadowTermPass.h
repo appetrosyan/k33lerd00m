@@ -121,6 +121,11 @@ private:
 	nvrhi::ShaderHandle				m_ShaderSurf;
 	nvrhi::BindingLayoutHandle		m_LayoutSurf;
 	nvrhi::ComputePipelineHandle	m_PipelineSurf;
+	// FUBINI SCANLINE permutation (SW_SCANLINE=1, r_softShadowScanline): the list walk fills an 8x32
+	// interval bit-grid (exact 1D union per chord) instead of the 16-sample mask. Same bindings as the
+	// shipped path, so it reuses m_Layout; separate pipeline keeps the shipped one byte-identical.
+	nvrhi::ShaderHandle				m_ShaderScan;
+	nvrhi::ComputePipelineHandle	m_PipelineScan;
 	nvrhi::BufferHandle				m_WalkCntBuffer;	// 8 uints, cleared per view, InterlockedAdd'd by the shader
 	bool							m_WalkCntEnabled = false;
 	nvrhi::BufferHandle				m_ConstantBuffer;

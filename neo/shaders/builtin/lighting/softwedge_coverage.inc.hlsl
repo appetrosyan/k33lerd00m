@@ -725,6 +725,97 @@ SW_FUNC int SoftPopcount32( uint x )
 	return ( int )( ( x * 0x01010101u ) >> 24 );
 }
 
+// ============================ FUBINI SCANLINE COVERAGE (SW_SCANLINE) ============================
+// Exact-union coverage by the Fubini identity: area( disk ∩ ⋃ tri ) = ∫ length( 1D interval-union along a
+// horizontal chord ) dy. Discretised as SW_SCAN_CHORDS chords x 32 bits: each occluder triangle fills a
+// CONTIGUOUS bit-run per chord, the union across triangles is a free bitwise OR (exactly the shipped
+// SW_FACE_SAMPLES mask, just 8x32 = 256 interval-filled samples instead of 16 point tests), coverage =
+// popcount( grid & diskMask ) / popcount( diskMask ). No sort, overlap-exact, no 1/N banding along a chord.
+// Validated in neo/tests/SoftShadowUnionGap_test.cpp (ScanlineBitGridCov / box_matches_union): 96%/94% of
+// penumbra samples within 0.06 of the ray union (best scalar 83%), matching the analytic scanline; the
+// accuracy plateaus at 8 chords because the exactness lives ALONG each chord, not in the chord count.
+#ifndef SW_SCANLINE
+	#define SW_SCANLINE 0
+#endif
+#if SW_SCANLINE
+#define SW_SCAN_CHORDS 8
+#define SW_SCAN_BITS   32
+// unit-disk half-chord widths: hc_m = sqrt( 1 - y_m^2 ), y_m = -1 + (m+0.5)*(2/SW_SCAN_CHORDS)
+static const float SW_SCAN_HC[SW_SCAN_CHORDS] =
+{
+	0.48412292f, 0.78062475f, 0.92696970f, 0.99215674f,
+	0.99215674f, 0.92696970f, 0.78062475f, 0.48412292f,
+};
+// [aN,bN] in disk-normalised [-1,1] -> a contiguous 32-bit column run (empty if b<a)
+SW_FUNC uint SoftScan_Run( float aN, float bN )
+{
+	int c0 = ( int )floor( ( aN + 1.0f ) * ( 0.5f * SW_SCAN_BITS ) );
+	int c1 = ( int )ceil( ( bN + 1.0f ) * ( 0.5f * SW_SCAN_BITS ) ) - 1;
+	c0 = max( c0, 0 );
+	c1 = min( c1, SW_SCAN_BITS - 1 );
+	if( c1 < c0 ) { return 0u; }
+	uint w = ( uint )( c1 - c0 + 1 );
+	return ( w >= 32u ) ? 0xffffffffu : ( ( ( 1u << w ) - 1u ) << ( uint )c0 );
+}
+// project a near-clipped triangle to the UNIT light disk and OR its per-chord bit-runs into swGrid
+SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, float3 v1, float3 v2,
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	float3 rel[3]; float dn[3];
+	rel[0] = v0 - swP; rel[1] = v1 - swP; rel[2] = v2 - swP;
+	dn[0] = dot( rel[0], swF.nrm ); dn[1] = dot( rel[1], swF.nrm ); dn[2] = dot( rel[2], swF.nrm );
+	float invR = 1.0f / swR;
+	float2 q[4]; int qn = 0;											// near-plane clip (dn >= eps) -> <=4 unit-disk verts
+	for( int e = 0; e < 3; e++ )
+	{
+		int i = e, k = ( e + 1 ) % 3;
+		bool ai = dn[i] >= swEps, bi = dn[k] >= swEps;
+		if( ai && qn < 4 ) { q[qn++] = SoftShadow_ProjectVert( rel[i], dn[i], swF ) * invR; }
+		if( ( ai != bi ) && qn < 4 )
+		{
+			float tt = ( swEps - dn[i] ) / ( dn[k] - dn[i] );
+			float3 rc = rel[i] + ( rel[k] - rel[i] ) * tt;
+			q[qn++] = SoftShadow_ProjectVert( rc, swEps, swF ) * invR;
+		}
+	}
+	if( qn < 3 ) { return; }
+	for( int m = 0; m < SW_SCAN_CHORDS; m++ )							// fill this triangle's run into every crossed chord
+	{
+		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
+		float xlo = 1e30f, xhi = -1e30f; bool any = false;
+		for( int e2 = 0; e2 < 4; e2++ )
+		{
+			if( e2 >= qn ) { break; }
+			float2 A = q[e2];
+			float2 B = q[( e2 + 1 ) % qn];
+			if( ( A.y <= Y ) != ( B.y <= Y ) )
+			{
+				float tt = ( Y - A.y ) / ( B.y - A.y );
+				float x = A.x + ( B.x - A.x ) * tt;
+				xlo = min( xlo, x ); xhi = max( xhi, x ); any = true;
+			}
+		}
+		if( any )
+		{
+			float hc = SW_SCAN_HC[m];
+			swGrid[m] |= SoftScan_Run( max( xlo, -hc ), min( xhi, hc ) );
+		}
+	}
+}
+// coverage = covered disk bits / total disk bits
+SW_FUNC float SoftScan_Coverage( uint swGrid[SW_SCAN_CHORDS] )
+{
+	int cov = 0, tot = 0;
+	for( int m = 0; m < SW_SCAN_CHORDS; m++ )
+	{
+		uint dm = SoftScan_Run( -SW_SCAN_HC[m], SW_SCAN_HC[m] );
+		cov += SoftPopcount32( swGrid[m] & dm );
+		tot += SoftPopcount32( dm );
+	}
+	return tot > 0 ? ( float )cov / ( float )tot : 0.0f;
+}
+#endif // SW_SCANLINE
+
 #ifndef SW_FACE_SAMPLES
 	#define SW_FACE_SAMPLES 16			// equal-area disk samples (8, 16 or 32); <=32 to pack the occlusion mask in one uint.
 #endif
@@ -1188,6 +1279,10 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 
 	uint swMask = 0u;
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+#if SW_SCANLINE
+	uint swGrid[SW_SCAN_CHORDS];		// Fubini scanline grid: SW_SCAN_CHORDS chords x 32 bits, OR-unioned
+	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = 0u; }
+#endif
 	SW_BKT_DECL
 #if SW_LIT_EARLYOUT
 	int swMtCnt = 0;					// survivors reaching MT so far (for the lit early-out)
@@ -1249,6 +1344,9 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		swProbe += cd;
 		continue;													// TIMING PROBE: + per-triangle cone culls
 #endif
+#if SW_SCANLINE
+		SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini: fill interval bit-runs, union by OR
+#else
 		float3 edge1 = v1 - v0;
 		float3 edge2 = v2 - v0;
 		float3 sp = swP - v0;
@@ -1279,15 +1377,22 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
 		}
 #endif	// SW_FP16_LOOP
-#if defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
+#if !SW_SCANLINE && defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
 		if( swMask != swOldMask ) { InterlockedAdd( u_WalkCnt[ 14 ], 1u ); }	// survivor HIT (set >=1 bit)
 		else { InterlockedAdd( u_WalkCnt[ 15 ], 1u ); }						// survivor tested, blocks NOTHING
 #endif
+#endif	// SW_SCANLINE
 #if SW_LIT_EARLYOUT
 		if( swMask == 0u && swMtCnt >= SW_LIT_EARLYOUT ) { break; }	// still fully unblocked after K survivors -> assume lit
 #endif
 		if( swMask == swAll ) { break; }
 	}
+#if SW_SCANLINE
+	// Fubini coverage from the OR-unioned interval grid; no morphological crack-close (interval fill leaves
+	// no interior sample gaps, unlike point sampling).
+	SW_BKT_FLUSH( swMask, swAll );
+	return SoftScan_Coverage( swGrid );
+#else
 	if( swMask != 0u && swMask != swAll )
 	{
 		uint filled = swMask;
@@ -1310,6 +1415,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 #endif
 	SW_BKT_FLUSH( swMask, swAll );
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
+#endif	// SW_SCANLINE
 }
 
 #if SW_SURF_CACHE
