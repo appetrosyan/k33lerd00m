@@ -127,6 +127,7 @@ bool SoftShadowSurfCache::EnsureResources()
 	extern idCVar r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
 	extern idCVar r_softShadowSurfCacheBudget, r_softShadowSurfCacheCap, r_softShadowSurfCachePoolCap;
 	extern idCVar r_softShadowSurfCacheErrTol, r_softShadowSurfCacheWarmBudget;
+	extern idCVar r_softShadowSurfCacheReduced, r_softShadowSurfCacheReducedK, r_softShadowSurfCacheReducedCutoff;
 	EnsurePipeline();
 	if( m_Pipeline == nullptr )
 	{
@@ -146,8 +147,16 @@ bool SoftShadowSurfCache::EnsureResources()
 	const float texel = ( float )r_softShadowSurfCacheTexel.GetInteger();
 	const float thr = r_softShadowSurfCacheSecondThr.GetFloat();
 	const float errTol = r_softShadowSurfCacheErrTol.GetFloat();
+	const int reduced = r_softShadowSurfCacheReduced.GetBool() ? 1 : 0;
+	const int reducedK = r_softShadowSurfCacheReducedK.GetInteger();
+	const float reducedCut = r_softShadowSurfCacheReducedCutoff.GetFloat();
+	// reduced-set snapshot kept as function statics, not class members: growing SoftShadowSurfCache shifts
+	// its heap layout and surfaces an init-time fault in the render backend (see the .h note).
+	static int s_reduced = -1, s_reducedK = -1;
+	static float s_reducedCut = -1.0f;
 	if( m_Table == nullptr || capP2 != m_TableCap || poolCap != m_PoolCap || budget != m_Budget
-			|| wantQueue != m_QueueWords || texel != m_Texel || thr != m_Thr || errTol != m_ErrTol )
+			|| wantQueue != m_QueueWords || texel != m_Texel || thr != m_Thr || errTol != m_ErrTol
+			|| reduced != s_reduced || reducedK != s_reducedK || reducedCut != s_reducedCut )
 	{
 		m_TableCap = capP2;
 		m_PoolCap = poolCap;
@@ -156,6 +165,9 @@ bool SoftShadowSurfCache::EnsureResources()
 		m_Texel = texel;
 		m_Thr = thr;
 		m_ErrTol = errTol;		// build semantics changed: drop + reseed
+		s_reduced = reduced;
+		s_reducedK = reducedK;
+		s_reducedCut = reducedCut;
 
 		nvrhi::BufferDesc bd;
 		bd.structStride = sizeof( uint32_t );
@@ -374,11 +386,15 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	cb.caps[0] = m_TableCap;
 	cb.caps[1] = m_PoolCap;
 	cb.caps[2] = SW_WARM_BUDGET;		// build dispatch bound (queue mode processes queue[0..budget))
-	cb.caps[3] = SW_SURF_MAX_RESIDUAL;
+	// REDUCED-SET mode: signal via a NEGATIVE caps[3] (magnitude = the top-K cap) and pass the solo cutoff
+	// in the errTol slot params[3] (the fold errTol gate is skipped in reduced mode). No new cbuffer field.
+	extern idCVar r_softShadowSurfCacheReduced, r_softShadowSurfCacheReducedK, r_softShadowSurfCacheReducedCutoff;
+	const bool reducedMode = r_softShadowSurfCacheReduced.GetBool();
+	cb.caps[3] = reducedMode ? -Max( 1, r_softShadowSurfCacheReducedK.GetInteger() ) : SW_SURF_MAX_RESIDUAL;
 	cb.params[0] = m_Texel;
 	cb.params[1] = m_Thr;
 	cb.params[2] = ( float )m_QueueWords;
-	cb.params[3] = r_softShadowSurfCacheErrTol.GetFloat();
+	cb.params[3] = reducedMode ? r_softShadowSurfCacheReducedCutoff.GetFloat() : r_softShadowSurfCacheErrTol.GetFloat();
 	cb.seed[0] = 0;						// QUEUE mode (consume the seed's enqueued slots)
 	cb.seed[1] = 0;
 	cb.seed[2] = nRecv;					// seed rasterises RECEIVER tris (one thread per tri)

@@ -335,6 +335,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 
 	const float thr = g_params.y;
 	const float eps = SW_NEAR_EPS;
+	// REDUCED-SET mode (r_softShadowSurfCacheReduced): the CPU study (grid-or-fold-study) found a
+	// translate-only grid caps ~80% (umbra breaks) but a per-texel top-K REPROJECTABLE occluder set walked
+	// exactly at P reaches the discretisation ceiling (~94% at K=32-64). So instead of folding affine
+	// occluders into a bilinear F scalar (the mid-penumbra error), keep EVERY occluder whose solo coverage
+	// clears a cutoff as residual and walk them exactly (F falls out to 0 since resMask==allMask). Signalled
+	// by a NEGATIVE caps.w (magnitude = K cap); the errTol slot params.w carries the solo cutoff (the errTol
+	// bilerp gate is skipped here - nothing folds). No new cbuffer field.
+	const bool  reduced = ( g_caps.w < 0 );
+	const uint  redCap  = reduced ? ( uint )( -g_caps.w ) : ( uint )g_caps.w;
+	const float redCut  = g_params.w;
 
 	// ---- two passes: 0 = classify + fold (count residuals, accumulate masks), 1 = emit residual indices
 	uint allMask[4] = { 0u, 0u, 0u, 0u };
@@ -408,6 +418,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 						scCtr = SurfBuild_SoloCovExact( Pc, v0, v1, v2, frC, swR2c );
 					}
 				}
+				// REDUCED mode: drop occluders whose max solo coverage across the texel (4 corners + centre,
+				// = the study's cell-ranked key) is below the cutoff. The union is dominated by a handful of
+				// large occluders; the tiny-solo tail is redundant. This bounds the kept set to the few that
+				// matter WITHOUT a GPU sort, and keeps them out of allMask/intMask so F stays 0.
+				if( reduced )
+				{
+					float msolo = max( max( scC[0], scC[1] ), max( scC[2], scC[3] ) );
+					msolo = max( msolo, scCtr );
+					if( msolo <= redCut ) { continue; }
+				}
 				// SAMPLED interior union masks (pass 0 only) - accumulate this triangle's occlusion at the
 				// 5 interior probes into the running union, for the umbra gate below.
 				uint intHit = 0u;
@@ -433,7 +453,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				}
 				const float scMean = 0.25f * ( scC[0] + scC[1] + scC[2] + scC[3] );
 				const float dev  = abs( scCtr - scMean );	// this occluder's deviation from bilinear over the texel
-				const bool  fold = ( dev <= thr );			// affine coverage across the texel => foldable
+				const bool  fold = reduced ? false : ( dev <= thr );	// reduced: walk EVERY kept occluder exactly (no bilinear fold)
 				if( pass == 0 )
 				{
 					for( int cc = 0; cc < 4; cc++ ) { scCornSum[cc] += scC[cc]; allMask[cc] |= solo[cc]; }
@@ -477,9 +497,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 		}
 		if( pass == 0 )
 		{
-			if( resCount > ( uint )g_caps.w )
+			if( resCount > redCap )
 			{
-				u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// WALK-ALWAYS -> FREE the slot (empty key). Was code 3: measured 77% of the table = dead weight oversubscribing it -> collision-misses. Empty reads as miss = exact walk (same result), keeps load low so BUILT records stay reachable. //		// too curved to be worth caching: WALK-ALWAYS (exact)
+				u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// over the K cap (reduced) / max residual (fold): WALK-ALWAYS -> FREE the slot (empty key). Empty reads as miss = exact walk (same result), keeps table load low so BUILT records stay reachable.
 				return;
 			}
 			if( resCount > 0u )
@@ -540,7 +560,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 	for( int cc2 = 0; cc2 < 4; cc2++ ) { sMax = max( sMax, scCornSum[cc2] ); }
 	const bool umbraSomewhere = ( maxCornerCov >= 0.999f || maxIntCov >= 0.999f || sMax + 3.0f * devAll >= 1.0f );
 	const bool umbraStraddle  = ( umbraSomewhere && minCornerCov < 0.999f );
-	if( umbraStraddle || ( devFold > g_params.w ) )
+	// reduced mode caches umbra + curved texels too (it walks the exact set, no bilinear F to erode), so the
+	// fold-only abandon gates are skipped; only the K-cap overflow above can abandon a reduced texel.
+	if( !reduced && ( umbraStraddle || ( devFold > g_params.w ) ) )
 	{
 		u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// WALK-ALWAYS -> FREE the slot (empty key). Was code 3: measured 77% of the table = dead weight oversubscribing it -> collision-misses. Empty reads as miss = exact walk (same result), keeps load low so BUILT records stay reachable. //		// umbra-straddle / too-curved fold: WALK-ALWAYS (exact)
 		return;

@@ -222,6 +222,8 @@ private:
 	float							m_Texel = 0.0f;
 	float							m_Thr = -1.0f;
 	float							m_ErrTol = -1.0f;
+	// reduced-set snapshot (build semantics; change drops the cache) lives in EnsureResources static
+	// locals, NOT as members - growing this class shifts its layout and surfaces a heap fault at init.
 	bool							m_NeedClear = false;
 	bool							m_Active = false;
 	// prewarm state: seed on first sight of a light's static-set hash, then sweep the table window
