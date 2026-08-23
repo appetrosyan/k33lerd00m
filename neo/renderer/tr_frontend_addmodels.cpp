@@ -117,7 +117,7 @@ static bool R_SoftCasterIsStatic( const idRenderEntityLocal* entityDef, const vi
 // Per LIGHT (never across lights), walk this light's caster triangles in depth order from the light; kept
 // geometry accumulates; a triangle whose full soft shadow falls inside the shadow of already-kept geometry
 // contributes nothing to the union coverage and is NOT emitted into the walk stream. The composite test is
-// the one VALIDATED offline (tests/SoftShadowProxyFit_test.cpp @study:SoftShadowUmbraAccum, softcap0062/63/
+// the one VALIDATED offline (tests/SoftShadowProxyFit_test.cpp @study:SoftShadowUmbraAccum, cap0062/63/
 // 64: 31-35% of records culled, zero supra-quantum false positives - every residual over-cull is below the
 // walk's own 1/16-disk resolution):
 //   1. coplanar-convex merge (signed planes) -> convex hull polygon certificates,

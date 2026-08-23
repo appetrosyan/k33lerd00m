@@ -300,7 +300,7 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 
 	// ---- SPILL PASS (overflowed tiles), STREAM V3 CLUSTERS -----------------------------------
 	// gsCount counted EVERY stage-2 tri survivor, but only the first K fit the tile slot. Instead
-	// of spilling the huge tri list (v1 spill: 19.4M-element demand at softcap0061), spill this
+	// of spilling the huge tri list (v1 spill: 19.4M-element demand at cap0061), spill this
 	// tile's surviving CLUSTER records - the caster table's k-d leaf spheres (<=32 tris each,
 	// caster c1.zw = cluster span, built in R_CollectPenumbraFaces). The dense tiles that overflow
 	// are exactly where the per-fragment cluster amortization wins (~3.6x fewer cone tests,

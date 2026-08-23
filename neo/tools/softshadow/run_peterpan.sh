@@ -10,11 +10,11 @@
 # when toggled mid-session from the console. Each config is therefore its own
 # launch, both driven to the exact same frozen viewpoint by softShadowGoto.
 #
-# Usage: run_peterpan.sh <capture.softcap> [map]
+# Usage: run_peterpan.sh <capture.cap> [map]
 #   default map is game/erebus1 (all erebusN captures load it).
 set -euo pipefail
 
-CAP="${1:?usage: run_peterpan.sh <capture.softcap> [map]}"
+CAP="${1:?usage: run_peterpan.sh <capture.cap> [map]}"
 MAP="${2:-game/erebus1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${RBDOOM_BIN:-$HERE/../../build/RBDoom3BFG}"

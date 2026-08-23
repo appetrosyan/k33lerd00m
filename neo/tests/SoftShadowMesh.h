@@ -15,7 +15,7 @@ the Free Software Foundation, either version 3 of the License, or
 ===========================================================================
 */
 
-// Offline reader + ray-cast ground truth for a soft-shadow scene capture (.softcap, see
+// Offline reader + ray-cast ground truth for a soft-shadow scene capture (.cap, see
 // renderer/RenderCapture.h). This is the tests-side half: it loads the POD blob with zero engine dependency,
 // ray-casts the captured caster triangle meshes for TRUE per-receiver occlusion, and reconstructs receiver
 // world positions from the captured depth (mirroring the engine's ReconstructWorldPos). Diffing the true
@@ -25,7 +25,7 @@ the Free Software Foundation, either version 3 of the License, or
 #ifndef __SOFTSHADOWMESH_H__
 #define __SOFTSHADOWMESH_H__
 
-#define SOFTCAP_NO_ENGINE_API		// POD structs only, no engine forward-decls
+#define CAP_NO_ENGINE_API		// POD structs only, no engine forward-decls
 #include "../renderer/RenderCapture.h"
 
 #include <vector>
@@ -39,25 +39,25 @@ namespace swtest
 {
 
 // the whole capture in memory
-struct SoftCap
+struct Cap
 {
-	softcapHeader_t              hdr;
-	std::vector<softcapLight_t>  lights;
-	std::vector<softcapEdge_t>   edges;
-	std::vector<softcapCaster_t> casters;
+	capHeader_t              hdr;
+	std::vector<capLight_t>  lights;
+	std::vector<capEdge_t>   edges;
+	std::vector<capCaster_t> casters;
 	std::vector<float>           meshVerts;	// float3 packed (caster meshes)
 	std::vector<uint32_t>        meshIdx;
 	std::vector<float>           depth;
-	std::vector<softcapReceiver_t> receivers;	// receiver interaction surfaces
+	std::vector<capReceiver_t> receivers;	// receiver interaction surfaces
 	std::vector<float>           recvVerts;	// float3 packed (receiver meshes)
 	std::vector<uint32_t>        recvIdx;
 	std::string                  mapName;	// v4+: the map this was captured on (for reload/reconstruct)
 	int                          gameTimeMs = 0;	// v4+: hdr.reserved[0]
-	std::vector<softcapShadowVol_t> shadowVols;	// v4+: capped shadow-volume surfs (per light)
+	std::vector<capShadowVol_t> shadowVols;	// v4+: capped shadow-volume surfs (per light)
 	std::vector<float>           shadowVerts;	// v4+: float3 packed (world space, w=0 verts pre-extruded)
 	std::vector<uint32_t>        shadowIdx;
-	std::vector<softcapMaterial_t> materials;	// v5 texture tail: unique receiver materials (baked diffuse)
-	std::vector<uint8_t>         texels;		// v5: RGB8 blob, indexed by softcapMaterial_t::firstTexel
+	std::vector<capMaterial_t> materials;	// v5 texture tail: unique receiver materials (baked diffuse)
+	std::vector<uint8_t>         texels;		// v5: RGB8 blob, indexed by capMaterial_t::firstTexel
 	std::vector<float>           recvST;		// v5: float2 packed per receiver vert
 	std::vector<uint32_t>        recvMat;		// v5: per receiver surface -> materials index
 
@@ -65,7 +65,7 @@ struct SoftCap
 	float3 SampleAlbedo( int mat, float s, float t ) const
 	{
 		if( mat < 0 || mat >= ( int )materials.size() ) { return float3( 0.55f, 0.52f, 0.48f ); }
-		const softcapMaterial_t& mrec = materials[mat];
+		const capMaterial_t& mrec = materials[mat];
 		if( mrec.texW == 0 || mrec.texH == 0 ) { return float3( 0.5f, 0.5f, 0.5f ); }
 		float fx = ( s - std::floor( s ) ) * mrec.texW - 0.5f;
 		float fy = ( t - std::floor( t ) ) * mrec.texH - 0.5f;
@@ -87,30 +87,30 @@ struct SoftCap
 };
 
 // ----------------------------------------------------------------------------------- binary IO (round-trip)
-inline bool WriteSoftCap( const char* path, const SoftCap& c )
+inline bool WriteCap( const char* path, const Cap& c )
 {
 	FILE* f = std::fopen( path, "wb" );
 	if( !f ) { return false; }
 	std::fwrite( &c.hdr, sizeof( c.hdr ), 1, f );
-	if( !c.lights.empty() )    { std::fwrite( c.lights.data(),    sizeof( softcapLight_t ),  c.lights.size(), f ); }
-	if( !c.edges.empty() )     { std::fwrite( c.edges.data(),     sizeof( softcapEdge_t ),   c.edges.size(), f ); }
-	if( !c.casters.empty() )   { std::fwrite( c.casters.data(),   sizeof( softcapCaster_t ), c.casters.size(), f ); }
+	if( !c.lights.empty() )    { std::fwrite( c.lights.data(),    sizeof( capLight_t ),  c.lights.size(), f ); }
+	if( !c.edges.empty() )     { std::fwrite( c.edges.data(),     sizeof( capEdge_t ),   c.edges.size(), f ); }
+	if( !c.casters.empty() )   { std::fwrite( c.casters.data(),   sizeof( capCaster_t ), c.casters.size(), f ); }
 	if( !c.meshVerts.empty() ) { std::fwrite( c.meshVerts.data(), sizeof( float ),           c.meshVerts.size(), f ); }
 	if( !c.meshIdx.empty() )   { std::fwrite( c.meshIdx.data(),   sizeof( uint32_t ),        c.meshIdx.size(), f ); }
 	if( !c.depth.empty() )     { std::fwrite( c.depth.data(),     sizeof( float ),           c.depth.size(), f ); }
-	if( !c.receivers.empty() ) { std::fwrite( c.receivers.data(), sizeof( softcapReceiver_t ), c.receivers.size(), f ); }
+	if( !c.receivers.empty() ) { std::fwrite( c.receivers.data(), sizeof( capReceiver_t ), c.receivers.size(), f ); }
 	if( !c.recvVerts.empty() ) { std::fwrite( c.recvVerts.data(), sizeof( float ),           c.recvVerts.size(), f ); }
 	if( !c.recvIdx.empty() )   { std::fwrite( c.recvIdx.data(),   sizeof( uint32_t ),        c.recvIdx.size(), f ); }
 	std::fclose( f );
 	return true;
 }
 
-inline bool LoadSoftCap( const char* path, SoftCap& c )
+inline bool LoadCap( const char* path, Cap& c )
 {
 	FILE* f = std::fopen( path, "rb" );
 	if( !f ) { return false; }
 	if( std::fread( &c.hdr, sizeof( c.hdr ), 1, f ) != 1 ) { std::fclose( f ); return false; }
-	if( c.hdr.magic != SOFTCAP_MAGIC || c.hdr.version < 2u || c.hdr.version > SOFTCAP_VERSION ) { std::fclose( f ); return false; }
+	if( c.hdr.magic != CAP_MAGIC || c.hdr.version < 2u || c.hdr.version > CAP_VERSION ) { std::fclose( f ); return false; }
 	c.lights.resize( c.hdr.numLights );
 	c.edges.resize( c.hdr.numEdges );
 	c.casters.resize( c.hdr.numCasters );
@@ -121,13 +121,13 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 	c.recvVerts.resize( ( size_t )c.hdr.numRecvVerts * 3 );
 	c.recvIdx.resize( c.hdr.numRecvIdx );
 	bool ok = true;
-	if( c.hdr.numLights )    { ok = ok && std::fread( c.lights.data(),    sizeof( softcapLight_t ),  c.lights.size(), f ) == c.lights.size(); }
-	if( c.hdr.numEdges )     { ok = ok && std::fread( c.edges.data(),     sizeof( softcapEdge_t ),   c.edges.size(), f ) == c.edges.size(); }
-	if( c.hdr.numCasters )   { ok = ok && std::fread( c.casters.data(),   sizeof( softcapCaster_t ), c.casters.size(), f ) == c.casters.size(); }
+	if( c.hdr.numLights )    { ok = ok && std::fread( c.lights.data(),    sizeof( capLight_t ),  c.lights.size(), f ) == c.lights.size(); }
+	if( c.hdr.numEdges )     { ok = ok && std::fread( c.edges.data(),     sizeof( capEdge_t ),   c.edges.size(), f ) == c.edges.size(); }
+	if( c.hdr.numCasters )   { ok = ok && std::fread( c.casters.data(),   sizeof( capCaster_t ), c.casters.size(), f ) == c.casters.size(); }
 	if( c.meshVerts.size() ) { ok = ok && std::fread( c.meshVerts.data(), sizeof( float ),           c.meshVerts.size(), f ) == c.meshVerts.size(); }
 	if( c.meshIdx.size() )   { ok = ok && std::fread( c.meshIdx.data(),   sizeof( uint32_t ),        c.meshIdx.size(), f ) == c.meshIdx.size(); }
 	if( c.depth.size() )     { ok = ok && std::fread( c.depth.data(),     sizeof( float ),           c.depth.size(), f ) == c.depth.size(); }
-	if( c.receivers.size() ) { ok = ok && std::fread( c.receivers.data(), sizeof( softcapReceiver_t ), c.receivers.size(), f ) == c.receivers.size(); }
+	if( c.receivers.size() ) { ok = ok && std::fread( c.receivers.data(), sizeof( capReceiver_t ), c.receivers.size(), f ) == c.receivers.size(); }
 	if( c.recvVerts.size() ) { ok = ok && std::fread( c.recvVerts.data(), sizeof( float ),           c.recvVerts.size(), f ) == c.recvVerts.size(); }
 	if( c.recvIdx.size() )   { ok = ok && std::fread( c.recvIdx.data(),   sizeof( uint32_t ),        c.recvIdx.size(), f ) == c.recvIdx.size(); }
 	c.gameTimeMs = ( int )c.hdr.reserved[0];
@@ -141,7 +141,7 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 		c.shadowVols.resize( c.hdr.reserved[2] );
 		c.shadowVerts.resize( ( size_t )c.hdr.reserved[3] * 3 );
 		c.shadowIdx.resize( c.hdr.reserved[4] );
-		ok = ok && std::fread( c.shadowVols.data(), sizeof( softcapShadowVol_t ), c.shadowVols.size(), f ) == c.shadowVols.size();
+		ok = ok && std::fread( c.shadowVols.data(), sizeof( capShadowVol_t ), c.shadowVols.size(), f ) == c.shadowVols.size();
 		if( c.shadowVerts.size() ) { ok = ok && std::fread( c.shadowVerts.data(), sizeof( float ), c.shadowVerts.size(), f ) == c.shadowVerts.size(); }
 		if( c.shadowIdx.size() )   { ok = ok && std::fread( c.shadowIdx.data(), sizeof( uint32_t ), c.shadowIdx.size(), f ) == c.shadowIdx.size(); }
 	}
@@ -149,14 +149,14 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 	if( ok )
 	{
 		uint32_t tail[5];
-		if( std::fread( tail, sizeof( uint32_t ), 5, f ) == 5 && tail[0] == SOFTCAP_TAIL_MAGIC )
+		if( std::fread( tail, sizeof( uint32_t ), 5, f ) == 5 && tail[0] == CAP_TAIL_MAGIC )
 		{
 			c.materials.resize( tail[1] );
 			c.texels.resize( tail[2] );
 			c.recvST.resize( tail[3] );
 			c.recvMat.resize( tail[4] );
 			bool tok = true;
-			if( c.materials.size() ) { tok = tok && std::fread( c.materials.data(), sizeof( softcapMaterial_t ), c.materials.size(), f ) == c.materials.size(); }
+			if( c.materials.size() ) { tok = tok && std::fread( c.materials.data(), sizeof( capMaterial_t ), c.materials.size(), f ) == c.materials.size(); }
 			if( c.texels.size() )    { tok = tok && std::fread( c.texels.data(), 1, c.texels.size(), f ) == c.texels.size(); }
 			if( c.recvST.size() )    { tok = tok && std::fread( c.recvST.data(), sizeof( float ), c.recvST.size(), f ) == c.recvST.size(); }
 			if( c.recvMat.size() )   { tok = tok && std::fread( c.recvMat.data(), sizeof( uint32_t ), c.recvMat.size(), f ) == c.recvMat.size(); }
@@ -172,9 +172,9 @@ inline bool LoadSoftCap( const char* path, SoftCap& c )
 	// a v2 dump to global so all downstream code sees one convention.
 	if( ok && c.hdr.version < 3u )
 	{
-		for( const softcapCaster_t& cs : c.casters )
+		for( const capCaster_t& cs : c.casters )
 			for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < c.meshIdx.size(); k++ ) { c.meshIdx[k] += cs.firstVert; }
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 			for( uint32_t k = R.firstIndex; k < R.firstIndex + R.numIndex && k < c.recvIdx.size(); k++ ) { c.recvIdx[k] += R.firstVert; }
 	}
 	return ok;
@@ -217,7 +217,7 @@ inline bool RayHitsMesh( float3 P, float3 dir, const float* verts, const uint32_
 // immune to the near plane (Carmack's reverse), which is why the z-fail core keeps the umbra solid. "In shadow"
 // = count != 0. This is stencil geometry, NOT occlusion math - it needs the captured camera, which the harness
 // has, so the dropout is measurable rather than eyeballed.
-inline void ShadowVolStencil( const std::vector<softcapEdge_t>& edges, uint32_t first, uint32_t count,
+inline void ShadowVolStencil( const std::vector<capEdge_t>& edges, uint32_t first, uint32_t count,
 							  float3 L, float3 C, float3 P, float nearD, int& zpass, int& zfail )
 {
 	zpass = 0; zfail = 0;
@@ -225,7 +225,7 @@ inline void ShadowVolStencil( const std::vector<softcapEdge_t>& edges, uint32_t 
 	const float BIG = 1e5f;
 	for( uint32_t r = first; r < first + count && r < edges.size(); r++ )
 	{
-		const softcapEdge_t& e = edges[r];
+		const capEdge_t& e = edges[r];
 		if( e.e0[3] < 0.0f ) { continue; }							// header record: skip
 		float3 A( e.e0[0], e.e0[1], e.e0[2] ), B( e.e1[0], e.e1[1], e.e1[2] );
 		float3 Ai = A + ( A - L ) * BIG, Bi = B + ( B - L ) * BIG;	// extrude away from the light to ~infinity
@@ -458,7 +458,7 @@ inline float MeshTruthShadowSoup( const float* verts, const uint32_t* idx, uint3
 
 // TRUE shadow (1=lit, 0=occluded): fraction of the light disk (centre L, radius r, facing P) whose ray from
 // P is NOT blocked by any captured caster mesh. Mirrors TruthShadow (SoftShadowBox.h) but over the soup.
-inline float MeshTruthShadow( const SoftCap& c, float3 P, float3 L, float r, int N = 64 )
+inline float MeshTruthShadow( const Cap& c, float3 P, float3 L, float r, int N = 64 )
 {
 	float3 toL = L - P;
 	float dist = std::sqrt( dot( toL, toL ) );
@@ -483,7 +483,7 @@ inline float MeshTruthShadow( const SoftCap& c, float3 P, float3 L, float r, int
 // Mirrors softwedge.ps.hlsl ReconstructWorldPos: uv -> ndc -> clip (clipW from the projection Z row) ->
 // world via unprojectionToWorldMatrix. NOTE: the row/column convention of the captured matrices must be
 // validated against a real capture before this is trusted; kept here so Phase 4 can wire it once confirmed.
-inline float3 ReconstructReceiver( const SoftCap& c, int x, int y )
+inline float3 ReconstructReceiver( const Cap& c, int x, int y )
 {
 	const float w = ( float )c.hdr.screenW, h = ( float )c.hdr.screenH;
 	float depth = c.depth.empty() ? 0.0f : c.depth[( size_t )y * c.hdr.screenW + x];

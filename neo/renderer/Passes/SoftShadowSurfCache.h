@@ -134,6 +134,10 @@ public:
 	{
 		return m_Pool;
 	}
+	// GRID mode (r_softShadowSurfCacheGrid): the parallel per-slot Fubini bit-grid buffer, or null when grid
+	// mode is off. Defined in the .cpp - it lives in a file-scope static (not a member) to avoid growing this
+	// class's heap layout (the known init-fault landmine; same reason the reduced-set snapshot uses statics).
+	nvrhi::IBuffer* GetGridBuffer() const;
 	nvrhi::IBuffer* GetQueue() const
 	{
 		return m_Queue;

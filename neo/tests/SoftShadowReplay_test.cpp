@@ -16,10 +16,10 @@ the Free Software Foundation, either version 3 of the License, or
 */
 
 // Offline soft-shadow SCENE CAPTURE tooling tests (renderer/RenderCapture.h + tests/SoftShadowMesh.h):
-//   * the .softcap POD format round-trips write->read byte-for-byte (the format self-check);
+//   * the .cap POD format round-trips write->read byte-for-byte (the format self-check);
 //   * RayHitsMesh over a triangle soup agrees with the analytic RayHitsBox on the same box;
 //   * MeshTruthShadow over a box mesh matches the box's TruthShadow.
-// These are engine-free and need no real capture. Once a real Erebus .softcap is minimized into
+// These are engine-free and need no real capture. Once a real Erebus .cap is minimized into
 // tests/data/, a further TEST loads it and asserts coverage-vs-truth to lock the artifact.
 
 #include "hlsl_compat.h"
@@ -56,16 +56,16 @@ static void BoxToMesh( const Box& b, std::vector<float>& verts, std::vector<uint
 }
 }
 
-TEST( SoftShadowReplay, softcap_round_trips )
+TEST( SoftShadowReplay, cap_round_trips )
 {
 	// build a small capture with every block populated, write it, read it back, compare field-for-field.
-	SoftCap c;
+	Cap c;
 	memset( &c.hdr, 0, sizeof( c.hdr ) );
-	c.hdr.magic = SOFTCAP_MAGIC;
-	c.hdr.version = SOFTCAP_VERSION;
+	c.hdr.magic = CAP_MAGIC;
+	c.hdr.version = CAP_VERSION;
 	c.hdr.screenW = 4; c.hdr.screenH = 3;
 	for( int i = 0; i < 16; i++ ) { c.hdr.projectionMatrix[i] = ( float )i; c.hdr.unprojectionToWorldMatrix[i] = ( float )( 16 - i ); }
-	softcapLight_t L; memset( &L, 0, sizeof( L ) );
+	capLight_t L; memset( &L, 0, sizeof( L ) );
 	L.origin[0] = 1; L.origin[1] = 2; L.origin[2] = 3; L.penumbraSize = 8.0f; L.edgeCount = 2; L.casterCount = 1;
 	c.lights.push_back( L );
 	c.edges.push_back( { { 0, 0, 0, -1 }, { 5, 0, 0, 0 } } );
@@ -77,10 +77,10 @@ TEST( SoftShadowReplay, softcap_round_trips )
 	for( uint32_t i = 0; i < c.hdr.screenW * c.hdr.screenH; i++ ) { c.depth.push_back( 0.1f * i ); }
 	c.hdr.numLights = 1; c.hdr.numEdges = 2; c.hdr.numCasters = 1; c.hdr.numMeshVerts = 8; c.hdr.numMeshIdx = 36;
 
-	const char* path = "softcap_roundtrip.tmp";
-	CHECK( WriteSoftCap( path, c ) );
-	SoftCap r;
-	CHECK( LoadSoftCap( path, r ) );
+	const char* path = "cap_roundtrip.tmp";
+	CHECK( WriteCap( path, c ) );
+	Cap r;
+	CHECK( LoadCap( path, r ) );
 	std::remove( path );
 
 	CHECK( r.hdr.screenW == 4 && r.hdr.screenH == 3 );
@@ -121,7 +121,7 @@ TEST( SoftShadowReplay, mesh_truth_matches_box_truth )
 	const float3 L( 0, 0, 12 );
 	const float  R = 3.0f;
 	Box b = MakeBox( float3( 0.5f, 0, 6 ), float3( 1.2f, 1.2f, 0.02f ) );	// planar-ish caster
-	SoftCap c;
+	Cap c;
 	memset( &c.hdr, 0, sizeof( c.hdr ) );
 	BoxToMesh( b, c.meshVerts, c.meshIdx );
 	float3 P0( 0, 0, 0 );
@@ -131,22 +131,22 @@ TEST( SoftShadowReplay, mesh_truth_matches_box_truth )
 	CHECK_NEAR( meshT, boxT, 0.02f );
 }
 
-// Real-capture validation. Loads a .softcap named by the SOFTCAP env var (skips cleanly if unset, so the
+// Real-capture validation. Loads a .cap named by the CAP env var (skips cleanly if unset, so the
 // committed roster stays green without the data). The key check is the depth->world reconstruction: a pixel
 // reconstructed to world and reprojected through worldMVP must return to itself. If the captured matrices'
 // row/column convention is right this is exact (bar TAA sub-pixel jitter); if it's wrong the error explodes.
 // This is what validates ReconstructReceiver against a real frame before Phase 4 trusts it.
 TEST( SoftShadowReplay, real_capture_reconstruction_roundtrips )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [real_capture] SOFTCAP unset; skipping (set it to a .softcap to validate)\n" );
+		std::printf( "    [real_capture] CAP unset; skipping (set it to a .cap to validate)\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap c;
-	if( !LoadSoftCap( path, c ) )
+	Cap c;
+	if( !LoadCap( path, c ) )
 	{
 		std::printf( "    [real_capture] could not load %s\n", path );
 		CHECK( false );

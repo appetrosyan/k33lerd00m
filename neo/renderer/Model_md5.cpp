@@ -567,7 +567,7 @@ void idMD5Mesh::UpdateSurface( const struct renderEntity_s* ent, const idJointMa
 	// The gate MUST include the soft-shadow face path: it originally covered only stencil shadows, and
 	// under the shipped config (r_useStencilShadows 0, face coverage on) posedShadowVerts stayed NULL,
 	// so the collect fell back to tri->verts = BIND POSE under GPU skinning. Every skinned caster then
-	// shadowed from a T-posed phantom standing inside its rendered body - measured on softcap0042 as
+	// shadowed from a T-posed phantom standing inside its rendered body - measured on cap0042 as
 	// the ragdoll's "large black bands on top of itself" (its own bind-pose copy 7.9u mean / 64u max
 	// from the drawn pose blocking its receivers).
 	extern idCVar r_useStencilShadows;

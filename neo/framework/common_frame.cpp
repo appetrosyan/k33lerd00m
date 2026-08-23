@@ -946,13 +946,19 @@ void idCommonLocal::Frame()
 #endif
 		// RB end
 
-		// soft-shadow self-test: skip the intro cinematic + pin the view at an armed .softcap camera through the
+		// soft-shadow self-test: skip the intro cinematic + pin the view at an armed .cap camera through the
 		// normal frame (see R_SoftShadowGoto_f). No-op unless `softShadowGoto` armed it.
 		extern void R_SoftShadowGotoTick();
 		R_SoftShadowGotoTick();
 		// headless corpus render state machine (softShadowShots): advances goto -> settle -> dumpHDR -> next -> quit
 		extern void R_SoftShadowBatchTick();
 		R_SoftShadowBatchTick();
+		// warn when a contradictory shadow-cvar combo is set (silent-no-op guard, e.g. scanline vs surf cache)
+		extern void R_ShadowConflictTick();
+		R_ShadowConflictTick();
+		// repro harness (softShadowRepro): loadGame(embedded save) -> settle -> freeze -> A/B shot -> next -> quit
+		extern void R_SoftShadowReproTick();
+		R_SoftShadowReproTick();
 
 		// start the game / draw command generation thread going in the background
 		gameReturn_t ret = gameThread.RunGameAndDraw( numGameFrames, userCmdMgr, IsClient(), gameFrame - numGameFrames );

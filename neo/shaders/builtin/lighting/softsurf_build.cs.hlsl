@@ -36,11 +36,25 @@ version. See <http://www.gnu.org/licenses/>.
 // *INDENT-OFF*
 StructuredBuffer<float4>	t_SoftEdges	: register( t0 );	// tri stream + caster table (joint buffer)
 StructuredBuffer<uint>		t_SoftTiles	: register( t1 );	// UNUSED dummy: the shared include declares walks that read it
+// GRID mode (SW_SURF_GRID, r_softShadowSurfCacheGrid): compile the Fubini scanline primitives
+// (SoftScan_FillTri/SoftScan_Run) into this build so it rasterises the per-texel 8x32 bit-grid instead of
+// the scalar-corner fold. The grid is order-independent, overlap-exact, fixed-size and umbra/tilt-safe, so
+// the build NEVER frees a claimed slot (the scalar fold's dominant in-game miss cause).
+#if SW_SURF_GRID
+	#define SW_SCANLINE 1
+#endif
 #include "softwedge_coverage.inc.hlsl"
 #include "softsurf_classify.inc.hlsl"	// SHARED fold classifier (compiled identically into the unit test)
 
 RWStructuredBuffer<uint>	u_SurfTable	: register( u0 );	// texel records, 8 uints each (layout: softterm.cs.hlsl)
+#if SW_SURF_GRID
+// GRID mode reuses register u1 (the residual pool is unused in grid mode) for the parallel Fubini grid
+// buffer - so the binding LAYOUT is identical to the scalar build (u0 table, u1, u2 queue), nothing to
+// strip/desync. SW_SCAN_CHORDS words per slot.
+RWStructuredBuffer<uint>	u_SurfGrid	: register( u1 );
+#else
 RWStructuredBuffer<uint>	u_SurfPool	: register( u1 );	// [0] alloc counter, then residual tri indices
+#endif
 RWStructuredBuffer<uint>	u_SurfQueue	: register( u2 );	// [0] count, then requested slot indices
 
 cbuffer c_SurfBuild : register( b0 )
@@ -213,6 +227,49 @@ void main( uint3 tid : SV_DispatchThreadID )
 	const float3 swL = g_lightR.xyz;
 	const float  swR = max( g_lightR.w, 1e-2f );
 
+#if SW_SURF_GRID
+	// GRID BUILD: rasterise every static occluder into ONE Fubini bit-grid at the texel-CENTRE frame,
+	// stored in the parallel u_SurfGrid buffer. No fold/residual classify, no abandon gates - the grid is
+	// fixed-size and represents umbra/silhouette/tilt directly, so a claimed slot is ALWAYS kept (BUILT).
+	// The term reads this grid and ORs it with the fragment's live dynamic grid (softterm.cs SW_SURF_GRID).
+	{
+		uint swGrid[SW_SCAN_CHORDS];
+		[unroll] for( int gz = 0; gz < SW_SCAN_CHORDS; gz++ ) { swGrid[gz] = 0u; }
+		const softFrame_t frG = SoftShadow_Frame( Pc, swL );
+		const float sinAG = saturate( swR / frG.distPL );
+		const float cosAG = sqrt( 1.0f - sinAG * sinAG );
+		const float epsG  = SW_NEAR_EPS;
+		uint gridFold = 0u;
+		for( int scG = 0; scG < g_range.y; scG++ )		// STATIC caster prefix only
+		{
+			const float4 c0 = t_SoftEdges[ g_range.z + scG * 2 + 0 ];
+			const float4 c1 = t_SoftEdges[ g_range.z + scG * 2 + 1 ];
+			const float3 dCv = float3( c0.x, c0.y, c0.z ) - Pc;
+			if( SoftShadow_CullCaster( dCv, c0.w + g * 1.42f, frG, sinAG, cosAG, epsG ) )
+			{
+				continue;
+			}
+			const int triFirstG = ( int )c1.x;
+			const int triEndG    = triFirstG + ( int )c1.y;
+			for( int tG = triFirstG; tG < triEndG; tG++ )
+			{
+				const int bG = g_range.x + tG * 3;
+				const float3 v0 = t_SoftEdges[ bG + 0 ].xyz;
+				const float3 v1 = t_SoftEdges[ bG + 1 ].xyz;
+				const float3 v2 = t_SoftEdges[ bG + 2 ].xyz;
+				SoftScan_FillTri( swGrid, v0, v1, v2, Pc, frG, swR, epsG );	// OR the tri's bit-runs in
+				gridFold++;
+			}
+		}
+		const uint gBase = slot * ( uint )SW_SCAN_CHORDS;
+		[unroll] for( int gw = 0; gw < SW_SCAN_CHORDS; gw++ ) { u_SurfGrid[ gBase + gw ] = swGrid[ gw ]; }
+		u_SurfTable[ sBase + 4 ] = ( min( gridFold, 0xFFFFu ) << 16 );	// hi: folded count (viz); lo: 0 residual
+		u_SurfTable[ sBase + 2 ] = ( curGen << 2 ) | 2u;				// BUILT - written last
+		return;
+	}
+#endif	// SW_SURF_GRID
+
+#if !SW_SURF_GRID	// ---- scalar-fold build (the whole classify/fold/residual/abandon body) ----
 	// ONE fixed rotation for all 5 points (texel-center hash, same formula as the term CS): the solo
 	// coverage DIFFERENCES between the points then measure geometry, not sampling noise. Determinism:
 	// the same texel always rebuilds bit-identically.
@@ -418,15 +475,17 @@ void main( uint3 tid : SV_DispatchThreadID )
 						scCtr = SurfBuild_SoloCovExact( Pc, v0, v1, v2, frC, swR2c );
 					}
 				}
-				// REDUCED mode: drop occluders whose max solo coverage across the texel (4 corners + centre,
-				// = the study's cell-ranked key) is below the cutoff. The union is dominated by a handful of
-				// large occluders; the tiny-solo tail is redundant. This bounds the kept set to the few that
-				// matter WITHOUT a GPU sort, and keeps them out of allMask/intMask so F stays 0.
+				// REDUCED mode: split each occluder by its max solo coverage across the texel (4 corners +
+				// centre, = the study's cell-ranked key). The union is dominated by a handful of LARGE
+				// occluders whose coverage is non-linear across the texel (the residual, walked EXACTLY at P).
+				// The tiny-solo TAIL is small + low-overlap, so its additive 4-corner bilerp fold is near-exact
+				// - FOLD it, do NOT drop it (dropping was the sub-cutoff under-shadow = the gate's UMBRA/EXTENT
+				// defects). Nothing is discarded, so the decomposition is lossless: big=exact walk, tail=bilerp.
+				float msolo = 0.0f;
 				if( reduced )
 				{
-					float msolo = max( max( scC[0], scC[1] ), max( scC[2], scC[3] ) );
+					msolo = max( max( scC[0], scC[1] ), max( scC[2], scC[3] ) );
 					msolo = max( msolo, scCtr );
-					if( msolo <= redCut ) { continue; }
 				}
 				// SAMPLED interior union masks (pass 0 only) - accumulate this triangle's occlusion at the
 				// 5 interior probes into the running union, for the umbra gate below.
@@ -453,7 +512,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				}
 				const float scMean = 0.25f * ( scC[0] + scC[1] + scC[2] + scC[3] );
 				const float dev  = abs( scCtr - scMean );	// this occluder's deviation from bilinear over the texel
-				const bool  fold = reduced ? false : ( dev <= thr );	// reduced: walk EVERY kept occluder exactly (no bilinear fold)
+				const bool  fold = reduced ? ( msolo <= redCut ) : ( dev <= thr );	// reduced: FOLD the small-solo tail (bilerp), walk the big occluders exactly
 				if( pass == 0 )
 				{
 					for( int cc = 0; cc < 4; cc++ ) { scCornSum[cc] += scC[cc]; allMask[cc] |= solo[cc]; }
@@ -560,9 +619,15 @@ void main( uint3 tid : SV_DispatchThreadID )
 	for( int cc2 = 0; cc2 < 4; cc2++ ) { sMax = max( sMax, scCornSum[cc2] ); }
 	const bool umbraSomewhere = ( maxCornerCov >= 0.999f || maxIntCov >= 0.999f || sMax + 3.0f * devAll >= 1.0f );
 	const bool umbraStraddle  = ( umbraSomewhere && minCornerCov < 0.999f );
-	// reduced mode caches umbra + curved texels too (it walks the exact set, no bilinear F to erode), so the
-	// fold-only abandon gates are skipped; only the K-cap overflow above can abandon a reduced texel.
-	if( !reduced && ( umbraStraddle || ( devFold > g_params.w ) ) )
+	// The fold-abandon gates exist ONLY for the fold's bilinear-F erosion (umbra clamp / curvature). They apply
+	// when something is actually FOLDED. A PURE-RESIDUAL texel (foldCnt==0, e.g. cutoff 0 / coarse region) has
+	// F==0 and its whole coverage is the residual walked EXACTLY at P - correct in umbra, no bilerp to erode -
+	// so it must NOT be freed. Gate the abandon on foldActive for reduced; non-reduced always folds so always
+	// gates. NOTE: gating reduced on the folded F alone while KEEPING residual-formed-umbra fold texels FAILS
+	// (the additive fFold+occEx cancels covRes only when the residual is bilinear, but it is non-linear by
+	// construction -> light leaks, 545 defects); the covAll straddle gate is correctness-required WHEN folding.
+	const bool foldActive = ( foldCnt > 0u );
+	if( ( !reduced || foldActive ) && ( umbraStraddle || ( devFold > g_params.w ) ) )
 	{
 		u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// WALK-ALWAYS -> FREE the slot (empty key). Was code 3: measured 77% of the table = dead weight oversubscribing it -> collision-misses. Empty reads as miss = exact walk (same result), keeps load low so BUILT records stay reachable. //		// umbra-straddle / too-curved fold: WALK-ALWAYS (exact)
 		return;
@@ -572,4 +637,5 @@ void main( uint3 tid : SV_DispatchThreadID )
 	u_SurfTable[ sBase + 5 ] = f32tof16( F[0] ) | ( f32tof16( F[1] ) << 16 );
 	u_SurfTable[ sBase + 6 ] = f32tof16( F[2] ) | ( f32tof16( F[3] ) << 16 );
 	u_SurfTable[ sBase + 2 ] = ( curGen << 2 ) | 2u;	// BUILT - written last
+#endif	// !SW_SURF_GRID
 }

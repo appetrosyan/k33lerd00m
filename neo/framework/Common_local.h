@@ -202,6 +202,12 @@ public:
 	virtual bool				LoadGame( const char* saveName );
 	virtual bool				SaveGame( const char* saveName );
 
+	// In-engine CAPTURE harness (.cap embedded savegame). Serialises the COMPLETE game state (no UI/dialog,
+	// unlike SaveGame): writes a real disk slot `slotName` via SaveGameSync (so the repro restores through
+	// the proven LoadGame path) AND copies the raw save/strings bytes out for embedding in the .cap (self-
+	// contained / portable). Restore side just calls LoadGame(slotName). Used only by RenderCapture.
+	bool						CaptureGameSave( const char* slotName, idList<byte>& outSave, idList<byte>& outStrings );
+
 	virtual int					ButtonState( int key );
 	virtual int					KeyState( int key );
 

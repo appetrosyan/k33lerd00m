@@ -28,7 +28,7 @@ the Free Software Foundation, either version 3 of the License, or
 #include "hlsl_compat.h"
 #include "softwedge_coverage.inc.hlsl"		// the live shader source, compiled as C++ (SW_FUNC=inline)
 #include "SoftShadowBox.h"					// MakeBox / Silhouette / BuildCaster / Box / Rng (namespace swtest)
-#include "SoftShadowMesh.h"					// SoftCap + LoadSoftCap (real-capture microbench)
+#include "SoftShadowMesh.h"					// Cap + LoadCap (real-capture microbench)
 #include "idUnitTest.h"
 
 #include <chrono>
@@ -251,7 +251,7 @@ STUDY_TEST( SoftShadowBench, deviation_vs_anchor )
 
 // ---------------------------------------------------------------------------- REAL-CAPTURE MICROBENCH
 // The A/B filter the plan requires: time the CURRENT walker (SoftShadow_FaceCoverage) vs a proposed
-// REPLACEMENT on a real .softcap's receivers, with a DEVIATION gate proving the replacement is
+// REPLACEMENT on a real .cap's receivers, with a DEVIATION gate proving the replacement is
 // lossless (coverage identical within tol) before it can claim a speedup. Today the "replacement" is
 // the current walker itself (A==B, deviation 0, ratio ~1) so the harness is proven and ready; a
 // candidate from the walk-attribution front (softshadow-walk-attribution memory: ~80 MT survivors/
@@ -261,7 +261,7 @@ STUDY_TEST( SoftShadowBench, deviation_vs_anchor )
 // losslessness + algorithmic (op-count) wins; the definitive speed proof is the GPU walk-phase timer
 // (com_softShadowGateBench, counters OFF). Nothing ships on a CPU win alone.
 //
-// Run:  SOFTCAP=/path/to/foo.softcap ./rbdoom3bfg_tests @study:SoftShadowBench
+// Run:  CAP=/path/to/foo.cap ./rbdoom3bfg_tests @study:SoftShadowBench
 namespace
 {
 // the A/B slot. variant 0 = shipped walker; variant 1 = candidate (currently identical). A real
@@ -280,15 +280,15 @@ inline float WalkVariant( int variant, float3 P, float3 L, float swR, int triBas
 
 STUDY_TEST( SoftShadowBench, real_capture )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [realbench] SOFTCAP unset; skipping\n" );
+		std::printf( "    [realbench] CAP unset; skipping\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) )
+	Cap cap;
+	if( !LoadCap( path, cap ) )
 	{
 		std::printf( "    [realbench] cannot load %s\n", path );
 		CHECK( false );
@@ -306,7 +306,7 @@ STUDY_TEST( SoftShadowBench, real_capture )
 	const int MAX_RECV = 400;
 	for( size_t li = 0; li < cap.lights.size(); li++ )
 	{
-		const softcapLight_t& L = cap.lights[li];
+		const capLight_t& L = cap.lights[li];
 		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 ) { continue; }
 		const size_t base4 = ( size_t )L.firstEdge * 2;
 		const size_t nTris = ( ( size_t )L.edgeCount * 2 ) / 3;
@@ -329,7 +329,7 @@ STUDY_TEST( SoftShadowBench, real_capture )
 		it.casterBase = ( int )( nTris * 3 );
 		it.L = float3( L.origin[0], L.origin[1], L.origin[2] );
 		it.swR = std::fmax( L.penumbraSize, 1e-2f );
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex != ( uint32_t )li ) { continue; }
 			const uint32_t tc = r.numIndex / 3;

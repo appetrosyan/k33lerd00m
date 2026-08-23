@@ -17,7 +17,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 // The defect COUNTER must itself be proven able to count before its zero is believed: synthetic term
 // images with KNOWN injected defect counts, checked exactly. These are analyzer tests, not renderer
-// tests - the renderer gate is the com_softShadowGate engine run over the softcap corpus.
+// tests - the renderer gate is the com_softShadowGate engine run over the cap corpus.
 
 #include "idUnitTest.h"
 #include "SoftShadowGate.h"

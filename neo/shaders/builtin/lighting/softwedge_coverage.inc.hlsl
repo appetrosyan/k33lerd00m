@@ -1425,8 +1425,10 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 #endif	// SW_SCANLINE
 }
 
-#if SW_SURF_CACHE
+#if SW_SURF_CACHE && !SW_SURF_GRID
 // SURFACE-FOLD CACHE probe (r_softShadowSurfCache): the EXACT part of a cached fragment's term.
+// EXCLUDED in GRID mode: the grid hit path ORs a Fubini dynamic grid instead of walking the residual
+// pool, so t_SurfPool is unbound in grid mode (its register t6 is reused for the static grid buffer).
 // Walks the texel's RESIDUAL static occluders (triangle indices from the persistent pool t_SurfPool,
 // declared by the term CS before this include) plus the frame's DYNAMIC casters (the caster-table
 // suffix after the static prefix) into ONE shared sample mask (union), then the shipped crack-close.

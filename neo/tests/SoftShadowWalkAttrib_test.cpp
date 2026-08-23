@@ -15,7 +15,7 @@ version. See <http://www.gnu.org/licenses/>.
 // WALK-ATTRIBUTION INSTRUMENT (study, not a test). Measure-first: the granular GPU phase timer says
 // the coverage WALK is ~17ms of a 27ms frame on the heavy captures, but NOT where inside the walk it
 // goes. This runs the EXACT shipped walker (SoftShadow_FaceCoverage, compiled as C++ via hlsl_compat)
-// over a real .softcap's receivers with the SW_ATTRIB op-counters ON, and reports the breakdown:
+// over a real .cap's receivers with the SW_ATTRIB op-counters ON, and reports the breakdown:
 //   caster-sphere tests/rejects | per-triangle COARSE (v0) tests/rejects | per-triangle TIGHT
 //   (centroid cone) tests/rejects | triangles reaching the Moller-Trumbore + 16-sample loop.
 // The last one (mtTri) x 16 is the expensive sample work; the rest is cull volume. So the numbers say
@@ -28,12 +28,12 @@ version. See <http://www.gnu.org/licenses/>.
 // caster-grouping-independent and transfer; the GPU per-fragment counters (r_softShadowWalkCounters)
 // measure the real tile-list path for cross-check.
 //
-// Run:  SOFTCAP=/path/to/foo.softcap ./rbdoom3bfg_tests @study:SoftShadowWalkAttrib
+// Run:  CAP=/path/to/foo.cap ./rbdoom3bfg_tests @study:SoftShadowWalkAttrib
 
 #include "hlsl_compat.h"
 #include "softwedge_coverage.inc.hlsl"		// the live shader source, compiled as C++ (SW_FUNC=inline)
 #include "SoftShadowBox.h"					// SoftRotAngle, namespace swtest
-#include "SoftShadowMesh.h"					// SoftCap + LoadSoftCap
+#include "SoftShadowMesh.h"					// Cap + LoadCap
 #include "idUnitTest.h"
 
 #include <cstdio>
@@ -52,15 +52,15 @@ using namespace swtest;
 
 STUDY_TEST( SoftShadowWalkAttrib, breakdown )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [walkattrib] SOFTCAP unset; skipping (set it to a .softcap)\n" );
+		std::printf( "    [walkattrib] CAP unset; skipping (set it to a .cap)\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) )
+	Cap cap;
+	if( !LoadCap( path, cap ) )
 	{
 		std::printf( "    [walkattrib] cannot load %s\n", path );
 		CHECK( false );
@@ -69,7 +69,7 @@ STUDY_TEST( SoftShadowWalkAttrib, breakdown )
 
 	const int MAX_RECV = 400;		// per-light receiver sample budget
 
-	// reinterpret the capture's edge block as the flat float4 tri stream (2 float4 per softcapEdge_t)
+	// reinterpret the capture's edge block as the flat float4 tri stream (2 float4 per capEdge_t)
 	auto F4 = [&]( size_t j ) -> const float*
 	{
 		return ( j & 1 ) ? cap.edges[j >> 1].e1 : cap.edges[j >> 1].e0;
@@ -85,7 +85,7 @@ STUDY_TEST( SoftShadowWalkAttrib, breakdown )
 
 	for( size_t li = 0; li < cap.lights.size(); li++ )
 	{
-		const softcapLight_t& L = cap.lights[li];
+		const capLight_t& L = cap.lights[li];
 		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
 		{
 			continue;
@@ -125,7 +125,7 @@ STUDY_TEST( SoftShadowWalkAttrib, breakdown )
 
 		// receiver-centroid P set for this light (the fragment positions the walk runs on)
 		std::vector<float3> recvPts;
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex != ( uint32_t )li )
 			{

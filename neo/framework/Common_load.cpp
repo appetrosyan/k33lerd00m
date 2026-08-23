@@ -1101,6 +1101,71 @@ bool idCommonLocal::SaveGame( const char* saveName )
 
 /*
 ===============
+idCommonLocal::CaptureGameSave
+
+In-engine capture harness: serialise the full game state the way SaveGame does, but WITHOUT the dialog /
+sound / screen-update side effects (the capture command already has the game thread quiesced and must not
+perturb the frozen frame). Writes a real, loadable disk slot `slotName` via SaveGameSync so the repro
+harness can restore through the proven LoadGame path, and copies the raw save/strings bytes out for the
+.cap embedded-save block (self-contained + portable). Returns false if not in a saveable state.
+===============
+*/
+bool idCommonLocal::CaptureGameSave( const char* slotName, idList<byte>& outSave, idList<byte>& outStrings )
+{
+	if( pipelineFile != NULL || mapSpawnData.savegameFile != NULL || game == NULL || IsMultiplayer() )
+	{
+		return false;
+	}
+	if( game->GetPersistentPlayerInfo( 0 ).GetInt( "health" ) <= 0 )
+	{
+		common->Warning( "CaptureGameSave: player must be alive to capture a save" );
+		return false;
+	}
+
+	// --- serialise (mirrors SaveGame's core, minus UI/dialog/sound) -------------------------------------
+	saveFile.MakeWritable();
+	saveFile.Clear( false );
+	stringsFile.MakeWritable();
+	stringsFile.Clear( false );
+
+	pipelineFile = new( TAG_SAVEGAMES ) idFile_SaveGamePipelined();
+	pipelineFile->OpenForWriting( &saveFile );
+
+	saveFile.WriteString( GAME_NAME );
+	saveFile.WriteString( currentMapName );
+	saveFile.WriteBool( consoleUsed );
+	game->GetServerInfo().WriteToFileHandle( &saveFile );
+	game->SaveGame( pipelineFile, &stringsFile );
+	pipelineFile->Finish();
+	delete pipelineFile;
+	pipelineFile = NULL;
+
+	// --- copy bytes out for the .cap embed (before the sync, which may rewind the buffers) --------------
+	outSave.SetNum( saveFile.Length() );
+	if( saveFile.Length() > 0 )   { memcpy( outSave.Ptr(),    saveFile.GetDataPtr(),    saveFile.Length() ); }
+	outStrings.SetNum( stringsFile.Length() );
+	if( stringsFile.Length() > 0 ) { memcpy( outStrings.Ptr(), stringsFile.GetDataPtr(), stringsFile.Length() ); }
+
+	// --- write the disk slot so LoadGame(slotName) restores it through the proven path ------------------
+	idSaveGameDetails gameDetails;
+	game->GetSaveGameDetails( gameDetails );
+	gameDetails.descriptors.Set( SAVEGAME_DETAIL_FIELD_LANGUAGE, sys_lang.GetString() );
+	gameDetails.descriptors.SetInt( SAVEGAME_DETAIL_FIELD_CHECKSUM, ( int )gameDetails.descriptors.Checksum() );
+	gameDetails.slotName = slotName;
+	ScrubSaveGameFileName( gameDetails.slotName );
+
+	saveFileEntryList_t files;
+	files.Append( &stringsFile );
+	files.Append( &saveFile );
+	session->SaveGameSync( gameDetails.slotName, files, gameDetails );
+
+	common->Printf( "CaptureGameSave: slot '%s' - save %d B, strings %d B\n",
+					gameDetails.slotName.c_str(), saveFile.Length(), stringsFile.Length() );
+	return true;
+}
+
+/*
+===============
 idCommonLocal::LoadGame
 ===============
 */

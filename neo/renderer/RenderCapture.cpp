@@ -55,11 +55,17 @@ static idVec3   s_gotoOrg;
 static idAngles s_gotoAng;
 static int      s_gotoFrames = 0;
 
-// EXPLICIT soft-shadow test config. The self-test must NOT inherit archived cvars from D3BFGConfig.cfg: e.g.
-// r_useRTShadows 1 silently makes the whole soft-wedge path INERT (frontend gate is `... && !r_useRTShadows`), so
-// the test measures RT instead of what it claims to. Pin every shadow-relevant cvar to a documented value BEFORE
-// the frontend runs (i.e. from softShadowGoto, which precedes the geometry-building frames), and LOUDLY log any
-// that differed from the live/archived value so a stale config can never masquerade as a code result again.
+// EXPLICIT soft-shadow test config.
+//
+// The self-test must NOT inherit archived cvars from D3BFGConfig.cfg:
+// e.g. r_useRTShadows 1 silently makes the whole soft-wedge path
+// inert, so the test/ measures RT instead of what it claims to.
+// 
+// Pin every shadow-relevant cvar to a documented value BEFORE the
+// frontend runs (i.e. from softShadowGoto, which precedes the
+// geometry-building frames), and LOUDLY log any that differed from
+// the live/archived value so a stale config can never masquerade as a
+// code result again.
 struct SoftPin { const char* name; const char* value; };
 static const SoftPin s_softTestConfig[] =
 {
@@ -99,6 +105,93 @@ void R_SoftShadowPinTestConfig( bool verbose )
 	if( verbose ) { common->Printf( "[softtest] ==== %d archived cvar(s) overridden ====\n", overridden ); }
 }
 
+// ---- shadow-technique cvar CONFLICT WARNINGS -------------------------------------------------------
+// Mutually-exclusive / prerequisite relationships between shadow cvars, encoded so a contradictory combo
+// WARNS instead of silently no-opping (the bug class that hid the scanline-vs-surfcache no-op and the
+// RT-vs-soft precedence). Each rule: when cvar `a`==`aVal` AND cvar `b`==`bVal`, `a`'s intent is defeated.
+struct shadowConflict_t { const char* a; int aVal; const char* b; int bVal; const char* why; };
+static const shadowConflict_t s_shadowConflicts[] =
+{
+	{ "r_softShadowScanline",    1, "r_softShadowSurfCache",    1, "scanline is a SILENT NO-OP while the surf cache is on (the term selects the surf permutation, not scan)" },
+	{ "r_softShadowScanline",    1, "r_softShadowFaceCoverage", 0, "scanline lives in the face-coverage path; faceCoverage 0 makes it inert" },
+	{ "r_softShadowScanline",    1, "r_softShadowCompute",      0, "the scanline term needs the compute soft-shadow path (softShadowCompute 1)" },
+	{ "r_useSoftShadowVolumes",  1, "r_useRTShadows",           1, "RT and soft-shadow volumes are mutually exclusive - RT precedence silently disables the soft path" },
+	{ "r_useSoftShadowVolumes",  1, "r_skipShadows",            1, "r_skipShadows disables ALL shadows, soft included" },
+	{ "r_useSoftShadowVolumes",  1, "r_softShadowCompute",      0, "the soft-shadow term needs softShadowCompute 1" },
+	{ "r_useRTShadows",          1, "r_skipShadows",            1, "r_skipShadows disables ALL shadows, RT included" },
+	{ "r_useRTShadows",          1, "r_useShadowMapping",       0, "the RT shadow dispatch keys on shadow-map occluders - needs useShadowMapping 1" },
+};
+// DEPENDENCY / INERT rules: cvar `cvar` is IGNORED (its value has no effect) while gate `gate`==`gateVal`.
+// Warn only when the inert cvar is at a NON-DEFAULT value - the user meaningfully set it but it does nothing.
+struct shadowInert_t { const char* cvar; const char* gate; int gateVal; const char* why; };
+static const shadowInert_t s_shadowInert[] =
+{
+	{ "r_softShadowSamples",          "r_softShadowScanline",   1, "the scanline term rasterises exact chords and IGNORES the disk sample count" },
+	{ "r_softShadowSamples",          "r_useSoftShadowVolumes", 0, "the disk sample count only affects the analytic soft-shadow path" },
+	{ "r_softShadowScanline",         "r_softShadowSurfCache",  1, "scanline is ignored while the surf cache serves the term" },
+	{ "r_softShadowSurfCacheGrid",    "r_softShadowSurfCache",  0, "the surf-cache grid mode is inert while the surf cache is off" },
+	{ "r_softShadowSurfCacheReduced", "r_softShadowSurfCache",  0, "reduced-set mode is inert while the surf cache is off" },
+	{ "r_rtShadowRays",               "r_useRTShadows",         0, "the RT ray count is inert while RT shadows are off" },
+	{ "r_rtShadowSoftRadius",         "r_useRTShadows",         0, "the RT soft radius is inert while RT shadows are off" },
+	{ "r_softShadowTermBlur",         "r_softShadowCompute",    0, "the term blur is inert without the compute soft-shadow path" },
+};
+static const char* const s_shadowWatchCvars[] =
+{
+	"r_softShadowScanline", "r_softShadowSurfCache", "r_softShadowFaceCoverage", "r_softShadowCompute",
+	"r_useSoftShadowVolumes", "r_useRTShadows", "r_skipShadows", "r_useShadowMapping",
+	"r_softShadowSamples", "r_softShadowSurfCacheGrid", "r_softShadowSurfCacheReduced", "r_rtShadowRays",
+	"r_rtShadowSoftRadius", "r_softShadowTermBlur",
+};
+
+// Evaluate every rule and WARN on each active conflict. Returns the conflict count. verbose: also log an
+// all-clear line. Callable directly (harness/test config pin) or by the per-frame poll below.
+int R_CheckShadowConflicts( bool verbose )
+{
+	int n = 0;
+	for( const shadowConflict_t& c : s_shadowConflicts )
+	{
+		if( cvarSystem->GetCVarInteger( c.a ) == c.aVal && cvarSystem->GetCVarInteger( c.b ) == c.bVal )
+		{
+			common->Warning( "shadow config CONFLICT: %s %d + %s %d -> %s", c.a, c.aVal, c.b, c.bVal, c.why );
+			n++;
+		}
+	}
+	for( const shadowInert_t& r : s_shadowInert )
+	{
+		idCVar* cv = cvarSystem->Find( r.cvar );
+		if( cv == NULL ) { continue; }
+		const bool nonDefault = idStr::Icmp( cv->GetString(), cv->GetDefaultString() ) != 0;
+		if( nonDefault && cvarSystem->GetCVarInteger( r.gate ) == r.gateVal )
+		{
+			common->Warning( "shadow config INERT: %s=%s has no effect while %s %d -> %s",
+							 r.cvar, cv->GetString(), r.gate, r.gateVal, r.why );
+			n++;
+		}
+	}
+	if( verbose && n == 0 ) { common->Printf( "[shadowcfg] no shadow-technique cvar conflicts\n" ); }
+	return n;
+}
+
+void R_CheckShadowConflicts_f( const idCmdArgs& args ) { ( void )args; R_CheckShadowConflicts( true ); }
+
+// Per-frame poll (called from Common::Frame): value-cache the watched cvars; when any changes, re-validate
+// and warn. Gives "warn the moment a conflicting value is set" without a cvar-change callback.
+void R_ShadowConflictTick()
+{
+	static int  s_last[ sizeof( s_shadowWatchCvars ) / sizeof( s_shadowWatchCvars[0] ) ];
+	static bool s_init = false;
+	const int N = ( int )( sizeof( s_shadowWatchCvars ) / sizeof( s_shadowWatchCvars[0] ) );
+	bool changed = false;
+	for( int i = 0; i < N; i++ )
+	{
+		const int v = cvarSystem->GetCVarInteger( s_shadowWatchCvars[i] );
+		if( !s_init || v != s_last[i] ) { changed = true; }
+		s_last[i] = v;
+	}
+	if( changed && s_init ) { R_CheckShadowConflicts( false ); }	// skip the boot-time state; only warn on CHANGES
+	s_init = true;
+}
+
 void R_SoftShadowGotoTick()
 {
 	if( s_gotoFrames <= 0 )
@@ -124,11 +217,11 @@ void R_SoftShadowGoto_f( const idCmdArgs& args )
 {
 	if( args.Argc() < 2 )
 	{
-		common->Warning( "usage: softShadowGoto <capture.softcap> | <x y z yaw pitch>  (then `wait 90` before testSoftShadowLocator)" );
+		common->Warning( "usage: softShadowGoto <capture.cap> | <x y z yaw pitch>  (then `wait 90` before testSoftShadowLocator)" );
 		return;
 	}
 	// FREE-CAM form: 5+ args -> raw "x y z yaw pitch", so the harness can render ANY spot in the live map, not just
-	// a captured viewpoint (dynamic props / elevated casters that no .softcap covers). testSoftShadowLocator takes
+	// a captured viewpoint (dynamic props / elevated casters that no .cap covers). testSoftShadowLocator takes
 	// the same form. No file needed - the goto tick just teleports the player there.
 	if( args.Argc() >= 6 )
 	{
@@ -141,8 +234,8 @@ void R_SoftShadowGoto_f( const idCmdArgs& args )
 		return;
 	}
 	FILE* cf = fopen( args.Argv( 1 ), "rb" );
-	softcapHeader_t hdr;
-	if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC )
+	capHeader_t hdr;
+	if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != CAP_MAGIC )
 	{
 		if( cf != NULL ) { fclose( cf ); }
 		common->Warning( "softShadowGoto: cannot read capture %s", args.Argv( 1 ) );
@@ -217,7 +310,7 @@ void R_SoftShadowShots_f( const idCmdArgs& args )
 {
 	if( args.Argc() < 2 )
 	{
-		common->Warning( "usage: softShadowShots <cap1.softcap> [cap2 ...] - renders each headless -> shot_<name>.png, then quits" );
+		common->Warning( "usage: softShadowShots <cap1.cap> [cap2 ...] - renders each headless -> shot_<name>.png, then quits" );
 		return;
 	}
 	s_batchCaps.Clear();
@@ -233,9 +326,266 @@ void R_SoftShadowShots_f( const idCmdArgs& args )
 	common->Printf( "[softbatch] armed %d captures, settle=%d frames each\n", s_batchCaps.Num(), SOFT_BATCH_SETTLE );
 }
 
+// forward decls: these are defined later in this TU (R_RenderOneFrame is static file-scope; ReadImageRGBA8
+// lives in the anonymous namespace above), and the repro command functions below call them.
+static void R_RenderOneFrame();
+namespace { bool ReadImageRGBA8( idImage* img, std::vector<uint8_t>& out, int& w, int& h ); }
+
+// ===================================================================================================
+// REPRO HARNESS (softShadowRepro <cap...>). Reconstructs each capture's EXACT live state from the .cap's
+// embedded savegame, positions the camera, FREEZES the sim, and A/Bs scanline-vs-sampled (+ vs a
+// shadows-off baseline) at one identical frozen pose, diffing in-engine. One process, batch, clean exit.
+// Differential CANARY: soft-vs-noshadow MUST differ (shadows present) and scanline-vs-sampled MUST differ
+// when it does (else the toggle silently no-op'd = instrument error). Menu/fade asserts kill garbage frames.
+namespace
+{
+idStrList s_reproCaps;
+int  s_reproIdx  = -1;
+int  s_reproState = 0;			// see RS_* below
+int  s_reproWait = 0;
+int  s_reproFails = 0;			// deviation + instrument-error count (process exit signal)
+enum { RS_LOAD = 0, RS_WAITLOAD, RS_SETTLE, RS_SHOTWAIT, RS_NEXT };
+const int REPRO_LOAD_TIMEOUT = 600;	// frames to reach INGAME before giving up on a capture
+const int REPRO_SETTLE       = 45;	// frames for the teleport to land + the frontend to rebuild soft edges
+
+// central-band mean luminance of an RGBA8 frame (fade-in / all-dark guard)
+double R_CentralLuma( const std::vector<uint8_t>& img, int w, int h )
+{
+	if( w <= 0 || h <= 0 || ( int )img.size() < w * h * 4 ) { return 0.0; }
+	double s = 0.0; int n = 0;
+	for( int y = h / 4; y < 3 * h / 4; y++ )
+		for( int x = w / 4; x < 3 * w / 4; x++ )
+		{
+			const uint8_t* p = img.data() + ( ( size_t )y * w + x ) * 4;
+			s += ( p[0] + p[1] + p[2] ) * ( 1.0 / 3.0 ); n++;
+		}
+	return n ? s / n : 0.0;
+}
+
+// per-pixel luminance-delta stats between two RGBA8 frames of the same size
+struct DiffStats { double meanAbs; int maxAbs; double darkerPct; double brighterPct; int bx0, by0, bx1, by1; };
+DiffStats R_LumDiff( const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, int w, int h )
+{
+	DiffStats d = { 0, 0, 0, 0, w, h, -1, -1 };
+	if( w <= 0 || h <= 0 || ( int )a.size() < w * h * 4 || ( int )b.size() < w * h * 4 ) { return d; }
+	double sum = 0.0; long darker = 0, brighter = 0; const int tot = w * h;
+	for( int y = 0; y < h; y++ )
+		for( int x = 0; x < w; x++ )
+		{
+			const size_t o = ( ( size_t )y * w + x ) * 4;
+			const int la = ( a[o] + a[o + 1] + a[o + 2] ), lb = ( b[o] + b[o + 1] + b[o + 2] );
+			const int dv = ( la - lb ) / 3;
+			const int ad = dv < 0 ? -dv : dv;
+			sum += ad;
+			if( ad > d.maxAbs ) { d.maxAbs = ad; }
+			if( dv < -24 ) { darker++;  if( x < d.bx0 ) d.bx0 = x; if( y < d.by0 ) d.by0 = y; if( x > d.bx1 ) d.bx1 = x; if( y > d.by1 ) d.by1 = y; }
+			else if( dv > 24 ) { brighter++; if( x < d.bx0 ) d.bx0 = x; if( y < d.by0 ) d.by0 = y; if( x > d.bx1 ) d.bx1 = x; if( y > d.by1 ) d.by1 = y; }
+		}
+	d.meanAbs = tot ? sum / tot : 0.0;
+	d.darkerPct   = tot ? 100.0 * darker   / tot : 0.0;
+	d.brighterPct = tot ? 100.0 * brighter / tot : 0.0;
+	return d;
+}
+
+idStr R_ReproSlot( const idStr& capPath )		// "…/cap0000.cap" -> savegame slot "cap0000"
+{
+	idStr s = capPath; s.StripPath(); s.StripFileExtension();
+	return s;
+}
+}
+
+// SYNCHRONOUS shot: config already pinned + camera positioned by the tick. Freeze, render the A/B set at the
+// identical frozen state, diff in-engine, run the differential canary, report, and dump to dumps/.
+void R_SoftShadowReproShot_f( const idCmdArgs& args )
+{
+	const idStr capPath = args.Argc() > 1 ? args.Argv( 1 ) : "";
+	const idStr name = R_ReproSlot( capPath );
+
+	// (a) NOT-IN-MENU assert (a render world exists for the loaded map = in-game, not the menu)
+	if( tr.primaryWorld == NULL || session == NULL || session->GetState() != idSession::INGAME )
+	{
+		common->Printf( "[repro] %s: FAIL not-in-game (no world / not INGAME) - skipped\n", name.c_str() );
+		return;
+	}
+
+	// pin config + validate it is not silently defeated
+	R_SoftShadowPinTestConfig( false );
+	cvarSystem->SetCVarInteger( "r_useTemporalAA", 0 );
+	cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 0 );
+	// the pin is the PCSS-LOCATOR baseline; scanline/sampled live in the COMPUTE face-coverage term, so enable
+	// that path explicitly (else r_softShadowScanline is inert and the A/B is a no-op - the exact trap we guard).
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_softShadowCompute 1 ; r_softShadowFaceCoverage 1 ; r_softShadowTileBin 1 ; r_softShadowSamples 16\n" );
+
+	// apply the captured per-light penumbra the goto path drops (read light[0] from the .cap header)
+	{
+		FILE* cf = fopen( capPath.c_str(), "rb" );
+		capHeader_t hdr;
+		if( cf != NULL && fread( &hdr, sizeof( hdr ), 1, cf ) == 1 && hdr.magic == CAP_MAGIC && hdr.numLights > 0 )
+		{
+			capLight_t l0;
+			if( fread( &l0, sizeof( l0 ), 1, cf ) == 1 && l0.penumbraSize > 0.0f )
+			{
+				cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", l0.penumbraSize );
+				cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", l0.penumbraSize );
+			}
+		}
+		if( cf != NULL ) { fclose( cf ); }
+	}
+
+	// settle the goto-positioned view (sim still live), then FADE / ALL-DARK assert
+	R_RenderOneFrame();
+	std::vector<uint8_t> settleImg; int sw = 0, sh = 0;
+	ReadImageRGBA8( globalImages->currentRenderHDRImage, settleImg, sw, sh );
+	const double luma = R_CentralLuma( settleImg, sw, sh );
+	if( luma < 2.0 )
+	{
+		common->Printf( "[repro] %s: FAIL frame too dark (central luma %.2f) - fade-in / not settled - skipped\n", name.c_str(), luma );
+		return;
+	}
+
+	// FREEZE the sim: repeated renders of this view now differ ONLY by the cvars we toggle
+	const int wasStop = cvarSystem->GetCVarInteger( "g_stopTime" );
+	cvarSystem->SetCVarInteger( "g_stopTime", 1 );
+
+	std::vector<uint8_t> noShadow, sampled, scanline; int w = 0, h = 0;
+	// no-shadow baseline: disable the soft path outright (skipShadows alone does not stop soft volumes)
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_softShadowSurfCache 0 ; r_softShadowScanline 0 ; r_useSoftShadowVolumes 0 ; r_skipShadows 1\n" );
+	R_RenderOneFrame();  ReadImageRGBA8( globalImages->currentRenderHDRImage, noShadow, w, h );
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_skipShadows 0 ; r_useSoftShadowVolumes 1 ; r_softShadowScanline 0\n" );	// sampled soft
+	R_CheckShadowConflicts( false );
+	R_RenderOneFrame();  ReadImageRGBA8( globalImages->currentRenderHDRImage, sampled, w, h );
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_softShadowScanline 1\n" );	// scanline soft
+	R_CheckShadowConflicts( false );		// warns here if scanline is inert (e.g. surf cache still on)
+	R_RenderOneFrame();  ReadImageRGBA8( globalImages->currentRenderHDRImage, scanline, w, h );
+
+	// diagnostic: per-config luma + soft-edge tally + active config (disambiguates "no soft term" vs stale renders)
+	{
+		int softEdges = 0;
+		for( viewLight_t* vl = tr.viewDef ? tr.viewDef->viewLights : NULL; vl != NULL; vl = vl->next ) { softEdges += vl->softEdgeCount; }
+		common->Printf( "[repro] %s: luma noShadow %.1f sampled %.1f scanline %.1f | softEdges(view)=%d cfg soft=%d compute=%d face=%d tilebin=%d pcss=%d scanline=%d\n",
+						name.c_str(), R_CentralLuma( noShadow, w, h ), R_CentralLuma( sampled, w, h ), R_CentralLuma( scanline, w, h ), softEdges,
+						cvarSystem->GetCVarInteger( "r_useSoftShadowVolumes" ), cvarSystem->GetCVarInteger( "r_softShadowCompute" ),
+						cvarSystem->GetCVarInteger( "r_softShadowFaceCoverage" ), cvarSystem->GetCVarInteger( "r_softShadowTileBin" ),
+						cvarSystem->GetCVarInteger( "r_shadowMapPCSS" ), cvarSystem->GetCVarInteger( "r_softShadowScanline" ) );
+	}
+	// ASSERTIONS - the diagnostics ARE the test. A meaningless result (config not taken, soft path inert) is a
+	// LOUD FAILURE, never a silent pass.
+	const DiffStats dSampled    = R_LumDiff( sampled,  noShadow, w, h );	// sampled soft vs no-shadow
+	const DiffStats dScanShadow = R_LumDiff( scanline, noShadow, w, h );	// scanline soft vs no-shadow
+	const DiffStats dScan       = R_LumDiff( scanline, sampled,  w, h );	// the technique difference (the test)
+
+	const bool cfgOK = cvarSystem->GetCVarInteger( "r_useSoftShadowVolumes" ) == 1 && cvarSystem->GetCVarInteger( "r_softShadowCompute" ) == 1
+					   && cvarSystem->GetCVarInteger( "r_softShadowFaceCoverage" ) == 1 && cvarSystem->GetCVarInteger( "r_softShadowScanline" ) == 1;
+	const bool softEngaged = dSampled.meanAbs > 1.0 || dScanShadow.meanAbs > 1.0;	// at least one soft path drew shadows
+
+	if( !cfgOK )
+	{
+		common->Warning( "[repro] %s: ASSERT FAIL - the soft/compute/faceCoverage/scanline config did not take (a cvar conflict is defeating it) - result meaningless", name.c_str() );
+		s_reproFails++;
+	}
+	else if( !softEngaged )
+	{
+		common->Warning( "[repro] %s: ASSERT FAIL - the soft-shadow path is INERT (both sampled AND scanline render == no-shadow, softEdges=%d). The state/config did not engage soft shadows - cannot test.",
+						 name.c_str(), 0 );
+		s_reproFails++;
+	}
+	else
+	{
+		// scanline and sampled MUST agree closely when both are correct. A large delta - or scanline drawing
+		// shadow where sampled draws none (dScanShadow big while dSampled ~0) - is the scanline DEVIATION.
+		const bool scanlineOnly = dSampled.meanAbs < 1.0 && dScanShadow.meanAbs > 1.0;
+		const bool bug = scanlineOnly || dScan.darkerPct > 2.0 || dScan.maxAbs > 200;
+		common->Printf( "[repro] %s: scanline-vs-sampled mean %.2f max %d darker %.2f%% bbox(%d,%d)-(%d,%d) | sampled-shadows %.2f scanline-shadows %.2f -> %s\n",
+						name.c_str(), dScan.meanAbs, dScan.maxAbs, dScan.darkerPct, dScan.bx0, dScan.by0, dScan.bx1, dScan.by1,
+						dSampled.meanAbs, dScanShadow.meanAbs,
+						bug ? ( scanlineOnly ? "DEVIATION (scanline draws shadow sampled does not)" : "DEVIATION (scanline over-dark)" ) : "ok (banding-level)" );
+		if( bug ) { s_reproFails++; }
+	}
+
+	// dump the pair + heatmap to the dumps dir for eyeballing
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_softShadowScanline 0\n" ); R_RenderOneFrame();
+	R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
+					  nvrhi::ResourceStates::ShaderResource, va( "dumps/repro_%s_sampled.png", name.c_str() ) );
+	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_softShadowScanline 1\n" ); R_RenderOneFrame();
+	R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
+					  nvrhi::ResourceStates::ShaderResource, va( "dumps/repro_%s_scanline.png", name.c_str() ) );
+
+	// restore
+	cvarSystem->SetCVarInteger( "g_stopTime", wasStop );
+	cvarSystem->SetCVarInteger( "r_softShadowScanline", 0 );
+}
+
+void R_SoftShadowReproTick()
+{
+	if( s_reproIdx < 0 ) { return; }
+	const idStr& cap = s_reproCaps[s_reproIdx];
+	switch( s_reproState )
+	{
+		case RS_LOAD:
+		{
+			const idStr slot = R_ReproSlot( cap );
+			cvarSystem->SetCVarString( "com_autoLoadGame", slot.c_str() );	// skip the shell enumeration pre-check
+			cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "loadGame %s\n", slot.c_str() ) );
+			common->Printf( "[repro] %s: loading embedded save (slot '%s')...\n", R_ReproSlot( cap ).c_str(), slot.c_str() );
+			s_reproWait = 0; s_reproState = RS_WAITLOAD;
+			break;
+		}
+		case RS_WAITLOAD:
+		{
+			const bool inGame = ( session != NULL && session->GetState() == idSession::INGAME )
+								&& tr.primaryWorld != NULL;
+			if( inGame )
+			{
+				cvarSystem->SetCVarString( "com_autoLoadGame", "" );
+				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowGoto %s\n", cap.c_str() ) );
+				s_reproWait = REPRO_SETTLE; s_reproState = RS_SETTLE;
+			}
+			else if( ++s_reproWait > REPRO_LOAD_TIMEOUT )
+			{
+				common->Warning( "[repro] %s: load did not reach INGAME in %d frames - skipping", R_ReproSlot( cap ).c_str(), REPRO_LOAD_TIMEOUT );
+				s_reproFails++; s_reproState = RS_NEXT;
+			}
+			break;
+		}
+		case RS_SETTLE:
+			if( --s_reproWait <= 0 )
+			{
+				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowReproShot %s\n", cap.c_str() ) );
+				s_reproState = RS_SHOTWAIT;
+			}
+			break;
+		case RS_SHOTWAIT:
+			s_reproState = RS_NEXT;		// the shot command ran this frame; advance next tick
+			break;
+		case RS_NEXT:
+			s_reproIdx++;
+			if( s_reproIdx < s_reproCaps.Num() ) { s_reproState = RS_LOAD; }
+			else
+			{
+				common->Printf( "[repro] done - %d capture(s), %d deviation/instrument failure(s)\n", s_reproCaps.Num(), s_reproFails );
+				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "quit\n" );
+				s_reproIdx = -1;
+			}
+			break;
+	}
+}
+
+void R_SoftShadowRepro_f( const idCmdArgs& args )
+{
+	if( args.Argc() < 2 )
+	{
+		common->Warning( "usage: softShadowRepro <cap1.cap> [cap2 ...] - restore each embedded save, freeze, A/B scanline vs sampled, diff in-engine, then quit" );
+		return;
+	}
+	s_reproCaps.Clear();
+	for( int i = 1; i < args.Argc(); i++ ) { s_reproCaps.Append( idStr( args.Argv( i ) ) ); }
+	s_reproIdx = 0; s_reproState = RS_LOAD; s_reproFails = 0;
+	common->Printf( "[repro] armed %d capture(s)\n", s_reproCaps.Num() );
+}
+
 // One-shot capture of a live soft-shadow view, reconstructable headless. See RenderCapture.h. The capture is
 // two-phase within one frame: the FRONTEND half snapshots the view/lights/edges/caster-meshes (all CPU-side),
-// the BACKEND half grabs the screenshot and writes the .softcap + .json. `captureSoftShadow` arms it; the
+// the BACKEND half grabs the screenshot and writes the .cap + .json. `captureSoftShadow` arms it; the
 // halves fire on the next main view and disarm.
 
 extern idCVar r_shadowPenumbraSize;
@@ -247,14 +597,14 @@ bool  s_armed = false;			// set by the command, cleared once both halves have ru
 bool  s_frontendDone = false;	// the frontend half snapshotted this frame
 
 // ---- accumulators (frame-scoped; cleared when a new capture is armed) ----
-softcapHeader_t         s_hdr;
-std::vector<softcapLight_t>  s_lights;
-std::vector<softcapEdge_t>   s_edges;
-std::vector<softcapCaster_t> s_casters;
+capHeader_t         s_hdr;
+std::vector<capLight_t>  s_lights;
+std::vector<capEdge_t>   s_edges;
+std::vector<capCaster_t> s_casters;
 std::vector<float>           s_meshVerts;	// float3 packed (caster meshes)
 std::vector<uint32_t>        s_meshIdx;
 std::vector<float>           s_depth;		// per-pixel raw depth (R channel), screenW*screenH, top-left origin
-std::vector<softcapReceiver_t> s_receivers;	// receiver interaction surfaces (the shaded surfaces)
+std::vector<capReceiver_t> s_receivers;	// receiver interaction surfaces (the shaded surfaces)
 std::vector<float>           s_recvVerts;	// float3 packed (receiver meshes)
 std::vector<uint32_t>        s_recvIdx;
 std::vector<float>           s_recvST;		// float2 packed per receiver vert (v5 TEXTURE TAIL)
@@ -263,7 +613,7 @@ std::vector<const idMaterial*> s_matPtrs;	// unique receiver materials, in first
 idStr                        s_mapName;		// current map (self-identifying capture: reload + reconstruct, v4+)
 std::vector<float>           s_shadowVerts;	// float3 packed, CAPPED shadow volumes (world space), v4+
 std::vector<uint32_t>        s_shadowIdx;
-std::vector<softcapShadowVol_t> s_shadowVols;
+std::vector<capShadowVol_t> s_shadowVols;
 // the frontend records each shadow surf's GPU cache handles + transform; the backend reads them back once the
 // GPU is idle (the shadow geometry lives only in shadowCache/shadowIndexCache - the drawSurf has no CPU tris).
 struct ShadowSurfRec { vertCacheHandle_t vc, ic; int numIdx; float m[16]; float lgt[3]; uint32_t li; };
@@ -321,7 +671,7 @@ void ResetAccumulators()
 	s_frontendDone = false;
 }
 
-// sequential base name "softcapNNNN" in the same spot screenshots go (fs_savepath).
+// sequential base name "capNNNN" in the same spot screenshots go (fs_savepath).
 // Read a RESIDENT texture back from the GPU as RGBA8 (v5 texture tail). Blit-decodes any sampleable
 // format (the shipped game has only BC-compressed .bimage data - there are no source TGAs to load, so
 // disk loading yields nothing; the VRAM copy is the only real texel source). Mirrors R_ReadPixelsRGB8.
@@ -371,14 +721,14 @@ void NextCaptureBaseName( idStr& out )
 {
 	for( int i = 0; i <= 9999; i++ )
 	{
-		idStr candidate = va( "softcap/softcap%04i.softcap", i );
+		idStr candidate = va( "cap/cap%04i.cap", i );
 		if( fileSystem->ReadFile( candidate, NULL, NULL ) == -1 )
 		{
-			out = va( "softcap/softcap%04i", i );
+			out = va( "cap/cap%04i", i );
 			return;
 		}
 	}
-	out = "softcap/softcap9999";
+	out = "cap/cap9999";
 }
 } // namespace
 
@@ -397,7 +747,7 @@ void R_CaptureLightEdges( const viewLight_t* vLight, const softShadowEdge_t* fla
 	const uint32_t first = ( uint32_t )s_edges.size();
 	for( int i = 0; i < records; i++ )
 	{
-		softcapEdge_t e;
+		capEdge_t e;
 		e.e0[0] = flat[i].e0.x; e.e0[1] = flat[i].e0.y; e.e0[2] = flat[i].e0.z; e.e0[3] = flat[i].e0.w;
 		e.e1[0] = flat[i].e1.x; e.e1[1] = flat[i].e1.y; e.e1[2] = flat[i].e1.z; e.e1[3] = flat[i].e1.w;
 		s_edges.push_back( e );
@@ -415,8 +765,8 @@ void R_CaptureFrontendView( const viewDef_t* viewDef )
 
 	// camera / view
 	const renderView_t& rv = viewDef->renderView;
-	s_hdr.magic = SOFTCAP_MAGIC;
-	s_hdr.version = SOFTCAP_VERSION;
+	s_hdr.magic = CAP_MAGIC;
+	s_hdr.version = CAP_VERSION;
 	s_hdr.screenW = ( uint32_t )( viewDef->viewport.x2 - viewDef->viewport.x1 + 1 );
 	s_hdr.screenH = ( uint32_t )( viewDef->viewport.y2 - viewDef->viewport.y1 + 1 );
 	for( int i = 0; i < 3; i++ ) { s_hdr.vieworg[i] = rv.vieworg[i]; }
@@ -449,7 +799,7 @@ void R_CaptureFrontendView( const viewDef_t* viewDef )
 		{
 			continue;	// armed after this light's flatten; skip rather than emit a light with no edges
 		}
-		softcapLight_t L;
+		capLight_t L;
 		memset( &L, 0, sizeof( L ) );
 		L.origin[0] = vLight->globalLightOrigin.x;
 		L.origin[1] = vLight->globalLightOrigin.y;
@@ -466,7 +816,7 @@ void R_CaptureFrontendView( const viewDef_t* viewDef )
 		// caster silhouette solids (for the ray-cast ground truth)
 		for( const drawSurf_t* cs = vLight->softShadowWedges; cs != NULL; cs = cs->nextOnLight )
 		{
-			softcapCaster_t C;
+			capCaster_t C;
 			C.lightIndex = lightIndex;
 			C.casterId   = 0.0f;	// (edge headers carry the real casterId; not needed for the ray-cast)
 			if( !AppendSurfMesh( cs, s_meshVerts, s_meshIdx, C.firstVert, C.numVerts, C.firstIndex, C.numIndex ) )
@@ -499,7 +849,7 @@ void R_CaptureFrontendView( const viewDef_t* viewDef )
 			const drawSurf_t* list = ( pass == 0 ) ? vLight->globalInteractions : vLight->localInteractions;
 			for( const drawSurf_t* rs = list; rs != NULL; rs = rs->nextOnLight )
 			{
-				softcapReceiver_t R;
+				capReceiver_t R;
 				R.lightIndex = lightIndex;
 				if( !AppendSurfMesh( rs, s_recvVerts, s_recvIdx, R.firstVert, R.numVerts, R.firstIndex, R.numIndex ) )
 				{
@@ -543,7 +893,7 @@ static bool R_ReadbackGPUBuffer( nvrhi::IBuffer* src, uint64 srcOffset, uint64 s
 	sd.cpuAccess = nvrhi::CpuAccessMode::Read;
 	sd.initialState = nvrhi::ResourceStates::CopyDest;	// let nvrhi auto-manage the state (source is keepInitialState)
 	sd.keepInitialState = true;
-	sd.debugName = "softcapReadback";
+	sd.debugName = "capReadback";
 	nvrhi::BufferHandle staging = device->createBuffer( sd );
 	if( staging == NULL ) { return false; }
 	nvrhi::CommandListHandle cl = device->createCommandList();
@@ -580,7 +930,7 @@ void R_CaptureBackendFinish()
 		std::vector<triIndex_t>   idxs( numIdx );
 		if( !R_ReadbackGPUBuffer( vb.GetAPIObject(), ( uint64 )vb.GetOffset(), ( uint64 )numVerts * sizeof( idShadowVert ), verts.data() ) ) { continue; }
 		if( !R_ReadbackGPUBuffer( ib.GetAPIObject(), ( uint64 )ib.GetOffset(), ( uint64 )numIdx * sizeof( triIndex_t ), idxs.data() ) ) { continue; }
-		softcapShadowVol_t sv; sv.lightIndex = rec.li;
+		capShadowVol_t sv; sv.lightIndex = rec.li;
 		sv.firstVert = ( uint32_t )( s_shadowVerts.size() / 3 );
 		sv.firstIdx  = ( uint32_t )s_shadowIdx.size();
 		idVec3 lLocal; R_GlobalPointToLocal( rec.m, idVec3( rec.lgt[0], rec.lgt[1], rec.lgt[2] ), lLocal );
@@ -634,36 +984,36 @@ void R_CaptureBackendFinish()
 	s_hdr.reserved[1]   = ( uint32_t )s_mapName.Length();		// MAPNAME block byte length (trailing, v4+)
 
 	// write the binary blob
-	idFile* f = fileSystem->OpenFileWrite( base + ".softcap", "fs_savepath" );
+	idFile* f = fileSystem->OpenFileWrite( base + ".cap", "fs_savepath" );
 	if( f != NULL )
 	{
 		f->Write( &s_hdr, sizeof( s_hdr ) );
-		if( !s_lights.empty() )    { f->Write( s_lights.data(),    ( int )( s_lights.size()    * sizeof( softcapLight_t ) ) ); }
-		if( !s_edges.empty() )     { f->Write( s_edges.data(),     ( int )( s_edges.size()     * sizeof( softcapEdge_t ) ) ); }
-		if( !s_casters.empty() )   { f->Write( s_casters.data(),   ( int )( s_casters.size()   * sizeof( softcapCaster_t ) ) ); }
+		if( !s_lights.empty() )    { f->Write( s_lights.data(),    ( int )( s_lights.size()    * sizeof( capLight_t ) ) ); }
+		if( !s_edges.empty() )     { f->Write( s_edges.data(),     ( int )( s_edges.size()     * sizeof( capEdge_t ) ) ); }
+		if( !s_casters.empty() )   { f->Write( s_casters.data(),   ( int )( s_casters.size()   * sizeof( capCaster_t ) ) ); }
 		if( !s_meshVerts.empty() ) { f->Write( s_meshVerts.data(), ( int )( s_meshVerts.size() * sizeof( float ) ) ); }
 		if( !s_meshIdx.empty() )   { f->Write( s_meshIdx.data(),   ( int )( s_meshIdx.size()   * sizeof( uint32_t ) ) ); }
 		if( s_hdr.hasDepth )        { f->Write( s_depth.data(),     ( int )( s_depth.size()      * sizeof( float ) ) ); }
-		if( !s_receivers.empty() )  { f->Write( s_receivers.data(), ( int )( s_receivers.size()  * sizeof( softcapReceiver_t ) ) ); }
+		if( !s_receivers.empty() )  { f->Write( s_receivers.data(), ( int )( s_receivers.size()  * sizeof( capReceiver_t ) ) ); }
 		if( !s_recvVerts.empty() )  { f->Write( s_recvVerts.data(), ( int )( s_recvVerts.size()  * sizeof( float ) ) ); }
 		if( !s_recvIdx.empty() )    { f->Write( s_recvIdx.data(),   ( int )( s_recvIdx.size()    * sizeof( uint32_t ) ) ); }
 		if( s_hdr.reserved[1] > 0 ) { f->Write( s_mapName.c_str(),  ( int )s_hdr.reserved[1] ); }	// MAPNAME block
 		if( s_hdr.reserved[2] > 0 )		// SHADOWVOL section (v4+): vols table, then verts, then indices
 		{
-			f->Write( s_shadowVols.data(), ( int )( s_shadowVols.size() * sizeof( softcapShadowVol_t ) ) );
+			f->Write( s_shadowVols.data(), ( int )( s_shadowVols.size() * sizeof( capShadowVol_t ) ) );
 			if( !s_shadowVerts.empty() ) { f->Write( s_shadowVerts.data(), ( int )( s_shadowVerts.size() * sizeof( float ) ) ); }
 			if( !s_shadowIdx.empty() )   { f->Write( s_shadowIdx.data(),   ( int )( s_shadowIdx.size()   * sizeof( uint32_t ) ) ); }
 		}
 		// v5 TEXTURE TAIL: self-describing, appended last - old readers stop before it. For each unique
 		// receiver material, load its diffuse image from disk (the GPU copy is not CPU-readable), box-
-		// downsample to <= SOFTCAP_TEX_MAX per side, store RGB8. Failures store a 1x1 grey.
+		// downsample to <= CAP_TEX_MAX per side, store RGB8. Failures store a 1x1 grey.
 		if( !s_recvMat.empty() && s_recvST.size() == s_recvVerts.size() / 3 * 2 )
 		{
-			std::vector<softcapMaterial_t> mats;
+			std::vector<capMaterial_t> mats;
 			std::vector<uint8_t> texels;
 			for( const idMaterial* m : s_matPtrs )
 			{
-				softcapMaterial_t rec = {};
+				capMaterial_t rec = {};
 				idStr::Copynz( rec.name, m ? m->GetName() : "<null>", sizeof( rec.name ) );
 				rec.firstTexel = ( uint32_t )texels.size();
 				idImage* img = m ? const_cast<idImage*>( m->GetFastPathDiffuseImage() ) : NULL;
@@ -687,7 +1037,7 @@ void R_CaptureBackendFinish()
 				int pw = 0, ph = 0;
 				if( ReadImageRGBA8( img, pic, pw, ph ) && pw > 0 && ph > 0 )
 				{
-					const int step = Max( 1, Max( pw, ph ) / SOFTCAP_TEX_MAX );
+					const int step = Max( 1, Max( pw, ph ) / CAP_TEX_MAX );
 					rec.texW = ( uint32_t )Max( 1, pw / step );
 					rec.texH = ( uint32_t )Max( 1, ph / step );
 					for( uint32_t y = 0; y < rec.texH; y++ )
@@ -715,28 +1065,49 @@ void R_CaptureBackendFinish()
 				}
 				mats.push_back( rec );
 			}
-			const uint32_t tail[5] = { SOFTCAP_TAIL_MAGIC, ( uint32_t )mats.size(), ( uint32_t )texels.size(),
+			const uint32_t tail[5] = { CAP_TAIL_MAGIC, ( uint32_t )mats.size(), ( uint32_t )texels.size(),
 									   ( uint32_t )s_recvST.size(), ( uint32_t )s_recvMat.size() };
 			f->Write( tail, sizeof( tail ) );
-			f->Write( mats.data(),     ( int )( mats.size()     * sizeof( softcapMaterial_t ) ) );
+			f->Write( mats.data(),     ( int )( mats.size()     * sizeof( capMaterial_t ) ) );
 			f->Write( texels.data(),   ( int )texels.size() );
 			f->Write( s_recvST.data(), ( int )( s_recvST.size() * sizeof( float ) ) );
 			f->Write( s_recvMat.data(), ( int )( s_recvMat.size() * sizeof( uint32_t ) ) );
 			common->Printf( "soft-shadow capture: v5 texture tail - %zu materials, %zu KB texels\n",
 							mats.size(), texels.size() / 1024 );
 		}
+		// v6 SAVEGAME TAIL: embed the engine's full save serialisation so the .cap reconstructs the EXACT
+		// live game state (health/ammo/weapons/inventory/entities), not just the render state. CaptureGameSave
+		// also writes a loadable disk slot the repro harness restores through the proven LoadGame path.
+		{
+			idStr slot = base;
+			slot.StripPath();							// "capNNNN" - the loadable disk slot name
+			idList<byte> saveBytes, stringBytes;
+			if( commonLocal.CaptureGameSave( slot.c_str(), saveBytes, stringBytes ) )
+			{
+				const uint32_t sv[3] = { CAP_SAVE_MAGIC, ( uint32_t )saveBytes.Num(), ( uint32_t )stringBytes.Num() };
+				f->Write( sv, sizeof( sv ) );
+				if( saveBytes.Num() > 0 )   { f->Write( saveBytes.Ptr(),   saveBytes.Num() ); }
+				if( stringBytes.Num() > 0 ) { f->Write( stringBytes.Ptr(), stringBytes.Num() ); }
+				common->Printf( "soft-shadow capture: v6 save tail - slot '%s', %d + %d bytes\n",
+								slot.c_str(), saveBytes.Num(), stringBytes.Num() );
+			}
+			else
+			{
+				common->Warning( "soft-shadow capture: CaptureGameSave failed - .cap has NO embedded save (repro cannot restore game state)" );
+			}
+		}
 		fileSystem->CloseFile( f );
-		common->Printf( "soft-shadow capture: %s.softcap  (%u lights, %u edges, %u casters/%u tris, %u recv/%u tris, depth=%u)\n",
+		common->Printf( "soft-shadow capture: %s.cap  (%u lights, %u edges, %u casters/%u tris, %u recv/%u tris, depth=%u)\n",
 						base.c_str(), s_hdr.numLights, s_hdr.numEdges, s_hdr.numCasters, s_hdr.numMeshIdx / 3,
 						s_hdr.numReceivers, s_hdr.numRecvIdx / 3, s_hdr.hasDepth );
 	}
 	else
 	{
-		common->Warning( "soft-shadow capture: could not open %s.softcap for write", base.c_str() );
+		common->Warning( "soft-shadow capture: could not open %s.cap for write", base.c_str() );
 	}
 
 	// human-readable / trimmable sidecar
-	idFile* j = fileSystem->OpenFileWrite( base + ".softcap.json", "fs_savepath" );
+	idFile* j = fileSystem->OpenFileWrite( base + ".cap.json", "fs_savepath" );
 	if( j != NULL )
 	{
 		j->Printf( "{\n  \"version\": %u,\n  \"screen\": [%u, %u],\n", s_hdr.version, s_hdr.screenW, s_hdr.screenH );
@@ -744,7 +1115,7 @@ void R_CaptureBackendFinish()
 		j->Printf( "  \"lights\": [\n" );
 		for( size_t i = 0; i < s_lights.size(); i++ )
 		{
-			const softcapLight_t& L = s_lights[i];
+			const capLight_t& L = s_lights[i];
 			j->Printf( "    { \"index\": %u, \"origin\": [%.3f, %.3f, %.3f], \"penumbra\": %.3f, \"edges\": %u, \"casters\": %u }%s\n",
 					   ( uint32_t )i, L.origin[0], L.origin[1], L.origin[2], L.penumbraSize, L.edgeCount, L.casterCount,
 					   ( i + 1 < s_lights.size() ) ? "," : "" );
@@ -788,7 +1159,7 @@ void R_CaptureSoftShadow_f( const idCmdArgs& args )
 	s_armed = false;
 	ResetAccumulators();
 
-	// The .softcap above is the live-config analytic dump. Now capture EVERYTHING the comparison needs -
+	// The .cap above is the live-config analytic dump. Now capture EVERYTHING the comparison needs -
 	// RT-ref + analytic-bandoff + analytic-bandon frame/term columns + the cvar manifest - forcing each config
 	// itself so the result never depends on how the game was launched (an RT-off launch must still yield a
 	// valid RT reference, not a black mask).
@@ -1012,7 +1383,7 @@ static bool SelfTestRenderReadback( idRenderWorld* rw, renderView_t* rv, std::ve
 // -1=setup error).
 int R_SoftShadowSelfTest( const char* mapName )
 {
-	// paired capture (neo/tests/data/<basename>.softcap) supplies the artifact CAMERA the user captured
+	// paired capture (neo/tests/data/<basename>.cap) supplies the artifact CAMERA the user captured
 	globalImages->LoadDeferredImages();		// splash/base images the render stack deferred at boot
 
 	idRenderWorld* rw = renderSystem->AllocRenderWorld();
@@ -1023,7 +1394,7 @@ int R_SoftShadowSelfTest( const char* mapName )
 		return -1;
 	}
 
-	// Gather the map's REAL lights (game-free parse), and DERIVE the camera from them: the .softcap camera is
+	// Gather the map's REAL lights (game-free parse), and DERIVE the camera from them: the .cap camera is
 	// in a different coordinate frame than the loaded .proc here, so we instead sit the camera among the lights
 	// (guaranteed to be in the lit, geometry-filled part of the world) and look into the cluster.
 	idMapFile map;
@@ -1149,8 +1520,8 @@ int R_SoftShadowSelfTest( const char* mapName )
 // ---- captured-geometry replay ---------------------------------------------------------------------------------
 // The harness renders the LIVE loadGame-quick world at the capture viewpoint, but a DYNAMIC caster present at
 // capture time (a physics gib, a moved crate) is absent from that world - so its shadow simply cannot be
-// reproduced (verified: softcap0019's lights show casters glob=n loc=n at replay though the capture recorded 37).
-// To reproduce the EXACT captured frame we rebuild the caster meshes the .softcap embeds (MESHVERTS/MESHIDX, world
+// reproduced (verified: cap0019's lights show casters glob=n loc=n at replay though the capture recorded 37).
+// To reproduce the EXACT captured frame we rebuild the caster meshes the .cap embeds (MESHVERTS/MESHIDX, world
 // space) into one static model and add it to the render world as a shadow-casting entity, so the normal atlas
 // occluder path renders it. Cleared after the A/B renders.
 static qhandle_t     s_capturedCasterEntity = -1;
@@ -1173,7 +1544,7 @@ static void R_SoftShadowClearCapturedCasters()
 }
 
 idCVar r_softShadowReplayCaster( "r_softShadowReplayCaster", "-1", CVAR_RENDERER | CVAR_INTEGER | CVAR_NEW,
-								 "harness: replay ONLY this caster index from the .softcap (isolates the dynamic crate/gib); -1 = all casters" );
+								 "harness: replay ONLY this caster index from the .cap (isolates the dynamic crate/gib); -1 = all casters" );
 
 static void R_SoftShadowSpawnCapturedCasters( const char* path, idRenderWorld* world = NULL )
 {
@@ -1190,8 +1561,8 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path, idRenderWorld* w
 
 	FILE* cf = fopen( path, "rb" );
 	if( cf == NULL ) { return; }
-	softcapHeader_t hdr;
-	if( fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC || hdr.numMeshVerts == 0 || hdr.numMeshIdx == 0 )
+	capHeader_t hdr;
+	if( fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != CAP_MAGIC || hdr.numMeshVerts == 0 || hdr.numMeshIdx == 0 )
 	{
 		fclose( cf );
 		common->Printf( "[softtest] no captured caster geometry to replay\n" );
@@ -1199,14 +1570,14 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path, idRenderWorld* w
 	}
 	// block order after the header: lights, edges, casters, then MESHVERTS (float3), MESHIDX (uint32).
 	const long castersOff = ( long )sizeof( hdr )
-							+ ( long )hdr.numLights * ( long )sizeof( softcapLight_t )
-							+ ( long )hdr.numEdges  * ( long )sizeof( softcapEdge_t );
-	const long meshVertsOff = castersOff + ( long )hdr.numCasters * ( long )sizeof( softcapCaster_t );
-	std::vector<softcapCaster_t> casters( hdr.numCasters );
+							+ ( long )hdr.numLights * ( long )sizeof( capLight_t )
+							+ ( long )hdr.numEdges  * ( long )sizeof( capEdge_t );
+	const long meshVertsOff = castersOff + ( long )hdr.numCasters * ( long )sizeof( capCaster_t );
+	std::vector<capCaster_t> casters( hdr.numCasters );
 	std::vector<float>    mv( ( size_t )hdr.numMeshVerts * 3 );
 	std::vector<uint32_t> mi( hdr.numMeshIdx );
 	if( fseek( cf, castersOff, SEEK_SET ) != 0
-		|| ( hdr.numCasters > 0 && fread( casters.data(), sizeof( softcapCaster_t ), casters.size(), cf ) != casters.size() )
+		|| ( hdr.numCasters > 0 && fread( casters.data(), sizeof( capCaster_t ), casters.size(), cf ) != casters.size() )
 		|| fseek( cf, meshVertsOff, SEEK_SET ) != 0
 		|| fread( mv.data(), sizeof( float ), mv.size(), cf ) != mv.size()
 		|| fread( mi.data(), sizeof( uint32_t ), mi.size(), cf ) != mi.size() )
@@ -1291,7 +1662,7 @@ static void R_SoftShadowSpawnCapturedCasters( const char* path, idRenderWorld* w
 }
 
 // ---- bench scene reconstruction: DEDUPED per-object captured casters -------------------------------
-// The softcap stores each caster mesh once PER LIGHT it casts for (~3.5x duplication), so the single
+// The cap stores each caster mesh once PER LIGHT it casts for (~3.5x duplication), so the single
 // map-spanning blob R_SoftShadowSpawnCapturedCasters builds is both duplicated AND unculled (every
 // light over-processes the whole soup -> the measured 4-min bench hang). This spawns each DISTINCT
 // physical object (deduped by first-vertex position + vert count, world space) as its OWN entity with
@@ -1338,21 +1709,21 @@ static int R_SoftShadowSpawnBenchCasters( const char* path, idRenderWorld* world
 	{
 		return 0;
 	}
-	softcapHeader_t hdr;
-	if( fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC || hdr.numMeshVerts == 0 || hdr.numMeshIdx == 0 )
+	capHeader_t hdr;
+	if( fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != CAP_MAGIC || hdr.numMeshVerts == 0 || hdr.numMeshIdx == 0 )
 	{
 		fclose( cf );
 		return 0;
 	}
 	const long castersOff = ( long )sizeof( hdr )
-							+ ( long )hdr.numLights * ( long )sizeof( softcapLight_t )
-							+ ( long )hdr.numEdges  * ( long )sizeof( softcapEdge_t );
-	const long meshVertsOff = castersOff + ( long )hdr.numCasters * ( long )sizeof( softcapCaster_t );
-	std::vector<softcapCaster_t> casters( hdr.numCasters );
+							+ ( long )hdr.numLights * ( long )sizeof( capLight_t )
+							+ ( long )hdr.numEdges  * ( long )sizeof( capEdge_t );
+	const long meshVertsOff = castersOff + ( long )hdr.numCasters * ( long )sizeof( capCaster_t );
+	std::vector<capCaster_t> casters( hdr.numCasters );
 	std::vector<float>    mv( ( size_t )hdr.numMeshVerts * 3 );
 	std::vector<uint32_t> mi( hdr.numMeshIdx );
 	if( fseek( cf, castersOff, SEEK_SET ) != 0
-		|| ( hdr.numCasters > 0 && fread( casters.data(), sizeof( softcapCaster_t ), casters.size(), cf ) != casters.size() )
+		|| ( hdr.numCasters > 0 && fread( casters.data(), sizeof( capCaster_t ), casters.size(), cf ) != casters.size() )
 		|| fseek( cf, meshVertsOff, SEEK_SET ) != 0
 		|| fread( mv.data(), sizeof( float ), mv.size(), cf ) != mv.size()
 		|| fread( mi.data(), sizeof( uint32_t ), mi.size(), cf ) != mi.size() )
@@ -1368,7 +1739,7 @@ static int R_SoftShadowSpawnBenchCasters( const char* path, idRenderWorld* world
 	std::set<uint64_t> seen;
 	for( uint32_t c = 0; c < hdr.numCasters; c++ )
 	{
-		const softcapCaster_t& C = casters[c];
+		const capCaster_t& C = casters[c];
 		if( C.numVerts == 0 || C.numIndex == 0 )
 		{
 			continue;
@@ -1433,14 +1804,14 @@ void R_SoftShadowSpawnCasters_f( const idCmdArgs& args )
 {
 	if( args.Argc() < 2 )
 	{
-		common->Warning( "usage: softShadowSpawnCasters <capture.softcap>" );
+		common->Warning( "usage: softShadowSpawnCasters <capture.cap>" );
 		return;
 	}
 	R_SoftShadowSpawnCapturedCasters( args.Argv( 1 ) );
 }
 
 // =========================================================== com_softShadowGate: the GPU DEFECT GATE
-// Minimal-init (no game/sound/menu) corpus gate: every .softcap is reconstructed into a real render
+// Minimal-init (no game/sound/menu) corpus gate: every .cap is reconstructed into a real render
 // world (its map + its captured dynamic casters + its captured lights), rendered through the SHIPPED
 // GPU soft-shadow path at the live resolution (>= 1920x1080 enforced), and the frames are analyzed
 // in-process by the shared defect counter (tests/SoftShadowGate.h) against three references:
@@ -1453,13 +1824,13 @@ namespace
 
 struct gateCap_t
 {
-	softcapHeader_t hdr;
-	std::vector<softcapLight_t> lights;
+	capHeader_t hdr;
+	std::vector<capLight_t> lights;
 	// TRUE captured caster meshes - the defect arbiter's PROXY-INDEPENDENT ground truth. The arbiter must
 	// NOT trace the render's consumed edge stream (s_edges): a lossy geometry proxy (r_softShadowProxyBox)
 	// makes the shader consume proxy triangles, so an s_edges arbiter would trace the proxy and rubber-stamp
 	// its own over-shadowing. These meshes are the recorded real geometry, unchanged by any proxy.
-	std::vector<softcapCaster_t> casters;
+	std::vector<capCaster_t> casters;
 	std::vector<float>           meshVerts;	// float3 packed
 	std::vector<uint32_t>        meshIdx;	// GLOBAL into meshVerts (v4+ caps are already global)
 	idStr mapName;
@@ -1474,14 +1845,14 @@ bool GateLoadCap( const char* path, gateCap_t& cap )
 	{
 		return false;
 	}
-	if( fread( &cap.hdr, sizeof( cap.hdr ), 1, f ) != 1 || cap.hdr.magic != SOFTCAP_MAGIC || cap.hdr.version < 4 )
+	if( fread( &cap.hdr, sizeof( cap.hdr ), 1, f ) != 1 || cap.hdr.magic != CAP_MAGIC || cap.hdr.version < 4 )
 	{
 		fclose( f );
 		return false;
 	}
-	const softcapHeader_t& h = cap.hdr;
+	const capHeader_t& h = cap.hdr;
 	cap.lights.resize( h.numLights );
-	if( h.numLights > 0 && fread( cap.lights.data(), sizeof( softcapLight_t ), h.numLights, f ) != h.numLights )
+	if( h.numLights > 0 && fread( cap.lights.data(), sizeof( capLight_t ), h.numLights, f ) != h.numLights )
 	{
 		fclose( f );
 		return false;
@@ -1490,27 +1861,27 @@ bool GateLoadCap( const char* path, gateCap_t& cap )
 	// TRUE caster meshes for the arbiter (see gateCap_t). Blocks follow lights: [edges][casters][meshVerts]
 	// [meshIdx]. On any read failure the arbiter simply has no ground truth and never masks (conservative).
 	{
-		const long castersOff = ( long )sizeof( h ) + ( long )h.numLights * ( long )sizeof( softcapLight_t )
-								+ ( long )h.numEdges * ( long )sizeof( softcapEdge_t );
-		const long meshVOff = castersOff + ( long )h.numCasters * ( long )sizeof( softcapCaster_t );
+		const long castersOff = ( long )sizeof( h ) + ( long )h.numLights * ( long )sizeof( capLight_t )
+								+ ( long )h.numEdges * ( long )sizeof( capEdge_t );
+		const long meshVOff = castersOff + ( long )h.numCasters * ( long )sizeof( capCaster_t );
 		const long meshIOff = meshVOff + ( long )h.numMeshVerts * 3L * ( long )sizeof( float );
 		cap.casters.resize( h.numCasters );
 		cap.meshVerts.resize( ( size_t )h.numMeshVerts * 3 );
 		cap.meshIdx.resize( h.numMeshIdx );
 		bool gok = true;
-		if( h.numCasters   && ( fseek( f, castersOff, SEEK_SET ) != 0 || fread( cap.casters.data(),   sizeof( softcapCaster_t ), cap.casters.size(),   f ) != cap.casters.size() ) )   { gok = false; }
+		if( h.numCasters   && ( fseek( f, castersOff, SEEK_SET ) != 0 || fread( cap.casters.data(),   sizeof( capCaster_t ), cap.casters.size(),   f ) != cap.casters.size() ) )   { gok = false; }
 		if( gok && cap.meshVerts.size() && ( fseek( f, meshVOff, SEEK_SET ) != 0 || fread( cap.meshVerts.data(), sizeof( float ),    cap.meshVerts.size(), f ) != cap.meshVerts.size() ) ) { gok = false; }
 		if( gok && cap.meshIdx.size()   && ( fseek( f, meshIOff, SEEK_SET ) != 0 || fread( cap.meshIdx.data(),   sizeof( uint32_t ), cap.meshIdx.size(),   f ) != cap.meshIdx.size() ) )   { gok = false; }
 		if( !gok ) { cap.casters.clear(); cap.meshVerts.clear(); cap.meshIdx.clear(); }
 	}
 	const long mapOff = ( long )sizeof( h )
-						+ ( long )h.numLights   * ( long )sizeof( softcapLight_t )
-						+ ( long )h.numEdges    * ( long )sizeof( softcapEdge_t )
-						+ ( long )h.numCasters  * ( long )sizeof( softcapCaster_t )
+						+ ( long )h.numLights   * ( long )sizeof( capLight_t )
+						+ ( long )h.numEdges    * ( long )sizeof( capEdge_t )
+						+ ( long )h.numCasters  * ( long )sizeof( capCaster_t )
 						+ ( long )h.numMeshVerts * 3L * ( long )sizeof( float )
 						+ ( long )h.numMeshIdx  * ( long )sizeof( uint32_t )
 						+ ( h.hasDepth ? ( long )h.screenW * h.screenH * ( long )sizeof( float ) : 0L )
-						+ ( long )h.numReceivers * ( long )sizeof( softcapReceiver_t )
+						+ ( long )h.numReceivers * ( long )sizeof( capReceiver_t )
 						+ ( long )h.numRecvVerts * 3L * ( long )sizeof( float )
 						+ ( long )h.numRecvIdx  * ( long )sizeof( uint32_t );
 	const uint32_t mapLen = h.reserved[1];
@@ -1669,7 +2040,7 @@ float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR, const 
 		// stream (r_softShadowProxyBox replaces that with box tris; an arbiter tracing the proxy would
 		// rubber-stamp its own over-shadow). Trace the full closed mesh: blocked if ANY triangle stops
 		// the ray to the disk sample.
-		for( const softcapCaster_t& C : cap.casters )
+		for( const capCaster_t& C : cap.casters )
 		{
 			if( ( int )C.lightIndex != li )
 			{
@@ -1723,7 +2094,7 @@ float GateTruthVisibility( const idVec3& P, const idVec3& L, float diskR, const 
 	return 1.0f - ( float )blocked / NS;
 }
 
-void GateSetup( const gateCap_t& cap, const softcapLight_t& light )
+void GateSetup( const gateCap_t& cap, const capLight_t& light )
 {
 	// pinned baseline first, then the per-probe overrides on top of it
 	R_SoftShadowPinTestConfig( false );
@@ -1785,8 +2156,7 @@ int R_SoftShadowGate( const char* arg )
 	using namespace swgate;
 
 	// SINGLE-INSTANCE GUARD: two concurrent gate runs contend for the GPU and clobber each other's
-	// softgate_* outputs, silently corrupting BOTH verdicts (observed 2026-08-20: an orphaned run
-	// surviving its killed parent shell overlapped a fresh run - both produced garbage). Hold an
+	// softgate_* outputs, silently corrupting BOTH verdicts. Hold an
 	// exclusive advisory lock for the whole run; a second instance aborts LOUDLY as a SETUP failure.
 	// The fd is deliberately leaked to process exit (the gate quits the process when done), which
 	// releases the flock; a crashed/killed run releases it automatically too - no stale-lock state.
@@ -1795,8 +2165,7 @@ int R_SoftShadowGate( const char* arg )
 		const int swLockFd = open( "softgate.lock", O_CREAT | O_RDWR, 0644 );
 		if( swLockFd < 0 || flock( swLockFd, LOCK_EX | LOCK_NB ) != 0 )
 		{
-			common->Printf( "[softgate] FATAL: another gate instance is running (softgate.lock held) - "
-							"concurrent runs corrupt each other's outputs and GPU timings. Kill it first.\n" );
+			common->Printf( "[softgate] FATAL: softgate.lock held - " );
 			return 1;
 		}
 	}
@@ -1809,7 +2178,7 @@ int R_SoftShadowGate( const char* arg )
 	extern int Sys_ListFiles( const char* directory, const char* extension, idStrList& list );
 	idStr dir = ( arg == NULL || arg[0] == '\0' || idStr::Icmp( arg, "corpus" ) == 0 ) ? "../tests/data" : arg;
 	idStrList files;
-	Sys_ListFiles( dir, ".softcap", files );
+	Sys_ListFiles( dir, ".cap", files );
 	if( files.Num() > 1 )
 	{
 		std::sort( &files[0], &files[0] + files.Num(), []( const idStr& a, const idStr& b )
@@ -1954,7 +2323,7 @@ int R_SoftShadowGate( const char* arg )
 					}
 					// STATIC MODEL ENTITIES (func_static, mover machinery, ...) are the live game's
 					// casters and roughly DOUBLE the soft-record stream vs the bare worldspawn
-					// (measured erebus1 softcap0061: 114k records in-game vs 56k without them - the
+					// (measured erebus1 cap0061: 114k records in-game vs 56k without them - the
 					// gate bench under-read the shipped soft cost ~3x). Add every entity whose
 					// spawnargs resolve to a loadable non-animated model; the bench places them so
 					// its frame carries the live caster density. Animated md5 meshes are skipped
@@ -2054,7 +2423,7 @@ int R_SoftShadowGate( const char* arg )
 		for( int pi = 0; pi < ( int )probeLights.size(); pi++ )
 		{
 			const int li = probeLights[pi];
-			const softcapLight_t& cl = cap.lights[li];
+			const capLight_t& cl = cap.lights[li];
 			idVec3 clOrg( cl.origin[0], cl.origin[1], cl.origin[2] );
 
 			// match the real .map light whose global origin is the captured one (globalLightOrigin
@@ -2173,7 +2542,7 @@ int R_SoftShadowGate( const char* arg )
 			}
 			// ALWAYS retain this render's edge records (the exact caster triangles the shader consumed)
 			// via the capture hook - the defect arbiter float64-traces against them. Diagnostic mode
-			// additionally writes the full .softcap for offline interrogation.
+			// additionally writes the full .cap for offline interrogation.
 			ResetAccumulators();
 			s_armed = true;
 			GateRenderFrame( rw, &rv );
@@ -2542,7 +2911,7 @@ int R_SoftShadowGate( const char* arg )
 			{
 				benchLights.push_back( rw->AddLightDef( &ml ) );
 			}
-			// CASTER SCENE. Default (BenchReplay on): reconstruct from the .softcap's DEDUPED captured
+			// CASTER SCENE. Default (BenchReplay on): reconstruct from the .cap's DEDUPED captured
 			// casters - the exact live soft-caster set, DYNAMIC objects included - and exclude the loaded
 			// worldspawn from soft-casting (its faces are already in the captured set) so nothing is
 			// double-counted. The old path (BenchReplay off) adds the static func_static map guess, which
@@ -2857,6 +3226,17 @@ int R_SoftShadowGate( const char* arg )
 	common->Printf( "[softgate] TOTAL: TURD=%d ANT=%d LIT_IN_UMBRA=%d STEP=%d EXTENT=%d TEMPORAL=%d CONTINUITY=%d SEAM=%d SETUP=%d\n",
 					counts[GATE_TURD], counts[GATE_ANT], counts[GATE_LIT_IN_UMBRA], counts[GATE_STEP],
 					counts[GATE_EXTENT], counts[GATE_TEMPORAL], counts[GATE_CONTINUITY], counts[GATE_SEAM], counts[GATE_SETUP] );
+	// NOTHING-TESTED IS A FAILURE, NOT A PASS. A run that probed 0 captures or 0 lights has verified
+	// nothing - reporting "0 defects -> PASS" is a false green that hides a missing corpus, a bad path,
+	// or an init abort (observed 2026-08-23: a stale gamescope stole the X socket, the gate loaded 0
+	// captures and still exited 0). Fail loudly with a SETUP-class exit code so CI/scripts see it.
+	if( capsRun == 0 || lightsRun == 0 )
+	{
+		common->Printf( "[softgate] TOTAL DEFECTS: %d across %d captures, %d lights -> FAIL (nothing tested - "
+						"missing corpus or aborted init; a run that probes 0 lights verifies nothing)\n",
+						( int )all.size(), capsRun, lightsRun );
+		return 124;		// distinct SETUP-fail code, below the 125 defect clamp and the 126 watchdog abort
+	}
 	common->Printf( "[softgate] TOTAL DEFECTS: %d across %d captures, %d lights -> %s\n",
 					( int )all.size(), capsRun, lightsRun, all.empty() ? "PASS" : "FAIL" );
 	return ( int )all.size();
@@ -2871,7 +3251,7 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 	}
 	if( args.Argc() < 2 )
 	{
-		common->Warning( "usage: testSoftShadowLocator <capture.softcap> | <x y z yaw pitch>  (load its map first - all erebusN are game/erebus1)" );
+		common->Warning( "usage: testSoftShadowLocator <capture.cap> | <x y z yaw pitch>  (load its map first - all erebusN are game/erebus1)" );
 		return;
 	}
 
@@ -2890,8 +3270,8 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 	else
 	{
 		FILE* cf = fopen( args.Argv( 1 ), "rb" );
-		softcapHeader_t hdr;
-		if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != SOFTCAP_MAGIC )
+		capHeader_t hdr;
+		if( cf == NULL || fread( &hdr, sizeof( hdr ), 1, cf ) != 1 || hdr.magic != CAP_MAGIC )
 		{
 			if( cf != NULL ) { fclose( cf ); }
 			common->Warning( "testSoftShadowLocator: cannot read capture %s", args.Argv( 1 ) );
@@ -3123,7 +3503,7 @@ void R_TestSoftShadowLocator_f( const idCmdArgs& args )
 		// console command) is a no-op and the RT oracle renders identically to the PCSS hybrid - a false PASS.
 		// The objective metric must be run as TWO launches with the config set on the command line:
 		common->Warning( "testSoftShadowLocator: oracle == hybrid (RT did NOT engage mid-run). Use the autonomous "
-						 "two-launch harness for a valid peter-pan measurement: neo/tools/softshadow/run_peterpan.sh <capture.softcap>" );
+						 "two-launch harness for a valid peter-pan measurement: neo/tools/softshadow/run_peterpan.sh <capture.cap>" );
 	}
 	common->Printf( "[softtest] %s : PETER-PAN shift=%.2f px (dx=%.2f dy=%.2f)  missed=%ld/%ld RTshadow (%.1f%%)  false=%ld  IoU=%.3f  shadowDelta=%ld  ->  %s\n",
 					args.Argv( 1 ), shift, shiftX, shiftY, missedN, oShad, missedRate * 100.0, falseN, iou, deltaN, pass ? "PASS" : "FAIL" );

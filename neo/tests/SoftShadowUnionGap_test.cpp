@@ -19,13 +19,13 @@ version. See <http://www.gnu.org/licenses/>.
 //   - if saturate(Sigma_solo) ~= union across the penumbra  -> per-triangle sum IS a banding-free general
 //     coverage (overlaps sparse); only umbra/apex texels need a correction.
 //   - if Sigma_solo >> union everywhere -> irreducibly a union; a different decomposition is needed.
-// Union truth = MeshTruthShadowSoup (ray oracle). Env: SOFTCAP (required), UG_N (disk side, def 32),
+// Union truth = MeshTruthShadowSoup (ray oracle). Env: CAP (required), UG_N (disk side, def 32),
 // UG_SAMP (recv samples/caster, def 40), UG_CASTERS (max casters, def 120), UG_MAXTRI (skip huge, def 1500).
 
 #include "hlsl_compat.h"
 #include "softwedge_coverage.inc.hlsl"		// SoftShadow_Frame, softFrame_t, SoftDisk_CircleTriArea
 #include "softsurf_classify.inc.hlsl"		// SurfBuild_SoloCovExact (per-triangle analytic occlusion)
-#include "SoftShadowMesh.h"					// SoftCap, LoadSoftCap, MeshTruthShadowSoup (union ray oracle)
+#include "SoftShadowMesh.h"					// Cap, LoadCap, MeshTruthShadowSoup (union ray oracle)
 #include "idUnitTest.h"
 
 #include <cstdio>
@@ -347,7 +347,7 @@ static float GridScoreBandsShift( const BandGrids& g, float du, float dv )
 // mesh -> per-edge (two adjacent face normals + boundary flag), WELDED by position so T-junction
 // duplicate verts do not masquerade as boundaries. Mirrors BuildCasterEdges in SoftShadowPrimitives_test.
 struct RAEdge2 { float3 a, b, nA, nB; bool boundary; int va = 0, vb = 0; };
-static std::vector<RAEdge2> BuildWeldedCasterEdges( const SoftCap& cap, const softcapCaster_t& cs, float weld )
+static std::vector<RAEdge2> BuildWeldedCasterEdges( const Cap& cap, const capCaster_t& cs, float weld )
 {
 	std::unordered_map<uint64_t, int> wmap;
 	auto weld1 = [&]( uint32_t gi ) -> int
@@ -450,16 +450,16 @@ static float SilhouetteCov( const std::vector<RAEdge2>& edges, float3 P, float3 
 
 STUDY_TEST( SoftShadowUnionGap, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [uniongap] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [uniongap] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [uniongap] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [uniongap] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 40 ), MAXC = envI( "UG_CASTERS", 120 ), MAXTRI = envI( "UG_MAXTRI", 1500 );
 
 	// receiver centroids per light (copied from the proxyfit harness)
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
@@ -479,7 +479,7 @@ STUDY_TEST( SoftShadowUnionGap, quantify )
 
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int nT = ( int )( cs.numIndex / 3 );
 		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
 		const std::vector<float3>& recv = lightRecv[cs.lightIndex];
@@ -553,14 +553,14 @@ STUDY_TEST( SoftShadowUnionGap, quantify )
 //   D grid rebuilt at P (floor)  = ScanlineBitGridCov(P)       (isolates discretisation from drift)
 // Truth = MeshTruthShadowSoup(P) union. Bin by penumbra AND by occluder depth-spread (1/phiMin-1/phiMax) - the
 // decisive parallax axis. Headline = of samples where the scalar bilerp FAILS (|C-truth|>0.06, i.e. today's
-// walk-always population), what fraction the grid CONVERTS to |err|<0.06. Env: SOFTCAP, UG_G (cell, def 8),
+// walk-always population), what fraction the grid CONVERTS to |err|<0.06. Env: CAP, UG_G (cell, def 8),
 // UG_M/UG_K (grid dims, def 8x32), reuse UG_N/UG_SAMP/UG_CASTERS/UG_MAXTRI. Sweep UG_G in {4,8,16} by hand.
 STUDY_TEST( SoftShadowCenterGridDrift, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [griddrift] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [griddrift] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [griddrift] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [griddrift] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 40 ), MAXC = envI( "UG_CASTERS", 120 ), MAXTRI = envI( "UG_MAXTRI", 1500 );
@@ -568,7 +568,7 @@ STUDY_TEST( SoftShadowCenterGridDrift, quantify )
 	const float G = envF( "UG_G", 8.0f );
 
 	std::vector<std::vector<std::pair<float3, float3>>> lightRecv( cap.lights.size() );	// (centroid, normal)
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
@@ -596,7 +596,7 @@ STUDY_TEST( SoftShadowCenterGridDrift, quantify )
 
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int nT = ( int )( cs.numIndex / 3 );
 		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
 		const std::vector<std::pair<float3, float3>>& recv = lightRecv[cs.lightIndex];
@@ -690,13 +690,13 @@ STUDY_TEST( SoftShadowCenterGridDrift, quantify )
 // existing residual pool but CAPPED at top-K instead of abandoning the texel at resCount>1024. THE question:
 // how small can K be? R(K) ranked-prefix coverage at P vs full-union truth; K=all == D (grid@P, ~96% floor).
 // If a small K hits 90%+, the 99% walk-always population is rescued by a bounded, reprojectable cache with a
-// bounded per-fragment walk. Env: SOFTCAP, UG_G (cell, def 8), reuse UG_N/UG_SAMP/UG_CASTERS/UG_MAXTRI.
+// bounded per-fragment walk. Env: CAP, UG_G (cell, def 8), reuse UG_N/UG_SAMP/UG_CASTERS/UG_MAXTRI.
 STUDY_TEST( SoftShadowReducedSet, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [redset] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [redset] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [redset] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [redset] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 40 ), MAXC = envI( "UG_CASTERS", 120 ), MAXTRI = envI( "UG_MAXTRI", 1500 );
@@ -706,7 +706,7 @@ STUDY_TEST( SoftShadowReducedSet, quantify )
 	const int NK = 7;
 
 	std::vector<std::vector<std::pair<float3, float3>>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
@@ -735,7 +735,7 @@ STUDY_TEST( SoftShadowReducedSet, quantify )
 
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int nT = ( int )( cs.numIndex / 3 );
 		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
 		const std::vector<std::pair<float3, float3>>& recv = lightRecv[cs.lightIndex];
@@ -842,10 +842,10 @@ STUDY_TEST( SoftShadowReducedSet, quantify )
 // which failure dominates (open boundary vs non-manifold vs non-orientable).
 STUDY_TEST( SoftShadowWinding, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [winding] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [winding] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [winding] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [winding] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	const int MINTRI = envI( "WD_MINTRI", 32 ), MAXTRI = envI( "WD_MAXTRI", 40000 );
@@ -855,7 +855,7 @@ STUDY_TEST( SoftShadowWinding, quantify )
 	long cTot = 0, cClean = 0, cOrientable = 0, cClosed = 0, cAlreadyConsistent = 0, cNonManifold = 0, cNonOrientable = 0, cOpen = 0;
 	double sumBoundaryFrac = 0;
 	long inconB2B = 0, inconDup = 0, inconFold = 0;		// inconsistent-edge kinds: back-to-back / duplicate / genuine fold
-	auto triNrm = [&]( const softcapCaster_t& cs2, int t ) -> float3
+	auto triNrm = [&]( const capCaster_t& cs2, int t ) -> float3
 	{
 		const uint32_t a = cap.meshIdx[cs2.firstIndex + t * 3 + 0], b = cap.meshIdx[cs2.firstIndex + t * 3 + 1], d = cap.meshIdx[cs2.firstIndex + t * 3 + 2];
 		float3 v0( cap.meshVerts[a * 3], cap.meshVerts[a * 3 + 1], cap.meshVerts[a * 3 + 2] );
@@ -867,7 +867,7 @@ STUDY_TEST( SoftShadowWinding, quantify )
 
 	for( uint32_t c = 0; c < cap.casters.size(); c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int nT = ( int )( cs.numIndex / 3 );
 		if( nT < MINTRI || nT > MAXTRI ) { continue; }
 		cTot++;
@@ -958,17 +958,17 @@ STUDY_TEST( SoftShadowWinding, quantify )
 // banding-free general-case coverage the analytic-drains/inconsistent-winding arguments wrongly foreclosed.
 STUDY_TEST( SoftShadowSilhouetteCov, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [silcov] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [silcov] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [silcov] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [silcov] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 60 ), MAXC = envI( "UG_CASTERS", 200 ), MAXTRI = envI( "UG_MAXTRI", 4000 );
 	const float WELD = envF( "WD_WELD", 0.05f );
 
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
@@ -986,7 +986,7 @@ STUDY_TEST( SoftShadowSilhouetteCov, quantify )
 	long nSamp = 0, nPen = 0, nPenNear = 0; int usedC = 0;
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int nT = ( int )( cs.numIndex / 3 );
 		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
 		const std::vector<float3>& recv = lightRecv[cs.lightIndex];
@@ -1077,10 +1077,10 @@ TEST( SilhouetteImpl, box_matches_union )
 // SW_RA_MAX(1024) edges so ProcCaster never clamps.
 STUDY_TEST( SoftShadowProcVsUnion, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [procun] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [procun] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [procun] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [procun] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 50 ), MAXC = envI( "UG_CASTERS", 200 ), MAXTRI = envI( "UG_MAXTRI", 300 );
@@ -1088,7 +1088,7 @@ STUDY_TEST( SoftShadowProcVsUnion, quantify )
 	const float FN = envI( "UG_FLIPN", 0 ) ? -1.0f : 1.0f;		// negate face normals (test inward-vs-outward winding convention)
 
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
@@ -1108,7 +1108,7 @@ STUDY_TEST( SoftShadowProcVsUnion, quantify )
 	double clAbs = 0, opAbs = 0, clUmbAbs = 0, opUmbAbs = 0; long clN = 0, opN = 0, clUmbN = 0, opUmbN = 0;
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int nT = ( int )( cs.numIndex / 3 );
 		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
 		const std::vector<float3>& recv = lightRecv[cs.lightIndex];
@@ -1174,17 +1174,17 @@ STUDY_TEST( SoftShadowProcVsUnion, quantify )
 // Winding-agnostic (SurfBuild_SoloCovExact uses |area|), banding-free (continuous solo). Env UG_BETA (0..1).
 STUDY_TEST( SoftShadowIndepProduct, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [indep] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [indep] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [indep] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [indep] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	const int N = envI( "UG_N", 32 ), SAMP = envI( "UG_SAMP", 60 ), MAXC = envI( "UG_CASTERS", 200 ), MAXTRI = envI( "UG_MAXTRI", 1500 );
 	const float BETA = envF( "UG_BETA", 0.5f );
 
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		for( uint32_t t = 0; t < r.numIndex / 3; t++ )
@@ -1203,7 +1203,7 @@ STUDY_TEST( SoftShadowIndepProduct, quantify )
 	const int SCANM = getenv( "UG_M2" ) ? atoi( getenv( "UG_M2" ) ) : 24;		// scanline chord count (perpendicular resolution)
 	for( uint32_t c = 0; c < cap.casters.size() && usedC < MAXC; c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int nT = ( int )( cs.numIndex / 3 );
 		if( nT < 1 || nT > MAXTRI || cs.lightIndex >= cap.lights.size() ) { continue; }
 		const std::vector<float3>& recv = lightRecv[cs.lightIndex];

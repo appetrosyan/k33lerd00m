@@ -28,7 +28,7 @@ the Free Software Foundation, either version 3 of the License, or
 //   3. A-PRIMITIVES      - each extracted step of softwedge_coverage.inc.hlsl vs closed forms / MC.
 //   4. B-PRIMITIVES      - each step of SoftShadowDir.h vs spherical closed forms / MC.
 //   5. FINDING TESTS     - one deterministic minimal input per adversarial-review finding F1..F15.
-//   6. CAPTURE INVARIANTS- engine edge-stream contract checked on all committed erebus*.softcap.
+//   6. CAPTURE INVARIANTS- engine edge-stream contract checked on all committed erebus*.cap.
 
 #include "hlsl_compat.h"
 #include "softwedge_coverage.inc.hlsl"		// the live shader source, compiled as C++ (SW_FUNC=inline)
@@ -1579,9 +1579,9 @@ STUDY_TEST( SoftShadowPipeline, aam_full_pipeline_accuracy_and_stability_on_capt
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() ) { continue; }
 		capsSeen++;
 		float3 cam0( c.hdr.vieworg[0], c.hdr.vieworg[1], c.hdr.vieworg[2] );
 		std::vector<float3> cams = { cam0,
@@ -1592,11 +1592,11 @@ STUDY_TEST( SoftShadowPipeline, aam_full_pipeline_accuracy_and_stability_on_capt
 		double errSum = 0;
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			float3 Lo( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
 			std::vector<uint32_t> castIdx;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 				if( cs.lightIndex == li ) { castIdx.insert( castIdx.end(), c.meshIdx.begin() + cs.firstIndex, c.meshIdx.begin() + cs.firstIndex + cs.numIndex ); }
 			if( castIdx.empty() ) { continue; }
 			// per-caster silhouette edge lists + centres (headers) for the shell
@@ -1604,7 +1604,7 @@ STUDY_TEST( SoftShadowPipeline, aam_full_pipeline_accuracy_and_stability_on_capt
 			std::vector<ShellCaster> shells;
 			for( uint32_t rIdx = Lt.firstEdge; rIdx < Lt.firstEdge + Lt.edgeCount && rIdx < c.edges.size(); rIdx++ )
 			{
-				const softcapEdge_t& e = c.edges[rIdx];
+				const capEdge_t& e = c.edges[rIdx];
 				if( e.e0[3] < 0.0f )
 				{
 					ShellCaster sc; sc.centre = float3( e.e0[0], e.e0[1], e.e0[2] );
@@ -1616,7 +1616,7 @@ STUDY_TEST( SoftShadowPipeline, aam_full_pipeline_accuracy_and_stability_on_capt
 				}
 			}
 			const float bandRp = Lt.penumbraSize * 1.1f;
-			for( const softcapReceiver_t& R : c.receivers )
+			for( const capReceiver_t& R : c.receivers )
 			{
 				if( R.lightIndex != li ) { continue; }
 				uint32_t step = R.numVerts > 24 ? R.numVerts / 8 : 3;
@@ -1629,7 +1629,7 @@ STUDY_TEST( SoftShadowPipeline, aam_full_pipeline_accuracy_and_stability_on_capt
 					// camera-independent by construction, so model it by its exact semantics (centre-ray
 					// blocked per caster; the committed captures are v2/v3 and carry no baked volumes).
 					int core = 0;
-					for( const softcapCaster_t& cs : c.casters )
+					for( const capCaster_t& cs : c.casters )
 					{
 						if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 						if( RayHitsMesh( P, Lo - P, c.meshVerts.data(), c.meshIdx.data() + cs.firstIndex, cs.numIndex ) ) { core += 1; }	// any deviation = umbra
@@ -1891,17 +1891,17 @@ TEST( SoftContract, coverage_area_physical_bound )
 	// clip (the dissected areas ran to -181258 x disk with winding 0). The drop must be OBSERVABLE on the
 	// live function: find receiver/caster pairs where ungated occlusion saturates but the centre-lit drop
 	// zeroes it - the exact pixels that shipped as ants before the physical bound existed.
-	SoftCap cw;
-	if( LoadSoftCap( "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/erebus1_08.softcap", cw ) && !cw.receivers.empty() )
+	Cap cw;
+	if( LoadCap( "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/erebus1_08.cap", cw ) && !cw.receivers.empty() )
 	{
 		SoftEdgeBuffer bufW{ reinterpret_cast<const float4*>( cw.edges.data() ), ( int )( cw.edges.size() * 2 ) };
 		int dropped = 0, sampledW = 0;
 		for( uint32_t li = 0; li < cw.hdr.numLights && dropped == 0; li++ )
 		{
-			const softcapLight_t& Lt = cw.lights[li];
+			const capLight_t& Lt = cw.lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			float3 Lo( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
-			for( const softcapReceiver_t& R : cw.receivers )
+			for( const capReceiver_t& R : cw.receivers )
 			{
 				if( R.lightIndex != li || dropped > 0 ) { continue; }
 				uint32_t step = R.numVerts > 24 ? R.numVerts / 12 : 2;
@@ -2053,13 +2053,13 @@ STUDY_TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		SwGBuffer g( W, H );
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
 				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
@@ -2072,7 +2072,7 @@ STUDY_TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
 		std::vector<L2> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			L2& lc = lights[li];
 			lc.soft = true;
@@ -2080,7 +2080,7 @@ STUDY_TEST( SoftShadowLocator, no_false_shadow_in_lit_region )
 			lc.rp = Lt.penumbraSize;
 			float3 ctr( 0, 0, 0 );
 			int nc = 0;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr;
@@ -2136,13 +2136,13 @@ STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		SwGBuffer g( W, H );
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
 				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
@@ -2167,7 +2167,7 @@ STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 		std::vector<LightCtx> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			LightCtx& lc = lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			lc.soft = true;
@@ -2176,7 +2176,7 @@ STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 			lc.bandRp = Lt.penumbraSize * 1.1f;
 			lc.firstElem = ( int )( Lt.firstEdge * 2 );
 			lc.nRec = ( int )Lt.edgeCount;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr;
@@ -2196,7 +2196,7 @@ STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 			}
 			for( uint32_t rIdx = Lt.firstEdge; rIdx < Lt.firstEdge + Lt.edgeCount && rIdx < c.edges.size(); rIdx++ )
 			{
-				const softcapEdge_t& e = c.edges[rIdx];
+				const capEdge_t& e = c.edges[rIdx];
 				if( e.e0[3] < 0.0f )
 				{
 					if( !lc.shellRec.empty() ) { lc.shellRec.back().second = ( int )rIdx - lc.shellRec.back().first; }
@@ -2418,7 +2418,7 @@ STUDY_TEST( SoftShadowDefects, no_ants_no_turds_no_camera_flips )
 
 		// isolation proof: colour defect map (gray = pipeline shadow term, red = turd, yellow = ant)
 		char out[512];
-		std::snprintf( out, sizeof( out ), "/home/app/Games/gog/doom-3-bfg-edition/base/softcap/defects_%s.ppm", nm );
+		std::snprintf( out, sizeof( out ), "/home/app/Games/gog/doom-3-bfg-edition/base/cap/defects_%s.ppm", nm );
 		std::FILE* f = std::fopen( out, "wb" );
 		if( f )
 		{
@@ -2461,13 +2461,13 @@ STUDY_TEST( SoftShadowFaceSum, erebus_analytic_matches_truth_over_whole_shadow )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		SwGBuffer g( W, H );
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
 				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
@@ -2480,12 +2480,12 @@ STUDY_TEST( SoftShadowFaceSum, erebus_analytic_matches_truth_over_whole_shadow )
 		std::vector<LC> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			LC& lc = lights[li];
 			lc.soft = true; lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
 			lc.rp = Lt.penumbraSize; lc.firstElem = ( int )( Lt.firstEdge * 2 ); lc.nRec = ( int )Lt.edgeCount;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
@@ -2602,13 +2602,13 @@ STUDY_TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 		for( const char* nm : names )
 		{
 			char path[512];
-			std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-			SoftCap c;
-			if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+			std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+			Cap c;
+			if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 			caps++;
 			int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 			SwGBuffer g( W, H );
-			for( const softcapReceiver_t& R : c.receivers )
+			for( const capReceiver_t& R : c.receivers )
 				for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 				{
 					uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
@@ -2619,11 +2619,11 @@ STUDY_TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 				}
 			for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 			{
-				const softcapLight_t& Lt = c.lights[li];
+				const capLight_t& Lt = c.lights[li];
 				if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 				float3 Lo( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
 				std::vector<CasterRange> casters; std::vector<FaceCasterCPU> faces;
-				for( const softcapCaster_t& cs : c.casters )
+				for( const capCaster_t& cs : c.casters )
 				{
 					if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 					CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
@@ -2674,7 +2674,7 @@ STUDY_TEST( SoftShadowFaceUmbra, coverage_saturates_in_the_umbra_vs_truth )
 //   (B) SILHOUETTE DISAGREEMENT - the composed shadow's lit/shadowed decision flips vs truth across the frame.
 STUDY_TEST( SoftShadowFacePipeline, face_mode_band_and_coverage_vs_truth )
 {
-	// erebus (penumbra-rich receivers) + the TRIPOD (softcap0012/0013): thin legs whose soft shadow becomes
+	// erebus (penumbra-rich receivers) + the TRIPOD (cap0012/0013): thin legs whose soft shadow becomes
 	// an unrecognisable mess of phantom wedges in face mode - the user's named catastrophic case.
 	const char* names[] = { "erebus1_03", "erebus1_06", "erebus1_09", "erebus1_12", "erebus1_13" };
 	const int W = 96;	// coarse frame; the failure modes are FRACTIONS of the penumbra, resolution-robust
@@ -2683,13 +2683,13 @@ STUDY_TEST( SoftShadowFacePipeline, face_mode_band_and_coverage_vs_truth )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		SwGBuffer g( W, H );
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
 				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
@@ -2703,12 +2703,12 @@ STUDY_TEST( SoftShadowFacePipeline, face_mode_band_and_coverage_vs_truth )
 		std::vector<LC> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			LC& lc = lights[li];
 			lc.soft = true; lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
 			lc.rp = Lt.penumbraSize; lc.bandRp = Lt.penumbraSize * 1.1f;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
@@ -3172,16 +3172,16 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		const bool hasTex = !c.materials.empty() && c.recvST.size() == c.recvVerts.size() / 3 * 2 && !c.recvMat.empty();
 		SwGBuffer g( W, H );
 		for( size_t ri = 0; ri < c.receivers.size(); ri++ )
 		{
-			const softcapReceiver_t& R = c.receivers[ri];
+			const capReceiver_t& R = c.receivers[ri];
 			int mat = hasTex && ri < c.recvMat.size() ? ( int )c.recvMat[ri] : -1;
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
@@ -3213,7 +3213,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		std::vector<RefLight> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			RefLight& lc = lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			lc.soft = true;
@@ -3222,7 +3222,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 			lc.bandRp = Lt.penumbraSize * 1.1f;
 			lc.firstElem = ( int )( Lt.firstEdge * 2 );
 			lc.nRec = ( int )Lt.edgeCount;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr;
@@ -3242,7 +3242,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 			}
 			for( uint32_t rIdx = Lt.firstEdge; rIdx < Lt.firstEdge + Lt.edgeCount && rIdx < c.edges.size(); rIdx++ )
 			{
-				const softcapEdge_t& e = c.edges[rIdx];
+				const capEdge_t& e = c.edges[rIdx];
 				if( e.e0[3] < 0.0f ) { lc.shells.push_back( { float3( e.e0[0], e.e0[1], e.e0[2] ), {} } ); }
 				else if( !lc.shells.empty() )
 				{
@@ -3580,7 +3580,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		std::snprintf( fpath, sizeof( fpath ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.ppm", nm );
 		bool haveFrame = LoadPPM( fpath, frame, fw, fh );
 		char out[512];
-		std::snprintf( out, sizeof( out ), "/home/app/Games/gog/doom-3-bfg-edition/base/softcap/ref_%s.ppm", nm );
+		std::snprintf( out, sizeof( out ), "/home/app/Games/gog/doom-3-bfg-edition/base/cap/ref_%s.ppm", nm );
 		std::FILE* f = std::fopen( out, "wb" );
 		if( f )
 		{
@@ -3623,7 +3623,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 		// VISCON: hard-stencil | symmetric distance-ramp | ray truth, all lit-shaded, so the penumbra softening
 		// reads in a game-like context. The middle pane is the candidate: stencil umbra + screen-space soft edge.
 		char rout[512];
-		std::snprintf( rout, sizeof( rout ), "/home/app/Games/gog/doom-3-bfg-edition/base/softcap/ramp_%s.ppm", nm );
+		std::snprintf( rout, sizeof( rout ), "/home/app/Games/gog/doom-3-bfg-edition/base/cap/ramp_%s.ppm", nm );
 		std::FILE* rf = std::fopen( rout, "wb" );
 		if( rf )
 		{
@@ -3687,7 +3687,7 @@ STUDY_TEST( SoftShadowReference, full_frame_vs_raytraced_all_captures )
 
 // ====================================================================== 5d-quater. EMERGENT-UMBRA HALO
 // The in-game defect the emergent-umbra GPU path (r_softShadowEmergentUmbra 1) surfaced: penumbra clipping
-// and haloes. Renders the exact captured frames (softcap0012/0013) through the SAME composition the GPU
+// and haloes. Renders the exact captured frames (cap0012/0013) through the SAME composition the GPU
 // runs - LIT / RING(guard on) / CORE(guard off) selected by centre-visibility - and the OLD solid-stamp
 // composition (core = black), and writes both terms plus a leak map. The hypothesis: the core coverage
 // UNDER-shadows (the proven cross-section root), so where the old path stamped solid umbra the emergent
@@ -3702,13 +3702,13 @@ STUDY_TEST( SoftShadowHalo, emergent_umbra_leak_is_confined_to_the_core )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		SwGBuffer g( W, H );
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
 				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
@@ -3723,13 +3723,13 @@ STUDY_TEST( SoftShadowHalo, emergent_umbra_leak_is_confined_to_the_core )
 		std::vector<RefLight> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			RefLight& lc = lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			lc.soft = true; lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] );
 			lc.rp = Lt.penumbraSize; lc.bandRp = Lt.penumbraSize * 1.1f;
 			lc.firstElem = ( int )( Lt.firstEdge * 2 ); lc.nRec = ( int )Lt.edgeCount;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
@@ -3744,7 +3744,7 @@ STUDY_TEST( SoftShadowHalo, emergent_umbra_leak_is_confined_to_the_core )
 			}
 			for( uint32_t r = Lt.firstEdge; r < Lt.firstEdge + Lt.edgeCount && r < c.edges.size(); r++ )
 			{
-				const softcapEdge_t& e = c.edges[r];
+				const capEdge_t& e = c.edges[r];
 				if( e.e0[3] < 0.0f ) { lc.shells.push_back( { float3( e.e0[0], e.e0[1], e.e0[2] ), {} } ); }
 				else if( !lc.shells.empty() ) { lc.shells.back().second.push_back( { float3( e.e0[0], e.e0[1], e.e0[2] ), float3( e.e1[0], e.e1[1], e.e1[2] ) } ); }
 			}
@@ -3790,7 +3790,7 @@ STUDY_TEST( SoftShadowHalo, emergent_umbra_leak_is_confined_to_the_core )
 		{
 			const char* tag = k == 0 ? "emergent" : k == 1 ? "stamp" : "leak";
 			std::vector<unsigned char>& im = k == 0 ? imgE : k == 1 ? imgS : imgD;
-			char out[600]; std::snprintf( out, sizeof( out ), "/home/app/Games/gog/doom-3-bfg-edition/base/softcap/halo_%s_%s.ppm", nm, tag );
+			char out[600]; std::snprintf( out, sizeof( out ), "/home/app/Games/gog/doom-3-bfg-edition/base/cap/halo_%s_%s.ppm", nm, tag );
 			FILE* f = std::fopen( out, "wb" );
 			if( f ) { std::fprintf( f, "P6\n%d %d\n255\n", W, H ); std::fwrite( im.data(), 1, im.size(), f ); std::fclose( f ); }
 		}
@@ -3944,13 +3944,13 @@ STUDY_TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section 
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		SwGBuffer g( W, H );
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 		{
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
@@ -3968,7 +3968,7 @@ STUDY_TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section 
 		std::vector<CLight> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			CLight& lc = lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			lc.soft = true;
@@ -3976,7 +3976,7 @@ STUDY_TEST( SoftShadowContour, receiver_apex_contour_recovers_the_cross_section 
 			lc.rp = Lt.penumbraSize;
 			lc.firstElem = ( int )( Lt.firstEdge * 2 );
 			lc.nRec = ( int )Lt.edgeCount;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
@@ -4217,13 +4217,13 @@ STUDY_TEST( SoftShadowCombine, union_of_casters_beats_max_in_the_penumbra )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) || c.receivers.empty() || c.recvVerts.empty() ) { continue; }
 		capsSeen++;
 		int H = c.hdr.screenW ? ( int )( ( double )W * c.hdr.screenH / c.hdr.screenW ) : W * 9 / 16;
 		SwGBuffer g( W, H );
-		for( const softcapReceiver_t& R : c.receivers )
+		for( const capReceiver_t& R : c.receivers )
 			for( uint32_t t = R.firstIndex; t + 2 < R.firstIndex + R.numIndex && t + 2 < c.recvIdx.size(); t += 3 )
 			{
 				uint32_t ia = c.recvIdx[t], ib = c.recvIdx[t + 1], ic = c.recvIdx[t + 2];
@@ -4241,11 +4241,11 @@ STUDY_TEST( SoftShadowCombine, union_of_casters_beats_max_in_the_penumbra )
 		std::vector<CLight> lights( c.hdr.numLights );
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& Lt = c.lights[li];
+			const capLight_t& Lt = c.lights[li];
 			CLight& lc = lights[li];
 			if( Lt.penumbraSize <= 0.0f || Lt.edgeCount == 0 ) { continue; }
 			lc.soft = true; lc.Lo = float3( Lt.origin[0], Lt.origin[1], Lt.origin[2] ); lc.rp = Lt.penumbraSize;
-			for( const softcapCaster_t& cs : c.casters )
+			for( const capCaster_t& cs : c.casters )
 			{
 				if( cs.lightIndex != li || cs.numIndex == 0 ) { continue; }
 				CasterRange cr; cr.first = cs.firstIndex; cr.num = cs.numIndex;
@@ -4415,7 +4415,7 @@ STUDY_TEST( SoftShadowSoftness, penumbra_width_tracks_truth_contact_hardening )
 // ====================================================================== 6. CAPTURE-STREAM INVARIANTS
 // The ENGINE feed contract, checked on every committed capture: chains walk-ordered and closed, headers
 // bounding their edges, per-light ranges valid, winding consistent per chain.
-TEST( SoftCaptureInvariant, edge_stream_contract_on_all_committed_captures )
+TEST( CaptureInvariant, edge_stream_contract_on_all_committed_captures )
 {
 	const char* names[] = { "erebus1_01", "erebus1_02", "erebus1_03", "erebus1_04", "erebus1_05", "erebus1_06", "erebus1_07",
 							"erebus1_08", "erebus1_09" };
@@ -4423,9 +4423,9 @@ TEST( SoftCaptureInvariant, edge_stream_contract_on_all_committed_captures )
 	for( const char* nm : names )
 	{
 		char path[512];
-		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.softcap", nm );
-		SoftCap c;
-		if( !LoadSoftCap( path, c ) )
+		std::snprintf( path, sizeof( path ), "/home/app/Games/gog/doom-3-bfg-edition/neo/tests/data/%s.cap", nm );
+		Cap c;
+		if( !LoadCap( path, c ) )
 		{
 			std::FILE* pf = std::fopen( path, "rb" );
 			uint32_t magicVer[2] = { 0, 0 };
@@ -4438,7 +4438,7 @@ TEST( SoftCaptureInvariant, edge_stream_contract_on_all_committed_captures )
 		int windPos = 0, windNeg = 0;
 		for( uint32_t li = 0; li < c.hdr.numLights; li++ )
 		{
-			const softcapLight_t& L = c.lights[li];
+			const capLight_t& L = c.lights[li];
 			CHECK( ( size_t )L.firstEdge + L.edgeCount <= c.edges.size() );		// range valid
 			if( L.penumbraSize <= 0.0f ) { continue; }
 			// v5 FACE captures store a PURE TRIANGLE stream (v0,triRad)(v1,0)(v2,0) - no silhouette edge
@@ -4449,7 +4449,7 @@ TEST( SoftCaptureInvariant, edge_stream_contract_on_all_committed_captures )
 			{
 				for( uint32_t rIdx = L.firstEdge; rIdx < L.firstEdge + L.edgeCount && rIdx < c.edges.size(); rIdx++ )
 				{
-					const softcapEdge_t& e = c.edges[rIdx];
+					const capEdge_t& e = c.edges[rIdx];
 					CHECK( e.e0[3] >= 0.0f );		// no legacy header record (e0.w<0) in a v5 face stream
 					for( int k = 0; k < 3; k++ ) { CHECK( std::isfinite( e.e0[k] ) && std::isfinite( e.e1[k] ) ); }
 				}
@@ -4493,7 +4493,7 @@ TEST( SoftCaptureInvariant, edge_stream_contract_on_all_committed_captures )
 			};
 			for( uint32_t rIdx = L.firstEdge; rIdx < L.firstEdge + L.edgeCount && rIdx < c.edges.size(); rIdx++ )
 			{
-				const softcapEdge_t& e = c.edges[rIdx];
+				const capEdge_t& e = c.edges[rIdx];
 				if( e.e0[3] < 0.0f )
 				{
 					finishChain();

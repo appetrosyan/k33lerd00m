@@ -121,6 +121,9 @@ private:
 	nvrhi::ShaderHandle				m_ShaderSurf;
 	nvrhi::BindingLayoutHandle		m_LayoutSurf;
 	nvrhi::ComputePipelineHandle	m_PipelineSurf;
+	// SURF-CACHE GRID permutation (SW_SURF_CACHE=1 + SW_SURF_GRID=1 + SW_SCANLINE=1, r_softShadowSurfCacheGrid)
+	// lives in FILE-SCOPE STATICS in the .cpp, NOT as members here: growing this class shifts its heap layout
+	// and can surface a latent init-time heap fault (the idImageManager-class landmine). Reuses m_LayoutSurf.
 	// FUBINI SCANLINE permutation (SW_SCANLINE=1, r_softShadowScanline): the list walk fills an 8x32
 	// interval bit-grid (exact 1D union per chord) instead of the 16-sample mask. Same bindings as the
 	// shipped path, so it reuses m_Layout; separate pipeline keeps the shipped one byte-identical.

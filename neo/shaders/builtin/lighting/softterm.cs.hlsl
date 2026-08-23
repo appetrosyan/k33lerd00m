@@ -59,7 +59,14 @@ RWStructuredBuffer<uint>	u_SurfTable	: register( u2 );
 // u_SurfQueue removed: the READ-ONLY runtime term never claims/enqueues (the burst seeds via
 // softsurf_seed), so it binds NO request queue. This also keeps the reflected binding layout stable
 // across sample-count permutations (a stripped-but-declared u3 desynced the layout and crashed at s32).
+#if SW_SURF_GRID
+// GRID mode reuses register t6 (the residual pool is excluded in grid mode) for the parallel static
+// Fubini grid buffer - so the binding LAYOUT is identical to the scalar surf permutation (u2 table + t6),
+// no extra slot to strip/desync. SW_SCAN_CHORDS words per slot.
+StructuredBuffer<uint>		t_SurfGrid	: register( t6 );
+#else
 StructuredBuffer<uint>		t_SurfPool	: register( t6 );	// read before the include: the residual walk consumes it
+#endif
 
 // order-preserving float->uint encoding for the texel anchor (word 7): anchors accumulate via
 // InterlockedMin so the value is the MIN height over all contributors - order-independent, so the
@@ -69,6 +76,14 @@ uint SwSurfFlipF( float f )
 	const uint u = asuint( f );
 	return ( u & 0x80000000u ) ? ~u : ( u | 0x80000000u );
 }
+#endif
+// GRID mode REQUIRES the Fubini scanline primitives (SoftScan_*, SW_SCAN_CHORDS). The shader-permutation
+// matrix (shaders.cfg) varies SW_SURF_GRID and SW_SCANLINE independently, so force SW_SCANLINE=1 whenever
+// SW_SURF_GRID=1 - the surfgrid pipeline is always requested with SW_SCANLINE=1 anyway; this just makes the
+// otherwise-invalid SW_SURF_GRID=1/SW_SCANLINE=0 cross-product entries compile (they are dead, never bound).
+#if SW_SURF_GRID
+	#undef SW_SCANLINE
+	#define SW_SCANLINE 1
 #endif
 #include "softwedge_coverage.inc.hlsl"
 
@@ -360,15 +375,45 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// flat-plane F is unsound. Flat receivers stay on the plane and still hit.
 							const uint aEnc = u_SurfTable[ sBase + 7 ];
 							const float aH = asfloat( ( aEnc & 0x80000000u ) ? ( aEnc ^ 0x80000000u ) : ~aEnc );
-							if( abs( pw - aH ) > g * 0.0625f )
+#if SW_SURF_GRID
+							// GRID mode: the bit-grid represents tilt/curve as bits directly (no flat-plane F),
+							// so the tilt/curve half of the guard's job is gone - a fragment up to ~1 texel above
+							// the min-anchor is the SAME tilted surface and the center-built grid is method-A valid.
+							// Only the genuine floor+step distinct-surface alias (two surfaces sharing the G-slab
+							// key) must still reject; widen the band to ~1 texel so tilt/curve stops walking.
+							// (measure-first 2026-08-23: 56% anchor-rej at 0.0625*g was almost all tilt; gate arbiter
+							// catches any floor+step alias that leaks through the wider band.)
+							const float swAnchBand = g * 0.0625f;
+#else
+							const float swAnchBand = g * 0.0625f;
+#endif
+							if( abs( pw - aH ) > swAnchBand )
 							{
 								swStatIdx = 3u;	// ANCHOR-REJECT: wrong surface for this record
 								break;			// exact miss path
 							}
-							const uint resOfs = u_SurfTable[ sBase + 3 ];
 							const uint w4 = u_SurfTable[ sBase + 4 ];
+							const uint foldedCnt = w4 >> 16;			// high 16: static occluders gridded/folded = the per-texel saving (viz)
+#if SW_SURF_GRID
+							// GRID hit: load the frozen static bit-grid into swGrid + build this fragment's
+							// circular disk mask (fragment-invariant). Dynamic casters OR into swGrid below;
+							// coverage = popcount(swGrid & diskMask)/diskBits - the exact Fubini union (no
+							// bilinear F, no residual pool; umbra / silhouette / tilt represented as bits).
+							uint swGrid[SW_SCAN_CHORDS];
+							uint swDiskMask[SW_SCAN_CHORDS];
+							int  swDiskBits = 0;
+							{
+								const uint gBaseR = slot * ( uint )SW_SCAN_CHORDS;
+								[unroll] for( int gr = 0; gr < SW_SCAN_CHORDS; gr++ )
+								{
+									swGrid[gr]     = t_SurfGrid[ gBaseR + gr ];
+									swDiskMask[gr] = SoftScan_Run( -SW_SCAN_HC[gr], SW_SCAN_HC[gr] );
+									swDiskBits    += SoftPopcount32( swDiskMask[gr] );
+								}
+							}
+#else
+							const uint resOfs = u_SurfTable[ sBase + 3 ];
 							const uint resCnt = w4 & 0xFFFFu;			// low 16: residual occluders still walked
-							const uint foldedCnt = w4 >> 16;			// high 16: static occluders folded away = the per-texel saving (walk-units)
 							const uint f01 = u_SurfTable[ sBase + 5 ];
 							const uint f23 = u_SurfTable[ sBase + 6 ];
 							const float fu = pu / g - floor( pu / g );
@@ -376,6 +421,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 							const float fLo = lerp( f16tof32( f01 & 0xFFFFu ), f16tof32( f01 >> 16 ), fu );
 							const float fHi = lerp( f16tof32( f23 & 0xFFFFu ), f16tof32( f23 >> 16 ), fu );
 							const float fFold = lerp( fLo, fHi, fv );
+#endif
 							// TILE the hit-path dynamic-caster walk (g_aa.w = r_softShadowSurfCacheTileDyn). The
 							// untiled all-caster residual walk re-walked the whole dynamic suffix per fragment and
 							// cost a HIT more than a tiled MISS when dynamic casters are many. Pass this fragment's
@@ -411,12 +457,45 @@ void main( uint3 tid : SV_DispatchThreadID )
 									}
 								}
 							}
+#if SW_SURF_GRID
+							// OR this fragment's DYNAMIC casters into the static grid at the true apex P: static
+							// bits are frozen at the texel centre (Phase-1 method-A drift), dynamic bits exact at
+							// P (contact shadows keep parallax). term = 1 - popcount(grid & diskMask)/diskBits.
+							// SPILL / corrupt / tiling-off (swHitListCount < 0): do NOT grid-rasterise here. The
+							// bounded dynamic handling already lives in the exact miss walk below - and in THIS
+							// (surfgrid) permutation that walk is itself Fubini (SW_SCANLINE=1) with the tile
+							// CLUSTER list on spill, so it stays banding-free AND bounded. Grid-rasterising every
+							// dynamic caster here was the dominant hit cost (measured: 14% of hits, 63% of the
+							// dynamic fill work, ~139 tris/hit). Fall through to it instead.
+							if( swHitListCount < 0 )
+							{
+								swStatIdx = 3u;		// take the exact (Fubini) miss walk for this fragment
+								break;
+							}
+							const softFrame_t swFP = SoftShadow_Frame( swP, g_lightR.xyz );
+							const float swRP = max( g_lightR.w, 1e-2 );
+							// TILED: OR this tile's DYNAMIC casters into the static grid at the TRUE apex P (contact
+							// shadows keep full parallax - filling them at the texel centre wrecks contact/umbra).
+							// The aperture shift only reconstructs the STATIC bits; dynamic is small vs a sub-texel
+							// aperture shift, so the shared shift is a negligible perturbation on it.
+							[loop] for( int ld = 0; ld < swHitListCount; ld++ )
+							{
+								const int se = ( int )t_SoftTiles[ swHitListBase + ld ];
+								if( se < swHitDynTri ) { continue; }		// dynamic tris only (static already gridded)
+								const int bd = g_range.x + se * 3;
+								SoftScan_FillTri( swGrid, t_SoftEdges[ bd + 0 ].xyz, t_SoftEdges[ bd + 1 ].xyz, t_SoftEdges[ bd + 2 ].xyz, swP, swFP, swRP, SW_NEAR_EPS );
+							}
+							int swCovG = 0;
+							[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCovG += SoftPopcount32( swGrid[cm] & swDiskMask[cm] ); }
+							float swTermC = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovG / ( float )swDiskBits : 0.0 );
+#else
 							const float occEx = SoftShadow_FaceCoverageSurfResidual(
 													swP, g_lightR.xyz, max( g_lightR.w, 1e-2 ), g_range.x,
 													( int )resOfs, ( int )resCnt,
 													g_flags.y, g_surfA.z, g_range.y,
 													swHitListBase, swHitListCount, swHitDynTri, swRotAng );
 							float swTermC = 1.0 - saturate( fFold + occEx );
+#endif
 							const int viz = ( int )g_surfParams.y;
 							if( viz == 1 && ( ( ( cu ^ cv ^ cw ) & 1 ) != 0 ) )
 							{

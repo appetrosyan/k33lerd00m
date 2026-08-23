@@ -116,7 +116,7 @@ int RunAllUnitTests( const char* filter )
 		std::printf( "  %d study instrument(s) skipped (CPU frame emulation, not tests) - run with `@study` if you want them\n", studySkipped );
 	}
 	// The renderer-correctness gate is NOT in this binary: it is the com_softShadowGate ENGINE run, which
-	// renders every .softcap through the real GPU pipeline vs the RT reference and counts defects.
+	// renders every .cap through the real GPU pipeline vs the RT reference and counts defects.
 	std::printf( "  image gate: RBDOOM_HIDDEN_WINDOW=1 ./RBDoom3BFG +set com_softShadowGate corpus  <-- the ONLY renderer verdict\n" );
 	return totalFailures;
 }

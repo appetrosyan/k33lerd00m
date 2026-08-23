@@ -65,7 +65,7 @@ struct idUnitTestCase
 	bool        study;		// true = heavy CPU frame-EMULATION measurement. NOT a test: it evaluates the coverage
 	//                          math, not the GPU frame, and stayed green through a total in-game breakage. Excluded
 	//                          from every default run; opt in with the "@study" filter. The image gate is the
-	//                          com_softShadowGate ENGINE run over the softcap corpus.
+	//                          com_softShadowGate ENGINE run over the cap corpus.
 	idUnitTestCase( const char* s, const char* n, idTestFn f, bool pipe = false, bool stud = false );
 };
 

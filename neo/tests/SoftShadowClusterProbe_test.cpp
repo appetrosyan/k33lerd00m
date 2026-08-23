@@ -20,7 +20,7 @@ the Free Software Foundation, either version 3 of the License, or
 // migration, measure - on a REAL capture's exact triangle stream and real receiver surfaces -
 // how much per-fragment cull work a second bounding level would save. The fragment walk today
 // tests EVERY tile-listed triangle against the fragment's sample cone (~2.5k tris/tile at
-// softcap0061 density, the measured ~12 ms residual); a 64-tri cluster sphere rejects its whole
+// cap0061 density, the measured ~12 ms residual); a 64-tri cluster sphere rejects its whole
 // span for the price of one test, IF consecutive-index clusters are spatially tight enough that
 // cluster-level rejection tracks triangle-level rejection.
 //
@@ -28,7 +28,7 @@ the Free Software Foundation, either version 3 of the License, or
 //   two-level cost  = nClusters + sum of surviving clusters' tri counts
 //   reduction       = flat / two-level           (GO criterion: >= 3x on the heavy lights)
 //
-// Run:  SOFTCAP=/path/to/softcap0061.softcap ./rbdoom3bfg_tests @study:ClusterProbe
+// Run:  CAP=/path/to/cap0061.cap ./rbdoom3bfg_tests @study:ClusterProbe
 
 #include "hlsl_compat.h"
 float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit, SoftEdgeBuffer t_SoftEdges );
@@ -78,15 +78,15 @@ static bool ConeCullPass( const float3& c, float r, const float3& P, const float
 
 STUDY_TEST( SoftShadowClusterProbe, amortization_on_real_capture )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [clusterprobe] SOFTCAP unset; skipping (set it to a .softcap)\n" );
+		std::printf( "    [clusterprobe] CAP unset; skipping (set it to a .cap)\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) )
+	Cap cap;
+	if( !LoadCap( path, cap ) )
 	{
 		std::printf( "    [clusterprobe] cannot load %s\n", path );
 		CHECK( false );
@@ -101,7 +101,7 @@ STUDY_TEST( SoftShadowClusterProbe, amortization_on_real_capture )
 
 	for( size_t li = 0; li < cap.lights.size(); li++ )
 	{
-		const softcapLight_t& L = cap.lights[li];
+		const capLight_t& L = cap.lights[li];
 		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
 		{
 			continue;
@@ -241,7 +241,7 @@ STUDY_TEST( SoftShadowClusterProbe, amortization_on_real_capture )
 		// receiver population: this light's REAL receiver surfaces from the capture, sampled at
 		// triangle centroids (fragments live on exactly these surfaces)
 		std::vector<float3> recvPts;
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex != ( uint32_t )li )
 			{
@@ -361,18 +361,18 @@ STUDY_TEST( SoftShadowClusterProbe, amortization_on_real_capture )
 //     hits (a coarse field reproduces them) and per-receiver occlusion COMPLEXITY is high
 //     (many distinct contributing clusters -> per-cluster methods stay expensive).
 // Sample cell: the disk's angular radius / 4 (16 samples ~ 4x4 angular cells).
-// Run:  SOFTCAP=/path/to/softcap0061.softcap ./rbdoom3bfg_tests @study:ClusterProbe
+// Run:  CAP=/path/to/cap0061.cap ./rbdoom3bfg_tests @study:ClusterProbe
 STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [proxyprobe] SOFTCAP unset; skipping\n" );
+		std::printf( "    [proxyprobe] CAP unset; skipping\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) )
+	Cap cap;
+	if( !LoadCap( path, cap ) )
 	{
 		CHECK( false );
 		return;
@@ -391,7 +391,7 @@ STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
 
 	for( size_t li = 0; li < cap.lights.size(); li++ )
 	{
-		const softcapLight_t& L = cap.lights[li];
+		const capLight_t& L = cap.lights[li];
 		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
 		{
 			continue;
@@ -495,7 +495,7 @@ STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
 
 		// receivers: this light's real receiver surfaces
 		std::vector<float3> recvPts;
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex != ( uint32_t )li )
 			{
@@ -691,7 +691,7 @@ STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
 
 // ---------------------------------------------------------------------------------------------
 // NEAR/FAR HYBRID EMULATION PROBE (study instrument): the GO/NO-GO for the hybrid soft-shadow
-// design (analytic near field + shadow-map far field). On the real softcap0061 stream + real
+// design (analytic near field + shadow-map far field). On the real cap0061 stream + real
 // receivers, it builds a per-light PERSPECTIVE DEPTH MAP (a simulated shadow-atlas tile) at
 // texel sizes {1,2,4}u, then computes 16-sample coverage the HYBRID way - near = exact analytic
 // triangle test on occluders within a penumbra-relative band; far = one atlas depth compare per
@@ -703,7 +703,7 @@ STUDY_TEST( SoftShadowClusterProbe, proxy_front_differentiator )
 // into a CENTER shadow map (degenerate - all 16 rays share the receiver end, so from the light
 // centre they collapse to one texel = HARD shadow).
 //
-// Run:  SOFTCAP=/path/to/softcap0061.softcap ./rbdoom3bfg_tests @study:ClusterProbe
+// Run:  CAP=/path/to/cap0061.cap ./rbdoom3bfg_tests @study:ClusterProbe
 namespace
 {
 // LAT-LONG (equirectangular) nearest-occluder map from the light CENTRE: covers ALL directions
@@ -761,15 +761,15 @@ struct DepthMap
 
 STUDY_TEST( SoftShadowClusterProbe, hybrid_far_field_emulation )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [hybridprobe] SOFTCAP unset; skipping\n" );
+		std::printf( "    [hybridprobe] CAP unset; skipping\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) )
+	Cap cap;
+	if( !LoadCap( path, cap ) )
 	{
 		CHECK( false );
 		return;
@@ -786,14 +786,14 @@ STUDY_TEST( SoftShadowClusterProbe, hybrid_far_field_emulation )
 	double skHard = 0.0, roSoft = 0.0;
 	long   skN = 0;
 
-	auto F4 = [&]( SoftCap & c, size_t j ) -> const float*
+	auto F4 = [&]( Cap & c, size_t j ) -> const float*
 	{
 		return ( j & 1 ) ? c.edges[j >> 1].e1 : c.edges[j >> 1].e0;
 	};
 
 	for( size_t li = 0; li < cap.lights.size(); li++ )
 	{
-		const softcapLight_t& L = cap.lights[li];
+		const capLight_t& L = cap.lights[li];
 		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
 		{
 			continue;
@@ -818,7 +818,7 @@ STUDY_TEST( SoftShadowClusterProbe, hybrid_far_field_emulation )
 		}
 		// receivers
 		std::vector<float3> recvPts;
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex != ( uint32_t )li )
 			{
@@ -1194,7 +1194,7 @@ STUDY_TEST( SoftShadowClusterProbe, hybrid_far_field_emulation )
 // GO iff a threshold gives a real reduction on the small-light lights while holding gate defects
 // ~0 and continuity no worse than the 16-sample path. Output feeds a shader collapse threshold.
 //
-// Run:  SOFTCAP=/path/to/softcap0061.softcap ./rbdoom3bfg_tests @study:ClusterProbe
+// Run:  CAP=/path/to/cap0061.cap ./rbdoom3bfg_tests @study:ClusterProbe
 namespace
 {
 // 16-sample truth blocked-mask against ALL tris (exact float64 MT), reused for P and P+displaced.
@@ -1327,15 +1327,15 @@ static bool CentreRayBlocked( const float3& P, const float3& Lp, const std::vect
 
 STUDY_TEST( SoftShadowClusterProbe, penumbra_collapse )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [collapseprobe] SOFTCAP unset; skipping\n" );
+		std::printf( "    [collapseprobe] CAP unset; skipping\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) )
+	Cap cap;
+	if( !LoadCap( path, cap ) )
 	{
 		CHECK( false );
 		return;
@@ -1373,7 +1373,7 @@ STUDY_TEST( SoftShadowClusterProbe, penumbra_collapse )
 
 	for( size_t li = 0; li < cap.lights.size(); li++ )
 	{
-		const softcapLight_t& L = cap.lights[li];
+		const capLight_t& L = cap.lights[li];
 		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
 		{
 			continue;
@@ -1402,7 +1402,7 @@ STUDY_TEST( SoftShadowClusterProbe, penumbra_collapse )
 			pt.rad = std::fmax( len3( pt.v0 - pt.cen ), std::fmax( len3( pt.v1 - pt.cen ), len3( pt.v2 - pt.cen ) ) ) * 1.00001f;
 		}
 		std::vector<float3> recvPts;
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex != ( uint32_t )li )
 			{

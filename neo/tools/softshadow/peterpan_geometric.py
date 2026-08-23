@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Objective GEOMETRIC peter-pan metric. No shadow-method comparison (which is blind for
-# dynamic gibs - all methods sample the same atlas). Instead: from the .softcap, project
+# dynamic gibs - all methods sample the same atlas). Instead: from the .cap, project
 # the caster from each light onto the floor it rests on -> where the shadow MUST be; then
 # compare to where the shadow actually renders. Displacement along the cast direction = peter-pan.
 #
-# usage: peterpan_geometric.py <render.png> <capture.softcap> [caster_index]
-#   render must be at the capture's native resolution (2560x1440 for softcap0020).
+# usage: peterpan_geometric.py <render.png> <capture.cap> [caster_index]
+#   render must be at the capture's native resolution (2560x1440 for cap0020).
 #   caster_index defaults to auto-pick the caster nearest the shard screen position.
 import sys, struct
 import numpy as np

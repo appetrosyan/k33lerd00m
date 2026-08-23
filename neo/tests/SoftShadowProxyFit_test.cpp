@@ -17,7 +17,7 @@ version. See <http://www.gnu.org/licenses/>.
 // the instruction-issue floor (see softshadow-walk-attribution); the ONE remaining lever is RECORD COUNT
 // per fragment, and a caster's triangle count IS that count. A 2000-tri pillar swapped for a 12-tri box
 // removes ~160x records from every tile it spans. But it is LOSSY, so before building the fitter this
-// probe answers three numbers straight off a .softcap, OFFLINE, no renderer/GPU:
+// probe answers three numbers straight off a .cap, OFFLINE, no renderer/GPU:
 //   (1) RECORD CEILING  - fraction of caster tri-mass on casters a primitive fits within tolerance.
 //   (2) COVERAGE ERROR  - real-mesh ray-truth vs proxy ray-truth over each light's penumbra receivers
 //                         (= what com_softShadowGate's RT oracle would see).
@@ -26,12 +26,12 @@ version. See <http://www.gnu.org/licenses/>.
 // axis-aligned, so if these already proxy a big tri-mass at low error the direction is proven and OBB/PCA
 // is a later refinement. Small casters (<= SMALL_TRIS) are not worth proxying and are only tallied.
 //
-// Run:  SOFTCAP=/path/to/foo.softcap ./rbdoom3bfg_tests @study:SoftShadowProxyFit
+// Run:  CAP=/path/to/foo.cap ./rbdoom3bfg_tests @study:SoftShadowProxyFit
 //   env: PROXY_TOL (penumbra mean-err ship threshold, default 0.05) | PROXY_N (disk samples/side, 16) |
 //        PROXY_RECV (receiver budget/light, 80) | PROXY_MINTRIS (probe only casters over this, 64)
 
 #include "hlsl_compat.h"
-#include "SoftShadowMesh.h"					// SoftCap + LoadSoftCap + MeshTruthShadowSoup + RayHitsMesh
+#include "SoftShadowMesh.h"					// Cap + LoadCap + MeshTruthShadowSoup + RayHitsMesh
 #include "idUnitTest.h"
 
 #include <cstdio>
@@ -180,15 +180,15 @@ ProxyMesh MakeCylinderAxis( float3 p0, float3 p1, float R, int N )
 
 STUDY_TEST( SoftShadowProxyFit, feasibility )
 {
-	const char* path = std::getenv( "SOFTCAP" );
+	const char* path = std::getenv( "CAP" );
 	if( path == NULL )
 	{
-		std::printf( "    [proxyfit] SOFTCAP unset; skipping\n" );
+		std::printf( "    [proxyfit] CAP unset; skipping\n" );
 		CHECK( true );
 		return;
 	}
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) )
+	Cap cap;
+	if( !LoadCap( path, cap ) )
 	{
 		std::printf( "    [proxyfit] cannot load %s\n", path );
 		CHECK( false );
@@ -204,7 +204,7 @@ STUDY_TEST( SoftShadowProxyFit, feasibility )
 
 	// receiver-centroid P set per light (reused for every caster of that light)
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		std::vector<float3>& dst = lightRecv[r.lightIndex];
@@ -250,7 +250,7 @@ STUDY_TEST( SoftShadowProxyFit, feasibility )
 	std::vector<std::vector<TileAABB>> lightTiles( cap.lights.size() ), lightTiles2( cap.lights.size() );
 	{
 		std::vector<std::unordered_map<int, std::vector<std::pair<float3, float>>>> tv( cap.lights.size() );
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex >= cap.lights.size() ) { continue; }
 			auto& m = tv[r.lightIndex];
@@ -322,7 +322,7 @@ STUDY_TEST( SoftShadowProxyFit, feasibility )
 		for( uint32_t cc = 0; cc < cap.casters.size(); cc++ )
 		{
 			if( cc == self || cap.casters[cc].lightIndex != sl ) { continue; }
-			const softcapCaster_t& C = cap.casters[cc];
+			const capCaster_t& C = cap.casters[cc];
 			if( RayHitsMesh( ctr, dir, cap.meshVerts.data(), &cap.meshIdx[C.firstIndex], C.numIndex ) ) { return true; }
 		}
 		return false;
@@ -341,7 +341,7 @@ STUDY_TEST( SoftShadowProxyFit, feasibility )
 
 	for( uint32_t c = 0; c < cap.casters.size(); c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int realT = ( int )( cs.numIndex / 3 );
 		if( realT <= 0 ) { continue; }
 		totalTris += realT;
@@ -480,10 +480,10 @@ STUDY_TEST( SoftShadowProxyFit, feasibility )
 // Deterministic: fixed grid, no RNG. Run twice -> bit-identical.
 STUDY_TEST( SoftShadowLitClassifier, headroom )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [litclass] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [litclass] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [litclass] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [litclass] cannot load %s\n", path ); CHECK( false ); return; }
 
 	auto envI = []( const char* k, int d )   { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
@@ -494,7 +494,7 @@ STUDY_TEST( SoftShadowLitClassifier, headroom )
 	// per light: the caster spheres + tri ranges (all same-light casters), for the shader-mirror cull.
 	struct CasterRef { float3 c; float rad; uint32_t first, num; };
 	std::vector<std::vector<CasterRef>> lightCasters( cap.lights.size() );
-	for( const softcapCaster_t& cs : cap.casters )
+	for( const capCaster_t& cs : cap.casters )
 	{
 		if( cs.lightIndex >= cap.lights.size() || cs.numIndex < 3 ) { continue; }
 		float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
@@ -517,7 +517,7 @@ STUDY_TEST( SoftShadowLitClassifier, headroom )
 	// density guards against that). Deterministic barycentric lattice.
 	std::vector<std::vector<float3>> lightPts( cap.lights.size() );
 	std::vector<std::vector<float3>> lightNrm( cap.lights.size() );		// receiver surface normal per sample (SURFACE cache plane)
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		std::vector<float3>& dst = lightPts[r.lightIndex];
@@ -1203,14 +1203,14 @@ STUDY_TEST( SoftShadowLitClassifier, headroom )
 // (does the box over- or under-shadow). Coverage is fraction-of-disk-blocked = 1 lit .. 0 umbra, so
 // |box-mesh| IS the intensity error at that receiver.
 //
-// Run:  SOFTCAP=/path/foo.softcap ./rbdoom3bfg_tests @study:SoftShadowProxyFalloff
+// Run:  CAP=/path/foo.cap ./rbdoom3bfg_tests @study:SoftShadowProxyFalloff
 //   env: BOXGAP (box-ness thresh, default 0.06 = the engine cvar) | PROXY_N (disk samples/side, default 64)
 STUDY_TEST( SoftShadowProxyFalloff, quantify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [falloff] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [falloff] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [falloff] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [falloff] cannot load %s\n", path ); CHECK( false ); return; }
 
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	auto envI = []( const char* k, int d )   { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
@@ -1220,7 +1220,7 @@ STUDY_TEST( SoftShadowProxyFalloff, quantify )
 
 	// per-light receiver-centroid P set
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		const uint32_t tc = r.numIndex / 3;
@@ -1241,7 +1241,7 @@ STUDY_TEST( SoftShadowProxyFalloff, quantify )
 
 	for( uint32_t c = 0; c < cap.casters.size(); c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int realT = ( int )( cs.numIndex / 3 );
 		if( realT < MINTRIS || cs.lightIndex >= cap.lights.size() ) { continue; }
 		const std::vector<float3>& recv = lightRecv[cs.lightIndex];
@@ -1311,13 +1311,13 @@ STUDY_TEST( SoftShadowProxyFalloff, quantify )
 // the true mesh (ray-truth) so only GENUINE primitives count, and reports the walk-RECORD fraction each
 // captures + the reduction under "1 record per proxied primitive". Answers: is there enough genuine
 // box+cylinder geometry to matter, or is the whole primitive direction marginal?  Coarse N (population, not
-// precise falloff).  Run: SOFTCAP=... ./rbdoom3bfg_tests @study:SoftShadowPrimitivePop
+// precise falloff).  Run: CAP=... ./rbdoom3bfg_tests @study:SoftShadowPrimitivePop
 STUDY_TEST( SoftShadowPrimitivePop, sizing )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [primpop] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [primpop] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [primpop] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [primpop] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	auto envI = []( const char* k, int d )   { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	const float TOL = envF( "PROXY_TOL", 0.05f );
@@ -1325,7 +1325,7 @@ STUDY_TEST( SoftShadowPrimitivePop, sizing )
 	const int   RCAP = 60;
 
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		const uint32_t tc = r.numIndex / 3;
@@ -1344,7 +1344,7 @@ STUDY_TEST( SoftShadowPrimitivePop, sizing )
 
 	for( uint32_t c = 0; c < cap.casters.size(); c++ )
 	{
-		const softcapCaster_t& cs = cap.casters[c];
+		const capCaster_t& cs = cap.casters[c];
 		const int realT = ( int )( cs.numIndex / 3 );
 		if( realT <= 0 || cs.lightIndex >= cap.lights.size() ) { continue; }
 		totRec += realT; nCas++;
@@ -1445,20 +1445,20 @@ STUDY_TEST( SoftShadowPrimitivePop, sizing )
 // a pebble in another caster's PENUMBRA (not umbra) is correctly KEPT. This simulates the cull and checks
 // SAFETY against ray-truth: a culled caster MUST actually shadow no receiver (else it's an unsafe cull =
 // under-shadow the gate would flag). Sweep UMBRA_SHRINK (safety factor on the occluder radius) to find the
-// yield at 0 unsafe culls.  Run: SOFTCAP=... UMBRA_SHRINK=1.0 ./rbdoom3bfg_tests @study:SoftShadowOccluderCull
+// yield at 0 unsafe culls.  Run: CAP=... UMBRA_SHRINK=1.0 ./rbdoom3bfg_tests @study:SoftShadowOccluderCull
 STUDY_TEST( SoftShadowOccluderCull, validate )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [umbracull] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [umbracull] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [umbracull] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [umbracull] cannot load %s\n", path ); CHECK( false ); return; }
 	auto envF = []( const char* k, float d ) { const char* s = std::getenv( k ); return s ? ( float )std::atof( s ) : d; };
 	const float SHRINK = envF( "UMBRA_SHRINK", 1.0f );
 	const int N = 8;
 
 	// per-light receiver centroids
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		const uint32_t tc = r.numIndex / 3;
@@ -1482,7 +1482,7 @@ STUDY_TEST( SoftShadowOccluderCull, validate )
 	//   dot(P-E0, N) + (R/distLE)*dot(P-edgeMid, toShadow) <= 0.
 	// The object's umbra = behind ALL its silhouette edges' umbra planes (conservative for concave: extra
 	// edges only shrink it). SHRINK scales R (>1 = smaller/safer umbra).
-	auto buildObjUmbra = [&]( const softcapCaster_t& C, float3 Lp, float R ) -> std::vector<Plane>
+	auto buildObjUmbra = [&]( const capCaster_t& C, float3 Lp, float R ) -> std::vector<Plane>
 	{
 		const uint32_t* ri = &cap.meshIdx[C.firstIndex];
 		struct EAcc { float3 a, b; int nF, nB; };
@@ -1537,7 +1537,7 @@ STUDY_TEST( SoftShadowOccluderCull, validate )
 		for( uint32_t c = 0; c < cap.casters.size(); c++ )
 		{
 			if( cap.casters[c].lightIndex != li ) { continue; }
-			const softcapCaster_t& C = cap.casters[c];
+			const capCaster_t& C = cap.casters[c];
 			int t = ( int )( C.numIndex / 3 ); if( t <= 0 ) { continue; }
 			float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
 			for( uint32_t k = C.firstVert; k < C.firstVert + C.numVerts; k++ )
@@ -1579,7 +1579,7 @@ STUDY_TEST( SoftShadowOccluderCull, validate )
 				if( certifier < 0 ) { continue; }
 				nCull++; culledRec += 1;
 				// SAFETY: the certifying occluder's TRUE ray-cast umbra must actually contain the triangle centroid.
-				const softcapCaster_t& A = cap.casters[occ[certifier].first];
+				const capCaster_t& A = cap.casters[occ[certifier].first];
 				if( MeshTruthShadowSoup( cap.meshVerts.data(), &cap.meshIdx[A.firstIndex], A.numIndex, tc, Lp, swRtrue, N ) > 0.01f ) { nUnsafe++; unsafeRec += 1; }
 			}
 		}
@@ -1596,17 +1596,17 @@ STUDY_TEST( SoftShadowOccluderCull, validate )
 //   OFF-PATH   : blocks ZERO light-disk rays for EVERY receiver (coverage == 1.0 exactly) - it is never
 //                geometrically between the light and any receiver.
 //   SUB-QUANTUM: blocks a few rays somewhere but max occlusion < 1% (never reaches one 1/16 coverage step).
-// Run: SOFTCAP=... ./rbdoom3bfg_tests @study:SoftShadowNoShadow
+// Run: CAP=... ./rbdoom3bfg_tests @study:SoftShadowNoShadow
 STUDY_TEST( SoftShadowNoShadow, classify )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [noshadow] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [noshadow] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [noshadow] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [noshadow] cannot load %s\n", path ); CHECK( false ); return; }
 	const int N = 16;
 
 	std::vector<std::vector<float3>> lightRecv( cap.lights.size() );
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.lightIndex >= cap.lights.size() ) { continue; }
 		const uint32_t tc = r.numIndex / 3;
@@ -1649,7 +1649,7 @@ STUDY_TEST( SoftShadowNoShadow, classify )
 		for( uint32_t c = 0; c < cap.casters.size(); c++ )
 		{
 			if( cap.casters[c].lightIndex != li ) { continue; }
-			const softcapCaster_t& C = cap.casters[c];
+			const capCaster_t& C = cap.casters[c];
 			int t = ( int )( C.numIndex / 3 ); if( t <= 0 ) { continue; }
 			totRec += t;
 			float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f ), sum( 0, 0, 0 );
@@ -1768,13 +1768,13 @@ STUDY_TEST( SoftShadowNoShadow, classify )
 //                       the DEPTH-BUFFER visibility test -> its shadow is invisible this frame -> cullable,
 //                       view-dependent.
 // Deterministic (fixed LCG); run twice, outputs must be bit-identical. Exact integer counts.
-// Run: SOFTCAP=... ./rbdoom3bfg_tests @study:SoftShadowCullCeiling
+// Run: CAP=... ./rbdoom3bfg_tests @study:SoftShadowCullCeiling
 STUDY_TEST( SoftShadowCullCeiling, enumerate )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [ceiling] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [ceiling] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [ceiling] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [ceiling] cannot load %s\n", path ); CHECK( false ); return; }
 	const int KPTS = 12, KDISK = 8, KORG = 3;
 	const int SW = ( int )cap.hdr.screenW, SH = ( int )cap.hdr.screenH;
 	const float* MVP = cap.hdr.worldMVP;
@@ -1793,7 +1793,7 @@ STUDY_TEST( SoftShadowCullCeiling, enumerate )
 	};
 	// receiver surfaces once (landing geometry for every light)
 	std::vector<Elem> recvElems;
-	for( const softcapReceiver_t& r : cap.receivers )
+	for( const capReceiver_t& r : cap.receivers )
 	{
 		if( r.numIndex < 3 ) { continue; }
 		auto s = sphereOf( cap.recvVerts.data(), r.firstVert, r.numVerts );
@@ -1839,7 +1839,7 @@ STUDY_TEST( SoftShadowCullCeiling, enumerate )
 	const size_t vizRecvCount = vizElems.size();
 	for( uint32_t c = 0; c < cap.casters.size(); c++ )
 	{
-		const softcapCaster_t& C = cap.casters[c];
+		const capCaster_t& C = cap.casters[c];
 		if( C.numIndex < 3 ) { continue; }
 		auto s = sphereOf( cap.meshVerts.data(), C.firstVert, C.numVerts );
 		vizElems.push_back( { C.firstIndex, C.numIndex, s.first, s.second } );	// mesh arrays
@@ -1924,7 +1924,7 @@ STUDY_TEST( SoftShadowCullCeiling, enumerate )
 		for( uint32_t c = 0; c < cap.casters.size(); c++ )
 		{
 			if( cap.casters[c].lightIndex != li ) { continue; }
-			const softcapCaster_t& C = cap.casters[c];
+			const capCaster_t& C = cap.casters[c];
 			if( C.numIndex < 3 ) { continue; }
 			auto s = sphereOf( cap.meshVerts.data(), C.firstVert, C.numVerts );
 			casElems.push_back( { C.firstIndex, C.numIndex, s.first, s.second } );
@@ -1937,7 +1937,7 @@ STUDY_TEST( SoftShadowCullCeiling, enumerate )
 
 		for( size_t dci = 0; dci < casElems.size(); dci++ )
 		{
-			const softcapCaster_t& D = cap.casters[casIdx[dci]];
+			const capCaster_t& D = cap.casters[casIdx[dci]];
 			const int tcount = ( int )( D.numIndex / 3 );
 			nCas++; totRec += tcount;
 			// area-weighted deterministic surface samples of D
@@ -2028,7 +2028,7 @@ STUDY_TEST( SoftShadowCullCeiling, enumerate )
 	{
 		for( auto& oc : offList )
 		{
-			const softcapCaster_t& D = cap.casters[oc.first];
+			const capCaster_t& D = cap.casters[oc.first];
 			const float3 Lp( cap.lights[oc.second].origin[0], cap.lights[oc.second].origin[1], cap.lights[oc.second].origin[2] );
 			const float  swR = std::fmax( cap.lights[oc.second].penumbraSize, 1e-2f );
 			auto s = sphereOf( cap.meshVerts.data(), D.firstVert, D.numVerts );
@@ -2080,13 +2080,13 @@ STUDY_TEST( SoftShadowCullCeiling, enumerate )
 // was culled, its backfaces are culled too (they lie deeper in the same umbra). Validated against ray
 // truth: FALSE POSITIVES (culled but genuinely contributing) must be EXACTLY 0; FALSE NEGATIVES
 // (redundant but kept) estimated on a strided sample. Deterministic - run twice, bit-identical.
-// Run: SOFTCAP=... ./rbdoom3bfg_tests @study:SoftShadowUmbraAccum
+// Run: CAP=... ./rbdoom3bfg_tests @study:SoftShadowUmbraAccum
 STUDY_TEST( SoftShadowUmbraAccum, validate )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [umbacc] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [umbacc] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [umbacc] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [umbacc] cannot load %s\n", path ); CHECK( false ); return; }
 	const int KDISK = 8;			// ground-truth disk rays per surface sample
 	const int KS = 6;				// ground-truth surface samples per triangle
 	const int FN_STRIDE = 7;		// kept-triangle stride for the false-negative estimate
@@ -2136,7 +2136,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 		for( uint32_t c = 0; c < cap.casters.size(); c++ )
 		{
 			if( cap.casters[c].lightIndex != li ) { continue; }
-			const softcapCaster_t& C = cap.casters[c];
+			const capCaster_t& C = cap.casters[c];
 			if( C.numIndex < 3 ) { continue; }
 			lightCas.push_back( c );
 			float3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
@@ -2278,7 +2278,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 				n = n * ( 1.0f / nl );
 				// NO sign canonicalization: merging opposite-facing coplanar tris (double-sided walls)
 				// double-counts their area, letting a non-convex union pass the hull-area test (measured
-				// FP on softcap0062 L6/c387: the hull covered a hole in the real geometry).
+				// FP on cap0062 L6/c387: the hull covered a hole in the real geometry).
 				float d = dot( n, T.v[0] );
 				uint64_t key = ( ( uint64_t )T.owner << 40 )
 							   ^ ( ( uint64_t )( int64_t )std::llround( n.x * 512 ) & 0x3FF )
@@ -2622,7 +2622,7 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 				}
 			}
 		}
-		// Backface propagation DISABLED: measured on softcap0062 it produced the study's ONLY false
+		// Backface propagation DISABLED: measured on cap0062 it produced the study's ONLY false
 		// positive (an open-mesh caster: front faces culled by DIFFERENT certificates union-cover the
 		// front, but the backface pokes out of every single one and genuinely contributes) for a yield
 		// of just 6 tris. "All front faces culled => backfaces cullable" is sound only for closed
@@ -2800,10 +2800,10 @@ STUDY_TEST( SoftShadowUmbraAccum, validate )
 //        erebus1_05 defect strips) | FARBAND_DENSE (dense samples/side, default 32)
 STUDY_TEST( SoftShadowFarBand, discriminate )
 {
-	const char* path = std::getenv( "SOFTCAP" );
-	if( path == NULL ) { std::printf( "    [farband] SOFTCAP unset; skipping\n" ); CHECK( true ); return; }
-	SoftCap cap;
-	if( !LoadSoftCap( path, cap ) ) { std::printf( "    [farband] cannot load %s\n", path ); CHECK( false ); return; }
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL ) { std::printf( "    [farband] CAP unset; skipping\n" ); CHECK( true ); return; }
+	Cap cap;
+	if( !LoadCap( path, cap ) ) { std::printf( "    [farband] cannot load %s\n", path ); CHECK( false ); return; }
 
 	auto envI = []( const char* k, int d ) { const char* s = std::getenv( k ); return s ? std::atoi( s ) : d; };
 	const uint32_t LI    = ( uint32_t )envI( "FARBAND_LIGHT", 0 );
@@ -2826,7 +2826,7 @@ STUDY_TEST( SoftShadowFarBand, discriminate )
 
 	// L0's exact caster soup (the truth==analytic geometry): idx global into cap.meshVerts.
 	std::vector<uint32_t> soup;
-	for( const softcapCaster_t& cs : cap.casters )
+	for( const capCaster_t& cs : cap.casters )
 	{
 		if( cs.lightIndex != LI ) { continue; }
 		for( uint32_t k = cs.firstIndex; k < cs.firstIndex + cs.numIndex && k < cap.meshIdx.size(); k++ ) { soup.push_back( cap.meshIdx[k] ); }
@@ -2836,12 +2836,12 @@ STUDY_TEST( SoftShadowFarBand, discriminate )
 	// CONSUMED STREAM soup: cap.edges for this light is what the GPU walk actually consumes. The ON-DISK
 	// encoding is VERSION-dependent: v5 = pure V2 tri triples (v0,triRad)(v1,0)(v2,0); pre-v5 (v1/v4) =
 	// inline caster headers (e0.w<0) + triangle PAIRS ( recA.e0=v0, recA.e1=v1, recB.e1=v2 ). Parse per
-	// version so we trace exactly the GPU's geometry vs the truth mesh (RenderCapture.h SOFTCAP_VERSION note;
+	// version so we trace exactly the GPU's geometry vs the truth mesh (RenderCapture.h CAP_VERSION note;
 	// mirrors FaceStreamFromV1Records in SoftShadowBox.h).
 	std::vector<float>    consV;
 	std::vector<uint32_t> consIdx;
 	{
-		const softcapLight_t& L = cap.lights[LI];
+		const capLight_t& L = cap.lights[LI];
 		auto pushTri = [&]( const float* a, const float* b, const float* c )
 		{
 			uint32_t base = ( uint32_t )( consV.size() / 3 );
@@ -2866,10 +2866,10 @@ STUDY_TEST( SoftShadowFarBand, discriminate )
 		{
 			for( uint32_t i = 0; i < L.edgeCount; i++ )
 			{
-				const softcapEdge_t& rA = cap.edges[L.firstEdge + i];
+				const capEdge_t& rA = cap.edges[L.firstEdge + i];
 				if( rA.e0[3] < 0.0f ) { continue; }			// caster header
 				if( i + 1 >= L.edgeCount ) { break; }
-				const softcapEdge_t& rB = cap.edges[L.firstEdge + i + 1];
+				const capEdge_t& rB = cap.edges[L.firstEdge + i + 1];
 				pushTri( rA.e0, rA.e1, rB.e1 );				// v0=recA.e0, v1=recA.e1, v2=recB.e1
 				i++;										// consumed recB
 			}
@@ -3022,7 +3022,7 @@ STUDY_TEST( SoftShadowFarBand, discriminate )
 			float3 ub = normalize( cross( upb, nb ) ), vb = cross( nb, ub );
 			for( size_t ci = 0; ci < cap.casters.size(); ci++ )
 			{
-				const softcapCaster_t& C = cap.casters[ci];
+				const capCaster_t& C = cap.casters[ci];
 				if( C.lightIndex != LI ) { continue; }
 				std::vector<uint32_t> one;
 				for( uint32_t k = C.firstIndex; k < C.firstIndex + C.numIndex && k < cap.meshIdx.size(); k++ ) { one.push_back( cap.meshIdx[k] ); }
@@ -3058,7 +3058,7 @@ STUDY_TEST( SoftShadowFarBand, discriminate )
 		// GRID-sample each L0 receiver triangle finely in world space (the penumbra strip is a few units wide
 		// and falls BETWEEN sparse mesh verts - vertex sampling misses it). ~0.5-unit spacing.
 		const float SPACING = 0.5f;
-		for( const softcapReceiver_t& r : cap.receivers )
+		for( const capReceiver_t& r : cap.receivers )
 		{
 			if( r.lightIndex != LI ) { continue; }
 			for( uint32_t t = r.firstIndex; t + 2 < r.firstIndex + r.numIndex && t + 2 < cap.recvIdx.size(); t += 3 )

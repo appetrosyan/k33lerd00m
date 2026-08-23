@@ -323,7 +323,7 @@ inline float FaceOcclusion( const FaceStreamCPU& s, float3 P, float3 L, float r 
 }
 
 // Convert a LEGACY v1 record blob (inline caster headers e0.w<0 + triangle PAIRS, as stored in
-// pre-v5 .softcap edge sections) into the v2 stream. Coverage is IDENTICAL: caster culls are
+// pre-v5 .cap edge sections) into the v2 stream. Coverage is IDENTICAL: caster culls are
 // conservative, so the caster grouping only affects cost, never the union mask.
 inline FaceStreamCPU FaceStreamFromV1Records( const float4* recs, int firstElem, int numRecords )
 {

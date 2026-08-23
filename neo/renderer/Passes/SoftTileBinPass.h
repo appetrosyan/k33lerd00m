@@ -64,18 +64,18 @@ public:
 	static const int TILE_K = 512;			// indices per tile; must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl.
 	// Measured (erebus1_05/07/09): K=64 overflowed the DENSE tiles - exactly the expensive ones -
 	// back to the full walk, erasing the win on heavy scenes; K=256 resolved every overflow at the
-	// OLD (entity-less) stream density, but at LIVE density (114k records, softcap0061 in-game
+	// OLD (entity-less) stream density, but at LIVE density (114k records, cap0061 in-game
 	// 2026-08-17) K=256 overflowed again: K=512 measured soft 55 -> 48 ms. Revisit if density grows.
 	// 8x8 tiles MEASURED WORSE (17.9/22.1/23.8 vs 16.7/19.6/20.1 ms on erebus1_05/07/09): 4x the
 	// prepass and per-tile list overhead, while the dense tiles' relevant sets barely shrink - a
 	// triangle near one tile is near its neighbours too. Do not retry without a new idea.
 	// SPILL region (2026-08-17): tiles denser than K no longer fall back to the O(all-casters) full
-	// walk (measured ~12 ms/frame at softcap0061 live density - K cannot chase it: K=1024 recovered
+	// walk (measured ~12 ms/frame at cap0061 live density - K cannot chase it: K=1024 recovered
 	// only ~4 ms at +320 MB). Instead the bin CS bump-allocates a span from the buffer TAIL and
 	// writes the tile's FULL index list there (SW_TILE_SPILL sentinel + span descriptor in the tile
 	// slot); consumers walk the span like a normal list. Exhausted region -> old sentinel fallback.
 	// Spill partition of the SAME 48M buffer (no extra VRAM). STREAM V3: overflowed tiles spill
-	// CLUSTER records (k-d leaves of <=32 tris), so the measured softcap0061 1080p demand collapsed
+	// CLUSTER records (k-d leaves of <=32 tris), so the measured cap0061 1080p demand collapsed
 	// from 19.4M tri entries to 1.45M cluster entries (7670 overflow tiles, worst 334 clusters) -
 	// 24M is now deep headroom even for 4K. Both halves degrade gracefully (slots: light falls to
 	// full walk; spill: tile falls to full walk) and the gate bench prints the spill demand so

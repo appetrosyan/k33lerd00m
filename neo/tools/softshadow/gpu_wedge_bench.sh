@@ -7,12 +7,12 @@
 # com_speeds "all:" with the analytic band OFF vs ON. The delta is the wedge's
 # real per-frame GPU cost; run it before/after a shader change for the speedup.
 #
-# Usage: gpu_wedge_bench.sh [cap.softcap] [width] [height]
+# Usage: gpu_wedge_bench.sh [cap.cap] [width] [height]
 # Requires a shipped-shader rebuild first (touch interactionSM.ps.hlsl; build RBDoom3BFG).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 BIN="$ROOT/neo/build/RBDoom3BFG"
-CAP="${1:-$HOME/.local/share/rbdoom3bfg/base/softcap/softcap0020.softcap}"
+CAP="${1:-$HOME/.local/share/rbdoom3bfg/base/cap/cap0020.cap}"
 W="${2:-2560}"; H="${3:-1440}"
 
 run() { # $1 = r_shadowMapPCSSAnalyticContact (0 off / 1 on)

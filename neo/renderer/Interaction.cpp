@@ -838,7 +838,7 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 	// in-place nth_element partition => leaves are CONTIGUOUS index runs) into <= SW_CLUSTER_TRIS
 	// leaves, each bounded by a sphere. The bin culls cluster spheres against the tile cone and the
 	// fragment walk culls them against its sample cone, so a rejected cluster skips its whole span
-	// for one 16B test - the measured amortization on softcap0061 receivers is ~3.6x fewer cone
+	// for one 16B test - the measured amortization on cap0061 receivers is ~3.6x fewer cone
 	// tests (probe: tests/SoftShadowClusterProbe_test.cpp; spatial split beats stream order ~2x).
 	// Conservative at every level, so coverage stays BIT-EXACT: a cluster cull can only DEFER
 	// per-triangle rejects the unchanged tight cull + sample test still make.
@@ -932,6 +932,49 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 
 /*
 ====================
+R_SeedEmitRecvTri
+
+Emit a world-space RECEIVER triangle into the prewarm seed stream, midpoint-subdividing until its
+dominant-axis TEXEL footprint fits under the seed's per-thread span clamp (softsurf_seed.cs.hlsl
+SW_SEED_MAX_SPAN). One seed thread rasterises one emitted tri; a single room-spanning floor/wall
+triangle otherwise claims only a 16x16 texel corner and every other texel the term reads stays
+EMPTY (never-seeded) - the dominant cache-miss cause on the moving cinematic (the lazy fragment
+claim path can't keep up with a scrolling camera). Sub-triangles are coplanar with the parent, so
+the seed derives identical texel keys and plane anchors: this is lossless, it only DISTRIBUTES the
+rasterisation across more threads so the whole surface gets seeded. g must equal the seed's texel
+size (r_softShadowSurfCacheTexel). Depth cap guards degenerate/huge tris; any residual over-span is
+still shed safely by the shader clamp.
+====================
+*/
+static void R_SeedEmitRecvTri( idList<idVec4>& out, const idVec3& a, const idVec3& b, const idVec3& c,
+		float g, int depth )
+{
+	const idVec3 n = ( b - a ).Cross( c - a );
+	const int d = ( idMath::Fabs( n.x ) >= idMath::Fabs( n.y ) && idMath::Fabs( n.x ) >= idMath::Fabs( n.z ) )
+			? 0 : ( ( idMath::Fabs( n.y ) >= idMath::Fabs( n.z ) ) ? 1 : 2 );
+	float au, av, bu, bv, cu, cv;
+	if( d == 0 )		{ au = a.y; av = a.z; bu = b.y; bv = b.z; cu = c.y; cv = c.z; }
+	else if( d == 1 )	{ au = a.z; av = a.x; bu = b.z; bv = b.x; cu = c.z; cv = c.x; }
+	else				{ au = a.x; av = a.y; bu = b.x; bv = b.y; cu = c.x; cv = c.y; }
+	const float spanU = ( Max( au, Max( bu, cu ) ) - Min( au, Min( bu, cu ) ) ) / g;
+	const float spanV = ( Max( av, Max( bv, cv ) ) - Min( av, Min( bv, cv ) ) ) / g;
+	// subdivide to <=12 texels (SW_SEED_MAX_SPAN is 16) so the shader clamp never sheds coverage
+	if( depth < 6 && ( spanU > 12.0f || spanV > 12.0f ) )
+	{
+		const idVec3 ab = ( a + b ) * 0.5f, bc = ( b + c ) * 0.5f, ca = ( c + a ) * 0.5f;
+		R_SeedEmitRecvTri( out, a, ab, ca, g, depth + 1 );
+		R_SeedEmitRecvTri( out, ab, b, bc, g, depth + 1 );
+		R_SeedEmitRecvTri( out, ca, bc, c, g, depth + 1 );
+		R_SeedEmitRecvTri( out, ab, bc, ca, g, depth + 1 );
+		return;
+	}
+	out.Append( idVec4( a.x, a.y, a.z, 0.0f ) );
+	out.Append( idVec4( b.x, b.y, b.z, 0.0f ) );
+	out.Append( idVec4( c.x, c.y, c.z, 0.0f ) );
+}
+
+/*
+====================
 R_BuildLightStaticSoftStream
 
 Assemble a light's FULL static soft-shadow caster stream CAMERA-INDEPENDENTLY, straight from its
@@ -969,6 +1012,8 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 	}
 
 	s_softFaceHeapAlloc = true;		// backend-safe: R_CollectPenumbraFaces heap-allocs (no frame arena)
+	extern idCVar r_softShadowSurfCacheTexel;
+	const float seedG = Max( 1.0f, ( float )r_softShadowSurfCacheTexel.GetInteger() );	// seed texel size
 	idList<int> staticEnts;
 	for( const idInteraction* inter = light->firstInteraction; inter != NULL; inter = inter->lightNext )
 	{
@@ -982,10 +1027,9 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 		{
 			continue;
 		}
-		// WORLD-MODEL ONLY. DM_STATIC entities include MOVEABLES (crates, physics debris) that move
-		// every frame in a cutscene - caching them meant a per-frame invalidate+re-warm storm (measured:
-		// 531 post-warm hitches, 37->15 fps in the erebus1 cutscene). The worldspawn never moves, is the
-		// dominant static receiver/caster, and so never invalidates. Non-world static props are walked.
+		// WORLD-MODEL ONLY. Broadening to DM_STATIC was measured NET-NEGATIVE on the cinematic (moving
+		// props churned invalidations, hit 10%->2%) AND did not reduce never-seeded (97% unchanged), which
+		// proved the miss cause is cw-drift on angled receivers, not receiver-surface set. See [[grid-or-fold-study]].
 		if( !model->IsStaticWorldModel() )
 		{
 			continue;
@@ -1035,9 +1079,8 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 					R_LocalPointToGlobal( ent->modelMatrix, tri->verts[ tri->indexes[i + 0] ].xyz, w0 );
 					R_LocalPointToGlobal( ent->modelMatrix, tri->verts[ tri->indexes[i + 1] ].xyz, w1 );
 					R_LocalPointToGlobal( ent->modelMatrix, tri->verts[ tri->indexes[i + 2] ].xyz, w2 );
-					outRecvTris.Append( idVec4( w0.x, w0.y, w0.z, 0.0f ) );
-					outRecvTris.Append( idVec4( w1.x, w1.y, w1.z, 0.0f ) );
-					outRecvTris.Append( idVec4( w2.x, w2.y, w2.z, 0.0f ) );
+					// subdivide big receiver tris so the seed claims the WHOLE footprint, not a clamped corner
+					R_SeedEmitRecvTri( outRecvTris, w0, w1, w2, seedG, 0 );
 				}
 			}
 			if( !shader->SurfaceCastsShadow() )
@@ -1148,7 +1191,7 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 		{
 			continue;
 		}
-		if( !model->IsStaticWorldModel() )		// WORLD-MODEL ONLY - see R_BuildLightStaticSoftStream
+		if( !model->IsStaticWorldModel() )		// MUST match R_BuildLightStaticSoftStream's gate
 		{
 			continue;
 		}

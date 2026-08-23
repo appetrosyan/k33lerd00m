@@ -15,7 +15,7 @@ the Free Software Foundation, either version 3 of the License, or
 ===========================================================================
 */
 
-// Soft-shadow SCENE CAPTURE (.softcap). Captures one main view's soft-shadow state - camera, the per-light
+// Soft-shadow SCENE CAPTURE (.cap). Captures one main view's soft-shadow state - camera, the per-light
 // analytic soft-shadow edge records the coverage shader consumes, each caster's triangle mesh (for an offline
 // ray-cast ground truth), and the depth buffer - so a problem spot can be reconstructed HEADLESS and its
 // coverage measured against truth, then simplified to a minimal repro. See .claude/plans/concurrent-kindling.
@@ -30,28 +30,35 @@ the Free Software Foundation, either version 3 of the License, or
 #include <stdint.h>
 
 // bump on any layout change; the reader rejects mismatches.
-#define SOFTCAP_MAGIC   0x50434653u			// 'SFCP' little-endian
-#define SOFTCAP_VERSION 5u					// v2: receiver meshes; v3: global mesh indices; v4: mapName + gameTime (self-identifying for reconstruction). reserved[0]=gameTimeMs, reserved[1]=mapName byte length (a trailing MAPNAME block follows recvIdx). v5: FACE-mode edge sections hold the STREAM V2 pure-tri float4 triples (zero-padded to pair records), no inline caster headers; pre-v5 face sections are v1 header+pair records (tests convert via FaceStreamFromV1Records).
+#define CAP_MAGIC   0x50434653u			// 'SFCP' little-endian
+#define CAP_VERSION 6u					// v2: receiver meshes; v3: global mesh indices; v4: mapName + gameTime (self-identifying for reconstruction). reserved[0]=gameTimeMs, reserved[1]=mapName byte length (a trailing MAPNAME block follows recvIdx). v5: FACE-mode edge sections hold the STREAM V2 pure-tri float4 triples (zero-padded to pair records), no inline caster headers; pre-v5 face sections are v1 header+pair records (tests convert via FaceStreamFromV1Records). v6: EMBEDDED SAVEGAME tail block (CAP_SAVE_MAGIC) after the v5 texture tail - the engine's full save serialization (health/ammo/weapons/inventory/all entities) so a capture reconstructs the EXACT live game state, not just the render state.
 
 // v5 TEXTURE TAIL: appended AFTER every v4 block, self-describing (magic + counts), so the header
 // layout never changes and old readers simply stop before it. Carries what the offline verification
 // renders REAL textures from: per-receiver-vertex UVs, a per-receiver material index, and each unique
-// material's diffuse image baked down to <=SOFTCAP_TEX_MAX on the long side (RGB8).
-#define SOFTCAP_TAIL_MAGIC 0x35544653u		// 'SFT5' little-endian
-#define SOFTCAP_TEX_MAX    128
+// material's diffuse image baked down to <=CAP_TEX_MAX on the long side (RGB8).
+#define CAP_TAIL_MAGIC 0x35544653u		// 'SFT5' little-endian
+#define CAP_TEX_MAX    128
+
+// v6 SAVEGAME TAIL: appended AFTER the v5 texture tail. Carries the engine's full save serialization
+// (idGameLocal::SaveGame over the session's in-memory idFile_SaveGame buffers) so a capture reconstructs
+// the EXACT live game state - health, ammo, weapons, inventory, every entity - not just the render state.
+// Two blobs: the main save buffer and the string-table buffer. Self-describing (magic + lengths), so a v5
+// reader simply stops before it.
+#define CAP_SAVE_MAGIC 0x36544653u		// 'SFT6' little-endian
 
 #pragma pack( push, 1 )
 
 // One flattened soft-shadow edge record = the coverage shader's t_SoftEdges element (softShadowEdge_t).
 // Header records carry e0w < 0 and the caster bounding sphere; edge records carry world endpoints.
-struct softcapEdge_t
+struct capEdge_t
 {
 	float e0[4];		// xyz endpoint 0 / (centre, -1 marker) for a header; w = silhouette weight
 	float e1[4];		// xyz endpoint 1 / (radius,0,0,casterId) for a header; w = header record index
 };
 
 // Per soft-shadow light: origin + the range of its edge records in the EDGES block.
-struct softcapLight_t
+struct capLight_t
 {
 	float    origin[3];			// vLight->globalLightOrigin
 	float    penumbraSize;		// r_shadowPenumbraSize at capture time (disk radius)
@@ -64,9 +71,9 @@ struct softcapLight_t
 
 // Per caster mesh (world space), for the offline ray-cast ground truth. Verts/indices live in the MESHVERTS
 // / MESHIDX blocks; firstVert/firstIndex are element offsets there.
-struct softcapCaster_t
+struct capCaster_t
 {
-	uint32_t lightIndex;		// which softcapLight_t this caster belongs to
+	uint32_t lightIndex;		// which capLight_t this caster belongs to
 	float    casterId;			// matches the header record's e1.w for correlation
 	uint32_t firstVert;			// index into MESHVERTS (float3 elements)
 	uint32_t numVerts;
@@ -76,9 +83,9 @@ struct softcapCaster_t
 
 // Per CAPPED shadow-volume surface (world space), read back from the GPU shadowCache/shadowIndexCache - the
 // exact geometry the stencil pass rasterises. w==0 verts already extruded to (far) infinity from the light.
-// A separate tagged array (NOT fields on softcapLight_t) so the existing structs keep their size/ABI. v4+.
+// A separate tagged array (NOT fields on capLight_t) so the existing structs keep their size/ABI. v4+.
 // Header: reserved[2]=numShadowVols, reserved[3]=numShadowVerts(float3), reserved[4]=numShadowIdx(uint32).
-struct softcapShadowVol_t
+struct capShadowVol_t
 {
 	uint32_t lightIndex;
 	uint32_t firstVert;			// index into SHADOWVERTS (float3)
@@ -90,18 +97,18 @@ struct softcapShadowVol_t
 // v5 TEXTURE TAIL: one entry per unique receiver material; texels are RGB8, row-major, firstTexel is a
 // BYTE offset into the tail's texel blob. Tail layout after the magic:
 //   uint32 numMaterials, numTexelBytes, numStFloats (= 2 * numRecvVerts), numRecvMats (= numReceivers)
-//   softcapMaterial_t[numMaterials] ; uint8 texels[numTexelBytes] ; float st[numStFloats] ; uint32 recvMat[numRecvMats]
-struct softcapMaterial_t
+//   capMaterial_t[numMaterials] ; uint8 texels[numTexelBytes] ; float st[numStFloats] ; uint32 recvMat[numRecvMats]
+struct capMaterial_t
 {
 	char     name[64];			// material name, for diagnostics
-	uint32_t texW, texH;		// baked diffuse dimensions (<= SOFTCAP_TEX_MAX per side)
+	uint32_t texW, texH;		// baked diffuse dimensions (<= CAP_TEX_MAX per side)
 	uint32_t firstTexel;		// byte offset of this material's RGB8 texels in the tail blob
 };
 
 // Per RECEIVER interaction surface (world space): the surfaces the coverage shader shades. The coverage uses
 // the receiver's surface position, so evaluating coverage-vs-truth at these surface points reproduces the
 // artifact WITHOUT depth reconstruction. Verts/indices live in the RECVVERTS / RECVIDX blocks.
-struct softcapReceiver_t
+struct capReceiver_t
 {
 	uint32_t lightIndex;		// which light this receiver surface interacts with
 	uint32_t firstVert;			// index into RECVVERTS (float3 elements)
@@ -114,7 +121,7 @@ struct softcapReceiver_t
 //   lights[numLights]  edges[numEdges]  casters[numCasters]  meshVerts[numMeshVerts*3]
 //   meshIdx[numMeshIdx]  depth[screenW*screenH] (float32, row-major top-left origin)
 // Each block's element count is here, so a reader seeks by accumulation; a newer version only appends.
-struct softcapHeader_t
+struct capHeader_t
 {
 	uint32_t magic;
 	uint32_t version;
@@ -132,12 +139,12 @@ struct softcapHeader_t
 	int32_t  taaFrameCount;
 
 	uint32_t numLights;
-	uint32_t numEdges;						// total softcapEdge_t across all lights
+	uint32_t numEdges;						// total capEdge_t across all lights
 	uint32_t numCasters;
 	uint32_t numMeshVerts;					// float3 count (caster meshes)
 	uint32_t numMeshIdx;					// uint32 count (caster meshes)
 	uint32_t hasDepth;						// 1 if a depth block follows, else 0
-	uint32_t numReceivers;					// softcapReceiver_t count
+	uint32_t numReceivers;					// capReceiver_t count
 	uint32_t numRecvVerts;					// float3 count (receiver meshes)
 	uint32_t numRecvIdx;					// uint32 count (receiver meshes)
 	uint32_t reserved[5];
@@ -146,7 +153,7 @@ struct softcapHeader_t
 #pragma pack( pop )
 
 #ifdef __cplusplus
-#ifndef SOFTCAP_NO_ENGINE_API
+#ifndef CAP_NO_ENGINE_API
 
 // ---- engine-side capture API (defined in RenderCapture.cpp) --------------------------------------
 struct viewDef_t;
@@ -161,7 +168,7 @@ void  R_CaptureShadowRefs_f( const idCmdArgs& args );
 // and prints a PASS/FAIL false-shadow verdict (exercises the real frontend/shader/atlas/uniform plumbing).
 void  R_TestSoftShadowLocator_f( const idCmdArgs& args );
 
-// Skip the intro cinematic and pin the view at a .softcap camera over the next ~120 frames, driven by the NORMAL
+// Skip the intro cinematic and pin the view at a .cap camera over the next ~120 frames, driven by the NORMAL
 // frame loop (Common::Frame calls R_SoftShadowGotoTick). Run `softShadowGoto <cap>` + `wait 90` before the test.
 void  R_SoftShadowGoto_f( const idCmdArgs& args );
 void  R_SoftShadowGotoTick();
@@ -169,6 +176,18 @@ void  R_SoftShadowGotoTick();
 // driven from the frame loop by R_SoftShadowBatchTick - no bash/+wait/timeout orchestration.
 void  R_SoftShadowShots_f( const idCmdArgs& args );
 void  R_SoftShadowBatchTick();
+// Warn on contradictory shadow-technique cvar combos (silent-no-op guard). R_CheckShadowConflicts returns
+// the active-conflict count; the _f is the `checkShadowConfig` console command; the Tick polls each frame.
+int   R_CheckShadowConflicts( bool verbose );
+void  R_CheckShadowConflicts_f( const idCmdArgs& args );
+void  R_ShadowConflictTick();
+
+// REPRO HARNESS: `softShadowRepro <cap...>` restores each capture's embedded savegame (exact game state),
+// freezes, A/Bs scanline-vs-sampled at one identical pose, diffs in-engine with a differential canary, then
+// quits. Driven by R_SoftShadowReproTick (frame loop); the per-capture score is the synchronous _Shot.
+void  R_SoftShadowRepro_f( const idCmdArgs& args );
+void  R_SoftShadowReproShot_f( const idCmdArgs& args );
+void  R_SoftShadowReproTick();
 void  R_SoftShadowSpawnCasters_f( const idCmdArgs& args );	// reproduce a capture's dynamic casters (the rock)
 // Pin every shadow-relevant cvar to the explicit soft-shadow test baseline (RT off, soft on, atlas+PCSS, etc.),
 // so the self-test NEVER inherits an archived D3BFGConfig value (e.g. r_useRTShadows 1 silently disabling the
@@ -180,7 +199,7 @@ void  R_SoftShadowPinTestConfig( bool verbose );
 // capture camera, renders RT-oracle vs soft+PCSS hybrid, prints the verdict. Returns false-shadow px (0=pass).
 int   R_SoftShadowSelfTest( const char* mapName );
 
-// MINIMAL-INIT corpus DEFECT GATE (com_softShadowGate): reconstructs every .softcap scene (map + captured
+// MINIMAL-INIT corpus DEFECT GATE (com_softShadowGate): reconstructs every .cap scene (map + captured
 // casters + captured lights), renders the SHIPPED GPU soft-shadow path at >=1920x1080 plus an in-engine RT
 // reference, and counts image defects individually (turds/ants/lit-in-umbra/penumbra steps/extent/temporal
 // jitter/view-continuity flips) via tests/SoftShadowGate.h. Green iff the returned total is ZERO.
@@ -198,10 +217,10 @@ void  R_CaptureLightEdges( const viewLight_t* vLight, const softShadowEdge_t* fl
 void  R_CaptureFrontendView( const viewDef_t* viewDef );
 
 // Called from the backend after the interaction pass (same frame): grabs the screenshot + depth and writes
-// the complete .softcap + .png. Fully disarms the capture.
+// the complete .cap + .png. Fully disarms the capture.
 void  R_CaptureBackendFinish();
 
-#endif // SOFTCAP_NO_ENGINE_API
+#endif // CAP_NO_ENGINE_API
 #endif // __cplusplus
 
 #endif // __RENDERCAPTURE_H__

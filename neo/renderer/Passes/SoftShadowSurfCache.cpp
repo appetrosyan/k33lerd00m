@@ -52,6 +52,31 @@ SoftShadowSurfCache::SoftShadowSurfCache( nvrhi::IDevice* device )
 {
 }
 
+// GRID-mode GPU resources kept OFF the class layout (not members): growing SoftShadowSurfCache shifts its
+// heap layout and surfaces an init-time fault in the render backend (same reason the reduced-set snapshot
+// below uses statics). They must ALSO outlive normal static teardown: a file-scope nvrhi handle runs its
+// destructor at PROGRAM EXIT, after the Vulkan device is already gone, and ComputePipeline::~ - >
+// vkDestroyPipeline on a dead device SIGSEGVs (confirmed backtrace 2026-08-23). So hold them in a
+// heap-allocated struct that is INTENTIONALLY LEAKED (accessor's local static pointer, never freed): the
+// handle destructors never run, and the GPU memory is reclaimed by device teardown. Single cache instance.
+struct SwGridStatics
+{
+	nvrhi::ShaderHandle				shader;
+	nvrhi::ComputePipelineHandle	pipeline;
+	nvrhi::BufferHandle				buffer;			// parallel per-slot Fubini grid (SW_SCAN_CHORDS uints/slot)
+	int								bufferCap = 0;	// slot capacity the grid buffer was sized for
+};
+static SwGridStatics& swGrid()
+{
+	static SwGridStatics* g = new SwGridStatics();	// leaked on purpose - see above; never delete
+	return *g;
+}
+
+nvrhi::IBuffer* SoftShadowSurfCache::GetGridBuffer() const
+{
+	return swGrid().buffer;
+}
+
 void SoftShadowSurfCache::EnsurePipeline()
 {
 	if( m_PipelineTried )
@@ -61,6 +86,7 @@ void SoftShadowSurfCache::EnsurePipeline()
 	m_PipelineTried = true;
 
 	idList<shaderMacro_t> macros;
+	macros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );	// scalar fold permutation (blob keys carry all axes)
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softsurf_build", SHADER_STAGE_COMPUTE, "", macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
 	{
@@ -85,6 +111,22 @@ void SoftShadowSurfCache::EnsurePipeline()
 	pd.bindingLayouts = { m_Layout };
 	pd.CS = m_Shader;
 	m_Pipeline = m_Device->createComputePipeline( pd );
+
+	// GRID build permutation (SW_SURF_GRID=1, r_softShadowSurfCacheGrid): rasterises the Fubini bit-grid
+	// into the parallel grid buffer, bound at u1 in place of the residual pool (unused in grid mode). REUSES
+	// the scalar build layout m_Layout (identical u0 table, u1, u2 queue); separate shader + pipeline only.
+	{
+		idList<shaderMacro_t> gridMacros;
+		gridMacros.Append( shaderMacro_t( "SW_SURF_GRID", "1" ) );
+		swGrid().shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softsurf_build", SHADER_STAGE_COMPUTE, "grid", gridMacros, true, LAYOUT_DRAW_VERT ) );
+		if( swGrid().shader != nullptr )
+		{
+			nvrhi::ComputePipelineDesc pg;
+			pg.bindingLayouts = { m_Layout };
+			pg.CS = swGrid().shader;
+			swGrid().pipeline = m_Device->createComputePipeline( pg );
+		}
+	}
 
 	// PREWARM seed pass (one thread per static tri -> texel claims with triangle-plane anchors).
 	// Failure is non-fatal: the cache just warms lazily via the fragment-claim path instead.
@@ -128,6 +170,7 @@ bool SoftShadowSurfCache::EnsureResources()
 	extern idCVar r_softShadowSurfCacheBudget, r_softShadowSurfCacheCap, r_softShadowSurfCachePoolCap;
 	extern idCVar r_softShadowSurfCacheErrTol, r_softShadowSurfCacheWarmBudget;
 	extern idCVar r_softShadowSurfCacheReduced, r_softShadowSurfCacheReducedK, r_softShadowSurfCacheReducedCutoff;
+	extern idCVar r_softShadowSurfCacheGrid;
 	EnsurePipeline();
 	if( m_Pipeline == nullptr )
 	{
@@ -150,13 +193,15 @@ bool SoftShadowSurfCache::EnsureResources()
 	const int reduced = r_softShadowSurfCacheReduced.GetBool() ? 1 : 0;
 	const int reducedK = r_softShadowSurfCacheReducedK.GetInteger();
 	const float reducedCut = r_softShadowSurfCacheReducedCutoff.GetFloat();
-	// reduced-set snapshot kept as function statics, not class members: growing SoftShadowSurfCache shifts
-	// its heap layout and surfaces an init-time fault in the render backend (see the .h note).
-	static int s_reduced = -1, s_reducedK = -1;
+	const int grid = r_softShadowSurfCacheGrid.GetBool() ? 1 : 0;
+	// reduced-set + grid-mode snapshots kept as function statics, not class members: growing SoftShadowSurfCache
+	// shifts its heap layout and surfaces an init-time fault in the render backend (see the .h note). Toggling
+	// grid mode changes what BUILD writes (bit-grid vs scalar fold), so it must DROP+rebuild the cache.
+	static int s_reduced = -1, s_reducedK = -1, s_gridMode = -1;
 	static float s_reducedCut = -1.0f;
 	if( m_Table == nullptr || capP2 != m_TableCap || poolCap != m_PoolCap || budget != m_Budget
 			|| wantQueue != m_QueueWords || texel != m_Texel || thr != m_Thr || errTol != m_ErrTol
-			|| reduced != s_reduced || reducedK != s_reducedK || reducedCut != s_reducedCut )
+			|| reduced != s_reduced || reducedK != s_reducedK || reducedCut != s_reducedCut || grid != s_gridMode )
 	{
 		m_TableCap = capP2;
 		m_PoolCap = poolCap;
@@ -168,6 +213,7 @@ bool SoftShadowSurfCache::EnsureResources()
 		s_reduced = reduced;
 		s_reducedK = reducedK;
 		s_reducedCut = reducedCut;
+		s_gridMode = grid;
 
 		nvrhi::BufferDesc bd;
 		bd.structStride = sizeof( uint32_t );
@@ -186,6 +232,18 @@ bool SoftShadowSurfCache::EnsureResources()
 		bd.byteSize = ( uint64_t )m_QueueWords * sizeof( uint32_t );
 		bd.debugName = "SoftShadowSurfCache/Queue";
 		m_Queue = m_Device->createBuffer( bd );
+
+		// GRID mode: parallel per-slot Fubini bit-grid (SW_SCAN_CHORDS = 8 uints/slot), allocated only when
+		// r_softShadowSurfCacheGrid is set. The scalar path never touches it. Written by the grid build
+		// (u3), read by the surfgrid term (t7). No clear needed: the build writes the grid before marking
+		// the slot BUILT, and the term reads it only for BUILT slots.
+		if( grid && swGrid().pipeline != nullptr )
+		{
+			bd.byteSize = ( uint64_t )m_TableCap * 8 * sizeof( uint32_t );
+			bd.debugName = "SoftShadowSurfCache/Grid";
+			swGrid().buffer = m_Device->createBuffer( bd );
+			swGrid().bufferCap = m_TableCap;
+		}
 
 		// HUD counter readback ring (non-blocking): CPU-readable staging, one per in-flight frame
 		nvrhi::BufferDesc rbd;
@@ -420,7 +478,10 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		commandList->dispatch( ( nRecv + 63 ) / 64, 1, 1 );
 	}
 
-	// BUILD: consume the enqueued texels (bounded), filling F for each
+	// BUILD: consume the enqueued texels (bounded), filling F (scalar) or the bit-grid (grid mode) for each.
+	// GRID mode routes to the SW_SURF_GRID pipeline/layout and binds the parallel grid buffer as UAV u3.
+	extern idCVar r_softShadowSurfCacheGrid;
+	const bool gridMode = r_softShadowSurfCacheGrid.GetBool() && swGrid().pipeline != nullptr && swGrid().buffer != nullptr;
 	nvrhi::BindingSetDesc sd;
 	sd.bindings =
 	{
@@ -428,13 +489,13 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_WarmStream ),
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, m_WarmStream ),	// dummy t1 (include requirement)
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_Table ),
-		nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_Pool ),
+		nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, gridMode ? swGrid().buffer.Get() : m_Pool.Get() ),	// u1 : pool (scalar) or grid (grid mode)
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_Queue ),
 	};
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
 	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;
-	cs.pipeline = m_Pipeline;
+	cs.pipeline = gridMode ? swGrid().pipeline : m_Pipeline;
 	cs.bindings = { set };
 	commandList->setComputeState( cs );
 	commandList->dispatch( ( SW_WARM_BUDGET + 63 ) / 64, 1, 1 );

@@ -17,17 +17,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${RBDOOM_BIN:-$HERE/../../build/RBDoom3BFG}"
 BINDIR="$(cd "$(dirname "$BIN")" && pwd)"; cd "$BINDIR"
 SAVE="${RBDOOM_SAVEPATH:-$HOME/.local/share/rbdoom3bfg/base}"
-CAPDIR="$SAVE/softcap"
+CAPDIR="$SAVE/cap"
 MAP="${MAP:-game/erebus1}"
 W="${W:-1920}"; H="${H:-1080}"
-CAPS="${CAPS:-softcap0000 softcap0001 softcap0002 softcap0003 softcap0004 softcap0005}"   # override with e.g. CAPS="softcap0001 ..."
+CAPS="${CAPS:-cap0000 cap0001 cap0002 cap0003 cap0004 cap0005}"   # override with e.g. CAPS="cap0001 ..."
 OUT="$SAVE"                                            # dumpHDR writes <name>.png here
 
 launch() { # $1 = tag (analytic|rt), $2.. = config cvars: pay init+map-load ONCE, then goto+dump each
            # capture with ZERO waits (a frozen still per capture = a fraction of a second each)
 	local tag="$1"; shift
 	local tail=""
-	for c in $CAPS; do tail="$tail +softShadowGoto $CAPDIR/$c.softcap +dumpHDR gate_${tag}_$c"; done
+	for c in $CAPS; do tail="$tail +softShadowGoto $CAPDIR/$c.cap +dumpHDR gate_${tag}_$c"; done
 	timeout 400 "$BIN" +set com_skipIntroVideos 1 +set com_skipSignInManager 1 +set com_showFPS 0 \
 		+set r_fullscreen 0 +set r_windowWidth "$W" +set r_windowHeight "$H" +set r_swapInterval 0 \
 		"$@" +devmap "$MAP" +loadGame quick +noclip $tail +quit

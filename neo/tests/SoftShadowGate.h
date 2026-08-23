@@ -655,7 +655,7 @@ inline void GateAgreement( const GateImg& ana, const GateImg& rt, const std::vec
 // The shadow lives in world space: sliding the camera a few units must not make a shadowed region
 // appear or disappear. Reproject each valid base pixel into the displaced view; where the SAME world
 // point is visible in both (depth agrees), a full lit<->umbra flip is a defect pixel; each cluster of
-// flips is one defect. Matrix conventions follow the .softcap capture (row-major, clip = M * (P,1)).
+// flips is one defect. Matrix conventions follow the .cap capture (row-major, clip = M * (P,1)).
 struct GateView
 {
 	float mvp[16];		// world -> clip for this view

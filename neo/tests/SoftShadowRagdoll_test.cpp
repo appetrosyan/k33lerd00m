@@ -15,7 +15,7 @@ the Free Software Foundation, either version 3 of the License, or
 */
 
 // FORENSICS for the ragdoll "large black bands on top of themselves" play-test report (2026-08-17,
-// softcap0042 = Excavation Hall, corpse close-up). For every light, evaluates the SHIPPED coverage
+// cap0042 = Excavation Hall, corpse close-up). For every light, evaluates the SHIPPED coverage
 // at receiver vertices, and for the fully-black ones re-traces the sample rays to identify WHAT is
 // blocking: the distance from the receiver to the nearest blocking triangle separates the candidate
 // mechanisms -
@@ -57,14 +57,14 @@ inline int BucketOf( float d )
 
 } // namespace
 
-STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
+STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_cap0042 )
 {
-	SoftCap cap;
-	const char* paths[] = { "../tests/data/softcap0042.softcap", "tests/data/softcap0042.softcap", "neo/tests/data/softcap0042.softcap" };
+	Cap cap;
+	const char* paths[] = { "../tests/data/cap0042.cap", "tests/data/cap0042.cap", "neo/tests/data/cap0042.cap" };
 	bool loaded = false;
 	for( const char* p : paths )
 	{
-		if( LoadSoftCap( p, cap ) )
+		if( LoadCap( p, cap ) )
 		{
 			loaded = true;
 			break;
@@ -72,7 +72,7 @@ STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
 	}
 	if( !loaded )
 	{
-		std::printf( "  softcap0042.softcap not found - skipping\n" );
+		std::printf( "  cap0042.cap not found - skipping\n" );
 		return;
 	}
 	std::printf( "  %d lights, %d edges, %d receivers, %d recv verts\n",
@@ -83,7 +83,7 @@ STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
 
 	for( size_t li = 0; li < cap.lights.size(); li++ )
 	{
-		const softcapLight_t& L = cap.lights[li];
+		const capLight_t& L = cap.lights[li];
 		if( L.edgeCount == 0 )
 		{
 			continue;
@@ -101,7 +101,7 @@ STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
 
 		for( size_t ri = 0; ri < cap.receivers.size(); ri++ )
 		{
-			const softcapReceiver_t& rs = cap.receivers[ri];
+			const capReceiver_t& rs = cap.receivers[ri];
 			if( rs.lightIndex != ( uint32_t )li )
 			{
 				continue;
@@ -226,14 +226,14 @@ STUDY_TEST( SoftShadowRagdoll, black_blob_forensics_softcap0042 )
 // receiver vertex should have a caster vertex of its own mesh at ~0 distance; a systematic offset
 // of units = the shadow is cast by a DIFFERENTLY-POSED copy of the body - which then darkens the
 // rendered body from centimetres above it ("large black bands on top").
-STUDY_TEST( SoftShadowRagdoll, pose_match_softcap0042 )
+STUDY_TEST( SoftShadowRagdoll, pose_match_cap0042 )
 {
-	SoftCap cap;
-	const char* paths[] = { "../tests/data/softcap0042.softcap", "tests/data/softcap0042.softcap", "neo/tests/data/softcap0042.softcap" };
+	Cap cap;
+	const char* paths[] = { "../tests/data/cap0042.cap", "tests/data/cap0042.cap", "neo/tests/data/cap0042.cap" };
 	bool loaded = false;
 	for( const char* p : paths )
 	{
-		if( LoadSoftCap( p, cap ) )
+		if( LoadCap( p, cap ) )
 		{
 			loaded = true;
 			break;
@@ -241,7 +241,7 @@ STUDY_TEST( SoftShadowRagdoll, pose_match_softcap0042 )
 	}
 	if( !loaded )
 	{
-		std::printf( "  softcap0042.softcap not found - skipping\n" );
+		std::printf( "  cap0042.cap not found - skipping\n" );
 		return;
 	}
 
@@ -250,7 +250,7 @@ STUDY_TEST( SoftShadowRagdoll, pose_match_softcap0042 )
 	// on subsamples - study-tier cost.
 	for( size_t ri = 0; ri < cap.receivers.size(); ri++ )
 	{
-		const softcapReceiver_t& rs = cap.receivers[ri];
+		const capReceiver_t& rs = cap.receivers[ri];
 		if( rs.numVerts < 200 )
 		{
 			continue;		// small brushes/decals: not the corpse
@@ -259,7 +259,7 @@ STUDY_TEST( SoftShadowRagdoll, pose_match_softcap0042 )
 		int bestCaster = -1;
 		for( size_t ci = 0; ci < cap.casters.size(); ci++ )
 		{
-			const softcapCaster_t& cs = cap.casters[ci];
+			const capCaster_t& cs = cap.casters[ci];
 			if( cs.lightIndex != rs.lightIndex || cs.numVerts < 200 )
 			{
 				continue;
@@ -298,7 +298,7 @@ STUDY_TEST( SoftShadowRagdoll, pose_match_softcap0042 )
 		}
 		if( bestCaster >= 0 && bestMean < 100.0f )
 		{
-			const softcapCaster_t& cs = cap.casters[bestCaster];
+			const capCaster_t& cs = cap.casters[bestCaster];
 			std::printf( "  recv %d (L%u, %u verts) ~ caster %d (id %.0f, %u verts): mean nearest %.2fu, max %.2fu %s\n",
 						 ( int )ri, rs.lightIndex, rs.numVerts, bestCaster, cs.casterId, cs.numVerts,
 						 bestMean, bestMax, bestMean > 1.0f ? "  <-- POSE MISMATCH?" : "" );
