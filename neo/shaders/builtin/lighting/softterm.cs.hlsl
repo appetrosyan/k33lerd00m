@@ -326,7 +326,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const uint capM = ( uint )g_surfA.x - 1u;	// capacity is a power of two (CPU-enforced)
 				const uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
 				uint slot = h & capM;
-				for( int pr = 0; pr < 16; pr++ )
+				[loop]										// keep the 16-slot probe ROLLED: unrolling it exploded the
+				for( int pr = 0; pr < 16; pr++ )		// surf-permutation VGPR count (256 + spill), collapsing occupancy
 				{
 					const uint sBase = slot * 8u;
 					const uint w0 = u_SurfTable[ sBase ];
