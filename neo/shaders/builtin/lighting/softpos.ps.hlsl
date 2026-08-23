@@ -74,5 +74,16 @@ void main( PS_IN fragment, out PS_OUT result )
 	worldNormal.x = dot3( localNormal, fragment.texcoord2 );
 	worldNormal.y = dot3( localNormal, fragment.texcoord3 );
 	worldNormal.z = dot3( localNormal, fragment.texcoord4 );
-	result.normal = float4( worldNormal, 0.0 );
+
+	// GEOMETRIC dominant axis for the surf-cache texel key (result.normal.w). The term used to derive the
+	// key axis from the normal-MAPPED shading normal above, but the surf-cache SEED keys texels off the flat
+	// GEOMETRIC triangle normal - so on any normal-mapped surface whose bump flips the dominant axis the two
+	// disagreed and every warm read missed (measured: hit ~4% on the cinematic). The flat geometric normal
+	// is the screen-space derivative of world position (per-triangle, sign-agnostic dominant axis == the
+	// seed's cross(edge,edge) axis). Same tie-break as softsurf_seed / softterm. Depth-edge pixels get a
+	// garbage derivative and simply miss (thin, harmless).
+	const float3 gn = cross( ddx( worldPosition ), ddy( worldPosition ) );
+	const float3 ga = abs( gn );
+	const float  gaxis = ( ga.x >= ga.y && ga.x >= ga.z ) ? 0.0 : ( ( ga.y >= ga.z ) ? 1.0 : 2.0 );
+	result.normal = float4( worldNormal, gaxis );
 }
