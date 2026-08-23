@@ -2711,9 +2711,28 @@ void R_AddModels()
 					extern idCVar r_softShadowSurfCache, r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
 					if( r_softShadowSurfCache.GetBool() && nCasStatic > 0 && nStaticTris > 0 )
 					{
-						uint64_t h = swSurfFold;
-						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )nCasStatic;
-						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )nStaticTris;
+						// CAMERA-INVARIANT static-set fingerprint. The old hash folded the VIEW-CULLED static
+						// counts (nCasStatic/nStaticTris/swSurfFold), so every camera move re-fingerprinted the
+						// light -> generation bump -> after 64 bumps the whole table GC-wiped, and on a moving
+						// cinematic the cache never stayed warm (measured: hit ~0%, one GC clear per run). Base
+						// the fingerprint instead on the SORTED static interacting-entity indices from the
+						// light's interaction chain (NOT view-culled) - the r_softShadowInvProbe below proved
+						// this stays stable under camera motion. A static caster genuinely added/removed/settled
+						// changes the set (R_SoftCasterIsStatic drops a moved one), so real changes still drop
+						// the cache; pure camera motion no longer does.
+						uint64_t h = 1469598103934665603ull;
+						if( vLight->lightDef != NULL )
+						{
+							std::vector<int> statics;
+							for( idInteraction* it = vLight->lightDef->firstInteraction; it != NULL; it = it->lightNext )
+							{
+								if( it->IsEmpty() || it->IsDeferred() || it->entityDef == NULL ) { continue; }
+								if( !R_SoftCasterIsStatic( it->entityDef, vLight ) ) { continue; }
+								statics.push_back( it->entityDef->index );
+							}
+							std::sort( statics.begin(), statics.end() );
+							for( int idx : statics ) { h = ( h ^ ( uint64_t )idx ) * 1099511628211ull; }
+						}
 						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( vLight->globalLightOrigin.x * 8.0f )
 							+ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.y * 8.0f ) << 20 )
 							+ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.z * 8.0f ) << 40 );
