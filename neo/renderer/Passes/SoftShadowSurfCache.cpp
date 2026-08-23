@@ -202,9 +202,17 @@ void SoftShadowSurfCache::DoClearIfNeeded( nvrhi::ICommandList* commandList )
 		return;
 	}
 	commandList->clearBufferUInt( m_Table, 0xFFFFFFFFu );	// empty sentinel everywhere
+	// ...but the 8 PATH/MISS counter words (base tableCap*8) must be ZERO, not the 0xFFFFFFFF sentinel:
+	// the per-frame stats readback was reporting 0xFFFFFFFF (a bogus even 25/25/25/25 split) because this
+	// clear left them at the sentinel and the first ring copy captured it before EndBuilds' reset ran.
+	{
+		const uint32_t swZeroC[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+		commandList->writeBuffer( m_Table, swZeroC, sizeof( swZeroC ), ( uint64_t )m_TableCap * 8 * sizeof( uint32_t ) );
+	}
 	commandList->clearBufferUInt( m_Pool, 0 );
 	commandList->clearBufferUInt( m_Queue, 0 );
 	m_NeedClear = false;
+	m_StatsRingFilled = 0;		// ring slots are stale after a wipe; don't read them until re-filled
 	s_gcClears++;
 	m_ScanCursor = m_TableCap;
 	std::lock_guard<std::mutex> lock( m_WarmMutex );
@@ -669,13 +677,19 @@ void SoftShadowSurfCache::EndBuilds( nvrhi::ICommandList* commandList )
 	{
 		commandList->copyBuffer( m_StatsRing[m_StatsRingWrite], 0, m_Table, swCounterOff, 4 * sizeof( uint32_t ) );
 		const int oldest = ( m_StatsRingWrite + 1 ) % SW_STATS_RING;
-		void* p = m_Device->mapBuffer( m_StatsRing[oldest], nvrhi::CpuAccessMode::Read );
-		if( p != nullptr )
+		// only read a ring slot once it has actually been WRITTEN (a full ring's worth of frames since the
+		// last wipe); before that the staging buffer is uninitialised and read back as garbage (0xFFFFFFFF).
+		if( m_StatsRingFilled >= SW_STATS_RING )
 		{
-			memcpy( m_HudStats, p, 4 * sizeof( uint32_t ) );
-			m_Device->unmapBuffer( m_StatsRing[oldest] );
+			void* p = m_Device->mapBuffer( m_StatsRing[oldest], nvrhi::CpuAccessMode::Read );
+			if( p != nullptr )
+			{
+				memcpy( m_HudStats, p, 4 * sizeof( uint32_t ) );
+				m_Device->unmapBuffer( m_StatsRing[oldest] );
+			}
 		}
 		m_StatsRingWrite = ( m_StatsRingWrite + 1 ) % SW_STATS_RING;
+		if( m_StatsRingFilled < SW_STATS_RING + 1 ) { m_StatsRingFilled++; }
 	}
 	// reset the per-frame path counters (the 4 words after the table) so each frame's term
 	// dispatches accumulate a fresh hit/miss/walkalways/anchor-reject sample
@@ -802,13 +816,18 @@ void SoftShadowSurfCache::DrainWarmQueue( nvrhi::ICommandList* commandList, int 
 	}
 
 	( void )maxLights;
-	// Build AT MOST ONE light per frame: each WarmLight is a bounded GPU dispatch, and more than one
-	// per frame can trip the GPU watchdog (device removed) on many-caster lights. Explicit queue first,
-	// then a bounded cheap-skip scan of the whole map. WarmLight returns true only when it actually
-	// dispatched a (re)build, so the map warms one light per frame (~a few seconds), stably.
-	bool builtOne = false;
+	// Build up to r_softShadowSurfCacheWarmLightsPerFrame lights per frame (default 1). Each WarmLight is a
+	// bounded GPU dispatch; more than one per frame historically risked the GPU watchdog on many-caster
+	// lights, but now that the term/permutation is cheap this budget can be flexible - a higher value clears
+	// the post-invalidation / post-GC re-warm backlog (149 lights, otherwise one/frame = 149 frames of
+	// stale misses) far faster, which is where the cinematic mean hit rate is dragged down. Explicit queue
+	// first, then a bounded cheap-skip scan of the whole map. WarmLight returns true only when it actually
+	// dispatched a (re)build.
+	extern idCVar r_softShadowSurfCacheWarmLightsPerFrame;
+	const int swMaxWarm = idMath::ClampInt( 1, 64, r_softShadowSurfCacheWarmLightsPerFrame.GetInteger() );
+	int builtCount = 0;
 	size_t qi = 0;
-	for( ; qi < warm.size() && !builtOne; qi++ )
+	for( ; qi < warm.size() && builtCount < swMaxWarm; qi++ )
 	{
 		const int idx = warm[qi];
 		if( idx >= 0 && idx < world->lightDefs.Num() )
@@ -816,7 +835,7 @@ void SoftShadowSurfCache::DrainWarmQueue( nvrhi::ICommandList* commandList, int 
 			const idRenderLightLocal* light = world->lightDefs[idx];
 			if( light != NULL && WarmLight( commandList, light ) )
 			{
-				builtOne = true;
+				builtCount++;
 				s_runtimeBuilds++;
 			}
 		}

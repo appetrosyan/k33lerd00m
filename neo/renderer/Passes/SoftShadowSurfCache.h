@@ -204,6 +204,7 @@ private:
 	static const int				SW_STATS_RING = 4;	// staging depth so the readback is always past its frame
 	nvrhi::BufferHandle				m_StatsRing[SW_STATS_RING];	// per-frame counter snapshots (non-blocking HUD readback)
 	int								m_StatsRingWrite = 0;
+	int								m_StatsRingFilled = 0;	// frames written since last wipe; read a slot only once >= SW_STATS_RING
 	uint32_t						m_HudStats[4] = { 0, 0, 0, 0 };	// last read-back [hit, miss, walkalways, anchor-rej]
 	// Queues are written by the GAME/LOAD thread (interaction/spawn hooks) and drained by the RENDER
 	// thread (GL_StartFrame), so they are mutex-guarded. All m_LightHash / GPU work stays render-thread

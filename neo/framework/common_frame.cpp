@@ -1134,8 +1134,9 @@ void idCommonLocal::Frame()
 					{
 						const double stot = s_probeH + s_probeM + s_probeW + s_probeA;
 						if( stot > 0.0 )
-							common->Printf( "[softprobe] cache-eligible fragments: hit %.0f%% | miss(unbuilt) %.0f%% | walk-always %.0f%% | anchor-rej %.0f%%\n",
-											100.0 * s_probeH / stot, 100.0 * s_probeM / stot, 100.0 * s_probeW / stot, 100.0 * s_probeA / stot );
+							common->Printf( "[softprobe] cache-eligible fragments: hit %.0f%% | miss(unbuilt) %.0f%% | walk-always %.0f%% | anchor-rej %.0f%%  [RAW h=%.0f m=%.0f wa=%.0f ar=%.0f]\n",
+											100.0 * s_probeH / stot, 100.0 * s_probeM / stot, 100.0 * s_probeW / stot, 100.0 * s_probeA / stot,
+											s_probeH, s_probeM, s_probeW, s_probeA );
 						// SPLIT the miss% by cause (last frame's sample): why a static texel missed instead of hitting.
 						extern bool R_SoftCacheMissReasons( uint32_t out[4] );
 						uint32_t mr[4] = { 0, 0, 0, 0 };
