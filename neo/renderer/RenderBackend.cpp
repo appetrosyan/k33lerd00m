@@ -108,6 +108,19 @@ bool R_SoftCacheMissReasons( uint32_t out[4] )
 	return sc->GetMissReasons( out );
 }
 
+// blocking one-shot: TRUSTWORTHY table census [built, requested-unbuilt, empty, other] - the honest warm-
+// state instrument (the per-frame hit/miss/walk counters are unreliable). Frame-probe summary only.
+bool R_SoftCacheTableCensus( uint32_t out[4] )
+{
+	extern idCVar r_softShadowSurfCache;
+	SoftShadowSurfCache* sc = backEnd.GetSoftShadowSurfCache();
+	if( sc == NULL || !sc->IsActive() || !r_softShadowSurfCache.GetBool() )
+	{
+		return false;
+	}
+	return sc->GetTableCensus( out );
+}
+
 idCVar r_drawEyeColor( "r_drawEyeColor", "0", CVAR_RENDERER | CVAR_BOOL, "Draw a colored box, red = left eye, blue = right eye, grey = non-stereo" );
 idCVar r_motionBlur( "r_motionBlur", "0", CVAR_RENDERER | CVAR_INTEGER | CVAR_ARCHIVE, "1 - 5, log2 of the number of motion blur samples" );
 idCVar r_forceZPassStencilShadows( "r_forceZPassStencilShadows", "0", CVAR_RENDERER | CVAR_BOOL, "force Z-pass rendering for performance testing" );

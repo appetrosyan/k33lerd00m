@@ -80,6 +80,10 @@ public:
 	// blocking readback of the 4 MISS sub-reason counters (0 stale-gen, 1 requested-unbuilt, 2 empty-slot,
 	// 3 probe-overflow) - splits WHERE the miss% comes from. Diagnostic (waitForIdle).
 	bool GetMissReasons( uint32_t out[4] );
+	// TRUSTWORTHY table census (blocking full scan): out = [built, requested-unbuilt, empty, other]. Unlike
+	// the per-frame path counters (whose GPU-atomic breakdown proved unreliable), this reads the actual slot
+	// states, so it honestly shows warm progress + table FILL (oversubscription = probe-overflow = no hits).
+	bool GetTableCensus( uint32_t out[4] );
 	// MEASUREMENT one-shot: read the whole warmed table back and print the per-texel saving distribution
 	// (foldedCount histogram, biggest saving + its cell, per-light Sum-folded vs static caster cost).
 	// r_softShadowSurfCacheDump gates the call at the end of WarmMapBurst. Blocking; diagnostic only.

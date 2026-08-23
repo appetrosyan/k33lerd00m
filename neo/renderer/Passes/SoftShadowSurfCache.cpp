@@ -548,6 +548,60 @@ bool SoftShadowSurfCache::GetMissReasons( uint32_t out[4] )
 	return true;
 }
 
+// TRUSTWORTHY table census (blocking full scan). The per-frame path counters read via GetHudStats proved
+// unreliable (a GPU-atomic mislabel: idx-1 misses landed in the walk-always word), so for the frame-probe
+// summary read the ACTUAL slot states instead - built/requested/empty is exact and shows table FILL, the
+// oversubscription that overflows the term's 16-slot probe and starves the hit rate.
+bool SoftShadowSurfCache::GetTableCensus( uint32_t out[4] )
+{
+	out[0] = out[1] = out[2] = out[3] = 0;
+	if( m_Table == nullptr || m_TableCap <= 0 )
+	{
+		return false;
+	}
+	const uint64_t words = ( uint64_t )m_TableCap * 8;
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = words * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowSurfCache/CensusReadback";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_Table, 0, words * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	const uint32_t* t = ( const uint32_t* )m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( t == nullptr )
+	{
+		return false;
+	}
+	for( uint64_t s = 0; s < ( uint64_t )m_TableCap; s++ )
+	{
+		const uint32_t w0 = t[s * 8 + 0];
+		if( w0 == 0xFFFFFFFFu )
+		{
+			out[2]++;    // empty
+			continue;
+		}
+		const uint32_t code = t[s * 8 + 2] & 3u;
+		if( code == 2u )
+		{
+			out[0]++;    // built
+		}
+		else if( code == 1u )
+		{
+			out[1]++;    // requested-unbuilt
+		}
+		else
+		{
+			out[3]++;    // other (walk-always / partial)
+		}
+	}
+	m_Device->unmapBuffer( staging );
+	return true;
+}
+
 // MEASUREMENT one-shot (r_softShadowSurfCacheDump, called at the end of WarmMapBurst): read the whole
 // warmed table back to the CPU and print the per-texel SAVING distribution - the answer to "how much
 // would be saved if all that can be cached were cached, and where". Per BUILT slot the saving is word 4

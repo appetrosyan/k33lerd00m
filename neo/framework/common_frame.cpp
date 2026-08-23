@@ -1147,6 +1147,19 @@ void idCommonLocal::Frame()
 								common->Printf( "[softprobe] miss breakdown (last frame): stale-gen %.0f%% | requested-unbuilt %.0f%% | empty-slot(never-seeded) %.0f%% | probe-overflow(collision) %.0f%%\n",
 												100.0 * mr[0] / mtot, 100.0 * mr[1] / mtot, 100.0 * mr[2] / mtot, 100.0 * mr[3] / mtot );
 						}
+						// TRUSTWORTHY table census (the per-frame path counters above are unreliable): actual slot
+						// states + FILL. A near-full table oversubscribes the term's 16-slot probe -> overflow ->
+						// no hits however many texels are built.
+						extern bool R_SoftCacheTableCensus( uint32_t out[4] );
+						uint32_t cen[4] = { 0, 0, 0, 0 };
+						if( R_SoftCacheTableCensus( cen ) )
+						{
+							const double ctot = ( double )cen[0] + cen[1] + cen[2] + cen[3];
+							const double occ = ctot > 0.0 ? 100.0 * ( cen[0] + cen[1] + cen[3] ) / ctot : 0.0;
+							common->Printf( "[softprobe] TABLE census (trustworthy): built %.0f%% | requested-unbuilt %.0f%% | empty %.0f%% | other %.0f%% | FILL %.0f%% of %.0f slots\n",
+											ctot > 0.0 ? 100.0 * cen[0] / ctot : 0.0, ctot > 0.0 ? 100.0 * cen[1] / ctot : 0.0,
+											ctot > 0.0 ? 100.0 * cen[2] / ctot : 0.0, ctot > 0.0 ? 100.0 * cen[3] / ctot : 0.0, occ, ctot );
+						}
 					}
 					// TIME ACTUALLY SAVED: the SOFT-SHADOW term GPU ms is the only thing the cache moves
 					// (hit% is fragments, not work). Compare this line cache-ON vs cache-OFF for the real
