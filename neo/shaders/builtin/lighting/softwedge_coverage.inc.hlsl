@@ -1357,10 +1357,22 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 #endif
 #if SW_SCANLINE
 		SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini: fill interval bit-runs, union by OR
-		{															// umbra early-out: all disk bits covered -> no tri can add more
-			bool swFull = true;
-			for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { if( ( swGrid[fm] & swDiskMask[fm] ) != swDiskMask[fm] ) { swFull = false; break; } }
-			if( swFull ) { break; }
+#if SW_FACE_PROFILE == 3
+		swProbe += ( float )swGrid[0];	// TIMING PROBE: walk + cull + SoftScan_FillTri, skip the umbra-check
+		continue;
+#endif
+		{															// UMBRA EARLY-OUT (coverage threshold, not all-bits-exact)
+			// Once the OR-union covers ~all of the light disk the fragment is umbra (term ~0), and no
+			// remaining occluder can reduce coverage (union is monotone), so stop walking. The old test
+			// required EVERY disk bit set, which almost never fires - a sub-bit gap between two projected
+			// runs leaves one bit unlit even in deep umbra - so umbra fragments kept walking the whole tile
+			// list. A high threshold tolerates the 32-bit-per-chord discretisation. The popcount is free (the
+			// term is memory-bound on the gather, so skipping the REMAINING gathers is the win); round the
+			// >=99%-occluded fragment to exact umbra (return 1) - the <1% residual is discretisation noise and
+			// reads as black regardless, so the visible penumbra gradient is untouched.
+			int swCovE = 0;
+			[unroll] for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
+			if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 		}
 #else
 		float3 edge1 = v1 - v0;
