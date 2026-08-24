@@ -116,6 +116,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		nvrhi::BindingLayoutItem::Texture_SRV( 3 ),				// t3 : light falloff (coverage early-out)
 		nvrhi::BindingLayoutItem::Texture_SRV( 4 ),				// t4 : light projection (coverage early-out)
 		nvrhi::BindingLayoutItem::Texture_SRV( 5 ),				// t5 : world shading normal (N.L early-out)
+		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 7 ),	// t7 : cull-before-load (centroid, triRad) per tile slot
 		nvrhi::BindingLayoutItem::Sampler( 0 ),					// s0 : falloff sampler
 		nvrhi::BindingLayoutItem::Sampler( 1 ),					// s1 : projection sampler
 		nvrhi::BindingLayoutItem::Texture_UAV( 0 ),				// u0 : term atlas
@@ -153,7 +154,7 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineCnt = m_Device->createComputePipeline( pc );
 
 			nvrhi::BufferDesc wc;
-			wc.byteSize = 16 * sizeof( uint32_t );
+			wc.byteSize = 20 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census
 			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
 			wc.canHaveUAVs = true;
 			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -376,6 +377,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 								   float penumbraRadius,
 								   int tileBase, int tileOx, int tileOy, int tilesX,
 								   nvrhi::IBuffer* tileBuffer,
+								   nvrhi::IBuffer* tileCullBuffer,
 								   nvrhi::ITexture* falloffTex, nvrhi::ISampler* falloffSamp,
 								   nvrhi::ITexture* projTex, nvrhi::ISampler* projSamp,
 								   bool coverageEarlyOut,
@@ -515,7 +517,9 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.aa[1] = cb.aa[2] = cb.aa[3] = 0.0f;
 	extern idCVar r_softShadowSurfCacheMinCost;
 	cb.surfCost[0] = r_softShadowSurfCacheMinCost.GetInteger();	// cost gate: min tile occluders to engage the cache
-	cb.surfCost[1] = cb.surfCost[2] = cb.surfCost[3] = 0;
+	extern idCVar r_softShadowCullBeforeLoad;
+	cb.surfCost[1] = r_softShadowCullBeforeLoad.GetBool() ? 1 : 0;	// cull-before-load runtime toggle (walk reads g_surfCost.y)
+	cb.surfCost[2] = cb.surfCost[3] = 0;
 	cb.surfA[0] = 0;
 	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
 	if( surf )
@@ -550,6 +554,9 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.
 	nvrhi::IBuffer* tiles = ( tileBuffer != nullptr ) ? tileBuffer : edgeBuffer;
+	// cull-before-load (t7): bind SOMETHING always (layout demands it). Only read on the binned list path,
+	// which is inactive when tileBuffer is null, so the edgeBuffer stand-in is never dereferenced there.
+	nvrhi::IBuffer* cull = ( tileCullBuffer != nullptr ) ? tileCullBuffer : edgeBuffer;
 	// same rule for t3/t4/s0/s1 when the early-out is off (flags.x 0 keeps the shader from
 	// sampling them): the caller passes black + any sampler in that case, but guard anyway.
 	nvrhi::ITexture* fallT = ( falloffTex != nullptr ) ? falloffTex : m_WorldPos.Get();
@@ -571,6 +578,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		nvrhi::BindingSetItem::Texture_SRV( 3, fallT ),
 		nvrhi::BindingSetItem::Texture_SRV( 4, projT ),
 		nvrhi::BindingSetItem::Texture_SRV( 5, m_WorldNormal ? m_WorldNormal.Get() : m_WorldPos.Get() ),
+		nvrhi::BindingSetItem::StructuredBuffer_SRV( 7, cull ),
 		nvrhi::BindingSetItem::Sampler( 0, fallS ),
 		nvrhi::BindingSetItem::Sampler( 1, projS ),
 		nvrhi::BindingSetItem::Texture_UAV( 0, m_TermTexture ),
@@ -647,20 +655,20 @@ void SoftShadowTermPass::BlurView( nvrhi::ICommandList* commandList )
 	commandList->commitBarriers();
 }
 
-bool SoftShadowTermPass::GetWalkStats( uint32_t out[16] )
+bool SoftShadowTermPass::GetWalkStats( uint32_t out[20] )
 {
 	if( !m_WalkCntEnabled || m_WalkCntBuffer == nullptr )
 	{
 		return false;
 	}
 	nvrhi::BufferDesc sbd;
-	sbd.byteSize = 16 * sizeof( uint32_t );
+	sbd.byteSize = 20 * sizeof( uint32_t );
 	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
 	sbd.debugName = "SoftShadowTerm/WalkCountersReadback";
 	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
 	nvrhi::CommandListHandle cl = m_Device->createCommandList();
 	cl->open();
-	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 16 * sizeof( uint32_t ) );
+	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 20 * sizeof( uint32_t ) );
 	cl->close();
 	m_Device->executeCommandList( cl );
 	m_Device->waitForIdle();
@@ -669,7 +677,7 @@ bool SoftShadowTermPass::GetWalkStats( uint32_t out[16] )
 	{
 		return false;
 	}
-	memcpy( out, p, 16 * sizeof( uint32_t ) );
+	memcpy( out, p, 20 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
 	return true;
 }

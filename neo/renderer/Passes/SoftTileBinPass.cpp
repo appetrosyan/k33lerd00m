@@ -134,6 +134,7 @@ void SoftTileBinPass::EnsurePipeline()
 		nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 2 ),	// t2 : shared per-tile depth min/max
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 0 ),	// u0 : tile lists
 		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 1 ),	// u1 : spill-region bump allocator (1 uint)
+		nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 2 ),	// u2 : per-slot cull data (centroid + triRad)
 	};
 	m_Layout = m_Device->createBindingLayout( ld );
 
@@ -158,6 +159,20 @@ void SoftTileBinPass::EnsurePipeline()
 	td.keepInitialState = true;
 	td.debugName = "SoftTileBin/Tiles";
 	m_TileBuffer = m_Device->createBuffer( td );
+
+	// CULL-BEFORE-LOAD parallel buffer: one float4 (centroid.xyz, tight triRad) per tile-list slot,
+	// same index as m_TileBuffer. The term walk reads it SEQUENTIALLY to run the per-fragment cone
+	// cull and only scatter-loads the 3 verts for survivors - the culled majority skips the vertex
+	// gather. Written by the bin CS (u2); read by softterm (SW_CULL_BEFORE_LOAD). Full float32 so the
+	// stored centroid is bit-identical to the walk's (v0+v1+v2)/3, keeping the surviving set exact.
+	nvrhi::BufferDesc cd4;
+	cd4.byteSize = ( uint64_t )SW_TILE_BUFFER_ELEMENTS * 2 * sizeof( uint32_t );	// uint2: centroid.xyz + triRad as 4 fp16
+	cd4.structStride = 2 * sizeof( uint32_t );
+	cd4.canHaveUAVs = true;
+	cd4.initialState = nvrhi::ResourceStates::UnorderedAccess;
+	cd4.keepInitialState = true;
+	cd4.debugName = "SoftTileBin/Cull";
+	m_TileCullBuffer = m_Device->createBuffer( cd4 );
 
 	nvrhi::BufferDesc scd;
 	scd.byteSize = 4 * sizeof( uint32_t );		// [0] bump cursor (= total demand), [1] overflow tiles, [2] max per-tile count
@@ -296,6 +311,9 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	cb.minmax[2] = SW_TILE_BUFFER_ELEMENTS - SPILL_ELEMENTS;	// spill region base (uint elements)
 	cb.minmax[3] = SW_TILE_BUFFER_ELEMENTS;						// spill region end
 	cb.tune[0] = activeK;	// unified active tile-K: stride + write cap + spill threshold
+	extern idCVar r_softShadowCullBeforeLoad;
+	cb.tune[1] = r_softShadowCullBeforeLoad.GetBool() ? 1 : 0;	// gate the parallel cull-buffer write (g_tune.y)
+	cb.tune[2] = cb.tune[3] = 0;
 
 	nvrhi::BindingSetDesc sd;
 	sd.bindings =
@@ -305,6 +323,7 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 		nvrhi::BindingSetItem::StructuredBuffer_SRV( 2, m_MinMaxBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_TileBuffer ),
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_SpillCounter ),
+		nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_TileCullBuffer ),
 	};
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
 

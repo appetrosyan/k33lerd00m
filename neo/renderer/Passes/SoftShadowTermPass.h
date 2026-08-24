@@ -65,6 +65,7 @@ public:
 				   float penumbraRadius,
 				   int tileBase, int tileOx, int tileOy, int tilesX,
 				   nvrhi::IBuffer* tileBuffer,
+				   nvrhi::IBuffer* tileCullBuffer,
 				   nvrhi::ITexture* falloffTex, nvrhi::ISampler* falloffSamp,
 				   nvrhi::ITexture* projTex, nvrhi::ISampler* projSamp,
 				   bool coverageEarlyOut,
@@ -75,7 +76,7 @@ public:
 	// COUNTING permutation accumulated this frame - slots 0..6 = SW_WALKIDX_* (caster/coarse/tight
 	// tests+culls, mtTri), 7 = fragments that ran the walk. Blocking readback (waitForIdle), bench-only.
 	// Returns false when counters were not enabled / buffer absent.
-	bool GetWalkStats( uint32_t out[16] );	// 0..7 attrib, 8/9 lit frags/survivors, 10/11 penumbra, 12/13 umbra
+	bool GetWalkStats( uint32_t out[20] );	// 0..7 attrib, 8/9 lit frags/survivors, 10/11 penumbra, 12/13 umbra, 14/15 hit/miss, 16..19 tile-class census (umbra-sentinel / empty-list / spill / listed threads)
 
 	// The atlas the interaction shader should Load: the BLURRED atlas when the temporal-stability blur
 	// ran this view (r_softShadowTermBlur), else the raw term atlas.

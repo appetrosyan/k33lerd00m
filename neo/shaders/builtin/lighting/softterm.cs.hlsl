@@ -85,6 +85,17 @@ uint SwSurfFlipF( float f )
 	#undef SW_SCANLINE
 	#define SW_SCANLINE 1
 #endif
+// CULL-BEFORE-LOAD (term compute path only; the interaction PS keeps the load-then-cull walk): the tile
+// walk reads this parallel per-slot (centroid, triRad) buffer to run the cone cull BEFORE the scattered
+// vertex gather, so culled entries never load verts. Declared + bound unconditionally to keep the reflected
+// binding layout stable across the sample/scanline/surf permutations (see the u3 desync note above).
+#define SW_CULL_BEFORE_LOAD 1
+// runtime toggle (r_softShadowCullBeforeLoad, via SoftTermCB.surfCost[1]). The coverage function is
+// defined by the include below - BEFORE the c_Term cbuffer - so it cannot read g_surfCost directly; main()
+// stashes the flag into this per-thread static before the walk, and SW_CBL_RT reads it.
+static bool swCblRT = false;
+#define SW_CBL_RT swCblRT
+StructuredBuffer<uint2>		t_SoftCull	: register( t7 );
 #include "softwedge_coverage.inc.hlsl"
 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
@@ -168,6 +179,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 		return;
 	}
 	const int2 px = int2( g_rect.x + ( int )tid.x, g_rect.y + ( int )tid.y );
+	swCblRT = ( g_surfCost.y != 0 );	// cull-before-load runtime toggle (read by the tile-list walk)
 
 	// EXACT receiver position (same value the interaction PS computes from texcoord7 x model
 	// matrix; softpos.ps stored it at float32). Pixels never rasterised by the position pass
@@ -599,12 +611,18 @@ void main( uint3 tid : SV_DispatchThreadID )
 		}
 		if( swCnt == SW_TILE_UMBRA )
 		{
+#if SW_GPU_WALK_COUNTERS
+			InterlockedAdd( u_WalkCnt[ 16 ], 1u );	// TILE-CLASS census: umbra-sentinel thread (zero walk iterations)
+#endif
 			// whole tile provably in umbra: the integral saturates to 1 for every receiver here
 			u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;
 			return;
 		}
 		if( swCnt == SW_TILE_SPILL )
 		{
+#if SW_GPU_WALK_COUNTERS
+			InterlockedAdd( u_WalkCnt[ 18 ], 1u );	// TILE-CLASS census: spill-tile thread (cluster walk)
+#endif
 			// overflowed tile: the span holds this tile's surviving CLUSTER records (stream v3) -
 			// the two-level walk amortizes the cone cull ~3.6x exactly where lists are huge
 			const uint swOfs = t_SoftTiles[ swSlot + 1 ];
@@ -615,6 +633,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 		}
 		else if( swCnt != 0xFFFFFFFFu )
 		{
+#if SW_GPU_WALK_COUNTERS
+			InterlockedAdd( u_WalkCnt[ ( swCnt == 0u ) ? 17 : 19 ], 1u );	// TILE-CLASS census: 17 = empty-list (provably lit, zero iterations), 19 = listed thread (walks swCnt entries)
+#endif
 			swOcc = SoftShadow_FaceCoverageList( swP, swL, swR, g_range.x, swSlot + 1, ( int )swCnt, swRotAng );
 		}
 		else

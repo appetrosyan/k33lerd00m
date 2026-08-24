@@ -42,6 +42,7 @@ StructuredBuffer<float4>	t_Edges		: register( t0 );	// STREAM V2: tri stream (3 
 StructuredBuffer<uint>		t_MinMax	: register( t2 );	// per-SCREEN-tile depth min/max bits (softtile_minmax.cs.hlsl)
 RWStructuredBuffer<uint>	u_Tiles		: register( u0 );	// [count | K indices] per tile + SPILL region at the buffer tail
 RWStructuredBuffer<uint>	u_SpillCnt	: register( u1 );	// spill allocator + stats (cleared per view): [0] bump cursor
+RWStructuredBuffer<uint2>	u_TileCull	: register( u2 );	// CULL-BEFORE-LOAD: (centroid.xyz, tight triRad) as 4 fp16, mirroring each u_Tiles list slot
 															// (== total demand: failed allocations bump it too),
 															// [1] overflow-tile count, [2] max per-tile survivor count
 
@@ -73,6 +74,13 @@ cbuffer c_TileBin : register( b0 )
 // live density) is now only the spill-region-exhausted fallback. Must match softterm.cs.hlsl +
 // interactionSM.ps.hlsl.
 #define SW_TILE_SPILL 0xFFFFFFFDu
+// SW_BIN_PROFILE: TIMING PROBE ONLY, never ship non-zero. 1 = run the caster PRE-cull then return before the
+// triangle cull (writes empty tiles - WRONG bins by design). Bench tilebin at 0 vs 1: profile-1 = min-max +
+// caster cull, profile-0 = + triangle cull; the delta isolates the triangle cull, and profile-1 itself shows
+// whether the caster cull is what the 8x8 4x-tiles multiplied (the two-level-bin target).
+#ifndef SW_BIN_PROFILE
+	#define SW_BIN_PROFILE 0
+#endif
 // *INDENT-ON*
 
 groupshared uint gsCount;
@@ -160,6 +168,11 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 	const float  swR    = max( g_lightR.w, 1e-2f );
 	const float  eps    = SW_NEAR_EPS;
 
+#if SW_BIN_PROFILE == 2
+	if( tid == 0 ) { u_Tiles[outSlot] = 0u; }	// TIMING PROBE: min-max + tile bound only, skip caster + triangle cull
+	return;
+#endif
+
 	// ---- stage 1: CASTER pre-cull. The caster's bounding sphere gets the SAME cone/slab test the
 	// triangles get (a triangle is contained in its caster's sphere, so a rejected sphere can hide
 	// no triangle - conservative). This is the O(tiles x tris) -> O(tiles x casters + survivors)
@@ -184,6 +197,11 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 		InterlockedOr( gsCasterKeep[c >> 5], 1u << ( c & 31 ) );
 	}
 	GroupMemoryBarrierWithGroupSync();
+
+#if SW_BIN_PROFILE == 1
+	if( tid == 0 ) { u_Tiles[outSlot] = 0u; }	// TIMING PROBE: min-max + caster cull only, skip the triangle cull
+	return;
+#endif
 
 	// ---- stage 2: triangle cull over SURVIVING casters only. The caster loop is group-uniform (every
 	// thread sees the same survivor bit), so a culled caster's whole span is skipped by the group in
@@ -223,6 +241,17 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 			if( slot < ( uint )g_tune.x )
 			{
 				u_Tiles[ outSlot + 1 + ( int )slot ] = ( uint )t;	// TRIANGLE index (stream v2)
+				// CULL-BEFORE-LOAD (runtime toggle g_tune.y = r_softShadowCullBeforeLoad): store this entry's
+				// centroid + tight radius (r1.w) as 4 fp16 so the term walk culls from a sequential read and
+				// skips the scattered vert gather for the culled majority. tcen is the SAME (v0+v1+v2)/3 the
+				// walk computes. Gated OFF by default - the write is pure overhead when the walk does not read
+				// it (measured net-negative), so it only pays when the toggle is on.
+				if( g_tune.y != 0 )
+				{
+					u_TileCull[ outSlot + 1 + ( int )slot ] = uint2(
+							f32tof16( tcen.x ) | ( f32tof16( tcen.y ) << 16 ),
+							f32tof16( tcen.z ) | ( f32tof16( r1.w ) << 16 ) );
+				}
 			}
 
 			// ---- WHOLE-TILE UMBRA SENTINEL (g_minmax.y, r_softShadowUmbraTiles) ----------------

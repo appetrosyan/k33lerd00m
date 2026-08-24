@@ -73,6 +73,20 @@ the Free Software Foundation, either version 3 of the License, or
 	#define SW_FACE_SCALAR_LIST 0
 #endif
 
+// SW_CULL_BEFORE_LOAD: 1 = the tile-list walk reads a parallel (centroid, triRad) buffer (t_SoftCull,
+// global, same slot as the index) and runs the per-fragment cone cull BEFORE scatter-loading the 3 verts,
+// so the culled majority skips the vertex gather. Only the term compute path defines it (and binds
+// t_SoftCull); the PS fallback and the C++ test keep the load-then-cull walk. Stored centroid/radius are
+// bit-identical to the load path's, so the surviving set - hence the term - is unchanged.
+#ifndef SW_CULL_BEFORE_LOAD
+	#define SW_CULL_BEFORE_LOAD 0
+#endif
+// SW_CBL_RT: the RUNTIME predicate (a cbuffer flag) that selects the cull-before-load path when the
+// capability is compiled in. Term defines it as (g_surfCost.y != 0); everyone else leaves it false.
+#ifndef SW_CBL_RT
+	#define SW_CBL_RT false
+#endif
+
 // SW_FACE_HOIST_DIRS: 1 = precompute all K sample ray directions into a per-fragment swDir[] array;
 // 0 = recompute each direction in-loop from the (unrolled-immediate) disk table + the hoisted rotation
 // and basis vectors. Bit-exact either way - same expression, same order. The array costs K*3 VGPRs live
@@ -1334,46 +1348,90 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 #endif
 	for( int li = 0; li < swListCount; li++ )
 	{
-		int se;
-#if SW_FACE_SCALAR_LIST
-		if( swScalarOK )
+		int    se = 0;
+		float3 v0, v1, v2;
+		float  cd = 0.0f;			// centroid depth along the receiver normal; used by the SW_FACE_PROFILE==2 probe
+		bool   swLoaded = false;	// set once a path has fetched v0/v1/v2 (a cull-before-load survivor)
+#if SW_CULL_BEFORE_LOAD && !SW_FACE_PROFILE
+		// CULL BEFORE LOAD (RUNTIME toggle SW_CBL_RT = r_softShadowCullBeforeLoad): cull from the tile-bin's
+		// stored (centroid, tight triRad) - a SEQUENTIAL read - and only scatter-load the 3 verts for
+		// survivors. tcen/triRad match the load path's ((v0+v1+v2)/3 and r1.w, fp16 + conservative inflate),
+		// so the surviving set (and the term) is bit-identical. When the toggle is OFF the bin SKIPS the
+		// parallel write, so this branch must not run: swLoaded stays false and the load-then-cull path
+		// below handles the entry. Kept off by default - measured net-negative on the current walk (the
+		// vertex gather is L0-cheap, so the deferral saves nothing) but retained as a lever for when a
+		// fewer-survivors change shortens the loop and could flip the balance.
+		if( SW_CBL_RT )
 		{
-			se = ( int )t_SoftTiles[ swBaseU + li ];				// uniform address => scalar load
-		}
-		else
-		{
-			se = ( int )t_SoftTiles[ swListBase + li ];
-		}
-#else
-		int seTmp = ( int )t_SoftTiles[ swListBase + li ];			// TRIANGLE index (stream v2)
-		se = seTmp;
-#endif
-		const int b = swFirstElem + se * 3;
-		float4 r0 = t_SoftEdges[ b + 0 ];							// ( v0.xyz, triRad )
-#if SW_FACE_PROFILE == 1
-		swProbe += r0.x;
-		continue;													// TIMING PROBE: list walk + r0 loads only
-#endif
-		float4 r1 = t_SoftEdges[ b + 1 ];
-		float4 r2 = t_SoftEdges[ b + 2 ];
-		float3 v0 = float3( r0.x, r0.y, r0.z );
-		float3 v1 = float3( r1.x, r1.y, r1.z );
-		float3 v2 = float3( r2.x, r2.y, r2.z );
-		// per-FRAGMENT cone/slab reject still runs: the tile cull is the same test at tile grain, so
-		// this prunes the tile list down to this fragment's true cone. Identical math to the full walk.
-		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
-		float3 rc   = tcen - swP;
-		float  cd   = dot( rc, swF.nrm );
-		float  triRad = r1.w;	// centroid radius (tight): exact original bound, so the sample-gated set is bit-exact
-		SW_ATTRIB_ADD( tightTest, 1 );	// tris in this fragment's tile list reaching the cone cull
+			{
+				uint2  swCullP = t_SoftCull[ swListBase + li ];			// (centroid.xyz, tight triRad) as 4 fp16
+				float3 tcen   = float3( f16tof32( swCullP.x & 0xffffu ), f16tof32( swCullP.x >> 16 ), f16tof32( swCullP.y & 0xffffu ) );
+				float  triRad = f16tof32( swCullP.y >> 16 );
+				float  swQErr = ( max( max( abs( tcen.x ), abs( tcen.y ) ), abs( tcen.z ) ) + triRad ) * ( 1.0f / 1024.0f );
+				triRad += swQErr;										// widen for fp16 rounding: looser cull only keeps EXTRA tris (disk reject -> 0), stays bit-identical
+				float3 rc     = tcen - swP;
+				cd            = dot( rc, swF.nrm );
+				SW_ATTRIB_ADD( tightTest, 1 );
 #if !SW_SKIP_CULL
-		if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
-		if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
-		float3 perp = rc - cd * swF.nrm;
-		float  coneR = swR * ( cd + triRad ) / swDistPL;
-		if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+				if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+				if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+				float3 perp  = rc - cd * swF.nrm;
+				float  coneR = swR * ( cd + triRad ) / swDistPL;
+				if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
 #endif
-		SW_ATTRIB_ADD( mtTri, 1 );	// survivor: pays the Moller-Trumbore + 16-sample test (the cull-collapse signal)
+			}
+			se = ( int )t_SoftTiles[ swListBase + li ];				// survivor only: fetch index + verts now
+			{
+				const int b = swFirstElem + se * 3;
+				v0 = t_SoftEdges[ b + 0 ].xyz;
+				v1 = t_SoftEdges[ b + 1 ].xyz;
+				v2 = t_SoftEdges[ b + 2 ].xyz;
+			}
+			SW_ATTRIB_ADD( mtTri, 1 );
+			swLoaded = true;
+		}
+#endif
+		if( !swLoaded )
+		{
+#if SW_FACE_SCALAR_LIST
+			if( swScalarOK )
+			{
+				se = ( int )t_SoftTiles[ swBaseU + li ];			// uniform address => scalar load
+			}
+			else
+			{
+				se = ( int )t_SoftTiles[ swListBase + li ];
+			}
+#else
+			se = ( int )t_SoftTiles[ swListBase + li ];				// TRIANGLE index (stream v2)
+#endif
+			const int b = swFirstElem + se * 3;
+			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, triRad )
+#if SW_FACE_PROFILE == 1
+			swProbe += r0.x;
+			continue;												// TIMING PROBE: list walk + r0 loads only
+#endif
+			float4 r1 = t_SoftEdges[ b + 1 ];
+			float4 r2 = t_SoftEdges[ b + 2 ];
+			v0 = float3( r0.x, r0.y, r0.z );
+			v1 = float3( r1.x, r1.y, r1.z );
+			v2 = float3( r2.x, r2.y, r2.z );
+			// per-FRAGMENT cone/slab reject: the tile cull is the same test at tile grain, so this prunes
+			// the tile list down to this fragment's true cone. Identical math to the full walk.
+			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+			float3 rc   = tcen - swP;
+			cd          = dot( rc, swF.nrm );
+			float  triRad = r1.w;	// centroid radius (tight): exact original bound, so the sample-gated set is bit-exact
+			SW_ATTRIB_ADD( tightTest, 1 );	// tris in this fragment's tile list reaching the cone cull
+#if !SW_SKIP_CULL
+			if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+			if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+			float3 perp = rc - cd * swF.nrm;
+			float  coneR = swR * ( cd + triRad ) / swDistPL;
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+#endif
+			SW_ATTRIB_ADD( mtTri, 1 );	// survivor: pays the Moller-Trumbore + 16-sample test (the cull-collapse signal)
+		}
 		SW_BKT_SURV
 #if SW_LIT_EARLYOUT
 		swMtCnt++;

@@ -5104,6 +5104,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 						r_shadowPenumbraSize.GetFloat(),
 						tileBase, tileOx, tileOy, tileTilesX,
 						( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
+						( softTileBinPass != NULL ) ? softTileBinPass->GetTileCullBuffer() : NULL,
 						swEarly ? ( nvrhi::ITexture* )vLight->falloffImage->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
 						swEarly ? ( nvrhi::ISampler* )vLight->falloffImage->GetSampler( samplerCache ) : ( nvrhi::ISampler* )globalImages->blackImage->GetSampler( samplerCache ),
 						swEarly ? ( nvrhi::ITexture* )swProjImg->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),
@@ -5128,6 +5129,10 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 		if( softTileBinPass != NULL && softTileBinPass->GetTileBuffer() != nullptr )
 		{
 			softComputeCL->setBufferState( softTileBinPass->GetTileBuffer(), nvrhi::ResourceStates::ShaderResource );
+		}
+		if( softTileBinPass != NULL && softTileBinPass->GetTileCullBuffer() != nullptr )
+		{
+			softComputeCL->setBufferState( softTileBinPass->GetTileCullBuffer(), nvrhi::ResourceStates::ShaderResource );
 		}
 		if( softShadowTermPass != NULL && softShadowTermPass->GetTermTexture() != nullptr )
 		{

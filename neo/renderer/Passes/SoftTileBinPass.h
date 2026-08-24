@@ -53,6 +53,13 @@ public:
 		return m_TileBuffer;
 	}
 
+	// CULL-BEFORE-LOAD parallel buffer (float4 centroid+triRad per tile-list slot); term walk reads it
+	// to cull before scatter-loading verts. See SoftTileBinPass.cpp for the rationale.
+	nvrhi::IBuffer* GetTileCullBuffer() const
+	{
+		return m_TileCullBuffer;
+	}
+
 	// blocking readback of the spill allocator/stats: [0] total demand (uint elements),
 	// [1] overflow-tile count, [2] max per-tile survivor count. Bench/diagnostic only.
 	bool GetSpillStats( uint32_t out[4] )
@@ -97,6 +104,7 @@ private:
 	nvrhi::ComputePipelineHandle	m_Pipeline;
 	nvrhi::BufferHandle				m_ConstantBuffer;
 	nvrhi::BufferHandle				m_TileBuffer;
+	nvrhi::BufferHandle				m_TileCullBuffer;	// parallel float4 (centroid, triRad) per tile-list slot for cull-before-load
 	nvrhi::BufferHandle				m_SpillCounter;	// 1-uint global bump allocator for the spill tail (cleared per view)
 	nvrhi::ShaderHandle				m_MinMaxShader;
 	nvrhi::BindingLayoutHandle		m_MinMaxLayout;
