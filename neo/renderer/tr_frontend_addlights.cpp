@@ -51,6 +51,7 @@ extern idCVar r_useShadowPreciseInsideTest;
 
 idCVar r_useAreasConnectedForShadowCulling( "r_useAreasConnectedForShadowCulling", "2", CVAR_RENDERER | CVAR_INTEGER, "cull entities cut off by doors" );
 idCVar r_useParallelAddLights( "r_useParallelAddLights", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "aadd all lights in parallel with jobs" );
+idCVar r_showLightMocCull( "r_showLightMocCull", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "debug: print each light the masked-occlusion pass culls by its bounding volume (origin, type, clip-w, near-plane corners) - hunting the view-dependent light-blackening flicker" );
 
 /*
 ============================
@@ -301,8 +302,14 @@ static void R_AddSingleLight( viewLight_t* vLight )
 			idRenderMatrix invProjectMVPMatrix;
 
 			// draw light volume 1 percentage bigger to avoid flickering
-			// right before entering the volume with the camera
-			const float mocLightScale = 0.99f;
+			// right before entering the volume with the camera.
+			// MUST be > 1 (EXPAND): MOC is conservative (never culls a visible occludee), so testing an
+			// EXPANDED light bound stays conservative and only ever spares a light. The old 0.99 SHRANK the
+			// bound - non-conservative - so a light peeking past an occluder edge by < 1% read as fully
+			// occluded and was dropped, blackening a lit region that popped back a few units later (the
+			// view-dependent light flicker). The shared wmin below is taken from this same cube, so the
+			// expansion also makes the spot-light TestRect path conservative. Do NOT revert to < 1.
+			const float mocLightScale = 1.01f;
 			idRenderMatrix scaledInverseBaseLightProject = light->inverseBaseLightProject;
 			scaledInverseBaseLightProject[0][0] *= mocLightScale;
 			scaledInverseBaseLightProject[0][1] *= mocLightScale;
@@ -321,6 +328,7 @@ static void R_AddSingleLight( viewLight_t* vLight )
 			tr.pc.c_mocTests += 1;
 
 			float wmin = idMath::INFINITUM;
+			int   wNonPos = 0;		// corners at/behind the near plane (w <= small): projection unreliable
 
 			// NOTE: zeroToOne cube is only for lights and models need the unit cube
 			idVec4* verts = tr.maskedZeroOneCubeVerts;
@@ -338,6 +346,26 @@ static void R_AddSingleLight( viewLight_t* vLight )
 				{
 					wmin = w;
 				}
+				if( w <= 1.0f ) { wNonPos++; }
+			}
+
+			extern idCVar r_showLightMocCull;
+
+			// NEAR-PLANE STRADDLE GUARD (the view-dependent light-blackening flicker). MOC's TestTriangles /
+			// TestRect are called WITHOUT near-plane clipping, so a light bound with any corner at/behind the
+			// near plane projects to garbage (wmin goes negative) and MOC reports it OCCLUDED - the light is
+			// wrongly culled, blackening a lit region until the camera moves the cube clear of the near plane.
+			// A bounding-cube occlusion test is only valid when the whole cube is in FRONT of the near plane;
+			// otherwise the projection is unreliable, so conservatively KEEP the light (never cull). This is
+			// the "flickering right before entering the volume" the code below was meant to avoid. Use the same
+			// near distance the occluder buffer was filled with (R_FillMaskedOcclusionBufferWithModels).
+			extern idCVar r_znear;
+			const float mocNear = ( viewDef->renderView.cramZNear ) ? ( r_znear.GetFloat() * 0.25f ) : r_znear.GetFloat();
+			const bool  nearStraddle = ( wmin <= mocNear );
+			if( nearStraddle && r_showLightMocCull.GetBool() )
+			{
+				common->Printf( "[moccull] KEEP light idx %d (%.0f %.0f %.0f) near-plane straddle wmin=%.3f cornersNearPlane=%d/8 (not culled)\n",
+								light->index, light->globalLightOrigin.x, light->globalLightOrigin.y, light->globalLightOrigin.z, wmin, wNonPos );
 			}
 
 			if( vLight->pointLight || vLight->parallel )
@@ -350,8 +378,12 @@ static void R_AddSingleLight( viewLight_t* vLight )
 #else
 				MaskedOcclusionCulling::CullingResult result = tr.maskedOcclusionCulling->TestTriangles( ( float* )triVerts, tr.maskedZeroOneCubeIndexes, 12, NULL, MaskedOcclusionCulling::BACKFACE_NONE );
 #endif
-				if( result != MaskedOcclusionCulling::VISIBLE )
+				if( result != MaskedOcclusionCulling::VISIBLE && !nearStraddle )
 				{
+					if( r_showLightMocCull.GetBool() )
+						common->Printf( "[moccull] TRI  light idx %d (%.0f %.0f %.0f) %s CULLED wmin=%.3f cornersNearPlane=%d/8\n",
+										light->index, light->globalLightOrigin.x, light->globalLightOrigin.y, light->globalLightOrigin.z,
+										vLight->parallel ? "parallel" : "point", wmin, wNonPos );
 					tr.pc.c_mocCulledLights += 1;
 					return;
 				}
@@ -380,8 +412,12 @@ static void R_AddSingleLight( viewLight_t* vLight )
 				wmin2 = Max( wmin2, 0.0f );
 
 				MaskedOcclusionCulling::CullingResult result = tr.maskedOcclusionCulling->TestRect( x1, y1, x2, y2, wmin2 );
-				if( result != MaskedOcclusionCulling::VISIBLE )
+				if( result != MaskedOcclusionCulling::VISIBLE && !nearStraddle )
 				{
+					if( r_showLightMocCull.GetBool() )
+						common->Printf( "[moccull] RECT light idx %d (%.0f %.0f %.0f) spot CULLED wmin=%.3f wmin2=%.4f rect(%d,%d,%d,%d) cornersNearPlane=%d/8\n",
+										light->index, light->globalLightOrigin.x, light->globalLightOrigin.y, light->globalLightOrigin.z,
+										wmin, wmin2, vLight->scissorRect.x1, vLight->scissorRect.y1, vLight->scissorRect.x2, vLight->scissorRect.y2, wNonPos );
 					tr.pc.c_mocCulledLights += 1;
 					return;
 				}
@@ -745,6 +781,15 @@ void R_AddLights()
 							vLight->globalShadows ? 'y' : 'n',
 							vLight->localShadows ? 'y' : 'n' );
 		}
+	}
+
+	extern idCVar r_showLightMocCull;
+	if( r_showLightMocCull.GetBool() )
+	{
+		const idVec3& o = tr.viewDef->renderView.vieworg;
+		const idVec3& f = tr.viewDef->renderView.viewaxis[0];
+		common->Printf( "[moccull] R_AddLights: cam(%.0f %.0f %.0f) fwd(%.2f %.2f %.2f) viewLights=%d mocTests=%d mocCulledLights=%d\n",
+						o.x, o.y, o.z, f.x, f.y, f.z, tr.pc.c_viewLights, tr.pc.c_mocTests, tr.pc.c_mocCulledLights );
 	}
 }
 
