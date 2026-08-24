@@ -111,6 +111,10 @@ private:
 	nvrhi::BufferHandle				m_MinMaxBuffer;
 	int								m_MinMaxTilesX = 0;	// screen-tile row stride of the last reduce
 	bool							m_MinMaxValid = false;
+	float							m_InvMvp[16];		// view-constant clip->world unprojection (BeginView; raw floats so this header needs no idRenderMatrix include)
+	bool							m_InvMvpValid = false;
+	nvrhi::BindingSetHandle			m_CachedSet;		// per-frame binding-set cache (only t0 = the frame's joint buffer varies; see BinLight)
+	nvrhi::IBuffer*					m_CachedSetEdgeBuffer = nullptr;
 	int								m_Cursor = 0;	// uint elements allocated this view
 };
 

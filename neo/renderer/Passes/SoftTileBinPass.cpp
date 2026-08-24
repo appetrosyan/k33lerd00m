@@ -56,6 +56,14 @@ void SoftTileBinPass::BeginView( nvrhi::ICommandList* commandList, const viewDef
 {
 	m_Cursor = 0;
 	m_MinMaxValid = false;
+	// the clip->world unprojection matrix is VIEW-constant: invert once here instead of once per
+	// light in BinLight (pure CPU saving, ~20 lights/view on the heavy scenes)
+	idRenderMatrix invMvp;
+	m_InvMvpValid = idRenderMatrix::Inverse( viewDef->worldSpace.mvp, invMvp );
+	if( m_InvMvpValid )
+	{
+		memcpy( m_InvMvp, invMvp[0], sizeof( m_InvMvp ) );
+	}
 	EnsurePipeline();
 	if( m_MinMaxPipeline == nullptr || depthTexture == nullptr )
 	{
@@ -280,14 +288,13 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	const int outBase = m_Cursor;
 	m_Cursor += slots;
 
-	idRenderMatrix invMvp;
-	if( !idRenderMatrix::Inverse( viewDef->worldSpace.mvp, invMvp ) )
+	if( !m_InvMvpValid )						// inverted once per view in BeginView
 	{
 		return -1;
 	}
 
 	SoftTileBinCB cb;
-	memcpy( cb.invMvp, invMvp[0], sizeof( cb.invMvp ) );
+	memcpy( cb.invMvp, m_InvMvp, sizeof( cb.invMvp ) );
 	cb.lightR[0] = vLight->globalLightOrigin.x;
 	cb.lightR[1] = vLight->globalLightOrigin.y;
 	cb.lightR[2] = vLight->globalLightOrigin.z;
@@ -315,17 +322,25 @@ int SoftTileBinPass::BinLight( nvrhi::ICommandList* commandList, const viewDef_t
 	cb.tune[1] = r_softShadowCullBeforeLoad.GetBool() ? 1 : 0;	// gate the parallel cull-buffer write (g_tune.y)
 	cb.tune[2] = cb.tune[3] = 0;
 
-	nvrhi::BindingSetDesc sd;
-	sd.bindings =
+	// binding-set CACHE: of the six bindings only t0 (the frame's joint buffer) can vary, and it is
+	// constant across every light in a view (the pointer rotates once per frame with frameData) -
+	// so one createBindingSet per frame instead of one per light (~20/view on heavy scenes).
+	if( m_CachedSet == nullptr || m_CachedSetEdgeBuffer != edgeBuffer )
 	{
-		nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
-		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, edgeBuffer ),
-		nvrhi::BindingSetItem::StructuredBuffer_SRV( 2, m_MinMaxBuffer ),
-		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_TileBuffer ),
-		nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_SpillCounter ),
-		nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_TileCullBuffer ),
-	};
-	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
+		nvrhi::BindingSetDesc sd;
+		sd.bindings =
+		{
+			nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, edgeBuffer ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 2, m_MinMaxBuffer ),
+			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_TileBuffer ),
+			nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_SpillCounter ),
+			nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_TileCullBuffer ),
+		};
+		m_CachedSet = m_Device->createBindingSet( sd, m_Layout );
+		m_CachedSetEdgeBuffer = edgeBuffer;
+	}
+	nvrhi::BindingSetHandle set = m_CachedSet;
 
 	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;

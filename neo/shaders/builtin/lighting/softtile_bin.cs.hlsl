@@ -236,8 +236,22 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 			float3 perp = rc - cd * nrm;
 			float  coneR = swR * ( cd + triRad ) / max( distPL - tR, 1e-4f );
 			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+			// WAVE-AGGREGATED slot allocation: the per-survivor InterlockedAdd on one groupshared word
+			// serialised the whole stage-2 cull on dense tiles (the ones that matter). The lanes
+			// reaching this point are exactly the survivors of this iteration, so allocate one span per
+			// wave (a single atomic by the first active lane) and hand out contiguous slots by prefix
+			// count. List ORDER changes but the walk is a commutative union - term bit-identical (gate 0).
 			uint slot;
-			InterlockedAdd( gsCount, 1u, slot );
+			{
+				const uint swWaveN   = WaveActiveCountBits( true );
+				const uint swWavePre = WavePrefixCountBits( true );
+				uint swWaveBase = 0;
+				if( WaveIsFirstLane() )
+				{
+					InterlockedAdd( gsCount, swWaveN, swWaveBase );
+				}
+				slot = WaveReadLaneFirst( swWaveBase ) + swWavePre;
+			}
 			if( slot < ( uint )g_tune.x )
 			{
 				u_Tiles[ outSlot + 1 + ( int )slot ] = ( uint )t;	// TRIANGLE index (stream v2)
