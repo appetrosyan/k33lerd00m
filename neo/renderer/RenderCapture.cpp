@@ -344,9 +344,21 @@ int  s_reproIdx  = -1;
 int  s_reproState = 0;			// see RS_* below
 int  s_reproWait = 0;
 int  s_reproFails = 0;			// deviation + instrument-error count (process exit signal)
-enum { RS_LOAD = 0, RS_WAITLOAD, RS_SETTLE, RS_SHOTWAIT, RS_NEXT };
+enum { RS_SETRES = 0, RS_LOAD, RS_WAITLOAD, RS_SETTLE, RS_SHOTWAIT, RS_NEXT };
 const int REPRO_LOAD_TIMEOUT = 600;	// frames to reach INGAME before giving up on a capture
 const int REPRO_SETTLE       = 45;	// frames for the teleport to land + the frontend to rebuild soft edges
+const int REPRO_RESTART_WAIT = 30;	// frames for vid_restart to recreate the render targets before loading
+
+// RESOLUTION MATRIX. Each capture is reproduced at every target resolution, not just the one it was taken at:
+// MOC rasterises occluders at half the render res, so resolution-sensitive culls (the near-plane light cull)
+// flip with size - a bug present at 1440p can be absent at 1080p and vice-versa, and the shipped renderer must
+// be correct at every resolution a player runs. The camera reconstruction (nodal inversion) is resolution-
+// independent; only the render size varies (all 16:9, so fov/aspect stay constant). 4K is opt-in (slow, and a
+// headless box may lack the VRAM) via r_softShadowRepro4K.
+struct ReproRes { int w, h; const char* tag; };
+const ReproRes s_reproResList[] = { { 1920, 1080, "1080p" }, { 2560, 1440, "1440p" }, { 3840, 2160, "4k" } };
+int s_reproResIdx   = 0;
+int s_reproResCount = 2;		// 1080p + 1440p by default; 4K appended when r_softShadowRepro4K is set (arm time)
 
 // central-band mean luminance of an RGBA8 frame (fade-in / all-dark guard)
 double R_CentralLuma( const std::vector<uint8_t>& img, int w, int h )
@@ -396,10 +408,34 @@ idStr R_ReproSlot( const idStr& capPath )		// "…/cap0000.cap" -> savegame slot
 
 // SYNCHRONOUS shot: config already pinned + camera positioned by the tick. Freeze, render the A/B set at the
 // identical frozen state, diff in-engine, run the differential canary, report, and dump to dumps/.
+// Invert idPlayer::GetViewPos so a plain `setviewpos` lands the RENDER eye EXACTLY on the captured vieworg,
+// WITHOUT touching any engine cvar (the harness must render the identical view model the shipped game does).
+// The engine builds the eye as: playerOrigin + eyeHeight + viewBob + [ fwd*g_viewNodalX + up*g_viewNodalZ +
+// gravity*g_viewNodalZ ] (the "nodal" eye-from-neck offset). setviewpos already inverts the eyeHeight (Z), and
+// the freeze zeroes viewBob, so the only residual is the nodal offset. Pre-subtract it - read from the engine's
+// OWN cvars so it always matches - and setviewpos + the unchanged GetViewPos reproduce the eye to < 0.25u.
+// gravity = (0,0,-1); fwd = viewaxis row0, up = viewaxis row2. Assumes standing (eyeHeight == pm_normalviewheight,
+// which setviewpos also assumes) and health > 0; both hold for the repro shot.
+static void R_CaptureViewposArg( const capHeader_t& hdr, idVec3& outArg, float& outYaw, float& outPitch )
+{
+	const idVec3 fwd( hdr.viewaxis[0], hdr.viewaxis[1], hdr.viewaxis[2] );
+	const idVec3 up( hdr.viewaxis[6], hdr.viewaxis[7], hdr.viewaxis[8] );
+	const float  nx = cvarSystem->GetCVarFloat( "g_viewNodalX" );
+	const float  nz = cvarSystem->GetCVarFloat( "g_viewNodalZ" );
+	const idVec3 E( hdr.vieworg[0], hdr.vieworg[1], hdr.vieworg[2] );
+	outArg.x = E.x - fwd.x * nx - up.x * nz;
+	outArg.y = E.y - fwd.y * nx - up.y * nz;
+	outArg.z = E.z - 0.25f + nz - up.z * nz;	// gravity*(-nz) removed; setviewpos's +0.25 eyeheight fudge cancelled
+	const idAngles a = fwd.ToAngles();
+	outYaw = a.yaw; outPitch = a.pitch;
+}
+
 void R_SoftShadowReproShot_f( const idCmdArgs& args )
 {
 	const idStr capPath = args.Argc() > 1 ? args.Argv( 1 ) : "";
-	const idStr name = R_ReproSlot( capPath );
+	// tag the name with the RENDER resolution: the same capture is reproduced at several resolutions, so prints
+	// and dump filenames (repro_<name>_*.png) must stay distinct per resolution instead of overwriting.
+	const idStr name = R_ReproSlot( capPath ) + va( "_%dx%d", renderSystem->GetWidth(), renderSystem->GetHeight() );
 
 	// (a) NOT-IN-MENU assert (a render world exists for the loaded map = in-game, not the menu)
 	if( tr.primaryWorld == NULL || session == NULL || session->GetState() != idSession::INGAME )
@@ -416,14 +452,26 @@ void R_SoftShadowReproShot_f( const idCmdArgs& args )
 	// that path explicitly (else r_softShadowScanline is inert and the A/B is a no-op - the exact trap we guard).
 	cmdSystem->BufferCommandText( CMD_EXEC_NOW, "r_softShadowCompute 1 ; r_softShadowFaceCoverage 1 ; r_softShadowTileBin 1 ; r_softShadowSamples 16\n" );
 
-	// apply the captured per-light penumbra the goto path drops (read light[0] from the .cap header)
+	// FREEZE first, THEN snap the frozen player to the EXACT captured eye pose. The live goto frames let
+	// physics/think settle the player (~6u drift) and view-bob jitter the eye Z - fatal for a knife-edge,
+	// view-dependent MOC light cull. g_stopTime kills bob + settle; the post-freeze setviewpos places the eye
+	// bit-exactly (setviewpos Z-adjusts by the view height, then Teleport). We still render through
+	// game->Draw (the REAL engine, full frontend incl. MOC culling) - only the camera is pinned exactly.
+	cvarSystem->SetCVarInteger( "g_stopTime", 1 );
 	{
 		FILE* cf = fopen( capPath.c_str(), "rb" );
 		capHeader_t hdr;
-		if( cf != NULL && fread( &hdr, sizeof( hdr ), 1, cf ) == 1 && hdr.magic == CAP_MAGIC && hdr.numLights > 0 )
+		if( cf != NULL && fread( &hdr, sizeof( hdr ), 1, cf ) == 1 && hdr.magic == CAP_MAGIC )
 		{
+			// Teleport the player so the UNCHANGED engine's GetViewPos lands the render eye on the captured
+			// vieworg (invert the nodal offset - see R_CaptureViewposArg). No engine cvars touched, no noclip:
+			// the harness renders the identical view model the shipped game does. Frozen sim => no bob/drift.
+			idVec3 argEye; float yaw = 0.0f, pitch = 0.0f;
+			R_CaptureViewposArg( hdr, argEye, yaw, pitch );
+			cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "setviewpos %f %f %f %f %f\n",
+									argEye.x, argEye.y, argEye.z, yaw, pitch ) );
 			capLight_t l0;
-			if( fread( &l0, sizeof( l0 ), 1, cf ) == 1 && l0.penumbraSize > 0.0f )
+			if( hdr.numLights > 0 && fread( &l0, sizeof( l0 ), 1, cf ) == 1 && l0.penumbraSize > 0.0f )
 			{
 				cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", l0.penumbraSize );
 				cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", l0.penumbraSize );
@@ -432,7 +480,8 @@ void R_SoftShadowReproShot_f( const idCmdArgs& args )
 		if( cf != NULL ) { fclose( cf ); }
 	}
 
-	// settle the goto-positioned view (sim still live), then FADE / ALL-DARK assert
+	// settle the frozen, exactly-posed view, then FADE / ALL-DARK assert. R_RenderOneFrame runs
+	// commonLocal.Draw -> game->Draw -> the REAL game render (full frontend incl. MOC light culling).
 	R_RenderOneFrame();
 	std::vector<uint8_t> settleImg; int sw = 0, sh = 0;
 	ReadImageRGBA8( globalImages->currentRenderHDRImage, settleImg, sw, sh );
@@ -442,10 +491,6 @@ void R_SoftShadowReproShot_f( const idCmdArgs& args )
 		common->Printf( "[repro] %s: FAIL frame too dark (central luma %.2f) - fade-in / not settled - skipped\n", name.c_str(), luma );
 		return;
 	}
-
-	// FREEZE the sim: repeated renders of this view now differ ONLY by the cvars we toggle
-	const int wasStop = cvarSystem->GetCVarInteger( "g_stopTime" );
-	cvarSystem->SetCVarInteger( "g_stopTime", 1 );
 
 	std::vector<uint8_t> noShadow, sampled, scanline; int w = 0, h = 0;
 	// no-shadow baseline: disable the soft path outright (skipShadows alone does not stop soft volumes)
@@ -460,10 +505,8 @@ void R_SoftShadowReproShot_f( const idCmdArgs& args )
 
 	// diagnostic: per-config luma + soft-edge tally + active config (disambiguates "no soft term" vs stale renders)
 	{
-		int softEdges = 0;
-		for( viewLight_t* vl = tr.viewDef ? tr.viewDef->viewLights : NULL; vl != NULL; vl = vl->next ) { softEdges += vl->softEdgeCount; }
-		common->Printf( "[repro] %s: luma noShadow %.1f sampled %.1f scanline %.1f | softEdges(view)=%d cfg soft=%d compute=%d face=%d tilebin=%d pcss=%d scanline=%d\n",
-						name.c_str(), R_CentralLuma( noShadow, w, h ), R_CentralLuma( sampled, w, h ), R_CentralLuma( scanline, w, h ), softEdges,
+		common->Printf( "[repro] %s: luma noShadow %.1f sampled %.1f scanline %.1f | cfg soft=%d compute=%d face=%d tilebin=%d pcss=%d scanline=%d\n",
+						name.c_str(), R_CentralLuma( noShadow, w, h ), R_CentralLuma( sampled, w, h ), R_CentralLuma( scanline, w, h ),
 						cvarSystem->GetCVarInteger( "r_useSoftShadowVolumes" ), cvarSystem->GetCVarInteger( "r_softShadowCompute" ),
 						cvarSystem->GetCVarInteger( "r_softShadowFaceCoverage" ), cvarSystem->GetCVarInteger( "r_softShadowTileBin" ),
 						cvarSystem->GetCVarInteger( "r_shadowMapPCSS" ), cvarSystem->GetCVarInteger( "r_softShadowScanline" ) );
@@ -511,7 +554,6 @@ void R_SoftShadowReproShot_f( const idCmdArgs& args )
 					  nvrhi::ResourceStates::ShaderResource, va( "dumps/repro_%s_scanline.png", name.c_str() ) );
 
 	// restore
-	cvarSystem->SetCVarInteger( "g_stopTime", wasStop );
 	cvarSystem->SetCVarInteger( "r_softShadowScanline", 0 );
 }
 
@@ -521,8 +563,31 @@ void R_SoftShadowReproTick()
 	const idStr& cap = s_reproCaps[s_reproIdx];
 	switch( s_reproState )
 	{
+		case RS_SETRES:
+		{
+			// enter a new target resolution: set the RENDER size (decoupled from the display - gamescope
+			// downscales) and vid_restart only if it actually changed. Then run every capture at this size.
+			const ReproRes& R = s_reproResList[s_reproResIdx];
+			if( renderSystem->GetWidth() != R.w || renderSystem->GetHeight() != R.h )
+			{
+				cvarSystem->SetCVarInteger( "r_windowWidth", R.w );
+				cvarSystem->SetCVarInteger( "r_windowHeight", R.h );
+				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "vid_restart\n" );
+				common->Printf( "[repro] === resolution %s (%dx%d) - vid_restart ===\n", R.tag, R.w, R.h );
+				s_reproWait = REPRO_RESTART_WAIT;
+			}
+			else
+			{
+				common->Printf( "[repro] === resolution %s (%dx%d) ===\n", R.tag, R.w, R.h );
+				s_reproWait = 0;
+			}
+			s_reproIdx = 0;			// restart the capture loop at this resolution
+			s_reproState = RS_LOAD;
+			break;
+		}
 		case RS_LOAD:
 		{
+			if( s_reproWait > 0 ) { s_reproWait--; break; }	// let vid_restart finish recreating the targets
 			const idStr slot = R_ReproSlot( cap );
 			cvarSystem->SetCVarString( "com_autoLoadGame", slot.c_str() );	// skip the shell enumeration pre-check
 			cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "loadGame %s\n", slot.c_str() ) );
@@ -537,6 +602,9 @@ void R_SoftShadowReproTick()
 			if( inGame )
 			{
 				cvarSystem->SetCVarString( "com_autoLoadGame", "" );
+				// position the REAL player view at the captured camera via setviewpos (instant teleport, applied
+				// over the goto's live frames), then the shot freezes + renders through game->Draw. Running the
+				// actual game render is the point - a renderer-only bypass can pass while the shipped path fails.
 				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowGoto %s\n", cap.c_str() ) );
 				s_reproWait = REPRO_SETTLE; s_reproState = RS_SETTLE;
 			}
@@ -559,10 +627,18 @@ void R_SoftShadowReproTick()
 			break;
 		case RS_NEXT:
 			s_reproIdx++;
-			if( s_reproIdx < s_reproCaps.Num() ) { s_reproState = RS_LOAD; }
+			if( s_reproIdx < s_reproCaps.Num() )
+			{
+				s_reproState = RS_LOAD;		// next capture at the current resolution
+			}
+			else if( ++s_reproResIdx < s_reproResCount )
+			{
+				s_reproState = RS_SETRES;	// done with this resolution; advance to the next
+			}
 			else
 			{
-				common->Printf( "[repro] done - %d capture(s), %d deviation/instrument failure(s)\n", s_reproCaps.Num(), s_reproFails );
+				common->Printf( "[repro] done - %d capture(s) x %d resolution(s), %d deviation/instrument failure(s)\n",
+								s_reproCaps.Num(), s_reproResCount, s_reproFails );
 				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "quit\n" );
 				s_reproIdx = -1;
 			}
@@ -579,14 +655,18 @@ void R_SoftShadowRepro_f( const idCmdArgs& args )
 	}
 	s_reproCaps.Clear();
 	for( int i = 1; i < args.Argc(); i++ ) { s_reproCaps.Append( idStr( args.Argv( i ) ) ); }
-	s_reproIdx = 0; s_reproState = RS_LOAD; s_reproFails = 0;
-	common->Printf( "[repro] armed %d capture(s)\n", s_reproCaps.Num() );
+	extern idCVar r_softShadowRepro4K;
+	s_reproResCount = r_softShadowRepro4K.GetBool() ? 3 : 2;		// 1080p+1440p, +4K opt-in
+	s_reproResIdx = 0; s_reproIdx = 0; s_reproState = RS_SETRES; s_reproFails = 0;
+	common->Printf( "[repro] armed %d capture(s) x %d resolution(s)\n", s_reproCaps.Num(), s_reproResCount );
 }
 
 // One-shot capture of a live soft-shadow view, reconstructable headless. See RenderCapture.h. The capture is
 // two-phase within one frame: the FRONTEND half snapshots the view/lights/edges/caster-meshes (all CPU-side),
 // the BACKEND half grabs the screenshot and writes the .cap + .json. `captureSoftShadow` arms it; the
 // halves fire on the next main view and disarm.
+
+idCVar r_softShadowRepro4K( "r_softShadowRepro4K", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "softShadowRepro: also reproduce every capture at 3840x2160 (in addition to 1080p + 1440p). Off by default - 4K is slow and a headless box may lack the VRAM." );
 
 extern idCVar r_shadowPenumbraSize;
 
@@ -2151,6 +2231,7 @@ static void R_SoftShadowBenchMotionPose( const idVec3& baseOrg, const idAngles& 
 
 // Iterates the corpus, prints one defect line per capture x light and the grand total; returns the
 // total defect count (the process exit code, clamped by the caller).
+// FIXME: This function is monstrous. Do not add more gates here. 
 int R_SoftShadowGate( const char* arg )
 {
 	using namespace swgate;

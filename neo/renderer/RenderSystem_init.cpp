@@ -1011,12 +1011,9 @@ bool R_ReadPixelsRGB8( nvrhi::IDevice* device, CommonRenderPasses* pPasses, nvrh
 		data[ i * 4 + 3 ] = 0xff;
 	}
 
-	// SRS - Save screen shots to fs_savepath on macOS (i.e. don't save into an app bundle's basepath)
-#if defined(__APPLE__)
+	// Save screen shots to fs_savepath (the writable user dir), never fs_basepath (the read-only install /
+	// repo tree - dumps landing there is a surprise and pollutes the checkout). Same rule on every platform.
 	R_WritePNG( fullname, static_cast<byte*>( pData ), 4, desc.width, desc.height, "fs_savepath" );
-#else
-	R_WritePNG( fullname, static_cast<byte*>( pData ), 4, desc.width, desc.height, "fs_basepath" );
-#endif
 
 	if( newData )
 	{
