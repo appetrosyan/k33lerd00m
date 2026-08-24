@@ -757,7 +757,7 @@ SW_FUNC uint SoftScan_Run( float aN, float bN )
 	uint w = ( uint )( c1 - c0 + 1 );
 	return ( w >= 32u ) ? 0xffffffffu : ( ( ( 1u << w ) - 1u ) << ( uint )c0 );
 }
-// project a near-clipped triangle to the UNIT light disk and OR its per-chord bit-run into swGrid. The
+// project a SLAB-clipped triangle to the UNIT light disk and OR its per-chord bit-run into swGrid. The
 // run is raw (disk-bbox columns [0,31]); the circular disk mask is applied ONCE at reduction, not per
 // triangle. Only the chords the triangle's projected y-extent spans are touched (most triangles cover a
 // couple of chords), which is the bulk of the per-triangle saving over walking all SW_SCAN_CHORDS.
@@ -767,26 +767,37 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 	float3 rel[3]; float dn[3];
 	rel[0] = v0 - swP; rel[1] = v1 - swP; rel[2] = v2 - swP;
 	dn[0] = dot( rel[0], swF.nrm ); dn[1] = dot( rel[1], swF.nrm ); dn[2] = dot( rel[2], swF.nrm );
-	float invR = 1.0f / swR;
-	float2 q[4]; int qn = 0;											// near-plane clip (dn >= eps) -> <=4 unit-disk verts
-	float ymin = 1e30f, ymax = -1e30f;
+	// Clip the triangle to the depth SLAB [swEps, distPL] BEFORE projecting: only geometry BETWEEN the
+	// receiver and the light occludes it. The old code clipped ONLY the near plane (dn >= swEps), so large
+	// world triangles that straddle or sit BEYOND the light survived the conservative cone cull and still
+	// projected into the disk - painting false self-shadow across lit surfaces (the broad scanline
+	// over-darkening). Every other coverage path clips this same slab, and the sampled MT path enforces it
+	// with tt <= 1. Two-plane Sutherland-Hodgman in (rel,dn) space -> up to 5 verts.
+	float3 nRel[4]; float nDn[4]; int nn = 0;							// after near clip (dn >= swEps)
 	for( int e = 0; e < 3; e++ )
 	{
 		int i = e, k = ( e + 1 ) % 3;
 		bool ai = dn[i] >= swEps, bi = dn[k] >= swEps;
-		if( ai && qn < 4 ) { float2 p = SoftShadow_ProjectVert( rel[i], dn[i], swF ) * invR; q[qn++] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); }
-		if( ( ai != bi ) && qn < 4 )
-		{
-			float tt = ( swEps - dn[i] ) / ( dn[k] - dn[i] );
-			float3 rc = rel[i] + ( rel[k] - rel[i] ) * tt;
-			float2 p = SoftShadow_ProjectVert( rc, swEps, swF ) * invR; q[qn++] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y );
-		}
+		if( ai && nn < 4 ) { nRel[nn] = rel[i]; nDn[nn] = dn[i]; nn++; }
+		if( ( ai != bi ) && nn < 4 ) { float t = ( swEps - dn[i] ) / ( dn[k] - dn[i] ); nRel[nn] = rel[i] + ( rel[k] - rel[i] ) * t; nDn[nn] = swEps; nn++; }
 	}
-	if( qn < 3 ) { return; }
+	if( nn < 3 ) { return; }
+	float3 fRel[5]; float fDn[5]; int fn = 0;							// after far clip (dn <= distPL = the light)
+	for( int e = 0; e < nn; e++ )
+	{
+		int i = e, k = ( e + 1 ) % nn;
+		bool ai = nDn[i] <= swF.distPL, bi = nDn[k] <= swF.distPL;
+		if( ai && fn < 5 ) { fRel[fn] = nRel[i]; fDn[fn] = nDn[i]; fn++; }
+		if( ( ai != bi ) && fn < 5 ) { float t = ( swF.distPL - nDn[i] ) / ( nDn[k] - nDn[i] ); fRel[fn] = nRel[i] + ( nRel[k] - nRel[i] ) * t; fDn[fn] = swF.distPL; fn++; }
+	}
+	if( fn < 3 ) { return; }
+	float invR = 1.0f / swR;
+	float2 q[5]; int qn = fn; float ymin = 1e30f, ymax = -1e30f;
+	for( int j = 0; j < fn; j++ ) { float2 p = SoftShadow_ProjectVert( fRel[j], fDn[j], swF ) * invR; q[j] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); }
 	// per-edge line params hoisted OUT of the chord loop: the reciprocal 1/(B.y-A.y) is the expensive
 	// term and is chord-invariant, so each chord evaluation is a single FMA x = A.x + slope*(Y - A.y).
-	float eax[4], eay[4], eslope[4], elo[4], ehi[4];
-	for( int e = 0; e < 4; e++ )
+	float eax[5], eay[5], eslope[5], elo[5], ehi[5];
+	for( int e = 0; e < 5; e++ )
 	{
 		if( e >= qn ) { eax[e] = 0; eay[e] = 0; eslope[e] = 0; elo[e] = 1e30f; ehi[e] = -1e30f; continue; }
 		float2 A = q[e], B = q[( e + 1 ) % qn];
@@ -801,7 +812,7 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 	{
 		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
 		float xlo = 1e30f, xhi = -1e30f; bool any = false;
-		for( int e2 = 0; e2 < 4; e2++ )
+		for( int e2 = 0; e2 < 5; e2++ )
 		{
 			if( Y >= elo[e2] && Y < ehi[e2] )						// chord crosses this edge (half-open = parity-exact)
 			{
