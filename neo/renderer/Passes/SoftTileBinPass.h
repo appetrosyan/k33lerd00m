@@ -91,7 +91,7 @@ public:
 	// 24M is now deep headroom even for 4K. Both halves degrade gracefully (slots: light falls to
 	// full walk; spill: tile falls to full walk) and the gate bench prints the spill demand so
 	// exhaustion is never silent.
-	static const int SPILL_ELEMENTS = 40 << 20;	// 8x8 tiles overflow ~4x as many tiles as 16x16; grown so dense scenes (cap0009 demanded ~29 M) do not EXHAUST the spill region and fall back to the full walk.
+	static const int SPILL_ELEMENTS = 56 << 20;	// 8x8 tiles overflow ~4x as many tiles as 16x16; sized for tileK 128 (denser slots spill more: cap0007 demanded ~47 M) so dense scenes do not EXHAUST the region and fall back to the full walk. Main region keeps 40 M, ample at K=128 (~half the K=256 slot usage).
 
 private:
 	void EnsurePipeline();

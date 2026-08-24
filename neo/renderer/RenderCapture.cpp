@@ -3177,10 +3177,14 @@ int R_SoftShadowGate( const char* arg )
 						}
 						// physically impossible sample (GPU seconds at sub-100ms wall): the GPU_TIME
 						// begin timestamp is STALE from before the bench (load/warm-up frames never
-						// fetched, so the parity slot holds an old begin) paired with a fresh end.
-						// An INSTRUMENT defect, distinct from a frame stall - named as such.
-						const char* cls = ( bf.gpu > 5000.0 && bf.wall < 100.0 ) ? "timer-artifact (stale cross-frame begin pairing)"
-										  : !gpuOut ? "cpu/extern (GPU clean)"
+						// fetched, so the parity slot holds an old begin) paired with a fresh end. A
+						// KNOWN instrument defect (root-fix pending: proper begin/end pairing), already
+						// excluded from every statistic - NOT printed; the line only obscured real stalls.
+						if( bf.gpu > 5000.0 && bf.wall < 100.0 )
+						{
+							continue;
+						}
+						const char* cls = !gpuOut ? "cpu/extern (GPU clean)"
 										  : ( ( bf.soft > 0.5 * ( bf.gpu - gMed ) ) ? "gpu-soft (soft-phase stall)" : "gpu-engine (outside soft: compile/sync)" );
 						common->Printf( "[softgate] BENCH %-14s STALL frame %2d: gpu %.1f wall %.1f soft %.1f ms (+%.1f over median) class=%s\n",
 										cap.name.c_str(), bf.idx, bf.gpu, bf.wall, bf.soft,
