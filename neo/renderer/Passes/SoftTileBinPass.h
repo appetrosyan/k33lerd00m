@@ -67,19 +67,17 @@ public:
 		return DebugReadSpillStats( out );
 	}
 
-	static const int TILE_SIZE = 8;			// 8x8 (was 16x16). See the 2026-08-24 measurement below.
-	static const int TILE_K = 512;			// MAX indices per tile (slot cap); must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl. Runtime STRIDE is r_softShadowTileK (default 256 at 8x8).
-	// 8x8 tiles measured a NET WIN 2026-08-24 (playtest cap corpus @1440p, scanline): the per-fragment
-	// WALK - which is ~100% of the term cost, all memory-bound on the tile-list gather - shrank 28-47%
-	// (cap0006 65->34 ms, cap0009 95->63 ms) because the smaller tile world-radius tR tightens the cone
-	// cull, so the relevant set DOES shrink. Net soft -12% to -31% even carrying the 4x tilebin overhead.
-	// This OVERTURNS the old "8x8 measured worse, do not retry" note: that was CONFOUNDED by tileK - at
-	// 8x8 the 4x tiles forced K down (buffer), which SPILLED dense tiles to the slower cluster walk and
-	// hid the win. At tileK 256 with the buffer/spill grown below there is no forced spill and the walk
-	// win is clean. (Remaining lever: the 4x tilebin caster-cull overhead, a two-level block-bin rewrite.)
-	// Earlier K notes (16x16 era, kept for the density history): K=64 overflowed dense tiles back to the
-	// full walk; K=256 was clean at OLD density, K=512 at cap0061 LIVE density (114k records). At 8x8 the
-	// per-tile sets are ~1/4, so K=256 is clean again.
+	static const int TILE_SIZE = 16;			// 16x16. History below - read it before "trying 8x8".
+	static const int TILE_K = 512;			// MAX indices per tile (slot cap); must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl. Runtime STRIDE is r_softShadowTileK (default 256 at 16x16).
+	// TILE-SIZE HISTORY (candid, both reversals): 16x16 -> 8x8 (2026-08-24, "net win -12..-31%") ->
+	// BACK to 16x16 (same day). The 8x8 "win" was measured on a bench whose multi-cap runs were
+	// CORRUPTED by cross-capture state leakage (the gate reused the render world; re-added lights fell
+	// off the interactionTable to per-frame dynamic interactions - up to 14x fabricated cost, see
+	// RenderCapture.cpp per-cap isolation). On the FIXED per-cap-isolated bench, 16x16 at K=256 beats
+	// 8x8 at its best K (128) on 4 of 5 heavy caps (cap0006 52.1->37.7, cap0008 48.2->37.1 ms net
+	// soft; cap0009 equal) and pays 2.5-5 ms tilebin instead of 6.5-14. The honest 16x16 K sweep:
+	// 256 best, 512 worse on most heavy caps, 128 worse. LESSON: a documented negative OR positive is
+	// only as good as the instrument that produced it; re-measure both after any instrument fix.
 	// SPILL region (2026-08-17): tiles denser than K no longer fall back to the O(all-casters) full
 	// walk (measured ~12 ms/frame at cap0061 live density - K cannot chase it: K=1024 recovered
 	// only ~4 ms at +320 MB). Instead the bin CS bump-allocates a span from the buffer TAIL and
@@ -91,7 +89,7 @@ public:
 	// 24M is now deep headroom even for 4K. Both halves degrade gracefully (slots: light falls to
 	// full walk; spill: tile falls to full walk) and the gate bench prints the spill demand so
 	// exhaustion is never silent.
-	static const int SPILL_ELEMENTS = 56 << 20;	// 8x8 tiles overflow ~4x as many tiles as 16x16; sized for tileK 128 (denser slots spill more: cap0007 demanded ~47 M) so dense scenes do not EXHAUST the region and fall back to the full walk. Main region keeps 40 M, ample at K=128 (~half the K=256 slot usage).
+	static const int SPILL_ELEMENTS = 56 << 20;	// sized generously (worst measured demand: ~47 M at the 8x8/K128 experiment; 16x16/K256 demands far less) so dense scenes never EXHAUST the region and fall back to the full walk. Main region keeps 40 M - at 16x16 K256 a full-screen 1440p light needs ~3.7 M slots, so ~10 lights of headroom before the graceful full-walk fallback.
 
 private:
 	void EnsurePipeline();

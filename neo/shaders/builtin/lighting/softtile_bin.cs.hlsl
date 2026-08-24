@@ -34,7 +34,7 @@ version. See <http://www.gnu.org/licenses/>.
 
 #pragma pack_matrix( row_major )
 
-#define SW_TILE_SIZE	8
+#define SW_TILE_SIZE	16
 #define SW_TILE_K		512		// indices per tile; must match interactionSM.ps.hlsl + SoftTileBinPass.h
 
 // *INDENT-OFF*

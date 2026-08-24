@@ -31,7 +31,7 @@ version. See <http://www.gnu.org/licenses/>.
 //     which the wave64 pixel shader forecloses. (No explicit subgroup-size control: this nvrhi
 //     has no VK_EXT_subgroup_size_control plumbing; the workgroup size only encourages it.)
 
-#define SW_TILE_SIZE	8
+#define SW_TILE_SIZE	16
 #define SW_TILE_K		512		// must match softtile_bin.cs.hlsl + SoftTileBinPass.h
 #define SW_TILE_UMBRA	0xFFFFFFFEu	// whole-tile umbra sentinel (softtile_bin.cs.hlsl): term is exactly 0
 #define SW_TILE_SPILL	0xFFFFFFFDu	// overflowed tile spilled its FULL list: slot+1/+2 = ( span offset, count )
