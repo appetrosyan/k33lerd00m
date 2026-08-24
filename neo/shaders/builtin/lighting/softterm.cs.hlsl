@@ -104,38 +104,43 @@ static bool swCblRT = false;
 StructuredBuffer<uint2>		t_SoftCull	: register( t7 );
 
 // CONTRIBUTOR CACHE (r_softShadowContribCache, SW_CONTRIB_CACHE permutation, SCANLINE only): the
-// evaluate-once-union design (studies: 95% of walk iterations are proven waste; per-cell contributor
-// unions of 7-17 tris are coverage-exact at K=64 evaluations, held-out verified on cap0004/7/9).
-// Per (world cell, light) the FIRST K fragments run the full walk and RECORD their solo-contributing
-// STATIC triangles into the cell's slot (the fragments themselves are the evaluation points - no
-// heuristic anywhere); at K evaluations the cell flips BUILT and later fragments walk only the
-// recorded union + live dynamic casters. Warm-up is INCREMENTAL: cells enter RECORDING only while a
-// bounded slot pool has room (header word 0), so a camera entering a fresh area warms over frames
-// with no atomic storm. All fallbacks (unbuilt / pool-full / overflow / stale generation) are the
-// exact shipped walk - the cache can only remove proven-waste iterations, never coverage.
-// Slot layout (stride SW_CONTRIB_STRIDE uints): [0] keyLo [1] keyHi (gen | light key)
-// [2] evalCount, bit31 = BUILT [3] triCount (<= SW_CONTRIB_K) [4..] recorded GLOBAL tri indices.
-// Header (first SW_CONTRIB_HEADER uints of the buffer): [0] recording-pool occupancy
-// [1] serve hits [2] recording evals [3] claimed cells (stats, wave-aggregated).
+// evaluate-once-union design (studies: 95% of walk iterations are proven waste). Per (world cell,
+// light) the fragments of each screen TILE record their solo-contributing STATIC triangles into
+// the cell's slot (the fragments themselves are the evaluation points - no heuristic anywhere);
+// once a tile's full-dispatch evaluation is certified, its fragments walk only the recorded union
+// + live dynamic casters. Warm-up is INCREMENTAL: cells enter the table only while the per-frame
+// claim budget has room (header word 0). All fallbacks (unclaimed / uncertified tile / budget /
+// overflow / stale generation) are the exact shipped walk.
+// Slot layout (stride SW_CONTRIB_STRIDE uints): [0] keyLo [1] keyHi (cz | light key, GEN-free)
+// [2] state (POISON) [3] triCount (advisory max, <= SW_CONTRIB_K) [4..67] recorded GLOBAL tri
+// indices (1-based, claim-by-value, contiguous) [68] LIVE tile mask [69] PEND tile mask
+// [70] pend frame [71] generation.
+// Header (first SW_CONTRIB_HEADER uints): [0] claim budget used this frame; [1..] stats (wave-
+// aggregated; see GetContribStats).
 #ifndef SW_CONTRIB_CACHE
 	#define SW_CONTRIB_CACHE 0
 #endif
 #if SW_CONTRIB_CACHE
 #define SW_CONTRIB_K		64
-// TILE-COVERAGE certification, frame-deferred (the BUILT-flip-defer analogue for tiles): a
-// record finalize PENDS its tile bit; any prober PROMOTES pends to LIVE only in a frame with no
-// record finalize yet (PENDFRAME != now). Trusting a bit the frame it was set let late-launching
-// waves serve a union whose recorders were still walking (spill records are slow) - measured
-// 4.6%/15.7% serve-verify mismatches; the deferral closes that window to one wave race.
+// v3 protocol (BUILT-at-claim): a CLAIM plants the key + generation and nothing else; the ONLY
+// warm path is the TILE-MISS record (a fragment whose tile's LIVE bit is unset - its whole tile
+// records that dispatch), and serving is gated purely by the frame-deferred tile certification.
+// The v2 eval-ticket/BUILT-flip machinery is gone: it existed only to bound a transient the
+// tile-cert one-shot already bounds, and burned a CAS retry loop on every warm fragment.
+// TILE-COVERAGE certification, frame-deferred: a record finalize PENDS its tile bit; any prober
+// PROMOTES pends to LIVE only in a frame with no record finalize yet (PENDFRAME != now). Trusting
+// a bit the frame it was set let late-launching waves serve a union whose recorders were still
+// walking (spill records are slow) - measured 4.6%/15.7% serve-verify mismatches.
 #define SW_CONTRIB_TILEBIT	( 4 + SW_CONTRIB_K )		// slot word: LIVE tile-coverage mask (serve gate)
 #define SW_CONTRIB_TILEPEND	( 4 + SW_CONTRIB_K + 1 )	// slot word: PENDING tile bits (this frame's records)
 #define SW_CONTRIB_TILEPFR	( 4 + SW_CONTRIB_K + 2 )	// slot word: frame of the last pend write
-#define SW_CONTRIB_STRIDE	( 4 + SW_CONTRIB_K + 3 )
+#define SW_CONTRIB_GEN		( 4 + SW_CONTRIB_K + 3 )	// slot word: generation (stale slot -> FREE + reclaim)
+#define SW_CONTRIB_STRIDE	( 4 + SW_CONTRIB_K + 4 )
 // header words 16-19: serve-verify mismatch attribution ([16] serve DARKER = over-coverage,
 // [17] serve LIGHTER = under-coverage, [18] on a SPILL fragment, [19] on a tile-list fragment)
 #define SW_CONTRIB_HEADER	24
-#define SW_CONTRIB_BUILT	0x80000000u
-#define SW_CONTRIB_POISON	0x40000000u		// list overflowed K after the flip: cell may NEVER serve (exact walk forever)
+#define SW_CONTRIB_POISON	0x40000000u		// refinement-revoked, or (with triCount >= K) permanent overflow
+#define SW_CONTRIB_FREEING	0xFFFFFFFFu		// keyLo sentinel while a stale slot is being cleared
 RWStructuredBuffer<uint>	u_Contrib	: register( u2 );
 // wave-aggregated diagnostic counter into a free header word (one atomic per wave, SwSurfStat
 // pattern): [7] budget-blocked claims [8] probe-exhausted (16 slots, no key/no empty admitted)
@@ -148,33 +153,56 @@ void SwContribDiag( uint word )
 		InterlockedAdd( u_Contrib[ word ], c );
 	}
 }
-// append tri rt (1-based encoded) to cell slot sB's union with linear dedup; overflow POISONs.
-// Returns true when the union grew (the refinement revoke signal).
-bool SwContribAppend( uint sB, int rt )
+// CLAIM-BY-VALUE append of tri rt (stored 1-based) into cell slot sB's union. The entry CAS is
+// the publication, so the list is contiguous (scan to the first zero) and only genuinely DISTINCT
+// contributors consume capacity - the earlier count-reserve scheme let torn-window duplicate
+// reservations from a full-tile dispatch racing the same few contributors spuriously overflow-
+// POISON a tiny union (caught by the SoftContribProtocolV3 sim). triCount is an advisory
+// InterlockedMax. Returns: 0 = already present, 1 = appended NEW (refinement revoke signal),
+// 2 = contention give-up (the caller must NOT certify its tile), 3 = genuine overflow (POISONed).
+int SwContribAppend( uint sB, int rt )
 {
-	const uint have = min( u_Contrib[ sB + 3 ], ( uint )SW_CONTRIB_K );
-	for( uint dd = 0; dd < have; dd++ )
+	const uint val = ( uint )( rt + 1 );
+	[loop] for( int aTry = 0; aTry < SW_CONTRIB_K + 16; aTry++ )
 	{
-		if( u_Contrib[ sB + 4 + dd ] == ( uint )( rt + 1 ) )
+		int idx = -1;
+		[loop] for( int i = 0; i < SW_CONTRIB_K; i++ )
 		{
-			return false;								// already recorded
+			const uint e = u_Contrib[ sB + 4u + ( uint )i ];
+			if( e == val )
+			{
+				return 0;								// already recorded
+			}
+			if( e == 0u )
+			{
+				idx = i;
+				break;
+			}
 		}
+		if( idx < 0 )
+		{
+			// K DISTINCT contributors exceeded: the union cannot represent this cell - permanent
+			// POISON (probe classifies POISON && triCount >= K as plain-walk-forever, no refinement)
+			uint pz;
+			InterlockedOr( u_Contrib[ sB + 2 ], SW_CONTRIB_POISON, pz );
+			u_Contrib[ sB + 3 ] = ( uint )SW_CONTRIB_K;
+			return 3;
+		}
+		uint got;
+		InterlockedCompareExchange( u_Contrib[ sB + 4u + ( uint )idx ], 0u, val, got );
+		if( got == 0u )
+		{
+			uint mx;
+			InterlockedMax( u_Contrib[ sB + 3 ], ( uint )( idx + 1 ), mx );
+			return 1;									// appended new
+		}
+		if( got == val )
+		{
+			return 0;									// a racer published our id into that slot
+		}
+		// slot taken by another id since the scan: rescan (their entry may still be ours upstream)
 	}
-	uint at;
-	InterlockedAdd( u_Contrib[ sB + 3 ], 1u, at );
-	if( at < ( uint )SW_CONTRIB_K )
-	{
-		u_Contrib[ sB + 4 + at ] = ( uint )( rt + 1 );	// benign dup on race: union semantics
-	}
-	else
-	{
-		// overflow: a contributor could not be stored, so serving this cell would under-cover.
-		// POISON it - pre-flip the BUILT withhold also blocks, but a post-flip overflow needs
-		// this to revoke serving.
-		uint pz;
-		InterlockedOr( u_Contrib[ sB + 2 ], SW_CONTRIB_POISON, pz );
-	}
-	return true;
+	return 2;											// contention cap: do not certify this tile
 }
 // wave-aggregated SUM of a per-lane value into a header word: serve-work attribution
 // ([12] union entries walked [13] union FillTri survivors [14] dyn FillTri survivors
@@ -378,7 +406,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 
 #if SW_CONTRIB_CACHE
 	// ---- CONTRIBUTOR CACHE (see the declaration block above for the design + slot layout) ----
-	// g_surfParams.x = cell size G, g_surfCost.z = eval threshold K', g_surfCost.w = table capacity
+	// g_surfParams.x = cell size G, g_surfCost.w = table capacity
 	// (slots, pow2), g_surfA.w = light key, g_aa.y = per-light generation, g_aa.z = recording-pool
 	// budget (g_flags.w stays the tile-K stride for the fallback tile walk).
 	if( g_surfParams.x > 0.0f && g_surfCost.w > 0 )
@@ -447,20 +475,51 @@ void main( uint3 tid : SV_DispatchThreadID )
 		{
 		const uint curGen = ( uint )( g_aa.y + 0.5f );
 		const uint capM = ( uint )g_surfCost.w - 1u;
-		uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u ^ curGen * 0xC2B2AE35u;
+		// GEN-FREE hash and keys: a generation bump must NOT move the slot index, or the stale slot
+		// at the old index is orphaned forever (measured live: 172M probe-exhausts, serve share 5.9%
+		// - the table filled with unreclaimable dead slots). The generation lives in its own slot
+		// word; a mismatch FREES the slot in place (see below).
+		uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
 		uint slot = h & capM;
 		int  servedBase = -1, servedCount = 0;
 		int  recordSlot = -1;
 		// probe-outcome diagnosis flags (classified into header words 7/8/9 after the loop)
 		bool swDgBudget = false, swDgKey = false, swDgUnserv = false;
 		bool swTileMissRec = false;			// this record is a tile-coverage fill-in, not a refinement verdict
+		bool swRefineRec = false;			// this record is the continuous validator (revoke/converge verdict)
 		[loop] for( int pr = 0; pr < 16; pr++ )
 		{
 			const uint sBase = SW_CONTRIB_HEADER + slot * SW_CONTRIB_STRIDE;
 			const uint w0 = u_Contrib[ sBase ];
-			if( w0 == keyLo && u_Contrib[ sBase + 1 ] == ( keyHi ^ ( curGen * 0x9E3779B9u ) ) )
+			if( w0 == keyLo && u_Contrib[ sBase + 1 ] == keyHi )
 			{
 				swDgKey = true;
+				// GENERATION RECLAIM = FREE the slot. The winner CASes keyLo to the FREEING sentinel
+				// (matches neither a key nor the vacancy, so every other prober skips past), clears
+				// state/counts/masks AND the entries (claim-by-value scans to the first zero, so a
+				// stale non-zero entry would both survive a count reset and break the scan), then
+				// publishes keyLo = 0 LAST - no reader can observe a half-cleared slot under a live
+				// key. The cell re-enters through the normal budget-gated claim.
+				if( u_Contrib[ sBase + SW_CONTRIB_GEN ] != curGen )
+				{
+					uint prevK;
+					InterlockedCompareExchange( u_Contrib[ sBase ], keyLo, SW_CONTRIB_FREEING, prevK );
+					if( prevK == keyLo )
+					{
+						u_Contrib[ sBase + 2 ] = 0u;
+						u_Contrib[ sBase + 3 ] = 0u;
+						u_Contrib[ sBase + SW_CONTRIB_TILEBIT ]  = 0u;
+						u_Contrib[ sBase + SW_CONTRIB_TILEPEND ] = 0u;
+						u_Contrib[ sBase + SW_CONTRIB_GEN ] = 0u;
+						[loop] for( int fc = 0; fc < SW_CONTRIB_K; fc++ )
+						{
+							u_Contrib[ sBase + 4u + ( uint )fc ] = 0u;
+						}
+						u_Contrib[ sBase ] = 0u;		// publish the vacancy LAST
+						SwContribDiag( 11u );			// stat: slots reclaimed
+					}
+					break;								// plain walk this frame either way
+				}
 				// PROMOTE pended tile bits to LIVE - only while no record has finalized THIS frame
 				// (a finalize stamps PENDFRAME before pending its bit, closing the same-frame window)
 				{
@@ -475,81 +534,55 @@ void main( uint3 tid : SV_DispatchThreadID )
 						}
 					}
 				}
-				const uint ev = u_Contrib[ sBase + 2 ];
-				// FLIP-FRAME DEFER (bits 16-30 = the frame the cell flipped BUILT): a cell must not
-				// serve in the dispatch that flipped it - stragglers of the same dispatch may still be
-				// appending (count is incremented before the entry store), which read as stale-zero
-				// entries / missing contributors: nondeterministic terms (measured TEMPORAL=43 gate
-				// defects). One frame later the list is quiescent (post-flip fragments only serve).
-				const uint swFrameNow = ( uint )g_surfA.y & 0x7FFFu;
-				if( ( ev & SW_CONTRIB_POISON ) != 0u && ( ev & SW_CONTRIB_BUILT ) == 0u )
+				const uint st = u_Contrib[ sBase + 2 ];
+				if( ( st & SW_CONTRIB_POISON ) != 0u && u_Contrib[ sBase + 3 ] >= ( uint )SW_CONTRIB_K )
 				{
-					// pre-flip overflow poison: the union needs > K entries, the cell can never
-					// serve - and it must NOT keep recording either (recording costs 2-3x a plain
-					// walk; measured: perpetual recording DOUBLED the live term). Plain walk.
+					// PERMANENT overflow: > K distinct contributors - the union cannot represent this
+					// cell. Plain walk forever, and no refinement either (its verdict cannot change).
 					break;
 				}
-				if( ( ev & SW_CONTRIB_BUILT ) != 0u && ( ev & SW_CONTRIB_POISON ) == 0u
-						&& ( swServeListCount >= 0 || swSpillN >= 0 )
-						&& ( ( ev >> 16 ) & 0x7FFFu ) != swFrameNow )
+				if( swServeListCount < 0 && swSpillN < 0 )
 				{
-					// CONTINUOUS REFINEMENT: 1 in 64 served fragments (pixel hash) runs the exact
-					// recording walk instead - its term is exact, its contributors append, and if it
-					// found one MISSING from the union the cell is revoked (POISON) and re-records
-					// with the new view's fragments included. Frozen unions were the measured
-					// CONTINUITY defect source (displaced views hit receivers the flip-view never
-					// evaluated); refinement converges them at ~1.5% average walk cost.
-					// SPILL fragments refine 8x rarer: their record walk is the full cluster hierarchy
-					// (~10x a tile-list record), and at 1/64 it alone regressed cap0007 term ~5 ms
-					const uint swRefN = ( uint )( g_aa.w + 0.5f ) * ( ( swServeListCount < 0 ) ? 8u : 1u );
-					if( ( u_Contrib[ sBase + SW_CONTRIB_TILEBIT ] & swTileBit ) == 0u )
+					// corrupt/untiled fragment: can neither record (list-based walk) nor serve
+					swDgUnserv = true;
+					break;
+				}
+				if( ( u_Contrib[ sBase + SW_CONTRIB_TILEBIT ] & swTileBit ) == 0u )
+				{
+					// TILE-MISS: no full-tile evaluation has certified this tile, so the union may
+					// lack its contributors - serving it under-covered (measured max|diff|=1.0).
+					// Record instead: the whole tile's fragments walk+append this dispatch, the bit
+					// pends at finalize, and the tile serves after the deferred promotion. This is
+					// the ONLY warm path (v3): a fresh claim's tiles are all uncertified.
+					swTileMissRec = true;
+					recordSlot = ( int )sBase;
+				}
+				else
+				{
+					// CONTINUOUS REFINEMENT: 1 in N served fragments runs the exact recording walk
+					// instead - a NEW append revokes the union (POISON), a converged eval restores
+					// it. Frozen unions were the measured CONTINUITY defect source. SPILL fragments
+					// refine 8x rarer (their record walk is the whole cluster hierarchy, ~10x a
+					// tile-list record: at 1/64 it alone regressed cap0007 term ~5 ms) - except at
+					// divisor 1, the exactness-debug config, which must stay exact everywhere.
+					const uint swRefBase = ( uint )( g_aa.w + 0.5f );
+					const uint swRefN = swRefBase * ( ( swServeListCount < 0 && swRefBase > 1u ) ? 8u : 1u );
+					if( swRefN != 0u && u_Contrib[ sBase + 3 ] < ( uint )SW_CONTRIB_K
+							&& ( ( ( uint )px.x * 7u + ( uint )px.y * 13u ) % swRefN ) == 0u )
 					{
-						// TILE-MISS: no eval from this tile has fed the union yet, so it may lack this
-						// tile's contributors - serving it under-covered (the 0.033% max|diff|=1.0
-						// verify class). Record instead: one dispatch's worth of this tile's fragments
-						// walk+append, the bit is set at finalize, and the tile serves next frame.
-						swTileMissRec = true;
+						SwContribDiag( 10u );			// refinement record volume
+						swRefineRec = true;
 						recordSlot = ( int )sBase;
 					}
-					else if( swRefN != 0u && ( ( ( uint )px.x * 7u + ( uint )px.y * 13u ) % swRefN ) == 0u )
+					else if( ( st & SW_CONTRIB_POISON ) != 0u )
 					{
-						SwContribDiag( 10u );						// refinement record volume
-						recordSlot = ( int )sBase;
+						break;							// revoked: only refinement records until convergence
 					}
 					else
 					{
 						servedBase  = ( int )( sBase + 4u );
 						servedCount = ( int )min( u_Contrib[ sBase + 3 ], ( uint )SW_CONTRIB_K );
 					}
-				}
-				else if( ( ev & SW_CONTRIB_BUILT ) != 0u && swServeListCount < 0 && swSpillN < 0 )
-				{
-					// BUILT but this fragment's tile cannot serve (corrupt/untiled): PLAIN walk.
-					// Routing these to the record path made every spill-tile fragment of a built cell
-					// run the 2-3x recording walk EVERY frame - the dominant live overhead (measured:
-					// term 30.9 -> 49-66 ms net-NEGATIVE).
-					swDgUnserv = true;
-					break;
-				}
-				else if( ( ev & SW_CONTRIB_BUILT ) != 0u )
-				{
-					// flipped THIS frame, or POISON-revoked by refinement: REFINEMENT-HASH fragments
-					// only may record; everyone else plain-walks. v1 routed ALL these fragments to the
-					// 2-3x record walk - measured 434-500k recording walks per STEADY frame (claims 0)
-					// on the cap0007 bench, term 46.8 -> 66.6 ms. The union is defined by the K'
-					// ticketed evals plus refinement convergence, not by a whole-cell stampede.
-					const uint swRefN2 = ( uint )( g_aa.w + 0.5f );
-					if( swRefN2 != 0u && ( ( ( uint )px.x * 7u + ( uint )px.y * 13u ) % swRefN2 ) == 0u )
-					{
-						SwContribDiag( 10u );	// refinement-class record (poison re-validation)
-						recordSlot = ( int )sBase;
-					}
-				}
-				else
-				{
-					// RECORDING state (not yet BUILT): the pre-walk CAS ticket below decides whether
-					// this fragment is one of the K' evaluators or plain-walks while the cell builds.
-					recordSlot = ( int )sBase;
 				}
 				break;
 			}
@@ -574,15 +607,22 @@ void main( uint3 tid : SV_DispatchThreadID )
 					InterlockedCompareExchange( u_Contrib[ sBase ], 0u, keyLo, prev );
 					if( prev == 0u )
 					{
-						u_Contrib[ sBase + 1 ] = keyHi ^ ( curGen * 0x9E3779B9u );
+						// GEN before keyHi: readers match on keyLo+keyHi, so the generation must be
+						// in place before the slot becomes matchable (else a racer frees a fresh claim)
+						u_Contrib[ sBase + SW_CONTRIB_GEN ] = curGen;
+						u_Contrib[ sBase + 1 ] = keyHi;
 						InterlockedAdd( u_Contrib[ 0 ], 1u );		// budget: one successful claim
 						InterlockedAdd( u_Contrib[ 3 ], 1u );		// stat: claimed cells
+						swTileMissRec = true;						// a fresh cell's tiles are all uncertified
 						recordSlot = ( int )sBase;
 						break;
 					}
-					if( prev == keyLo && u_Contrib[ sBase + 1 ] == ( keyHi ^ ( curGen * 0x9E3779B9u ) ) )
+					if( prev == keyLo )
 					{
-						recordSlot = ( int )sBase;					// lost the race to our own key
+						// lost the race to our own key mid-construction (keyHi/GEN may not be
+						// visible yet): record as a tile-miss - the slot's tiles are uncertified
+						swTileMissRec = true;
+						recordSlot = ( int )sBase;
 						break;
 					}
 				}
@@ -593,47 +633,6 @@ void main( uint3 tid : SV_DispatchThreadID )
 				}
 			}
 			slot = ( slot + 1u ) & capM;
-		}
-		// PRE-WALK EVAL TICKET (bounded-transient fix): only K' fragments per cell EVER run the
-		// record walk. The ticket is a CAS (never a blind add) so the count can NEVER carry into the
-		// flip-stamp bits, no matter how many fragments race: a CAS only succeeds from a value below
-		// K' with BUILT/POISON clear. Losers plain-walk while the cell builds - v1 instead recorded
-		// EVERY in-flight fragment of a claiming cell (the unbounded transient: term +20 ms).
-		// Refinement fragments (BUILT cell) keep the frozen counter and take no ticket.
-		uint swMyTicket = 0xFFFFFFFFu;
-		if( recordSlot >= 0 && swServeListCount < 0 && swSpillN < 0 )
-		{
-			// the record walk is LIST based (normal tile list or spill cluster list): a fragment with
-			// neither (corrupt/untiled) cannot record (nor ever serve its tile) - plain, no ticket
-			recordSlot = -1;
-		}
-		if( recordSlot >= 0 )
-		{
-			const uint swEvPre = u_Contrib[ ( uint )recordSlot + 2u ];
-			if( ( swEvPre & SW_CONTRIB_BUILT ) == 0u )
-			{
-				[loop] for( int swTa = 0; swTa < 4; swTa++ )
-				{
-					const uint evc = u_Contrib[ ( uint )recordSlot + 2u ];
-					if( ( evc & ( SW_CONTRIB_BUILT | SW_CONTRIB_POISON ) ) != 0u
-							|| ( evc & 0xFFFFu ) >= ( uint )g_surfCost.z )
-					{
-						break;
-					}
-					uint got;
-					InterlockedCompareExchange( u_Contrib[ ( uint )recordSlot + 2u ], evc, evc + 1u, got );
-					if( got == evc )
-					{
-						swMyTicket = evc & 0xFFFFu;
-						break;
-					}
-				}
-				if( swMyTicket == 0xFFFFFFFFu )
-				{
-					SwContribDiag( 11u );			// ticket denied: exact plain walk while the cell builds
-					recordSlot = -1;
-				}
-			}
 		}
 		// probe-outcome classification (plain-walk fall-throughs only; serve/record paths excluded):
 		// budget-blocked = the claim rate limiter, probe-exhausted = table congestion. One wave-
@@ -657,7 +656,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 		if( servedBase >= 0 )
 		{
 			// ---- SERVE: recorded static union + live dynamic casters, one Fubini grid ----
-			InterlockedAdd( u_Contrib[ 1 ], 1u );					// stat: serve hit
+			SwContribDiag( 1u );									// stat: serve hit (wave-aggregated)
 			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
 			const float swRC = max( g_lightR.w, 1e-2 );
 			uint swGrid[SW_SCAN_CHORDS];
@@ -903,8 +902,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 			// refine OFF dropped term 70.6 -> 33.5 ms). Ticketing requires a normal tile list, so
 			// swServeListCount >= 0 here always. Records STATIC tris only (index below the first
 			// dynamic tri); the fragment's own term comes from the same grid - one pass.
-			InterlockedAdd( u_Contrib[ 2 ], 1u );					// stat: recording eval
+			SwContribDiag( 2u );									// stat: recording eval (wave-aggregated)
 			bool swAppendedNew = false;								// did this eval extend the union?
+			bool swAppendGaveUp = false;							// CAS contention cap: must not certify
 			const int dynFirstTri = ( g_surfA.z < g_range.y ) ? ( int )t_SoftEdges[ g_flags.y + g_surfA.z * 2 + 1 ].x : 0x7FFFFFFF;
 			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
 			const float swRC = max( g_lightR.w, 1e-2 );
@@ -955,10 +955,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 					{
 						// ENTRIES ARE 1-BASED (rt+1): 0 marks a reserved-but-unstored slot, so concurrent
 						// serves can never read a torn entry (they skip 0s).
-						if( SwContribAppend( ( uint )recordSlot, rt ) )
-						{
-							swAppendedNew = true;
-						}
+						const int swApR = SwContribAppend( ( uint )recordSlot, rt );
+						swAppendedNew = swAppendedNew || ( swApR == 1 );
+						swAppendGaveUp = swAppendGaveUp || ( swApR == 2 );
 					}
 				}
 			}
@@ -1019,74 +1018,41 @@ void main( uint3 tid : SV_DispatchThreadID )
 					}
 					if( soloRaw2 != 0u && rt2 < dynFirstTri )
 					{
-						if( SwContribAppend( ( uint )recordSlot, rt2 ) )
-						{
-							swAppendedNew = true;
-						}
+						const int swApR2 = SwContribAppend( ( uint )recordSlot, rt2 );
+						swAppendedNew = swAppendedNew || ( swApR2 == 1 );
+						swAppendGaveUp = swAppendGaveUp || ( swApR2 == 2 );
 					}
 				}
 			}
-			// FINALIZE. Every completed record marks its TILE-COVERAGE bit (appends are done in
-			// program order for this thread; cross-thread visibility is the same relaxed model the
-			// rest of the protocol uses - a same-dispatch under-covered serve is transient and the
-			// refinement validator converges it). Ticketed evaluators (swMyTicket valid) counted
-			// themselves via the pre-walk CAS; EXACTLY the holder of ticket K'-1 flips BUILT.
-			// Refinement fragments (no ticket, BUILT cell, tile already covered) resolve the
-			// revoke/converge outcome - and ONLY they: a ticketed straggler or a tile-miss fill-in
-			// legitimately appends (poisoning on those would revoke every freshly built cell /
-			// every newly joined tile).
-			// ONLY a tile-miss record certifies its tile: it is a FULL-TILE evaluation (every fragment
-			// of the tile records that dispatch), so the union provably holds that tile's contributors.
-			// Warm-phase ticket winners must NOT set bits - K' wave-order tickets cluster, and a
-			// shadow-boundary tile certified by K' lit fragments served an EMPTY union to its shadowed
-			// pixels (the persistent max|diff|=1.0 verify class).
-			if( swTileMissRec )
+			// FINALIZE (v3). A TILE-MISS record certifies its tile - it is a FULL-TILE evaluation, so
+			// the union provably holds that tile's contributors - unless an append gave up under CAS
+			// contention (the tile then re-records next frame instead of certifying incompletely).
+			// PEND, never LIVE directly: stamp PENDFRAME FIRST so concurrent probers stop promoting
+			// this frame, THEN pend the bit - the deferred promotion makes the tile servable only
+			// after every recorder of this dispatch has finalized its appends.
+			if( swTileMissRec && !swAppendGaveUp )
 			{
-				// PEND (never LIVE directly): stamp PENDFRAME FIRST so concurrent probers stop
-				// promoting this frame, THEN pend the bit - the promotion in a later frame makes
-				// it servable only after every recorder of this dispatch has finalized its appends
 				uint swTbDummy;
 				InterlockedExchange( u_Contrib[ ( uint )recordSlot + SW_CONTRIB_TILEPFR ], ( uint )g_surfA.y & 0x7FFFu, swTbDummy );
 				InterlockedOr( u_Contrib[ ( uint )recordSlot + SW_CONTRIB_TILEPEND ], swTileBit, swTbDummy );
 			}
-			const uint swEvNow = u_Contrib[ ( uint )recordSlot + 2 ];
-			if( ( swEvNow & SW_CONTRIB_BUILT ) != 0u && swMyTicket == 0xFFFFFFFFu && !swTileMissRec )
+			else if( swRefineRec )
 			{
-				// REFINEMENT outcome on a BUILT cell: a NEW contributor means the served union was
-				// incomplete for this view - REVOKE serving (POISON) until a later eval converges
-				// (appends nothing new), which restores BUILT service with a fresh flip stamp.
+				// REFINEMENT outcome: a NEW contributor means the served union was incomplete for
+				// this view - REVOKE serving (POISON) until a later eval converges (appends nothing
+				// new), which restores service. Only the validator renders this verdict: a tile-miss
+				// fill-in legitimately appends (poisoning on it would revoke every newly joined tile).
 				if( swAppendedNew )
 				{
 					uint pz2;
 					InterlockedOr( u_Contrib[ ( uint )recordSlot + 2 ], SW_CONTRIB_POISON, pz2 );
 				}
-				else if( ( swEvNow & SW_CONTRIB_POISON ) != 0u
-						 && u_Contrib[ ( uint )recordSlot + 3 ] <= ( uint )SW_CONTRIB_K )
+				else if( u_Contrib[ ( uint )recordSlot + 3 ] < ( uint )SW_CONTRIB_K )
 				{
 					// converged: this full eval found every contributor already recorded
 					uint pz3;
 					InterlockedAnd( u_Contrib[ ( uint )recordSlot + 2 ], ~SW_CONTRIB_POISON, pz3 );
 				}
-				int swCovS = 0;
-				[unroll] for( int cs2 = 0; cs2 < SW_SCAN_CHORDS; cs2++ )
-				{
-					swCovS += SoftPopcount32( swGrid[cs2] & swDiskMask[cs2] );
-				}
-				if( swCovS * 100 >= swDiskBits * 99 )
-				{
-					swCovS = swDiskBits;		// plain-walk umbra rounding, matched exactly
-				}
-				u_Term[ uint2( px + g_tile.zw ) ] = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovS / ( float )swDiskBits : 0.0 );
-				return;
-			}
-			if( swMyTicket != 0xFFFFFFFFu
-					&& swMyTicket + 1u == ( uint )g_surfCost.z
-					&& u_Contrib[ ( uint )recordSlot + 3 ] <= ( uint )SW_CONTRIB_K )
-			{
-				uint dummy;
-				// stamp the flip FRAME (bits 16-30) with the BUILT bit so serving defers one frame
-				// (no pool release: the claim counter is per-frame now and resets on the CPU)
-				InterlockedOr( u_Contrib[ ( uint )recordSlot + 2 ], SW_CONTRIB_BUILT | ( ( ( uint )g_surfA.y & 0x7FFFu ) << 16 ), dummy );
 			}
 			int swCovR = 0;
 			[unroll] for( int cr = 0; cr < SW_SCAN_CHORDS; cr++ )

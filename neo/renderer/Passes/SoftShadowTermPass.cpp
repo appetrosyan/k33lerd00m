@@ -264,10 +264,10 @@ void SoftShadowTermPass::EnsurePipeline()
 
 			extern idCVar r_softShadowContribCap;
 			nvrhi::BufferDesc cbd;
-			// header (16 uints: pool occupancy + stats) + cap slots x (4 + 64 entries + 3 tile-coverage
-			// words: live mask, pending mask, pend-frame) uints - must match SW_CONTRIB_STRIDE in
+			// header (24 uints: pool occupancy + stats) + cap slots x (4 + 64 entries + 4 words: tile
+			// live/pending/pend-frame + generation) uints - must match SW_CONTRIB_STRIDE/HEADER in
 			// softterm.cs.hlsl
-			cbd.byteSize = ( uint64_t )( 24 + ( uint64_t )r_softShadowContribCap.GetInteger() * 71 ) * sizeof( uint32_t );
+			cbd.byteSize = ( uint64_t )( 24 + ( uint64_t )r_softShadowContribCap.GetInteger() * 72 ) * sizeof( uint32_t );
 			cbd.structStride = sizeof( uint32_t );
 			cbd.canHaveUAVs = true;
 			cbd.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -596,10 +596,9 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	{
 		// contributor-cache fields (the contrib permutation reuses the surf CB slots; the two
 		// permutations are mutually exclusive, so the meanings cannot collide at runtime)
-		extern idCVar r_softShadowContribG, r_softShadowContribEvalK, r_softShadowContribPool, r_softShadowContribCap;
+		extern idCVar r_softShadowContribG, r_softShadowContribPool, r_softShadowContribCap;
 		cb.surfParams[0] = r_softShadowContribG.GetFloat();							// cell size G
 		cb.surfParams[1] = ( r_softShadowContribCache.GetInteger() == 2 ) ? 1.0f : 0.0f;	// SERVE-VERIFY mode
-		cb.surfCost[2] = r_softShadowContribEvalK.GetInteger();						// eval threshold K'
 		cb.surfCost[3] = r_softShadowContribCap.GetInteger();						// table capacity (slots)
 		cb.surfA[1] = ( int )( m_ContribTick & 0x7FFF );							// flip-frame stamp (serve-defer race fix; own tick - tr.frameCount is dead in minimal-init)
 		cb.surfA[2] = vLight->softStaticCasterCount;								// dynamic caster suffix start

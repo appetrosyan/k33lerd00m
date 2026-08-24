@@ -1082,6 +1082,17 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 
 	uint swMask = 0u;						// bit i set once sample i's ray is blocked by any triangle (union)
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+#if SW_SCANLINE
+	// Fubini scanline port for the UNBINNED full walk - the last coverage path still on 16-sample
+	// disk coverage after the tile-list and cluster-list ports. Any light that misses the bin/term
+	// budget in a contended frame (many soft lights: cutscene closeups) fell back here, so the
+	// frame mixed exact interval unions with sampled coverage - the playtest-visible "ants" that
+	// the per-light gate (which never contends) structurally cannot reproduce.
+	uint swGrid[SW_SCAN_CHORDS];
+	uint swDiskMask[SW_SCAN_CHORDS];
+	int  swDiskBits = 0;
+	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = 0u; swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftPopcount32( swDiskMask[gi] ); }
+#endif
 	SW_BKT_DECL
 #if SW_FACE_PROFILE
 	// keeps the probed stages LIVE: the accumulator feeds an unprovable branch at the end, so the
@@ -1154,6 +1165,15 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 #if SW_FACE_PROFILE == 2
 			swProbe += cd; continue;		// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
 #endif
+#if SW_SCANLINE
+			SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini interval union
+			{
+				// UMBRA EARLY-OUT + rounding, identical to the tile-list/cluster scanline walkers
+				int swCovE = 0;
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
+				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+			}
+#else
 			float3 edge1 = v1 - v0;
 			float3 edge2 = v2 - v0;
 			float3 sp = swP - v0;
@@ -1192,9 +1212,20 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			}
 #endif	// SW_FP16_LOOP
 			if( swMask == swAll ) { break; }	// every sample blocked: fully in umbra
+#endif	// SW_SCANLINE
 		}
+#if !SW_SCANLINE
 		if( swMask == swAll ) { break; }		// umbra: no caster can add anything
+#endif
 	}
+#if SW_SCANLINE
+	{
+		int swCovF = 0;
+		for( int cmf = 0; cmf < SW_SCAN_CHORDS; cmf++ ) { swCovF += SoftPopcount32( swGrid[cmf] & swDiskMask[cmf] ); }
+		SW_BKT_FLUSH( swMask, swAll );
+		return swDiskBits > 0 ? ( float )swCovF / ( float )swDiskBits : 0.0f;
+	}
+#endif
 	// Morphological CLOSE: seal INTERIOR tessellation cracks without touching the penumbra. A sample ray that
 	// threads a T-junction / brush-seam gap is reported lit even deep in the umbra. Uniform barycentric dilation
 	// would seal them but also expands the OUTER silhouette, over-darkening the penumbra toe (measured +0.35 bias).

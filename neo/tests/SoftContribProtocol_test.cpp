@@ -12,29 +12,27 @@ version. See <http://www.gnu.org/licenses/>.
 ===========================================================================
 */
 
-// CONTRIBUTOR-CACHE PROTOCOL SIM. A CPU replica of the softterm.cs.hlsl contrib slot protocol
-// (claim / eval ticket / append / flip / poison / refinement / serve-defer / per-frame claim
-// budget) run under deterministic adversarial interleavings, at micro-op granularity for exactly
-// the operations whose ordering the GPU does not sequence: the claim CAS, the ticket add, the
-// triCount reserve vs the entry store, and the BUILT flip vs same-dispatch stragglers.
+// CONTRIBUTOR-CACHE PROTOCOL SIM, v3 (BUILT-at-claim). A CPU replica of the softterm.cs.hlsl
+// contrib slot protocol run under deterministic adversarial interleavings at micro-op granularity
+// for the operations the GPU does not sequence (claim CAS, triCount reserve vs entry store,
+// pend-frame stamp vs pend write, generation reclaim).
 //
-// This is NOT a coverage test - there is no geometry. Each fragment carries a synthetic
-// "observed contributor set" (a subset of its cell's ground-truth union); the protocol's job is
-// to build the union from bounded evaluations and never serve wrong/torn state. The properties
-// asserted here are the spec for the TICKET-GATED protocol (the eval ticket taken BEFORE the
-// record walk):
-//   1. record walks per cell  <=  K' + scheduler concurrency (bounded transient),
-//   2. no serve on the flip frame; no serve of a POISONed cell; no torn (zero) entry served,
-//   3. the per-frame budget admits min(budget, demand) unique claims - no clog, no overshoot
-//      beyond in-flight concurrency,
-//   4. refinement: an eval that appends a new contributor revokes serving (POISON) until a
-//      converged eval restores it; overflow ( > K entries ) poisons permanently,
-//   5. quiescence: once no eval appends anything new, every fragment either serves the full
-//      union of what refinement has observed, or its cell is poisoned (exact walk) - never an
-//      under-covering serve that refinement cannot repair.
-// A negative control runs the SAME machine with the ticket taken AFTER the walk (the v1 shader
-// order) and asserts the transient is unbounded there - proving the instrument detects the
-// defect this spec exists to kill.
+// v3 spec (the machine this file is the executable spec for):
+//   - CLAIM plants the key + generation; there is no eval counter, no tickets, no BUILT flip.
+//   - The ONLY warm path is the TILE-MISS record: a fragment whose tile's LIVE bit is unset runs
+//     the full record walk (its whole tile does, that dispatch), then stamps PENDFRAME and pends
+//     its tile bit. Pends promote to LIVE only in a later frame with no same-frame finalize.
+//   - SERVE requires: key+generation match, not permanently poisoned, tile LIVE bit set.
+//   - REFINEMENT: 1-in-N served fragments run the exact record walk instead; a NEW append revokes
+//     (POISON), a converged eval (nothing new, triCount <= K) restores. Permanently overflowed
+//     cells (POISON && triCount > K) take the plain walk - no refinement, no recording.
+//   - GENERATION RECLAIM: a probe finding its cell's slot with a stale generation CAS-reclaims it
+//     in place (clear LIVE/PEND/triCount/state, publish the new generation); losers see LIVE=0
+//     and become tile-miss recorders.
+// NOTE on the deferral negative control: within this sim each frame's batch runs to completion
+// before the next frame, so cross-frame incomplete-union serves are unrepresentable by
+// construction - the pend/live deferral property is asserted positively (no serve of a tile
+// before a later-frame promotion), not by a broken-variant control.
 
 #include "idUnitTest.h"
 
@@ -42,33 +40,34 @@ version. See <http://www.gnu.org/licenses/>.
 #include <set>
 #include <cstdint>
 
-namespace swcontrib
+namespace swcontrib3
 {
 
-// ---- tunables mirroring the shader defines (small K so overflow paths are reachable) ----------
 static const int K_ENTRIES  = 16;		// SW_CONTRIB_K analogue (entry capacity)
-static const uint32_t BUILT  = 0x80000000u;
 static const uint32_t POISON = 0x40000000u;
 
 struct Slot
 {
 	uint32_t keyLo = 0;
-	uint32_t ev = 0;				// evalCount | BUILT | POISON | flipFrame<<16
+	uint32_t state = 0;					// POISON bit only (v3: no BUILT, no counters)
 	uint32_t triCount = 0;
 	uint32_t entries[K_ENTRIES] = {};	// 1-based tri ids, 0 = reserved-not-stored
+	uint32_t live = 0;					// promoted tile-coverage mask
+	uint32_t pend = 0;					// this-frame pended tile bits
+	uint32_t pendFrame = 0xFFFFFFFFu;	// frame of the last pend write
+	uint32_t gen = 0;					// slot generation (reclaim on mismatch)
 };
 
 struct Table
 {
 	std::vector<Slot> slots;
-	uint32_t pool = 0;				// header[0]: per-frame successful-claim counter
-	int recordWalks = 0;			// instrument: full record walks executed (the overhead)
-	int appends = 0;				// instrument: entry stores (quiescence = appends stop, walks may refine forever)
+	uint32_t pool = 0;					// header[0]: per-frame successful-claim counter
+	int recordWalks = 0;
+	int appends = 0;
 	int serves = 0;
 	Table( int n ) : slots( n ) {}
 };
 
-// deterministic LCG - the scheduler's only randomness source (seeded per test run)
 struct Rng
 {
 	uint64_t s;
@@ -80,81 +79,116 @@ struct Rng
 	}
 };
 
-// A fragment's interaction with the protocol, decomposed into resumable micro-ops. step() returns
-// false when the fragment is done. The scheduler interleaves step() calls across in-flight
-// fragments - each step is one "atomic" unit; everything the GPU can reorder is split across steps.
+// A fragment's protocol interaction as resumable micro-ops; the scheduler interleaves Step()
+// calls across in-flight fragments. Everything the GPU can reorder is split across steps.
 struct Fragment
 {
 	// inputs
-	int cell = 0;						// slot index (direct-mapped: the hash probe is not under test)
+	int cell = 0;
 	uint32_t key = 0;
-	std::vector<int> observed;			// this fragment's true contributor set (1-based ids)
-	bool refinementHash = false;		// the 1-in-64 pixel hash analogue
+	int tile = 0;						// tile index -> bit (1u << tile), tile < 32
+	std::vector<int> observed;			// true contributor set at this fragment (1-based ids)
+	bool refinementHash = false;
 	int frame = 0;
+	uint32_t gen = 0;					// current generation for this cell's light
+	uint32_t budget = 0;
 
-	// protocol config
-	bool ticketGate = true;				// spec order (ticket BEFORE walk); false = v1 defect order
-	int evalK = 8;						// K' threshold
-	uint32_t budget = 0;				// per-frame claim budget
-
-	// state machine
 	enum Phase { P_PROBE, P_WALK, P_APPEND_RESERVE, P_APPEND_STORE, P_FINALIZE, P_DONE };
 	Phase phase = P_PROBE;
-	bool recording = false;
+	bool tileMissRec = false;
+	bool refineRec = false;
 	bool appendedNew = false;
-	uint32_t myTicket = 0xFFFFFFFFu;
-	size_t appendIdx = 0;				// cursor over `observed` during append
-	int pendingStore = -1;				// reserved entry index awaiting store (the torn window)
+	bool appendGaveUp = false;			// CAS contention cap hit: tile must not certify
+	int appendTries = 0;				// per-id CAS retry counter
+	size_t appendIdx = 0;
+	int pendingStore = -1;
 	int pendingVal = 0;
 
 	// outputs
 	bool served = false;
-	std::set<int> servedUnion;			// what a serve read (must never contain 0/torn garbage)
+	std::set<int> servedUnion;
 	bool plainWalk = false;
+	bool recorded = false;
 
 	bool Step( Table& t )
 	{
 		Slot& s = t.slots[cell];
+		const uint32_t tileBit = 1u << ( uint32_t )tile;
 		switch( phase )
 		{
 			case P_PROBE:
 			{
 				if( s.keyLo == 0 )
 				{
-					// claim CAS: racy pool pre-check then increment on success (mirrors the shader)
 					if( t.pool < budget )
 					{
-						s.keyLo = key;		// single-threaded scheduler = the CAS always wins here
+						s.keyLo = key;					// claim CAS (single-threaded scheduler wins)
+						s.gen = gen;
 						t.pool++;
-						recording = true;
-						phase = P_WALK;
-					}
-					else
-					{
-						plainWalk = true;	// budget exhausted
-						phase = P_DONE;
-					}
-					return phase != P_DONE;
-				}
-				const uint32_t ev = s.ev;
-				const uint32_t flipFrame = ( ev >> 16 ) & 0x7FFFu;
-				if( ( ev & POISON ) != 0 && ( ev & BUILT ) == 0 )
-				{
-					plainWalk = true;		// pre-flip overflow: never record, never serve
-					phase = P_DONE;
-					return false;
-				}
-				if( ( ev & BUILT ) != 0 && ( ev & POISON ) == 0 && flipFrame != ( uint32_t )( frame & 0x7FFF ) )
-				{
-					if( refinementHash )
-					{
-						recording = true;	// refinement: exact walk + append check
+						tileMissRec = true;				// claimer's tile is uncertified by construction
 						phase = P_WALK;
 						return true;
 					}
-					// SERVE: snapshot the entries, skipping torn zeros
-					served = true;
-					t.serves++;
+					plainWalk = true;
+					phase = P_DONE;
+					return false;
+				}
+				// GENERATION RECLAIM = FREE the slot: the winner CASes keyLo to a freeing sentinel
+				// (everyone else plain-walks this frame - the sentinel matches neither key nor
+				// vacancy), clears state/counts/masks AND the entries (claim-by-value scans to the
+				// first zero, so stale non-zero entries would both survive a count reset and break
+				// the scan), then publishes keyLo = 0 LAST. The cell re-enters through the normal
+				// budget-gated claim next frame - no reader can ever observe a half-cleared slot
+				// under a live key.
+				if( s.gen != gen )
+				{
+					s.keyLo = 0xFFFFFFFFu;				// the freeing CAS (single-threaded step = atomic)
+					s.state = 0;
+					s.triCount = 0;
+					s.live = 0;
+					s.pend = 0;
+					for( int ei = 0; ei < K_ENTRIES; ei++ )
+					{
+						s.entries[ei] = 0;
+					}
+					s.gen = 0;
+					s.keyLo = 0;						// publish the vacancy LAST
+					plainWalk = true;
+					phase = P_DONE;
+					return false;
+				}
+				// PROMOTE pends -> live, only when no record finalized this frame
+				if( s.pendFrame != ( uint32_t )frame && s.pend != 0 )
+				{
+					s.live |= s.pend;
+				}
+				if( ( s.state & POISON ) != 0 && s.triCount >= ( uint32_t )K_ENTRIES )
+				{
+					plainWalk = true;					// permanent overflow: no serve, no refinement
+					phase = P_DONE;
+					return false;
+				}
+				if( ( s.live & tileBit ) == 0 )
+				{
+					tileMissRec = true;					// tile uncertified: full-tile record
+					phase = P_WALK;
+					return true;
+				}
+				if( refinementHash && s.triCount < ( uint32_t )K_ENTRIES )
+				{
+					refineRec = true;
+					phase = P_WALK;
+					return true;
+				}
+				if( ( s.state & POISON ) != 0 )
+				{
+					plainWalk = true;					// revoked: only refinement records
+					phase = P_DONE;
+					return false;
+				}
+				served = true;							// SERVE: snapshot entries (skip torn zeros)
+				t.serves++;
+				{
 					const uint32_t have = s.triCount < ( uint32_t )K_ENTRIES ? s.triCount : ( uint32_t )K_ENTRIES;
 					for( uint32_t i = 0; i < have; i++ )
 					{
@@ -163,58 +197,14 @@ struct Fragment
 							servedUnion.insert( ( int )s.entries[i] );
 						}
 					}
-					phase = P_DONE;
-					return false;
 				}
-				if( ( ev & BUILT ) != 0 && ( ev & POISON ) != 0 )
-				{
-					// BUILT+POISON (refinement revoked): spec = only the refinement hash records
-					if( refinementHash )
-					{
-						recording = true;
-						phase = P_WALK;
-						return true;
-					}
-					plainWalk = true;
-					phase = P_DONE;
-					return false;
-				}
-				if( ( ev & BUILT ) != 0 )
-				{
-					// BUILT but not serveable THIS frame (flip-frame defer / poison handled above).
-					// SPEC: plain walk - no ticket, no recording. v1 let these stragglers record
-					// (the unbounded "record-through-flip"), which the negative control preserves.
-					if( ticketGate )
-					{
-						plainWalk = true;
-						phase = P_DONE;
-						return false;
-					}
-					recording = true;
-				}
-				else if( ticketGate )
-				{
-					// SPEC ORDER: take the eval ticket BEFORE the walk; losers plain-walk
-					myTicket = s.ev & 0xFFFFu;
-					if( ( int )myTicket >= evalK )
-					{
-						plainWalk = true;	// tickets exhausted, waiting for flip
-						phase = P_DONE;
-						return false;
-					}
-					s.ev++;					// the InterlockedAdd
-					recording = true;
-				}
-				else
-				{
-					recording = true;		// v1 order: everyone records, ticket taken at the end
-				}
-				phase = P_WALK;
-				return true;
+				phase = P_DONE;
+				return false;
 			}
 			case P_WALK:
 			{
-				t.recordWalks++;			// THE overhead being bounded
+				t.recordWalks++;
+				recorded = true;
 				appendIdx = 0;
 				appendedNew = false;
 				phase = P_APPEND_RESERVE;
@@ -222,33 +212,55 @@ struct Fragment
 			}
 			case P_APPEND_RESERVE:
 			{
-				// dedup scan + reserve, one observed contributor per step
+				// CLAIM-BY-VALUE append: scan to the first ZERO entry (entries are published by the
+				// id CAS itself, so no reserved-unstored gaps exist and the list stays contiguous),
+				// then CAS the id into that slot in the NEXT step (the adversarial window). Count-
+				// reserve schemes let torn-window duplicates inflate triCount - a full-tile dispatch
+				// racing the same 3 contributors blew 6 distinct ids to 16 reservations and
+				// spuriously overflow-POISONed the cell (caught by this sim; the v2 shader has the
+				// same flaw). triCount becomes an advisory InterlockedMax.
 				while( appendIdx < observed.size() )
 				{
 					const int id = observed[appendIdx];
-					const uint32_t have = s.triCount < ( uint32_t )K_ENTRIES ? s.triCount : ( uint32_t )K_ENTRIES;
-					bool dup = false;
-					for( uint32_t i = 0; i < have && !dup; i++ )
+					if( appendTries >= K_ENTRIES + 16 )
 					{
-						dup = ( s.entries[i] == ( uint32_t )id );
-					}
-					appendIdx++;
-					if( dup )
-					{
+						appendGaveUp = true;			// contention cap: do not certify this tile
+						appendTries = 0;
+						appendIdx++;
 						continue;
 					}
-					appendedNew = true;
-					const uint32_t at = s.triCount++;	// InterlockedAdd reserve
-					if( at < ( uint32_t )K_ENTRIES )
+					int idx = -1;
+					bool dup = false;
+					for( int i = 0; i < K_ENTRIES; i++ )
 					{
-						pendingStore = ( int )at;		// store happens NEXT step: the torn window
-						pendingVal = id;
-						phase = P_APPEND_STORE;
+						if( s.entries[i] == ( uint32_t )id )
+						{
+							dup = true;
+							break;
+						}
+						if( s.entries[i] == 0 )
+						{
+							idx = i;
+							break;
+						}
 					}
-					else
+					if( dup )
 					{
-						s.ev |= POISON;					// overflow
+						appendTries = 0;
+						appendIdx++;
+						continue;
 					}
+					if( idx < 0 )
+					{
+						s.state |= POISON;				// K DISTINCT contributors exceeded: genuine overflow
+						s.triCount = ( uint32_t )K_ENTRIES;
+						appendTries = 0;
+						appendIdx++;
+						continue;
+					}
+					pendingStore = idx;					// CAS attempt happens next step (the race window)
+					pendingVal = id;
+					phase = P_APPEND_STORE;
 					return true;
 				}
 				phase = P_FINALIZE;
@@ -256,41 +268,45 @@ struct Fragment
 			}
 			case P_APPEND_STORE:
 			{
-				t.appends++;
-				s.entries[pendingStore] = ( uint32_t )pendingVal;
+				// the id CAS: publish-by-value; a loser rescans (the winner's entry may be our id)
+				if( s.entries[pendingStore] == 0 )
+				{
+					s.entries[pendingStore] = ( uint32_t )pendingVal;
+					if( s.triCount < ( uint32_t )( pendingStore + 1 ) )
+					{
+						s.triCount = ( uint32_t )( pendingStore + 1 );	// InterlockedMax analogue
+					}
+					t.appends++;
+					appendedNew = true;
+					appendTries = 0;
+					appendIdx++;
+				}
+				else
+				{
+					appendTries++;						// slot taken since the scan: retry this id
+				}
 				pendingStore = -1;
 				phase = P_APPEND_RESERVE;
 				return true;
 			}
 			case P_FINALIZE:
 			{
-				const uint32_t evNow = s.ev;
-				// refinement outcome resolves ONLY for ticketless fragments: a ticketed straggler
-				// finishing after the flip legitimately extended the union and must not poison
-				const bool ticketed = ticketGate && myTicket != 0xFFFFFFFFu;
-				if( ( evNow & BUILT ) != 0 && !ticketed )
+				if( tileMissRec && !appendGaveUp )
 				{
-					// refinement outcome (or v1 straggler on a flipped cell)
+					// stamp FIRST (blocks same-frame promotion), then pend the bit
+					s.pendFrame = ( uint32_t )frame;
+					s.pend |= tileBit;
+				}
+				else if( refineRec )
+				{
 					if( appendedNew )
 					{
-						s.ev |= POISON;					// revoke serving
+						s.state |= POISON;				// union was incomplete: revoke serving
 					}
-					else if( ( evNow & POISON ) != 0 && s.triCount <= ( uint32_t )K_ENTRIES )
+					else if( ( s.state & POISON ) != 0 && s.triCount < ( uint32_t )K_ENTRIES )
 					{
-						s.ev &= ~POISON;				// converged: restore service
+						s.state &= ~POISON;				// converged: restore
 					}
-					phase = P_DONE;
-					return false;
-				}
-				if( !ticketGate )
-				{
-					myTicket = s.ev & 0xFFFFu;			// v1: ticket AFTER the walk
-					s.ev++;
-				}
-				if( ( int )myTicket + 1 == evalK && s.triCount <= ( uint32_t )K_ENTRIES )
-				{
-					// the K'-th evaluator flips BUILT with the flip-frame stamp
-					s.ev = ( s.ev & 0xFFFFu ) | BUILT | ( ( uint32_t )( frame & 0x7FFF ) << 16 );
 				}
 				phase = P_DONE;
 				return false;
@@ -301,7 +317,6 @@ struct Fragment
 	}
 };
 
-// scheduler: run `frags` to completion with `width` in flight, interleaved by rng
 static void RunInterleaved( Table& t, std::vector<Fragment>& frags, int width, Rng& rng )
 {
 	std::vector<size_t> inflight;
@@ -324,115 +339,95 @@ static void RunInterleaved( Table& t, std::vector<Fragment>& frags, int width, R
 	}
 }
 
-// build one frame's fragment batch for a cell: nFrags fragments, each observing a deterministic
-// subset of the cell's ground-truth union (all of it collectively within the first evalK frags)
-static std::vector<Fragment> MakeBatch( int cell, int frame, int nFrags, const std::vector<int>& truth,
-										bool ticketGate, int evalK, uint32_t budget, Rng& rng )
+// one frame's fragments for a cell: nPerTile fragments in each of nTiles tiles; a tile-T fragment
+// observes the per-tile contributor triple truth[T]
+static std::vector<Fragment> MakeBatch( int cell, int frame, int nTiles, int nPerTile,
+										const std::vector<std::vector<int>>& truth,
+										uint32_t gen, uint32_t budget, Rng& rng )
 {
 	std::vector<Fragment> v;
-	v.reserve( nFrags );
-	for( int i = 0; i < nFrags; i++ )
+	v.reserve( ( size_t )nTiles * nPerTile );
+	for( int tl = 0; tl < nTiles; tl++ )
 	{
-		Fragment f;
-		f.cell = cell;
-		f.key = ( uint32_t )( cell + 1 );
-		f.frame = frame;
-		f.ticketGate = ticketGate;
-		f.evalK = evalK;
-		f.budget = budget;
-		f.refinementHash = ( ( i * 7 + frame * 13 ) & 63 ) == 0;
-		// observed subset: 3 contributors starting at a rotating offset -> the union of any evalK
-		// consecutive fragments covers `truth` when evalK >= truth.size()
-		for( int k = 0; k < 3; k++ )
+		for( int i = 0; i < nPerTile; i++ )
 		{
-			f.observed.push_back( truth[( i + k * ( int )( rng.Next() % 3 + 1 ) ) % truth.size()] );
+			Fragment f;
+			f.cell = cell;
+			f.key = ( uint32_t )( cell + 1 );
+			f.tile = tl;
+			f.frame = frame;
+			f.gen = gen;
+			f.budget = budget;
+			f.refinementHash = ( ( i * 7 + tl * 3 + frame * 13 ) & 63 ) == 0;
+			f.observed = truth[tl];
+			( void )rng;
+			v.push_back( f );
 		}
-		v.push_back( f );
 	}
 	return v;
 }
 
-}	// namespace swcontrib
+}	// namespace swcontrib3
 
-using namespace swcontrib;
+using namespace swcontrib3;
 
-// 1 + 3: bounded record transient under the ticket gate, budget admits demand, across seeds
-TEST( SoftContribProtocol, TicketGateBoundsRecordWalks )
+// warm shape + steady bound: frame 0 = one full-record dispatch per tile (claim path), frame 1 =
+// pends promote and EVERY certified-tile fragment serves the complete union; steady recording is
+// refinement-only. Across seeds.
+TEST( SoftContribProtocolV3, TileMissRecordsOnceThenServes )
 {
+	const std::vector<std::vector<int>> truth = { { 1, 2, 3 }, { 4, 5 }, { 6 } };
 	for( uint64_t seed = 1; seed <= 24; seed++ )
 	{
 		Rng rng( seed );
 		Table t( 4 );
-		const int WIDTH = 16;			// in-flight concurrency (the overshoot bound)
-		const int EVALK = 8;
-		const std::vector<int> truth = { 1, 2, 3, 4, 5, 6 };
-		int walksFrame0;
+		const int PER_TILE = 20;
+		std::vector<Fragment> f0 = MakeBatch( 0, 0, 3, PER_TILE, truth, /*gen*/ 1, /*budget*/ 8, rng );
+		RunInterleaved( t, f0, 16, rng );
+		// frame 0: every fragment records (all tiles uncertified) - bounded by the dispatch itself
+		CHECK( t.recordWalks == 3 * PER_TILE );
+		CHECK( t.pool == 1 );
+		for( const Fragment& f : f0 )
 		{
-			std::vector<Fragment> b = MakeBatch( 0, /*frame*/ 0, /*nFrags*/ 256, truth, true, EVALK, /*budget*/ 8, rng );
-			RunInterleaved( t, b, WIDTH, rng );
-			walksFrame0 = t.recordWalks;
-			// SPEC 1: the claim-frame transient is bounded by K' + concurrency, NOT by fragment count
-			CHECK( walksFrame0 <= EVALK + WIDTH );
-			// SPEC 3: exactly one unique claim consumed (one cell)
-			CHECK( t.pool == 1 );
-			// no serve on the flip frame (SPEC 2): nothing served in frame 0
-			for( const Fragment& f : b )
+			CHECK_FALSE( f.served );		// no serve before promotion (deferral property)
+		}
+		// frame 1: pends promoted, everyone serves except the refinement hash
+		t.pool = 0;
+		std::vector<Fragment> f1 = MakeBatch( 0, 1, 3, PER_TILE, truth, 1, 8, rng );
+		RunInterleaved( t, f1, 16, rng );
+		int served = 0, refined = 0;
+		std::set<int> want;
+		for( const auto& tt : truth )
+		{
+			want.insert( tt.begin(), tt.end() );
+		}
+		for( const Fragment& f : f1 )
+		{
+			if( f.served )
 			{
-				CHECK_FALSE( f.served );
+				served++;
+				CHECK( f.servedUnion == want );	// complete union - every tile's contributors present
+			}
+			if( f.recorded )
+			{
+				refined++;
 			}
 		}
-		{
-			t.pool = 0;					// per-frame CPU reset
-			std::vector<Fragment> b = MakeBatch( 0, /*frame*/ 1, 256, truth, true, EVALK, 8, rng );
-			RunInterleaved( t, b, WIDTH, rng );
-			// steady state: recording is refinement-only (SPEC 1 steady form)
-			int refiners = 0;
-			for( const Fragment& f : b )
-			{
-				refiners += f.refinementHash ? 1 : 0;
-			}
-			CHECK( t.recordWalks - walksFrame0 <= refiners );
-			// serves happened and never contain a torn zero or an id outside truth (SPEC 2)
-			int served = 0;
-			for( const Fragment& f : b )
-			{
-				if( f.served )
-				{
-					served++;
-					for( int id : f.servedUnion )
-					{
-						CHECK( id >= 1 && id <= ( int )truth.size() );
-					}
-				}
-			}
-			CHECK( served > 0 );
-		}
+		CHECK( served + refined == 3 * PER_TILE );
+		CHECK( refined <= 3 );					// steady recording = refinement-only
 	}
 }
 
-// negative control: the v1 order (ticket AFTER the walk) is unbounded - every fragment of the
-// claim dispatch records. Proves this harness detects the defect the spec kills.
-TEST( SoftContribProtocol, V1OrderTransientIsUnbounded )
+// budget clamps unique claims per frame to min(budget, demand); the rest claim next frame
+TEST( SoftContribProtocolV3, BudgetAdmitsDemandWithoutClog )
 {
-	Rng rng( 7 );
-	Table t( 4 );
-	const std::vector<int> truth = { 1, 2, 3, 4, 5, 6 };
-	std::vector<Fragment> b = MakeBatch( 0, 0, 256, truth, /*ticketGate*/ false, 8, 8, rng );
-	RunInterleaved( t, b, 16, rng );
-	CHECK( t.recordWalks > 8 + 16 );	// far beyond K' + concurrency: the live 49.5ms-vs-30.9 defect
-}
-
-// 3: budget clamps unique claims per frame to min(budget, demand); next frame admits the rest
-TEST( SoftContribProtocol, BudgetAdmitsDemandWithoutClog )
-{
+	const std::vector<std::vector<int>> truth = { { 1, 2 } };
 	Rng rng( 11 );
 	Table t( 64 );
-	const std::vector<int> truth = { 1, 2, 3 };
-	// 32 distinct cells demand claims, budget 8: exactly 8 unique claims this frame
 	std::vector<Fragment> all;
 	for( int c = 0; c < 32; c++ )
 	{
-		std::vector<Fragment> b = MakeBatch( c, 0, 2, truth, true, 8, /*budget*/ 8, rng );
+		std::vector<Fragment> b = MakeBatch( c, 0, 1, 2, truth, 1, /*budget*/ 8, rng );
 		all.insert( all.end(), b.begin(), b.end() );
 	}
 	RunInterleaved( t, all, 16, rng );
@@ -443,12 +438,11 @@ TEST( SoftContribProtocol, BudgetAdmitsDemandWithoutClog )
 		claimed += ( s.keyLo != 0 ) ? 1 : 0;
 	}
 	CHECK( claimed == 8 );
-	// frame 1: pool resets, the NEXT 8 cells claim - no clog (the held-ticket model's failure)
 	t.pool = 0;
 	std::vector<Fragment> again;
 	for( int c = 0; c < 32; c++ )
 	{
-		std::vector<Fragment> b = MakeBatch( c, 1, 2, truth, true, 8, 8, rng );
+		std::vector<Fragment> b = MakeBatch( c, 1, 1, 2, truth, 1, 8, rng );
 		again.insert( again.end(), b.begin(), b.end() );
 	}
 	RunInterleaved( t, again, 16, rng );
@@ -460,29 +454,29 @@ TEST( SoftContribProtocol, BudgetAdmitsDemandWithoutClog )
 	CHECK( claimed == 16 );
 }
 
-// 4: refinement revoke/restore + overflow poison
-TEST( SoftContribProtocol, RefinementRevokesAndOverflowPoisons )
+// refinement revoke/restore + permanent-overflow poison (no serve, no refinement there)
+TEST( SoftContribProtocolV3, RefinementRevokesAndOverflowPoisons )
 {
-	// (a) refinement discovers a missing contributor -> POISON blocks serving until convergence
+	// (a) refinement discovers a missing contributor -> POISON until a converged eval restores
 	{
+		const std::vector<std::vector<int>> truth = { { 1, 2, 3 } };
 		Rng rng( 3 );
 		Table t( 1 );
-		const std::vector<int> truthSmall = { 1, 2, 3 };
-		std::vector<Fragment> warm = MakeBatch( 0, 0, 64, truthSmall, true, 4, 8, rng );
+		std::vector<Fragment> warm = MakeBatch( 0, 0, 1, 32, truth, 1, 8, rng );
 		RunInterleaved( t, warm, 8, rng );
-		CHECK( ( t.slots[0].ev & BUILT ) != 0 );
-		// frame 1: a refinement fragment observes a NEW contributor (7) -> must revoke
 		Fragment ref;
 		ref.cell = 0;
 		ref.key = 1;
+		ref.tile = 0;
 		ref.frame = 1;
+		ref.gen = 1;
 		ref.refinementHash = true;
-		ref.observed = { 7 };
+		ref.observed = { 7 };					// NEW contributor
 		std::vector<Fragment> b = { ref };
 		RunInterleaved( t, b, 1, rng );
-		CHECK( ( t.slots[0].ev & POISON ) != 0 );
-		// frame 2: non-refinement fragments must NOT serve while poisoned
-		std::vector<Fragment> b2 = MakeBatch( 0, 2, 8, truthSmall, true, 4, 8, rng );
+		CHECK( ( t.slots[0].state & POISON ) != 0 );
+		// poisoned: non-refinement fragments plain-walk, never serve
+		std::vector<Fragment> b2 = MakeBatch( 0, 2, 1, 8, truth, 1, 8, rng );
 		for( Fragment& f : b2 )
 		{
 			f.refinementHash = false;
@@ -493,89 +487,79 @@ TEST( SoftContribProtocol, RefinementRevokesAndOverflowPoisons )
 			CHECK_FALSE( f.served );
 			CHECK( f.plainWalk );
 		}
-		// frame 3: a converged refinement eval (nothing new) restores service
-		Fragment conv;
-		conv.cell = 0;
-		conv.key = 1;
+		// converged refinement (nothing new) restores service
+		Fragment conv = ref;
 		conv.frame = 3;
-		conv.refinementHash = true;
-		conv.observed = { 1, 7 };		// both already recorded
+		conv.observed = { 1, 7 };
 		std::vector<Fragment> b3 = { conv };
 		RunInterleaved( t, b3, 1, rng );
-		CHECK( ( t.slots[0].ev & POISON ) == 0 );
+		CHECK( ( t.slots[0].state & POISON ) == 0 );
 	}
-	// (b) union larger than K_ENTRIES -> overflow poison, cell never serves
+	// (b) union larger than K -> permanent poison: no serves AND no further record walks
 	{
 		Rng rng( 5 );
 		Table t( 1 );
-		std::vector<int> big;
+		std::vector<std::vector<int>> big( 1 );
 		for( int i = 1; i <= K_ENTRIES + 8; i++ )
 		{
-			big.push_back( i );
+			big[0].push_back( i );
 		}
-		// every fragment observes a distinct triple -> the union overflows during recording
-		std::vector<Fragment> b;
-		for( int i = 0; i < 64; i++ )
-		{
-			Fragment f;
-			f.cell = 0;
-			f.key = 1;
-			f.frame = 0;
-			f.evalK = 32;
-			f.budget = 8;
-			f.observed = { big[( i * 3 ) % ( int )big.size()], big[( i * 3 + 1 ) % ( int )big.size()], big[( i * 3 + 2 ) % ( int )big.size()] };
-			b.push_back( f );
-		}
+		std::vector<Fragment> b = MakeBatch( 0, 0, 1, 8, big, 1, 8, rng );
 		RunInterleaved( t, b, 8, rng );
-		CHECK( ( t.slots[0].ev & POISON ) != 0 );
-		std::vector<Fragment> b2 = MakeBatch( 0, 1, 8, big, true, 32, 8, rng );
+		CHECK( ( t.slots[0].state & POISON ) != 0 );
+		CHECK( t.slots[0].triCount >= ( uint32_t )K_ENTRIES );	// CAS-append parks AT capacity on overflow
+		const int walksBefore = t.recordWalks;
+		std::vector<Fragment> b2 = MakeBatch( 0, 1, 1, 8, big, 1, 8, rng );
 		RunInterleaved( t, b2, 8, rng );
 		for( const Fragment& f : b2 )
 		{
 			CHECK_FALSE( f.served );
+			CHECK( f.plainWalk );
 		}
+		CHECK( t.recordWalks == walksBefore );	// permanently poisoned cells stop recording entirely
 	}
 }
 
-// 5: quiescence - after appends stop, serving fragments see the full recorded union (subset of
-// truth, and covering once refinement has observed everything)
-TEST( SoftContribProtocol, QuiescentServesAreComplete )
+// generation reclaim: a bumped generation clears service in place; old entries are never served
+// again, the tiles re-certify, and the new-generation union serves complete
+TEST( SoftContribProtocolV3, GenerationReclaimFreesSlot )
 {
 	Rng rng( 9 );
 	Table t( 1 );
-	const std::vector<int> truth = { 1, 2, 3, 4, 5 };
-	int lastAppends = -1;
-	// run frames until APPENDS stop growing (refinement walks continue forever by design)
-	for( int frame = 0; frame < 32; frame++ )
+	const std::vector<std::vector<int>> truthA = { { 1, 2 } };
+	const std::vector<std::vector<int>> truthB = { { 8, 9 } };	// content changed with the bump
+	std::vector<Fragment> f0 = MakeBatch( 0, 0, 1, 16, truthA, /*gen*/ 1, 8, rng );
+	RunInterleaved( t, f0, 8, rng );
+	std::vector<Fragment> f1 = MakeBatch( 0, 1, 1, 16, truthA, 1, 8, rng );
+	RunInterleaved( t, f1, 8, rng );
+	bool servedOld = false;
+	for( const Fragment& f : f1 )
 	{
-		t.pool = 0;
-		std::vector<Fragment> b = MakeBatch( 0, frame, 128, truth, true, 8, 8, rng );
-		RunInterleaved( t, b, 16, rng );
-		if( t.appends == lastAppends && frame > 2 )
-		{
-			// quiescent: every serve this frame returned the complete recorded union
-			const Slot& s = t.slots[0];
-			std::set<int> recorded;
-			for( uint32_t i = 0; i < s.triCount && i < ( uint32_t )K_ENTRIES; i++ )
-			{
-				if( s.entries[i] != 0 )
-				{
-					recorded.insert( ( int )s.entries[i] );
-				}
-			}
-			int served = 0;
-			for( const Fragment& f : b )
-			{
-				if( f.served )
-				{
-					served++;
-					CHECK( f.servedUnion == recorded );
-				}
-			}
-			CHECK( served > 0 );
-			return;
-		}
-		lastAppends = t.appends;
+		servedOld |= f.served;
 	}
-	CHECK( false );		// never quiesced
+	CHECK( servedOld );
+	// generation bump (content changed): frame 2 must NOT serve old entries; tiles re-record
+	std::vector<Fragment> f2 = MakeBatch( 0, 2, 1, 16, truthB, /*gen*/ 2, 8, rng );
+	RunInterleaved( t, f2, 8, rng );
+	for( const Fragment& f : f2 )
+	{
+		CHECK_FALSE( f.served );				// reclaim cleared LIVE: recording frame, no serves
+	}
+	CHECK( t.slots[0].gen == 2u );
+	// frame 3: the new-generation union serves, containing ONLY new-content contributors
+	std::vector<Fragment> f3 = MakeBatch( 0, 3, 1, 16, truthB, 2, 8, rng );
+	RunInterleaved( t, f3, 8, rng );
+	int served = 0;
+	for( const Fragment& f : f3 )
+	{
+		if( f.served )
+		{
+			served++;
+			for( int id : f.servedUnion )
+			{
+				CHECK( id == 8 || id == 9 );	// no stale generation-1 entries
+			}
+		}
+	}
+	CHECK( served > 0 );
 }

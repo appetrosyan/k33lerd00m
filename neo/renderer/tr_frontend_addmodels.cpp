@@ -2315,8 +2315,15 @@ void R_AddModels()
 			// every frame - so idle camera sway no longer churns the prefix, the fingerprint stays put,
 			// and the GPU cache stops wiping itself wholesale. The DYNAMIC runs pass through verbatim.
 			{
-				extern idCVar r_softShadowSurfCache, r_softShadowSurfCacheInvariant;
-				if( r_softShadowSurfCache.GetBool() && r_softShadowSurfCacheInvariant.GetBool() && vLight->lightDef != NULL )
+				extern idCVar r_softShadowSurfCache, r_softShadowSurfCacheInvariant, r_softShadowContribCache;
+				// The CONTRIBUTOR cache is a HARD dependent of the invariant prefix: its unions store
+				// GLOBAL tri indices, so a view-culled (per-frame) static stream shifts every index
+				// under camera motion and served unions FillTri arbitrary WRONG triangles. Played
+				// live with surfCache 0 this was ants + banding + penumbra texel swimming at
+				// gate-0-defects (every instrument was frozen-view or non-culling). Contrib must
+				// never run without this block.
+				if( ( ( r_softShadowSurfCache.GetBool() && r_softShadowSurfCacheInvariant.GetBool() )
+						|| r_softShadowContribCache.GetInteger() != 0 ) && vLight->lightDef != NULL )
 				{
 					swStaticLightCache_t& sc = s_swStaticCasterCache[ vLight->lightDef->index ];
 
@@ -2342,14 +2349,36 @@ void R_AddModels()
 													^ ( uint64_t )( int64_t )( e[0].y * 8.0f ) * 0x2545F4914F6CDD1Dull
 													^ ( uint64_t )( int64_t )( e[0].z * 8.0f );
 								const uint64_t key = ( ( uint64_t )( uint32_t )eidx << 32 ) ^ ( vq & 0xFFFFFFFFull );
+								// PER-ENTITY UNIQUENESS (LINGER safety): a mover that paused gets copied at
+								// pose A; pausing again at pose B mints a NEW content key - without this
+								// purge the stale pose-A copy kept emitting as "static" forever (double
+								// geometry: measured live serve-verify mismatches TRIPLED, texel swimming).
+								// Non-world entities own exactly ONE cache entry; a different-key sibling is
+								// the stale pose - erase it. World surfaces keep per-surface entries (one
+								// entity, many keys - immobile, so the hazard cannot arise).
+								const bool qIsWorld = q->space->entityDef != NULL && q->space->entityDef->parms.hModel != NULL
+													  && q->space->entityDef->parms.hModel->IsStaticWorldModel();
+								if( !qIsWorld && eidx >= 0 )
+								{
+									for( auto pit = sc.casters.begin(); pit != sc.casters.end(); )
+									{
+										if( pit->second.entityIndex == eidx && pit->second.key != key && !pit->second.isWorld )
+										{
+											pit = sc.casters.erase( pit );
+										}
+										else
+										{
+											++pit;
+										}
+									}
+								}
 								swStaticCaster_t& c = sc.casters[ key ];
 								if( c.entityDef == NULL )		// first sight: copy the persistent stream
 								{
 									c.key = key;
 									c.entityIndex = eidx;
 									c.entityDef = q->space->entityDef;
-									c.isWorld = q->space->entityDef != NULL && q->space->entityDef->parms.hModel != NULL
-												&& q->space->entityDef->parms.hModel->IsStaticWorldModel();
+									c.isWorld = qIsWorld;
 									c.tris.assign( e, e + q->numSoftEdges );
 									if( q->softClusters != NULL && q->numSoftClusters > 0 )
 									{
@@ -2359,8 +2388,25 @@ void R_AddModels()
 								c.lastSeenFrame = tr.frameCount;
 							}
 						}
-						else	// dynamic run: keep verbatim
+						else	// dynamic run: keep verbatim - and PURGE the mover's stale static copies
 						{
+							// the entity is MOVING now: its cached "static" stream is a stale pose and
+							// must leave the emission THIS frame, not after the 600-frame eviction
+							const int didx = runHead->space->entityDef != NULL ? runHead->space->entityDef->index : -1;
+							if( didx >= 0 )
+							{
+								for( auto pit = sc.casters.begin(); pit != sc.casters.end(); )
+								{
+									if( pit->second.entityIndex == didx && !pit->second.isWorld )
+									{
+										pit = sc.casters.erase( pit );
+									}
+									else
+									{
+										++pit;
+									}
+								}
+							}
 							runTail->nextOnLight = NULL;
 							if( dynTail == NULL ) { dynHead = runHead; }
 							else { dynTail->nextOnLight = runHead; }

@@ -47,7 +47,32 @@ the Free Software Foundation, either version 3 of the License, or
 // reader simply stops before it.
 #define CAP_SAVE_MAGIC 0x36544653u		// 'SFT6' little-endian
 
+// v7 LIGHT-PARMS TAIL: the LIVE renderLight_t essentials per captured light, appended after the v6
+// save tail (magic + count + array). Cutscenes script-move and retint lights, so the defect gate's
+// map-parse reconstruction diverges from the captured frame (cap0010: matched light 187u away,
+// pre-cutscene state, drew 0 px). With this tail the gate rebuilds each probe light from the
+// CAPTURED state and needs no map match at all. Older caps simply lack the tail (map-match path).
+#define CAP_LPARM_MAGIC 0x37544653u		// 'SFT7' little-endian
+
 #pragma pack( push, 1 )
+
+struct capLightParms_t
+{
+	float    origin[3];
+	float    axis[9];
+	float    lightRadius[3];
+	float    lightCenter[3];
+	float    target[3];			// spot projection (all zero for point lights)
+	float    right[3];
+	float    up[3];
+	float    start[3];
+	float    end[3];
+	float    shaderParms[12];
+	uint32_t pointLight;
+	uint32_t parallel;
+	uint32_t noShadows;
+	char     shaderName[64];
+};
 
 // One flattened soft-shadow edge record = the coverage shader's t_SoftEdges element (softShadowEdge_t).
 // Header records carry e0w < 0 and the caster bounding sphere; edge records carry world endpoints.

@@ -679,6 +679,7 @@ bool  s_frontendDone = false;	// the frontend half snapshotted this frame
 // ---- accumulators (frame-scoped; cleared when a new capture is armed) ----
 capHeader_t         s_hdr;
 std::vector<capLight_t>  s_lights;
+std::vector<capLightParms_t> s_lightParms;	// v7 tail: LIVE renderLight_t per captured light (script-true state)
 std::vector<capEdge_t>   s_edges;
 std::vector<capCaster_t> s_casters;
 std::vector<float>           s_meshVerts;	// float3 packed (caster meshes)
@@ -731,6 +732,7 @@ void ResetAccumulators()
 {
 	memset( &s_hdr, 0, sizeof( s_hdr ) );
 	s_lights.clear();
+	s_lightParms.clear();
 	s_edges.clear();
 	s_casters.clear();
 	s_meshVerts.clear();
@@ -956,6 +958,44 @@ void R_CaptureFrontendView( const viewDef_t* viewDef )
 			}
 		}
 		s_lights.push_back( L );
+
+		// v7 LIGHT-PARMS: the LIVE light state (scripts move/retint cutscene lights; the map-parse
+		// reconstruction diverged 187u on cap0010 and drew nothing). One record per capLight_t.
+		{
+			capLightParms_t P;
+			memset( &P, 0, sizeof( P ) );
+			if( vLight->lightDef != NULL )
+			{
+				const renderLight_t& lp = vLight->lightDef->parms;
+				for( int k = 0; k < 3; k++ )
+				{
+					P.origin[k] = lp.origin[k];
+					P.lightRadius[k] = lp.lightRadius[k];
+					P.lightCenter[k] = lp.lightCenter[k];
+					P.target[k] = lp.target[k];
+					P.right[k] = lp.right[k];
+					P.up[k] = lp.up[k];
+					P.start[k] = lp.start[k];
+					P.end[k] = lp.end[k];
+				}
+				for( int k = 0; k < 9; k++ )
+				{
+					P.axis[k] = lp.axis[k / 3][k % 3];
+				}
+				for( int k = 0; k < 12 && k < MAX_ENTITY_SHADER_PARMS; k++ )
+				{
+					P.shaderParms[k] = lp.shaderParms[k];
+				}
+				P.pointLight = lp.pointLight ? 1u : 0u;
+				P.parallel   = lp.parallel ? 1u : 0u;
+				P.noShadows  = lp.noShadows ? 1u : 0u;
+				if( lp.shader != NULL )
+				{
+					idStr::Copynz( P.shaderName, lp.shader->GetName(), sizeof( P.shaderName ) );
+				}
+			}
+			s_lightParms.push_back( P );
+		}
 	}
 
 	s_frontendDone = true;
@@ -1175,6 +1215,20 @@ void R_CaptureBackendFinish()
 			{
 				common->Warning( "soft-shadow capture: CaptureGameSave failed - .cap has NO embedded save (repro cannot restore game state)" );
 			}
+		}
+		// v7 LIGHT-PARMS TAIL (see RenderCapture.h): [magic][count][array][count][magic]. The
+		// trailing FOOTER lets the gate reader find it by seeking from the file END, without
+		// walking every variable-length tail (textures, savegame) in between. LIVE script-true
+		// light state, so the gate reconstructs cutscene lights instead of the stale map parse.
+		{
+			const uint32_t lp[2] = { CAP_LPARM_MAGIC, ( uint32_t )s_lightParms.size() };
+			f->Write( lp, sizeof( lp ) );
+			if( !s_lightParms.empty() )
+			{
+				f->Write( s_lightParms.data(), s_lightParms.size() * sizeof( capLightParms_t ) );
+			}
+			const uint32_t lpf[2] = { ( uint32_t )s_lightParms.size(), CAP_LPARM_MAGIC };
+			f->Write( lpf, sizeof( lpf ) );
 		}
 		fileSystem->CloseFile( f );
 		common->Printf( "soft-shadow capture: %s.cap  (%u lights, %u edges, %u casters/%u tris, %u recv/%u tris, depth=%u)\n",
@@ -1913,6 +1967,9 @@ struct gateCap_t
 	std::vector<capCaster_t> casters;
 	std::vector<float>           meshVerts;	// float3 packed
 	std::vector<uint32_t>        meshIdx;	// GLOBAL into meshVerts (v4+ caps are already global)
+	// v7: the LIVE per-light renderLight_t state at capture time (index-parallel with `lights`).
+	// Empty on pre-v7 caps -> the probe falls back to map-light matching.
+	std::vector<capLightParms_t> lightParms;
 	idStr mapName;
 	idStr path, name;
 };
@@ -1975,6 +2032,25 @@ bool GateLoadCap( const char* path, gateCap_t& cap )
 			if( cap.mapName.Icmpn( "maps/", 5 ) != 0 )
 			{
 				cap.mapName = "maps/" + cap.mapName;
+			}
+		}
+	}
+	// v7 LIGHT-PARMS TAIL: locate via the trailing footer [count][magic] at the file END (the tail
+	// follows variable-length texture/save blobs; the footer avoids walking them). Sanity-bounded;
+	// any inconsistency leaves lightParms empty (map-match fallback).
+	{
+		uint32_t lpf[2] = { 0, 0 };
+		if( fseek( f, -( long )sizeof( lpf ), SEEK_END ) == 0
+				&& fread( lpf, sizeof( uint32_t ), 2, f ) == 2
+				&& lpf[1] == CAP_LPARM_MAGIC
+				&& lpf[0] == cap.lights.size() && lpf[0] <= 4096 )
+		{
+			const long arrOff = -( long )sizeof( lpf ) - ( long )lpf[0] * ( long )sizeof( capLightParms_t );
+			cap.lightParms.resize( lpf[0] );
+			if( lpf[0] == 0 || fseek( f, arrOff, SEEK_END ) != 0
+					|| fread( cap.lightParms.data(), sizeof( capLightParms_t ), lpf[0], f ) != lpf[0] )
+			{
+				cap.lightParms.clear();
 			}
 		}
 	}
@@ -2467,6 +2543,49 @@ int R_SoftShadowGate( const char* arg )
 		rv.fov_x = cap.hdr.fovx;
 		rv.fov_y = cap.hdr.fovy;
 
+		// CINEMATIC-CAMERA RESCUE: cutscene cameras can sit outside the playable BSP (sealed
+		// cinematic rooms, skybox vantages) - point-in-solid resolves to area -1 and the view
+		// renders NOTHING, so every light "draws 0 px" and the capture is silently untestable
+		// (cap0010, the hunter-arena cutscene: the exact scene a playtest saw ants in). Nudge the
+		// camera along its forward axis, then vertically, until it lands in a real area; the view
+		// direction still frames the captured scene. Loud either way.
+		{
+			int swVArea = rw->PointInArea( rv.vieworg );
+			if( swVArea < 0 )
+			{
+				const idVec3 swVFwd = rv.viewaxis[0];
+				const idVec3 swVOrg0 = rv.vieworg;
+				for( int st = 1; st <= 64 && swVArea < 0; st++ )
+				{
+					const idVec3 p = swVOrg0 + swVFwd * ( ( float )st * 4.0f );
+					swVArea = rw->PointInArea( p );
+					if( swVArea >= 0 )
+					{
+						rv.vieworg = p;
+					}
+				}
+				for( int st = 1; st <= 32 && swVArea < 0; st++ )
+				{
+					const idVec3 p = swVOrg0 - idVec3( 0.0f, 0.0f, ( float )st * 8.0f );
+					swVArea = rw->PointInArea( p );
+					if( swVArea >= 0 )
+					{
+						rv.vieworg = p;
+					}
+				}
+				if( swVArea >= 0 )
+				{
+					common->Printf( "[softgate] %s: capture camera IN SOLID (cinematic?) - nudged %.0f units to area %d\n",
+									cap.name.c_str(), ( rv.vieworg - swVOrg0 ).Length(), swVArea );
+				}
+				else
+				{
+					common->Printf( "[softgate] %s: capture camera IN SOLID and no rescue within 256u - expect 0-px lights\n",
+									cap.name.c_str() );
+				}
+			}
+		}
+
 		capsRun++;
 
 		// ---- rank the captured lights by soft-edge count and probe EVERY one that draws. The
@@ -2507,6 +2626,40 @@ int R_SoftShadowGate( const char* arg )
 			const capLight_t& cl = cap.lights[li];
 			idVec3 clOrg( cl.origin[0], cl.origin[1], cl.origin[2] );
 
+			renderLight_t rl;
+			if( li < ( int )cap.lightParms.size() )
+			{
+				// v7: rebuild the light from its CAPTURED live state - scripts move/retint cutscene
+				// lights, so the map-parse state can be wrong by hundreds of units (cap0010: the
+				// matched pre-cutscene light drew 0 px at the cinematic camera)
+				const capLightParms_t& LP = cap.lightParms[li];
+				memset( &rl, 0, sizeof( rl ) );
+				rl.origin.Set( LP.origin[0], LP.origin[1], LP.origin[2] );
+				rl.axis[0].Set( LP.axis[0], LP.axis[1], LP.axis[2] );
+				rl.axis[1].Set( LP.axis[3], LP.axis[4], LP.axis[5] );
+				rl.axis[2].Set( LP.axis[6], LP.axis[7], LP.axis[8] );
+				rl.lightRadius.Set( LP.lightRadius[0], LP.lightRadius[1], LP.lightRadius[2] );
+				rl.lightCenter.Set( LP.lightCenter[0], LP.lightCenter[1], LP.lightCenter[2] );
+				rl.target.Set( LP.target[0], LP.target[1], LP.target[2] );
+				rl.right.Set( LP.right[0], LP.right[1], LP.right[2] );
+				rl.up.Set( LP.up[0], LP.up[1], LP.up[2] );
+				rl.start.Set( LP.start[0], LP.start[1], LP.start[2] );
+				rl.end.Set( LP.end[0], LP.end[1], LP.end[2] );
+				for( int k = 0; k < 12 && k < MAX_ENTITY_SHADER_PARMS; k++ )
+				{
+					rl.shaderParms[k] = LP.shaderParms[k];
+				}
+				rl.pointLight = LP.pointLight != 0;
+				rl.parallel   = LP.parallel != 0;
+				rl.noShadows  = LP.noShadows != 0;
+				rl.shader = declManager->FindMaterial( LP.shaderName[0] != '\0' ? LP.shaderName : "lights/squarelight1", false );
+				if( rl.shader == NULL )
+				{
+					rl.shader = declManager->FindMaterial( "lights/squarelight1", false );
+				}
+			}
+			else
+			{
 			// match the real .map light whose global origin is the captured one (globalLightOrigin
 			// includes light_center, so try both origin and origin+center)
 			int best = -1;
@@ -2522,7 +2675,6 @@ int R_SoftShadowGate( const char* arg )
 					best = m;
 				}
 			}
-			renderLight_t rl;
 			if( best >= 0 )
 			{
 				rl = mapLights[best];
@@ -2543,6 +2695,7 @@ int R_SoftShadowGate( const char* arg )
 				common->Printf( "[softgate] %s L%d: no .map light at (%.0f %.0f %.0f) - SYNTHESIZED point light\n",
 								cap.name.c_str(), li, clOrg.x, clOrg.y, clOrg.z );
 			}
+			}	// pre-v7 map-match fallback
 
 			qhandle_t lh = rw->AddLightDef( &rl );
 			GateCreateStaticInteractionsForLight( rw, lh );
@@ -2737,9 +2890,15 @@ int R_SoftShadowGate( const char* arg )
 			if( validN < 1000 )
 			{
 				// the matched map light doesn't reach this camera (closed door, tiny scissor) -
-				// not a defect on its own; only if NO light draws does the capture flag SETUP below
-				common->Printf( "[softgate] %s L%d: light drew only %ld px - skipped\n",
-								cap.name.c_str(), li, validN );
+				// not a defect on its own; only if NO light draws does the capture flag SETUP below.
+				// Print the light's parsed params: a script-driven cinematic light parses with its
+				// EDITOR state (_color black / start_off) and draws nothing here despite being lit
+				// in the captured cutscene frame.
+				common->Printf( "[softgate] %s L%d: light drew only %ld px - skipped (matched org %.0f %.0f %.0f color %.2f %.2f %.2f radius %.0f shader %s)\n",
+								cap.name.c_str(), li, validN,
+								rl.origin.x, rl.origin.y, rl.origin.z,
+								rl.shaderParms[SHADERPARM_RED], rl.shaderParms[SHADERPARM_GREEN], rl.shaderParms[SHADERPARM_BLUE],
+								rl.lightRadius[0], rl.shader != NULL ? rl.shader->GetName() : "NULL" );
 				rw->FreeLightDef( lh );
 				if( pi + 1 >= ( int )probeLights.size() && !capProbed )
 				{
@@ -3355,6 +3514,156 @@ int R_SoftShadowGate( const char* arg )
 									100.0 * ( cList + cSpill ) / cTot, 100.0 * cList / cTot, 100.0 * cSpill / cTot, cTot );
 				}
 			}
+			// ---- FULL-FRAME QUALITY A/B (com_softShadowGateFullFrame N) --------------------------------
+			// The harness for what the per-light frozen-view probes are STRUCTURALLY blind to: (a) light
+			// CONTENTION - one probed light never exhausts term slots / bin budgets / spill regions, so
+			// every fallback a real multi-light frame triggers is invisible; (b) MOVING-CAMERA cache
+			// staleness - unions served along a motion path are perpetually a few frames behind the
+			// view. Both were playtest-visible (ants + stairstepping) at gate 0-defects (2026-08-24).
+			// Every pose renders the complete shipped frame twice - contributor cache OFF then ON - at
+			// the SAME pose; the ON cache state carries across poses exactly as in play. The lit HDR
+			// R-channel diff is classified (area levels, isolated-pixel ants, horizontal-run steps) and
+			// the ON frame's light-path provenance is tracked; the worst pose is re-rendered and dumped
+			// as an OFF/ON PNG pair for the eyeball.
+			extern idCVar com_softShadowGateFullFrame;
+			const int ffPoses = com_softShadowGateFullFrame.GetInteger();
+			if( ffPoses > 0 )
+			{
+				const idVec3   ffBaseOrg = rv.vieworg;
+				const idAngles ffBaseAng = rv.viewaxis.ToAngles();
+				const int ffPrevContrib = cvarSystem->GetCVarInteger( "r_softShadowContribCache" );
+				swgate::GateImg ffA, ffB;
+				std::vector<unsigned char> ffMask;
+				uint64_t ffLo = 0, ffHi = 0, ffAnts = 0, ffSteps = 0, ffCmp = 0;
+				uint64_t ffWorstHi = 0;
+				int      ffWorstPose = -1;
+				double   ffMaxRel = 0.0;
+				int      ffTermMin = INT_MAX, ffTotMax = 0, ffFallbackMax = 0;
+				for( int ffp = 0; ffp < ffPoses; ffp++ )
+				{
+					R_SoftShadowBenchMotionPose( ffBaseOrg, ffBaseAng, ffp, ffPoses, &rv );
+					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 0 );
+					GateRenderFrame( rw, &rv );
+					if( !GateReadR32F( globalImages->currentRenderHDRImage, ffA ) )
+					{
+						continue;
+					}
+					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 1 );
+					// inline render (not GateRenderFrame): the light-path provenance counters must be
+					// sampled BETWEEN RenderCommandBuffers and the draining swap, which resets them
+					{
+						rw->RenderScene( &rv );
+						const emptyCommand_t* ffCmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+						tr.RenderCommandBuffers( ffCmd );
+						ffTermMin     = Min( ffTermMin, backEnd.pc.c_softLightsTerm );
+						ffTotMax      = Max( ffTotMax, backEnd.pc.c_softLightsTotal );
+						ffFallbackMax = Max( ffFallbackMax, backEnd.pc.c_softLightsTotal - backEnd.pc.c_softLightsTerm );
+						tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
+					}
+					if( !GateReadR32F( globalImages->currentRenderHDRImage, ffB ) )
+					{
+						continue;
+					}
+					if( ffA.W != ffB.W || ffA.H != ffB.H || ffA.t.empty() )
+					{
+						continue;
+					}
+					const int ffW = ffA.W, ffH = ffA.H;
+					ffMask.assign( ( size_t )ffW * ffH, 0 );
+					uint64_t lo = 0, hi = 0;
+					for( size_t i = 0; i < ffA.t.size(); i++ )
+					{
+						const float a = ffA.t[i], b = ffB.t[i];
+						// RELATIVE diff in linear HDR (the +0.02 floor keeps black areas from
+						// exploding the ratio); 5% = visible shading shift, 25% = gross error
+						const float dr = fabsf( a - b ) / ( fabsf( a ) + 0.02f );
+						ffMaxRel = Max( ffMaxRel, ( double )dr );
+						if( dr > 0.25f )
+						{
+							ffMask[i] = 2;
+							hi++;
+							lo++;
+						}
+						else if( dr > 0.05f )
+						{
+							ffMask[i] = 1;
+							lo++;
+						}
+					}
+					// ants: gross-error pixels with at most one deviating 4-neighbour (isolated speckle)
+					// steps: pixels inside horizontal deviation runs >= 8 px (the stairstep signature)
+					for( int y = 0; y < ffH; y++ )
+					{
+						int run = 0;
+						for( int x = 0; x < ffW; x++ )
+						{
+							const size_t i = ( size_t )y * ffW + x;
+							if( ffMask[i] != 0 )
+							{
+								run++;
+							}
+							else
+							{
+								if( run >= 8 )
+								{
+									ffSteps += run;
+								}
+								run = 0;
+							}
+							if( ffMask[i] == 2 )
+							{
+								int nb = 0;
+								nb += ( x > 0 && ffMask[i - 1] != 0 ) ? 1 : 0;
+								nb += ( x + 1 < ffW && ffMask[i + 1] != 0 ) ? 1 : 0;
+								nb += ( y > 0 && ffMask[i - ffW] != 0 ) ? 1 : 0;
+								nb += ( y + 1 < ffH && ffMask[i + ffW] != 0 ) ? 1 : 0;
+								if( nb <= 1 )
+								{
+									ffAnts++;
+								}
+							}
+						}
+						if( run >= 8 )
+						{
+							ffSteps += run;
+						}
+					}
+					ffLo += lo;
+					ffHi += hi;
+					ffCmp += ffA.t.size();
+					if( hi >= ffWorstHi )
+					{
+						ffWorstHi = hi;
+						ffWorstPose = ffp;
+					}
+				}
+				// worst pose: re-render both states and dump the PNG pair for the eyeball
+				if( ffWorstPose >= 0 )
+				{
+					R_SoftShadowBenchMotionPose( ffBaseOrg, ffBaseAng, ffWorstPose, ffPoses, &rv );
+					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 0 );
+					GateRenderFrame( rw, &rv );
+					R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
+									  nvrhi::ResourceStates::ShaderResource, va( "dumps/fullframe_%s_off.png", cap.name.c_str() ) );
+					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 1 );
+					GateRenderFrame( rw, &rv );
+					R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
+									  nvrhi::ResourceStates::ShaderResource, va( "dumps/fullframe_%s_on.png", cap.name.c_str() ) );
+				}
+				common->Printf( "[softgate] FULLFRAME %-10s %d poses: diff>5%% %llu (%.4f%% of %llu px) | gross>25%% %llu | ANTS %llu | STEP-px %llu | maxRel %.3f | worst pose %d (PNG pair in dumps/)\n",
+								cap.name.c_str(), ffPoses,
+								( unsigned long long )ffLo, ffCmp ? 100.0 * ffLo / ffCmp : 0.0, ( unsigned long long )ffCmp,
+								( unsigned long long )ffHi, ( unsigned long long )ffAnts, ( unsigned long long )ffSteps,
+								ffMaxRel, ffWorstPose );
+				common->Printf( "[softgate] FULLFRAME %-10s provenance (ON frames): lights term-path min %d of %d total | worst fallback count %d%s\n",
+								cap.name.c_str(), ffTermMin == INT_MAX ? 0 : ffTermMin, ffTotMax, ffFallbackMax,
+								ffFallbackMax > 0 ? "  <-- lights OFF the cached/binned path (contention: sampled-quality risk pre-scanline-port, uncached perf)" : "" );
+				cvarSystem->SetCVarInteger( "r_softShadowContribCache", ffPrevContrib );
+				// restore the base pose for any later block
+				rv.vieworg  = ffBaseOrg;
+				rv.viewaxis = ffBaseAng.ToMat3();
+			}
+
 			// ---- MOTION A/B (com_softShadowGateBenchMotion N): the surf-cache proof --------------------
 			// Run N frames of camera motion (shake/rotate/move/combo segments) TWICE - cache OFF then ON -
 			// recording each frame's GPU ms. The cache warms one light per frame during the ON pass, so
