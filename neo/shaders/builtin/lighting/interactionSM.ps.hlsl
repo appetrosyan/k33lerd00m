@@ -63,7 +63,7 @@ StructuredBuffer<float4> t_SoftEdges : register( t12 VK_DESCRIPTOR_SET( 0 ) );
 // Tile binning (r_softShadowTileBin): per-tile triangle lists written by softtile_bin.cs.hlsl,
 // [count | SW_TILE_K indices] per 16x16 tile. rpUser7 = ( base | -1, tilesX, tileOx, tileOy ).
 #define SW_TILE_K 512
-#define SW_TILE_SIZE 16
+#define SW_TILE_SIZE 8
 #define SW_TILE_UMBRA 0xFFFFFFFEu	// whole-tile umbra sentinel (softtile_bin.cs.hlsl): occlusion is exactly 1
 #define SW_TILE_SPILL 0xFFFFFFFDu	// overflowed tile spilled its FULL list: slot+1/+2 = ( span offset, count )
 StructuredBuffer<uint> t_SoftTiles : register( t13 VK_DESCRIPTOR_SET( 0 ) );

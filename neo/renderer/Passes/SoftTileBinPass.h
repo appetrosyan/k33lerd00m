@@ -60,15 +60,19 @@ public:
 		return DebugReadSpillStats( out );
 	}
 
-	static const int TILE_SIZE = 16;
-	static const int TILE_K = 512;			// indices per tile; must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl.
-	// Measured (erebus1_05/07/09): K=64 overflowed the DENSE tiles - exactly the expensive ones -
-	// back to the full walk, erasing the win on heavy scenes; K=256 resolved every overflow at the
-	// OLD (entity-less) stream density, but at LIVE density (114k records, cap0061 in-game
-	// 2026-08-17) K=256 overflowed again: K=512 measured soft 55 -> 48 ms. Revisit if density grows.
-	// 8x8 tiles MEASURED WORSE (17.9/22.1/23.8 vs 16.7/19.6/20.1 ms on erebus1_05/07/09): 4x the
-	// prepass and per-tile list overhead, while the dense tiles' relevant sets barely shrink - a
-	// triangle near one tile is near its neighbours too. Do not retry without a new idea.
+	static const int TILE_SIZE = 8;			// 8x8 (was 16x16). See the 2026-08-24 measurement below.
+	static const int TILE_K = 512;			// MAX indices per tile (slot cap); must match softtile_bin.cs.hlsl + interactionSM.ps.hlsl. Runtime STRIDE is r_softShadowTileK (default 256 at 8x8).
+	// 8x8 tiles measured a NET WIN 2026-08-24 (playtest cap corpus @1440p, scanline): the per-fragment
+	// WALK - which is ~100% of the term cost, all memory-bound on the tile-list gather - shrank 28-47%
+	// (cap0006 65->34 ms, cap0009 95->63 ms) because the smaller tile world-radius tR tightens the cone
+	// cull, so the relevant set DOES shrink. Net soft -12% to -31% even carrying the 4x tilebin overhead.
+	// This OVERTURNS the old "8x8 measured worse, do not retry" note: that was CONFOUNDED by tileK - at
+	// 8x8 the 4x tiles forced K down (buffer), which SPILLED dense tiles to the slower cluster walk and
+	// hid the win. At tileK 256 with the buffer/spill grown below there is no forced spill and the walk
+	// win is clean. (Remaining lever: the 4x tilebin caster-cull overhead, a two-level block-bin rewrite.)
+	// Earlier K notes (16x16 era, kept for the density history): K=64 overflowed dense tiles back to the
+	// full walk; K=256 was clean at OLD density, K=512 at cap0061 LIVE density (114k records). At 8x8 the
+	// per-tile sets are ~1/4, so K=256 is clean again.
 	// SPILL region (2026-08-17): tiles denser than K no longer fall back to the O(all-casters) full
 	// walk (measured ~12 ms/frame at cap0061 live density - K cannot chase it: K=1024 recovered
 	// only ~4 ms at +320 MB). Instead the bin CS bump-allocates a span from the buffer TAIL and
@@ -80,7 +84,7 @@ public:
 	// 24M is now deep headroom even for 4K. Both halves degrade gracefully (slots: light falls to
 	// full walk; spill: tile falls to full walk) and the gate bench prints the spill demand so
 	// exhaustion is never silent.
-	static const int SPILL_ELEMENTS = 24 << 20;
+	static const int SPILL_ELEMENTS = 40 << 20;	// 8x8 tiles overflow ~4x as many tiles as 16x16; grown so dense scenes (cap0009 demanded ~29 M) do not EXHAUST the spill region and fall back to the full walk.
 
 private:
 	void EnsurePipeline();

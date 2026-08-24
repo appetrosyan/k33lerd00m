@@ -18,7 +18,7 @@ version. See <http://www.gnu.org/licenses/>.
 // depth loads. Output: [tileIdx*2] = min depth bits, [tileIdx*2+1] = max depth bits (asuint order
 // preserving for depths in [0,1)); min > max encodes "no valid depth in tile" (sky).
 
-#define SW_TILE_SIZE 16
+#define SW_TILE_SIZE 8
 
 // *INDENT-OFF*
 Texture2D<float>			t_Depth		: register( t0 );

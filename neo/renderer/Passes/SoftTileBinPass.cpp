@@ -39,13 +39,13 @@ struct SoftTileMinMaxCB
 };
 
 // per-screen-tile min/max pairs: 4K-class screens are 256x160 tiles
-static const int SW_MINMAX_MAX_TILES = 256 * 160;
+static const int SW_MINMAX_MAX_TILES = 512 * 288;	// covers 8x8 tiles up to 4K (480x270); 16x16 used 256x160
 
 // 48M uints = 192 MB: ~94k tile slots at K=512 (a heavy frame's soft lights measured ~54k slots
 // on erebus1_09, so this holds every light with headroom; lights past the cap fall back to the
 // full per-fragment walk for one frame). The TAIL of the buffer (SPILL_ELEMENTS, see the header)
 // is reserved for overflowed tiles' spilled full lists - tile-slot allocation stops short of it.
-static const int SW_TILE_BUFFER_ELEMENTS = 48 << 20;
+static const int SW_TILE_BUFFER_ELEMENTS = 96 << 20;	// 384 MB. 8x8 tiles (TILE_SIZE 8) allocate ~2x the 16x16 layout at tileK 256 (main region ~48 MB of slots) + the spill tail below; sized so heavy multi-light scenes do not hit the full-walk fallback. Scale with resolution/scene if BUFFER FULL warns (r_rtAccelDebug).
 
 SoftTileBinPass::SoftTileBinPass( nvrhi::IDevice* device )
 	: m_Device( device )
