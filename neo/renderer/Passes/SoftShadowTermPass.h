@@ -77,6 +77,14 @@ public:
 	// tests+culls, mtTri), 7 = fragments that ran the walk. Blocking readback (waitForIdle), bench-only.
 	// Returns false when counters were not enabled / buffer absent.
 	bool GetWalkStats( uint32_t out[20] );	// 0..7 attrib, 8/9 lit frags/survivors, 10/11 penumbra, 12/13 umbra, 14/15 hit/miss, 16..19 tile-class census (umbra-sentinel / empty-list / spill / listed threads)
+	bool GetContribStats( uint32_t out[20] );	// contrib-cache header: [0] recording pool [1] serves [2] recording evals [3] claimed cells [4] verify compares [5] verify mismatches [6] max |diff| (float bits) [7] budget-blocked [8] probe-exhausted [9] BUILT-unservable [10] refinement records
+
+	// once per rendered VIEW, before the AddLight loop: advances the contributor cache's own frame
+	// tick (tr.frameCount is dead in minimal-init paths) for the flip-defer stamp + claim budget
+	void ContribNewView()
+	{
+		m_ContribTick++;
+	}
 
 	// The atlas the interaction shader should Load: the BLURRED atlas when the temporal-stability blur
 	// ran this view (r_softShadowTermBlur), else the raw term atlas.
@@ -130,6 +138,21 @@ private:
 	// shipped path, so it reuses m_Layout; separate pipeline keeps the shipped one byte-identical.
 	nvrhi::ShaderHandle				m_ShaderScan;
 	nvrhi::ComputePipelineHandle	m_PipelineScan;
+	// CONTRIBUTOR CACHE permutation (SW_CONTRIB_CACHE=1, scanline forced): evaluate-once union of
+	// observed contributors per (world cell, light). Own layout (base + u2 table UAV); own buffer.
+	nvrhi::ShaderHandle				m_ShaderContrib;
+	nvrhi::BindingLayoutHandle		m_LayoutContrib;
+	nvrhi::ComputePipelineHandle	m_PipelineContrib;
+	nvrhi::BufferHandle				m_ContribBuffer;
+	bool							m_ContribCleared = false;	// lazy first-use clear (needs a command list)
+	uint64_t						m_ContribClaimFrame = ~0ull;	// last TICK the per-frame claim counter was reset
+	uint64_t						m_ContribTick = 0;				// own per-view frame tick (see ContribNewView)
+public:
+	uint64_t						m_ContribStaticTris = 0;		// diagnosis: static-prefix tris accumulated over AddLights
+	uint64_t						m_ContribTotalTris = 0;			// diagnosis: total stream tris accumulated over AddLights
+	uint64_t						m_ContribActiveLights = 0;		// diagnosis: AddLight calls that took the contrib pipeline
+	uint64_t						m_ContribFragments = 0;			// diagnosis: contrib-kernel threads dispatched (scissor area sum)
+private:
 	nvrhi::BufferHandle				m_WalkCntBuffer;	// 8 uints, cleared per view, InterlockedAdd'd by the shader
 	bool							m_WalkCntEnabled = false;
 	nvrhi::BufferHandle				m_ConstantBuffer;

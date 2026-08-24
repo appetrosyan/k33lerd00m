@@ -804,14 +804,29 @@ STUDY_TEST( SoftShadowPruneHoldout, coverage )
 				const float* r2 = F4( base4 + t * 3 + 2 );
 				if( contribOut != NULL )
 				{
-					uint32_t solo[SW_SCAN_CHORDS] = {};
-					SoftScan_FillTri( solo, float3( r0[0], r0[1], r0[2] ), float3( r1[0], r1[1], r1[2] ), float3( r2[0], r2[1], r2[2] ), P, F, swR, swEps );
-					if( MaskedBits( solo, diskMask ) > 0 )
+					// PRUNEDELTA=1: record by cumulative DELTA (did this tri add new masked bits) -
+					// the free signal the live walk already has; default = SOLO (the validated one)
+					static const bool sDelta = ( std::getenv( "PRUNEDELTA" ) != NULL );
+					if( sDelta )
 					{
-						contribOut->push_back( ( uint32_t )t );
-						for( int m = 0; m < SW_SCAN_CHORDS; m++ )
+						const int pre = MaskedBits( grid, diskMask );
+						SoftScan_FillTri( grid, float3( r0[0], r0[1], r0[2] ), float3( r1[0], r1[1], r1[2] ), float3( r2[0], r2[1], r2[2] ), P, F, swR, swEps );
+						if( MaskedBits( grid, diskMask ) > pre )
 						{
-							grid[m] |= solo[m];
+							contribOut->push_back( ( uint32_t )t );
+						}
+					}
+					else
+					{
+						uint32_t solo[SW_SCAN_CHORDS] = {};
+						SoftScan_FillTri( solo, float3( r0[0], r0[1], r0[2] ), float3( r1[0], r1[1], r1[2] ), float3( r2[0], r2[1], r2[2] ), P, F, swR, swEps );
+						if( MaskedBits( solo, diskMask ) > 0 )
+						{
+							contribOut->push_back( ( uint32_t )t );
+							for( int m = 0; m < SW_SCAN_CHORDS; m++ )
+							{
+								grid[m] |= solo[m];
+							}
 						}
 					}
 				}

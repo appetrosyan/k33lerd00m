@@ -85,6 +85,12 @@ uint SwSurfFlipF( float f )
 	#undef SW_SCANLINE
 	#define SW_SCANLINE 1
 #endif
+// the contributor cache is SCANLINE-only (its record/serve paths fill the Fubini grid); force the
+// axis for the same dead-cross-product-compiles reason as SW_SURF_GRID above.
+#if SW_CONTRIB_CACHE
+	#undef SW_SCANLINE
+	#define SW_SCANLINE 1
+#endif
 // CULL-BEFORE-LOAD (term compute path only; the interaction PS keeps the load-then-cull walk): the tile
 // walk reads this parallel per-slot (centroid, triRad) buffer to run the cone cull BEFORE the scattered
 // vertex gather, so culled entries never load verts. Declared + bound unconditionally to keep the reflected
@@ -96,6 +102,92 @@ uint SwSurfFlipF( float f )
 static bool swCblRT = false;
 #define SW_CBL_RT swCblRT
 StructuredBuffer<uint2>		t_SoftCull	: register( t7 );
+
+// CONTRIBUTOR CACHE (r_softShadowContribCache, SW_CONTRIB_CACHE permutation, SCANLINE only): the
+// evaluate-once-union design (studies: 95% of walk iterations are proven waste; per-cell contributor
+// unions of 7-17 tris are coverage-exact at K=64 evaluations, held-out verified on cap0004/7/9).
+// Per (world cell, light) the FIRST K fragments run the full walk and RECORD their solo-contributing
+// STATIC triangles into the cell's slot (the fragments themselves are the evaluation points - no
+// heuristic anywhere); at K evaluations the cell flips BUILT and later fragments walk only the
+// recorded union + live dynamic casters. Warm-up is INCREMENTAL: cells enter RECORDING only while a
+// bounded slot pool has room (header word 0), so a camera entering a fresh area warms over frames
+// with no atomic storm. All fallbacks (unbuilt / pool-full / overflow / stale generation) are the
+// exact shipped walk - the cache can only remove proven-waste iterations, never coverage.
+// Slot layout (stride SW_CONTRIB_STRIDE uints): [0] keyLo [1] keyHi (gen | light key)
+// [2] evalCount, bit31 = BUILT [3] triCount (<= SW_CONTRIB_K) [4..] recorded GLOBAL tri indices.
+// Header (first SW_CONTRIB_HEADER uints of the buffer): [0] recording-pool occupancy
+// [1] serve hits [2] recording evals [3] claimed cells (stats, wave-aggregated).
+#ifndef SW_CONTRIB_CACHE
+	#define SW_CONTRIB_CACHE 0
+#endif
+#if SW_CONTRIB_CACHE
+#define SW_CONTRIB_K		64
+// TILE-COVERAGE certification, frame-deferred (the BUILT-flip-defer analogue for tiles): a
+// record finalize PENDS its tile bit; any prober PROMOTES pends to LIVE only in a frame with no
+// record finalize yet (PENDFRAME != now). Trusting a bit the frame it was set let late-launching
+// waves serve a union whose recorders were still walking (spill records are slow) - measured
+// 4.6%/15.7% serve-verify mismatches; the deferral closes that window to one wave race.
+#define SW_CONTRIB_TILEBIT	( 4 + SW_CONTRIB_K )		// slot word: LIVE tile-coverage mask (serve gate)
+#define SW_CONTRIB_TILEPEND	( 4 + SW_CONTRIB_K + 1 )	// slot word: PENDING tile bits (this frame's records)
+#define SW_CONTRIB_TILEPFR	( 4 + SW_CONTRIB_K + 2 )	// slot word: frame of the last pend write
+#define SW_CONTRIB_STRIDE	( 4 + SW_CONTRIB_K + 3 )
+// header words 16-19: serve-verify mismatch attribution ([16] serve DARKER = over-coverage,
+// [17] serve LIGHTER = under-coverage, [18] on a SPILL fragment, [19] on a tile-list fragment)
+#define SW_CONTRIB_HEADER	24
+#define SW_CONTRIB_BUILT	0x80000000u
+#define SW_CONTRIB_POISON	0x40000000u		// list overflowed K after the flip: cell may NEVER serve (exact walk forever)
+RWStructuredBuffer<uint>	u_Contrib	: register( u2 );
+// wave-aggregated diagnostic counter into a free header word (one atomic per wave, SwSurfStat
+// pattern): [7] budget-blocked claims [8] probe-exhausted (16 slots, no key/no empty admitted)
+// [9] BUILT-but-unservable-tile plain walks [10] refinement records. One-shot readback deltas.
+void SwContribDiag( uint word )
+{
+	const uint c = WaveActiveCountBits( true );
+	if( WaveIsFirstLane() )
+	{
+		InterlockedAdd( u_Contrib[ word ], c );
+	}
+}
+// append tri rt (1-based encoded) to cell slot sB's union with linear dedup; overflow POISONs.
+// Returns true when the union grew (the refinement revoke signal).
+bool SwContribAppend( uint sB, int rt )
+{
+	const uint have = min( u_Contrib[ sB + 3 ], ( uint )SW_CONTRIB_K );
+	for( uint dd = 0; dd < have; dd++ )
+	{
+		if( u_Contrib[ sB + 4 + dd ] == ( uint )( rt + 1 ) )
+		{
+			return false;								// already recorded
+		}
+	}
+	uint at;
+	InterlockedAdd( u_Contrib[ sB + 3 ], 1u, at );
+	if( at < ( uint )SW_CONTRIB_K )
+	{
+		u_Contrib[ sB + 4 + at ] = ( uint )( rt + 1 );	// benign dup on race: union semantics
+	}
+	else
+	{
+		// overflow: a contributor could not be stored, so serving this cell would under-cover.
+		// POISON it - pre-flip the BUILT withhold also blocks, but a post-flip overflow needs
+		// this to revoke serving.
+		uint pz;
+		InterlockedOr( u_Contrib[ sB + 2 ], SW_CONTRIB_POISON, pz );
+	}
+	return true;
+}
+// wave-aggregated SUM of a per-lane value into a header word: serve-work attribution
+// ([12] union entries walked [13] union FillTri survivors [14] dyn FillTri survivors
+// [15] serve umbra early-outs). One atomic per wave.
+void SwContribDiagSum( uint word, uint v )
+{
+	const uint s = WaveActiveSum( v );
+	if( WaveIsFirstLane() )
+	{
+		InterlockedAdd( u_Contrib[ word ], s );
+	}
+}
+#endif
 #include "softwedge_coverage.inc.hlsl"
 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
@@ -283,6 +375,735 @@ void main( uint3 tid : SV_DispatchThreadID )
 	if( g_surfParams.w > 0.0f ) { swRotP = round( swP / g_surfParams.w ) * g_surfParams.w; }
 	const float swRotHash = dot( swRotP, float3( 12.9898, 78.233, 37.719 ) );
 	const float swRotAng = ( swRotHash - floor( swRotHash ) ) * 6.28318531;
+
+#if SW_CONTRIB_CACHE
+	// ---- CONTRIBUTOR CACHE (see the declaration block above for the design + slot layout) ----
+	// g_surfParams.x = cell size G, g_surfCost.z = eval threshold K', g_surfCost.w = table capacity
+	// (slots, pow2), g_surfA.w = light key, g_aa.y = per-light generation, g_aa.z = recording-pool
+	// budget (g_flags.w stays the tile-K stride for the fallback tile walk).
+	if( g_surfParams.x > 0.0f && g_surfCost.w > 0 )
+	{
+		// TILE PEEK: (a) UMBRA-SENTINEL BYPASS - a whole-tile umbra certificate writes term EXACTLY 0
+		// with zero walk; strictly better than any cached walk, and mixing the two flickers the last
+		// coverage bit (measured TEMPORAL gate defects). (b) capture the tile's NORMAL list for the
+		// serve path's tiled dynamic walk - fragments without one (spill/corrupt/untiled) never
+		// serve (the plain walk handles them; the untiled dynamic suffix measured hit > tiled miss).
+		int swServeListBase = 0, swServeListCount = -1;
+		int swSpillBase = 0, swSpillN = -1;
+		const int swPTx = px.x / SW_TILE_SIZE - g_tile.x;
+		const int swPTy = px.y / SW_TILE_SIZE - g_tile.y;
+		// this fragment's TILE-COVERAGE bit (slot word SW_CONTRIB_TILEBIT): local 8x4-tile neighborhood
+		// bit. The union is recorded from TILE LISTS, so it is only complete for tiles that contributed
+		// an eval - serving a tile whose bit is unset produced under-covering terms (measured 0.033%
+		// verify mismatches, max|diff| 1.0). Distant cells span 1-4 tiles (exact); near cells alias
+		// (a wrongly-set bit), which the refinement validator converges instead.
+		const uint swTileBit = 1u << ( ( ( uint )swPTx & 7u ) * 4u + ( ( uint )swPTy & 3u ) );
+		{
+			if( g_range.z >= 0 && swPTx >= 0 && swPTy >= 0 )
+			{
+				const int  swPSlot = g_range.z + ( swPTy * g_range.w + swPTx ) * ( g_flags.w + 1 );
+				const uint swPCnt = t_SoftTiles[ swPSlot ];
+				if( swPCnt == SW_TILE_UMBRA )
+				{
+					u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;
+					return;
+				}
+				if( swPCnt <= ( uint )g_flags.w )
+				{
+					swServeListBase  = swPSlot + 1;
+					swServeListCount = ( int )swPCnt;
+				}
+				else if( swPCnt == SW_TILE_SPILL )
+				{
+					// SPILL tile: the fragment's walk set is the cluster list (absolute cluster-record
+					// offsets). The heavy caps are spill-DOMINATED (cap0009: claims 839, recordings 0 -
+					// the tile-list-only guard disabled the cache exactly where the walk is dearest), so
+					// record/serve must run through the cluster hierarchy too.
+					swSpillBase = ( int )t_SoftTiles[ swPSlot + 1 ];
+					swSpillN    = ( int )min( t_SoftTiles[ swPSlot + 2 ], 65536u );
+				}
+			}
+		}
+		const float cg = g_surfParams.x;
+		const int3  cc = int3( floor( swP / cg ) );
+		// COLLISION-FREE cell key, surf-cache style: 16 bits per axis (biased) + 13-bit light key =
+		// 61 of 64 bits, no folding. The earlier 21-bit XOR-fold aliased distinct cells into one
+		// slot - two cells serving one union (measured: ANT speckle + cell-grain SEAM defects).
+		// Out-of-range cells (|coord| >= 32768 cells) are never cached (exact walk).
+		const int3 cb2 = cc + int3( 32768, 32768, 32768 );
+		if( ( uint )cb2.x > 65535u || ( uint )cb2.y > 65535u || ( uint )cb2.z > 65535u )
+		{
+			// fall through to the plain path below
+		}
+		else
+		{
+		const uint keyLo = ( uint )cb2.x | ( ( uint )cb2.y << 16 );
+		const uint keyHi = ( uint )cb2.z | ( ( uint )g_surfA.w << 16 );
+		if( keyLo == 0u )
+		{
+			// the (-32768,-32768,*) far corner aliases the vacancy sentinel: never cached
+		}
+		else
+		{
+		const uint curGen = ( uint )( g_aa.y + 0.5f );
+		const uint capM = ( uint )g_surfCost.w - 1u;
+		uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u ^ curGen * 0xC2B2AE35u;
+		uint slot = h & capM;
+		int  servedBase = -1, servedCount = 0;
+		int  recordSlot = -1;
+		// probe-outcome diagnosis flags (classified into header words 7/8/9 after the loop)
+		bool swDgBudget = false, swDgKey = false, swDgUnserv = false;
+		bool swTileMissRec = false;			// this record is a tile-coverage fill-in, not a refinement verdict
+		[loop] for( int pr = 0; pr < 16; pr++ )
+		{
+			const uint sBase = SW_CONTRIB_HEADER + slot * SW_CONTRIB_STRIDE;
+			const uint w0 = u_Contrib[ sBase ];
+			if( w0 == keyLo && u_Contrib[ sBase + 1 ] == ( keyHi ^ ( curGen * 0x9E3779B9u ) ) )
+			{
+				swDgKey = true;
+				// PROMOTE pended tile bits to LIVE - only while no record has finalized THIS frame
+				// (a finalize stamps PENDFRAME before pending its bit, closing the same-frame window)
+				{
+					const uint swFrameP = ( uint )g_surfA.y & 0x7FFFu;
+					if( u_Contrib[ sBase + SW_CONTRIB_TILEPFR ] != swFrameP )
+					{
+						const uint swPendB = u_Contrib[ sBase + SW_CONTRIB_TILEPEND ];
+						if( swPendB != 0u )
+						{
+							uint swPdD;
+							InterlockedOr( u_Contrib[ sBase + SW_CONTRIB_TILEBIT ], swPendB, swPdD );
+						}
+					}
+				}
+				const uint ev = u_Contrib[ sBase + 2 ];
+				// FLIP-FRAME DEFER (bits 16-30 = the frame the cell flipped BUILT): a cell must not
+				// serve in the dispatch that flipped it - stragglers of the same dispatch may still be
+				// appending (count is incremented before the entry store), which read as stale-zero
+				// entries / missing contributors: nondeterministic terms (measured TEMPORAL=43 gate
+				// defects). One frame later the list is quiescent (post-flip fragments only serve).
+				const uint swFrameNow = ( uint )g_surfA.y & 0x7FFFu;
+				if( ( ev & SW_CONTRIB_POISON ) != 0u && ( ev & SW_CONTRIB_BUILT ) == 0u )
+				{
+					// pre-flip overflow poison: the union needs > K entries, the cell can never
+					// serve - and it must NOT keep recording either (recording costs 2-3x a plain
+					// walk; measured: perpetual recording DOUBLED the live term). Plain walk.
+					break;
+				}
+				if( ( ev & SW_CONTRIB_BUILT ) != 0u && ( ev & SW_CONTRIB_POISON ) == 0u
+						&& ( swServeListCount >= 0 || swSpillN >= 0 )
+						&& ( ( ev >> 16 ) & 0x7FFFu ) != swFrameNow )
+				{
+					// CONTINUOUS REFINEMENT: 1 in 64 served fragments (pixel hash) runs the exact
+					// recording walk instead - its term is exact, its contributors append, and if it
+					// found one MISSING from the union the cell is revoked (POISON) and re-records
+					// with the new view's fragments included. Frozen unions were the measured
+					// CONTINUITY defect source (displaced views hit receivers the flip-view never
+					// evaluated); refinement converges them at ~1.5% average walk cost.
+					// SPILL fragments refine 8x rarer: their record walk is the full cluster hierarchy
+					// (~10x a tile-list record), and at 1/64 it alone regressed cap0007 term ~5 ms
+					const uint swRefN = ( uint )( g_aa.w + 0.5f ) * ( ( swServeListCount < 0 ) ? 8u : 1u );
+					if( ( u_Contrib[ sBase + SW_CONTRIB_TILEBIT ] & swTileBit ) == 0u )
+					{
+						// TILE-MISS: no eval from this tile has fed the union yet, so it may lack this
+						// tile's contributors - serving it under-covered (the 0.033% max|diff|=1.0
+						// verify class). Record instead: one dispatch's worth of this tile's fragments
+						// walk+append, the bit is set at finalize, and the tile serves next frame.
+						swTileMissRec = true;
+						recordSlot = ( int )sBase;
+					}
+					else if( swRefN != 0u && ( ( ( uint )px.x * 7u + ( uint )px.y * 13u ) % swRefN ) == 0u )
+					{
+						SwContribDiag( 10u );						// refinement record volume
+						recordSlot = ( int )sBase;
+					}
+					else
+					{
+						servedBase  = ( int )( sBase + 4u );
+						servedCount = ( int )min( u_Contrib[ sBase + 3 ], ( uint )SW_CONTRIB_K );
+					}
+				}
+				else if( ( ev & SW_CONTRIB_BUILT ) != 0u && swServeListCount < 0 && swSpillN < 0 )
+				{
+					// BUILT but this fragment's tile cannot serve (corrupt/untiled): PLAIN walk.
+					// Routing these to the record path made every spill-tile fragment of a built cell
+					// run the 2-3x recording walk EVERY frame - the dominant live overhead (measured:
+					// term 30.9 -> 49-66 ms net-NEGATIVE).
+					swDgUnserv = true;
+					break;
+				}
+				else if( ( ev & SW_CONTRIB_BUILT ) != 0u )
+				{
+					// flipped THIS frame, or POISON-revoked by refinement: REFINEMENT-HASH fragments
+					// only may record; everyone else plain-walks. v1 routed ALL these fragments to the
+					// 2-3x record walk - measured 434-500k recording walks per STEADY frame (claims 0)
+					// on the cap0007 bench, term 46.8 -> 66.6 ms. The union is defined by the K'
+					// ticketed evals plus refinement convergence, not by a whole-cell stampede.
+					const uint swRefN2 = ( uint )( g_aa.w + 0.5f );
+					if( swRefN2 != 0u && ( ( ( uint )px.x * 7u + ( uint )px.y * 13u ) % swRefN2 ) == 0u )
+					{
+						SwContribDiag( 10u );	// refinement-class record (poison re-validation)
+						recordSlot = ( int )sBase;
+					}
+				}
+				else
+				{
+					// RECORDING state (not yet BUILT): the pre-walk CAS ticket below decides whether
+					// this fragment is one of the K' evaluators or plain-walks while the cell builds.
+					recordSlot = ( int )sBase;
+				}
+				break;
+			}
+			if( w0 == 0u )
+			{
+				if( swServeListCount < 0 && swSpillN < 0 )
+				{
+					break;		// no walk list: this fragment could never record - don't burn a slot
+				}
+				// empty: try to CLAIM (bounded by the recording pool - incremental warm-up)
+				uint pool;
+				// PER-FRAME claim budget (header[0] resets each frame on the CPU): budget is consumed by
+				// SUCCESSFUL claims only - the earlier attempt-consuming version burned the whole frame
+				// budget on duplicate attempts against the same few hot cells (~10-40 unique claims per
+				// frame instead of ~budget). The pre-check read is racy; overshoot is bounded by
+				// in-flight concurrency and harmless (the budget is a rate limiter, not a hard cap).
+				const uint swPoolBudget = ( uint )( g_aa.z + 0.5f );
+				pool = u_Contrib[ 0 ];
+				if( pool < swPoolBudget )
+				{
+					uint prev;
+					InterlockedCompareExchange( u_Contrib[ sBase ], 0u, keyLo, prev );
+					if( prev == 0u )
+					{
+						u_Contrib[ sBase + 1 ] = keyHi ^ ( curGen * 0x9E3779B9u );
+						InterlockedAdd( u_Contrib[ 0 ], 1u );		// budget: one successful claim
+						InterlockedAdd( u_Contrib[ 3 ], 1u );		// stat: claimed cells
+						recordSlot = ( int )sBase;
+						break;
+					}
+					if( prev == keyLo && u_Contrib[ sBase + 1 ] == ( keyHi ^ ( curGen * 0x9E3779B9u ) ) )
+					{
+						recordSlot = ( int )sBase;					// lost the race to our own key
+						break;
+					}
+				}
+				else
+				{
+					swDgBudget = true;
+					break;											// frame budget exhausted: plain walk this frame
+				}
+			}
+			slot = ( slot + 1u ) & capM;
+		}
+		// PRE-WALK EVAL TICKET (bounded-transient fix): only K' fragments per cell EVER run the
+		// record walk. The ticket is a CAS (never a blind add) so the count can NEVER carry into the
+		// flip-stamp bits, no matter how many fragments race: a CAS only succeeds from a value below
+		// K' with BUILT/POISON clear. Losers plain-walk while the cell builds - v1 instead recorded
+		// EVERY in-flight fragment of a claiming cell (the unbounded transient: term +20 ms).
+		// Refinement fragments (BUILT cell) keep the frozen counter and take no ticket.
+		uint swMyTicket = 0xFFFFFFFFu;
+		if( recordSlot >= 0 && swServeListCount < 0 && swSpillN < 0 )
+		{
+			// the record walk is LIST based (normal tile list or spill cluster list): a fragment with
+			// neither (corrupt/untiled) cannot record (nor ever serve its tile) - plain, no ticket
+			recordSlot = -1;
+		}
+		if( recordSlot >= 0 )
+		{
+			const uint swEvPre = u_Contrib[ ( uint )recordSlot + 2u ];
+			if( ( swEvPre & SW_CONTRIB_BUILT ) == 0u )
+			{
+				[loop] for( int swTa = 0; swTa < 4; swTa++ )
+				{
+					const uint evc = u_Contrib[ ( uint )recordSlot + 2u ];
+					if( ( evc & ( SW_CONTRIB_BUILT | SW_CONTRIB_POISON ) ) != 0u
+							|| ( evc & 0xFFFFu ) >= ( uint )g_surfCost.z )
+					{
+						break;
+					}
+					uint got;
+					InterlockedCompareExchange( u_Contrib[ ( uint )recordSlot + 2u ], evc, evc + 1u, got );
+					if( got == evc )
+					{
+						swMyTicket = evc & 0xFFFFu;
+						break;
+					}
+				}
+				if( swMyTicket == 0xFFFFFFFFu )
+				{
+					SwContribDiag( 11u );			// ticket denied: exact plain walk while the cell builds
+					recordSlot = -1;
+				}
+			}
+		}
+		// probe-outcome classification (plain-walk fall-throughs only; serve/record paths excluded):
+		// budget-blocked = the claim rate limiter, probe-exhausted = table congestion. One wave-
+		// aggregated atomic per class - readback is one-shot, deltas taken CPU-side.
+		if( servedBase < 0 && recordSlot < 0 )
+		{
+			if( swDgBudget )
+			{
+				SwContribDiag( 7u );
+			}
+			else if( swDgUnserv )
+			{
+				SwContribDiag( 9u );
+			}
+			else if( !swDgKey )
+			{
+				SwContribDiag( 8u );
+			}
+		}
+
+		if( servedBase >= 0 )
+		{
+			// ---- SERVE: recorded static union + live dynamic casters, one Fubini grid ----
+			InterlockedAdd( u_Contrib[ 1 ], 1u );					// stat: serve hit
+			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
+			const float swRC = max( g_lightR.w, 1e-2 );
+			uint swGrid[SW_SCAN_CHORDS];
+			uint swDiskMask[SW_SCAN_CHORDS];
+			int  swDiskBits = 0;
+			[unroll] for( int gm = 0; gm < SW_SCAN_CHORDS; gm++ )
+			{
+				swGrid[gm] = 0u;
+				swDiskMask[gm] = SoftScan_Run( -SW_SCAN_HC[gm], SW_SCAN_HC[gm] );
+				swDiskBits += SoftPopcount32( swDiskMask[gm] );
+			}
+			// BIT-PARITY RULE: every path must FillTri exactly the tris the plain walk would - the
+			// per-tri cone cull is only approximately conservative at float boundaries, so a path
+			// that skips (or adds) the cull flips single penumbra-edge bits vs the plain frames
+			// (measured: 1-5 px TEMPORAL defects per light at the 1e-6 gate tolerance).
+			// UMBRA EARLY-OUT, exactly the plain list walker's (softwedge_coverage.inc.hlsl): once the
+			// OR-union covers >=99% of the disk no later occluder can reduce it (monotone), and the tail
+			// rounds to full coverage anyway - so stop walking. Without it every umbra serve walked ALL
+			// union entries + the whole dynamic scan while the plain walk it replaced exited after a few
+			// tris: measured serves 3.6M/frame costing term 46.8 -> 72.0 ms (the serve-loses-to-plain
+			// economics). break (not return) so serve-verify still compares.
+			bool swUmbE = false;
+			int  swUCnt = 0, swUFill = 0, swDFill = 0;			// serve-work attribution (diag sums)
+			[loop] for( int ls = 0; ls < servedCount; ls++ )
+			{
+				const uint seEnc = u_Contrib[ servedBase + ls ];	// 1-BASED entries: 0 = a concurrent
+				if( seEnc == 0u )									// append reserved this slot but has
+				{													// not stored yet - skip, never read torn
+					continue;
+				}
+				swUCnt++;
+				const int se = ( int )( seEnc - 1u );
+				const int b = g_range.x + se * 3;
+				const float4 r0 = t_SoftEdges[ b + 0 ];
+				const float4 r1 = t_SoftEdges[ b + 1 ];
+				const float4 r2 = t_SoftEdges[ b + 2 ];
+				const float3 tc = ( r0.xyz + r1.xyz + r2.xyz ) * ( 1.0f / 3.0f );
+				const float3 rcv = tc - swP;
+				const float  cdv = dot( rcv, swFC.nrm );
+				const float  trv = r1.w;
+				if( cdv + trv < SW_NEAR_EPS ) { continue; }
+				if( cdv - trv > swFC.distPL ) { continue; }
+				const float3 ppv = rcv - cdv * swFC.nrm;
+				const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
+				if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
+				swUFill++;
+				SoftScan_FillTri( swGrid, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+				int swCovE = 0;
+				[unroll] for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ )
+				{
+					swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] );
+				}
+				if( swCovE * 100 >= swDiskBits * 99 )
+				{
+					swUmbE = true;
+					break;
+				}
+			}
+			// dynamic casters via THIS fragment's TILE LIST, dynamic tris only (se >= first dynamic
+			// tri) - the surf cache measured the untiled all-caster suffix costing a HIT more than a
+			// tiled MISS on dynamics-heavy scenes (the RoE intro), and the same held here (probe:
+			// term 30.9 -> 30.2 only). Serving requires a NORMAL tile list; spill/corrupt/untiled
+			// fragments never reach here (the serve guard below routed them to the plain walk).
+			const int swDynFirstTri = ( g_surfA.z < g_range.y ) ? ( int )t_SoftEdges[ g_flags.y + g_surfA.z * 2 + 1 ].x : 0x7FFFFFFF;
+			// ALL-STATIC light: no dynamic suffix exists, skip both dynamic scans outright - the spill
+			// cluster scan alone (2 reads x every cluster, all filtered out) measured cap0007 term
+			// 41.1 -> 47.4 ms once spill tiles started serving.
+			const bool swHasDyn = swDynFirstTri != 0x7FFFFFFF;
+			[loop] for( int ld2 = 0; swHasDyn && !swUmbE && ld2 < swServeListCount; ld2++ )
+			{
+				const int dt = ( int )t_SoftTiles[ swServeListBase + ld2 ];
+				if( dt < swDynFirstTri )
+				{
+					continue;						// static tri: served from the recorded union above
+				}
+				const int b = g_range.x + dt * 3;
+				const float4 r0 = t_SoftEdges[ b + 0 ];
+				const float4 r1 = t_SoftEdges[ b + 1 ];
+				const float4 r2 = t_SoftEdges[ b + 2 ];
+				const float3 tc = ( r0.xyz + r1.xyz + r2.xyz ) * ( 1.0f / 3.0f );
+				const float3 rcv = tc - swP;
+				const float  cdv = dot( rcv, swFC.nrm );
+				const float  trv = r1.w;
+				if( cdv + trv < SW_NEAR_EPS ) { continue; }
+				if( cdv - trv > swFC.distPL ) { continue; }
+				const float3 ppv = rcv - cdv * swFC.nrm;
+				const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
+				if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
+				swDFill++;
+				SoftScan_FillTri( swGrid, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+				int swCovD = 0;
+				[unroll] for( int fm2 = 0; fm2 < SW_SCAN_CHORDS; fm2++ )
+				{
+					swCovD += SoftPopcount32( swGrid[fm2] & swDiskMask[fm2] );
+				}
+				if( swCovD * 100 >= swDiskBits * 99 )
+				{
+					break;							// umbra early-out, same rule as the union loop
+				}
+			}
+			// SPILL-tile dynamics: same dynamic-only filter through the cluster hierarchy. Clusters
+			// are per-caster contiguous tri runs and a caster is wholly static or wholly dynamic, so
+			// firstTri >= dynFirstTri identifies dynamic clusters exactly.
+			[loop] for( int sc2 = 0; swHasDyn && !swUmbE && sc2 < swSpillN; sc2++ )
+			{
+				const int se2 = ( int )t_SoftTiles[ swSpillBase + sc2 ];	// ABSOLUTE cluster-record offset
+				const float4 q1 = t_SoftEdges[ se2 + 1 ];					// ( firstTri, numTris, 0, 0 )
+				if( ( int )q1.x < swDynFirstTri )
+				{
+					continue;						// static cluster: served from the recorded union
+				}
+				const float4 q0 = t_SoftEdges[ se2 + 0 ];					// ( centre.xyz, radius )
+				{
+					const float3 crc = q0.xyz - swP;
+					const float  ccd = dot( crc, swFC.nrm );
+					if( ccd + q0.w < SW_NEAR_EPS ) { continue; }
+					if( ccd - q0.w > swFC.distPL ) { continue; }
+					const float3 cpp = crc - ccd * swFC.nrm;
+					const float  ccr = swRC * ( ccd + q0.w ) / swFC.distPL;
+					if( dot( cpp, cpp ) > ( ccr + q0.w ) * ( ccr + q0.w ) ) { continue; }
+				}
+				const int sTriEnd = ( int )q1.x + ( int )q1.y;
+				[loop] for( int st = ( int )q1.x; st < sTriEnd; st++ )
+				{
+					const int b = g_range.x + st * 3;
+					const float4 r0 = t_SoftEdges[ b + 0 ];
+					{
+						// the plain spill walker's COARSE v0-radius reject, mirrored in order (bit parity)
+						const float3 rc0 = r0.xyz - swP;
+						const float  cd0 = dot( rc0, swFC.nrm );
+						if( cd0 + r0.w < SW_NEAR_EPS ) { continue; }
+						if( cd0 - r0.w > swFC.distPL ) { continue; }
+						const float3 pp0 = rc0 - cd0 * swFC.nrm;
+						const float  cr0 = swRC * ( cd0 + r0.w ) / swFC.distPL;
+						if( dot( pp0, pp0 ) > ( cr0 + r0.w ) * ( cr0 + r0.w ) ) { continue; }
+					}
+					const float4 r1 = t_SoftEdges[ b + 1 ];
+					const float4 r2 = t_SoftEdges[ b + 2 ];
+					const float3 tc = ( r0.xyz + r1.xyz + r2.xyz ) * ( 1.0f / 3.0f );
+					const float3 rcv = tc - swP;
+					const float  cdv = dot( rcv, swFC.nrm );
+					const float  trv = r1.w;
+					if( cdv + trv < SW_NEAR_EPS ) { continue; }
+					if( cdv - trv > swFC.distPL ) { continue; }
+					const float3 ppv = rcv - cdv * swFC.nrm;
+					const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
+					if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
+					swDFill++;
+					SoftScan_FillTri( swGrid, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+					int swCovS2 = 0;
+					[unroll] for( int fm3 = 0; fm3 < SW_SCAN_CHORDS; fm3++ )
+					{
+						swCovS2 += SoftPopcount32( swGrid[fm3] & swDiskMask[fm3] );
+					}
+					if( swCovS2 * 100 >= swDiskBits * 99 )
+					{
+						swUmbE = true;
+						break;
+					}
+				}
+			}
+			// serve-work attribution (one-shot readback deltas, one atomic per wave per word)
+			SwContribDiagSum( 12u, ( uint )swUCnt );
+			SwContribDiagSum( 13u, ( uint )swUFill );
+			SwContribDiagSum( 14u, ( uint )swDFill );
+			if( swUmbE )
+			{
+				SwContribDiag( 15u );
+			}
+			int swCov = 0;
+			[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ )
+			{
+				swCov += SoftPopcount32( swGrid[cm] & swDiskMask[cm] );
+			}
+			// match the plain walk's >=99% umbra rounding EXACTLY (it returns coverage 1.0 there);
+			// without it plain-vs-cached frames flicker the last coverage bit (TEMPORAL defects)
+			if( swCov * 100 >= swDiskBits * 99 )
+			{
+				swCov = swDiskBits;
+			}
+			const float swTermServe = 1.0 - saturate( swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0 );
+			if( g_surfParams.y != 0.0f )
+			{
+				// SERVE-VERIFY (r_softShadowContribCache 2): run the PLAIN walk for the same fragment,
+				// tally mismatches into the table header ([4] compares, [5] mismatches, [6] max |diff|
+				// as float bits via InterlockedMax - monotonic for non-negative floats), and RENDER the
+				// plain term. Millions of deterministic comparisons per run - the cache's self-check.
+				float swOccP;
+				const int swVTx = px.x / SW_TILE_SIZE - g_tile.x;
+				const int swVTy = px.y / SW_TILE_SIZE - g_tile.y;
+				if( g_range.z >= 0 && swVTx >= 0 && swVTy >= 0 )
+				{
+					const int  swVSlot = g_range.z + ( swVTy * g_range.w + swVTx ) * ( g_flags.w + 1 );
+					uint swVCnt = t_SoftTiles[ swVSlot ];
+					if( swVCnt > ( uint )g_flags.w && swVCnt < SW_TILE_SPILL )
+					{
+						swVCnt = 0xFFFFFFFFu;
+					}
+					if( swVCnt == SW_TILE_SPILL )
+					{
+						const uint swVOfs = t_SoftTiles[ swVSlot + 1 ];
+						const uint swVSpN = min( t_SoftTiles[ swVSlot + 2 ], 65536u );
+						swOccP = SoftShadow_FaceCoverageClusterList( swP, g_lightR.xyz, swRC, g_range.x, ( int )swVOfs, ( int )swVSpN, swRotAng );
+					}
+					else if( swVCnt != 0xFFFFFFFFu )
+					{
+						swOccP = SoftShadow_FaceCoverageList( swP, g_lightR.xyz, swRC, g_range.x, swVSlot + 1, ( int )swVCnt, swRotAng );
+					}
+					else
+					{
+						swOccP = SoftShadow_Coverage( swP, g_lightR.xyz, swRC, g_range.x, g_flags.y, g_range.y, 0.0, true, swRotAng );
+					}
+				}
+				else
+				{
+					swOccP = SoftShadow_Coverage( swP, g_lightR.xyz, swRC, g_range.x, g_flags.y, g_range.y, 0.0, true, swRotAng );
+				}
+				const float swTermPlain = 1.0 - saturate( swOccP );
+				InterlockedAdd( u_Contrib[ 4 ], 1u );
+				if( abs( swTermPlain - swTermServe ) > 1e-7f )
+				{
+					InterlockedAdd( u_Contrib[ 5 ], 1u );
+					uint swDm;
+					InterlockedMax( u_Contrib[ 6 ], asuint( abs( swTermPlain - swTermServe ) ), swDm );
+					// mismatch attribution: direction + fragment class (the debugging split)
+					InterlockedAdd( u_Contrib[ swTermServe < swTermPlain ? 16 : 17 ], 1u );
+					InterlockedAdd( u_Contrib[ ( swServeListCount < 0 ) ? 18 : 19 ], 1u );
+				}
+				u_Term[ uint2( px + g_tile.zw ) ] = swTermPlain;
+				return;
+			}
+			u_Term[ uint2( px + g_tile.zw ) ] = swTermServe;
+			return;
+		}
+
+		if( recordSlot >= 0 )
+		{
+			// ---- RECORD: this fragment's TILE LIST walked with per-triangle SOLO contribution tests
+			// (the validated recording signal; delta-recording measured lossy). The tile list is the
+			// shipped-exact triangle set for this fragment (the plain walk uses nothing else), so it
+			// finds exactly this fragment's contributors at ~1/10th the cost of the old full-caster
+			// walk - which made the 1-in-64 refinement validator alone cost +37 ms/frame (measured:
+			// refine OFF dropped term 70.6 -> 33.5 ms). Ticketing requires a normal tile list, so
+			// swServeListCount >= 0 here always. Records STATIC tris only (index below the first
+			// dynamic tri); the fragment's own term comes from the same grid - one pass.
+			InterlockedAdd( u_Contrib[ 2 ], 1u );					// stat: recording eval
+			bool swAppendedNew = false;								// did this eval extend the union?
+			const int dynFirstTri = ( g_surfA.z < g_range.y ) ? ( int )t_SoftEdges[ g_flags.y + g_surfA.z * 2 + 1 ].x : 0x7FFFFFFF;
+			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
+			const float swRC = max( g_lightR.w, 1e-2 );
+			uint swGrid[SW_SCAN_CHORDS];
+			uint swDiskMask[SW_SCAN_CHORDS];
+			int  swDiskBits = 0;
+			[unroll] for( int gm = 0; gm < SW_SCAN_CHORDS; gm++ )
+			{
+				swGrid[gm] = 0u;
+				swDiskMask[gm] = SoftScan_Run( -SW_SCAN_HC[gm], SW_SCAN_HC[gm] );
+				swDiskBits += SoftPopcount32( swDiskMask[gm] );
+			}
+			[loop] for( int rl2 = 0; rl2 < swServeListCount; rl2++ )
+			{
+				const int rt = ( int )t_SoftTiles[ swServeListBase + rl2 ];
+				{
+					const int b = g_range.x + rt * 3;
+					const float4 r0 = t_SoftEdges[ b + 0 ];
+					const float4 r1 = t_SoftEdges[ b + 1 ];
+					const float4 r2 = t_SoftEdges[ b + 2 ];
+					// the SAME per-tri cone cull as the plain walk (bit-parity rule, see the serve path)
+					const float3 tc = ( r0.xyz + r1.xyz + r2.xyz ) * ( 1.0f / 3.0f );
+					const float3 rcv = tc - swP;
+					const float  cdv = dot( rcv, swFC.nrm );
+					const float  trv = r1.w;
+					if( cdv + trv < SW_NEAR_EPS ) { continue; }
+					if( cdv - trv > swFC.distPL ) { continue; }
+					const float3 ppv = rcv - cdv * swFC.nrm;
+					const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
+					if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
+					uint solo[SW_SCAN_CHORDS];
+					[unroll] for( int sm = 0; sm < SW_SCAN_CHORDS; sm++ )
+					{
+						solo[sm] = 0u;
+					}
+					SoftScan_FillTri( solo, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+					// record on ANY RAW solo bits, not only in-disk-mask bits: a tri whose intervals
+					// land just outside the disk at every evaluated pixel becomes a contributor under
+					// a sub-pixel view displacement - the dominant frozen-union CONTINUITY class
+					// (gate: 2717 defects evidence-only vs 52 with all serves re-validated)
+					uint soloRaw = 0u;
+					[unroll] for( int sm2b = 0; sm2b < SW_SCAN_CHORDS; sm2b++ )
+					{
+						soloRaw |= solo[sm2b];
+						swGrid[sm2b] |= solo[sm2b];
+					}
+					if( soloRaw != 0u && rt < dynFirstTri )
+					{
+						// ENTRIES ARE 1-BASED (rt+1): 0 marks a reserved-but-unstored slot, so concurrent
+						// serves can never read a torn entry (they skip 0s).
+						if( SwContribAppend( ( uint )recordSlot, rt ) )
+						{
+							swAppendedNew = true;
+						}
+					}
+				}
+			}
+			// SPILL-tile record: the same solo-contribution walk through the cluster hierarchy (the
+			// heavy caps are spill-dominated; without this the cache never engages exactly where the
+			// walk is dearest). Mirrors the plain spill walker's cluster + coarse + tight culls.
+			[loop] for( int sr = 0; sr < swSpillN; sr++ )
+			{
+				const int se3 = ( int )t_SoftTiles[ swSpillBase + sr ];		// ABSOLUTE cluster-record offset
+				const float4 q0 = t_SoftEdges[ se3 + 0 ];					// ( centre.xyz, radius )
+				{
+					const float3 crc = q0.xyz - swP;
+					const float  ccd = dot( crc, swFC.nrm );
+					if( ccd + q0.w < SW_NEAR_EPS ) { continue; }
+					if( ccd - q0.w > swFC.distPL ) { continue; }
+					const float3 cpp = crc - ccd * swFC.nrm;
+					const float  ccr = swRC * ( ccd + q0.w ) / swFC.distPL;
+					if( dot( cpp, cpp ) > ( ccr + q0.w ) * ( ccr + q0.w ) ) { continue; }
+				}
+				const float4 q1 = t_SoftEdges[ se3 + 1 ];					// ( firstTri, numTris, 0, 0 )
+				const int sTriEnd2 = ( int )q1.x + ( int )q1.y;
+				[loop] for( int rt2 = ( int )q1.x; rt2 < sTriEnd2; rt2++ )
+				{
+					const int b = g_range.x + rt2 * 3;
+					const float4 r0 = t_SoftEdges[ b + 0 ];
+					{
+						// plain spill walker's COARSE v0-radius reject, in order (bit parity)
+						const float3 rc0 = r0.xyz - swP;
+						const float  cd0 = dot( rc0, swFC.nrm );
+						if( cd0 + r0.w < SW_NEAR_EPS ) { continue; }
+						if( cd0 - r0.w > swFC.distPL ) { continue; }
+						const float3 pp0 = rc0 - cd0 * swFC.nrm;
+						const float  cr0 = swRC * ( cd0 + r0.w ) / swFC.distPL;
+						if( dot( pp0, pp0 ) > ( cr0 + r0.w ) * ( cr0 + r0.w ) ) { continue; }
+					}
+					const float4 r1 = t_SoftEdges[ b + 1 ];
+					const float4 r2 = t_SoftEdges[ b + 2 ];
+					const float3 tc = ( r0.xyz + r1.xyz + r2.xyz ) * ( 1.0f / 3.0f );
+					const float3 rcv = tc - swP;
+					const float  cdv = dot( rcv, swFC.nrm );
+					const float  trv = r1.w;
+					if( cdv + trv < SW_NEAR_EPS ) { continue; }
+					if( cdv - trv > swFC.distPL ) { continue; }
+					const float3 ppv = rcv - cdv * swFC.nrm;
+					const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
+					if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
+					uint solo2[SW_SCAN_CHORDS];
+					[unroll] for( int sm3 = 0; sm3 < SW_SCAN_CHORDS; sm3++ )
+					{
+						solo2[sm3] = 0u;
+					}
+					SoftScan_FillTri( solo2, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+					uint soloRaw2 = 0u;								// ANY raw bits (see the tile-list record)
+					[unroll] for( int sm4 = 0; sm4 < SW_SCAN_CHORDS; sm4++ )
+					{
+						soloRaw2 |= solo2[sm4];
+						swGrid[sm4] |= solo2[sm4];
+					}
+					if( soloRaw2 != 0u && rt2 < dynFirstTri )
+					{
+						if( SwContribAppend( ( uint )recordSlot, rt2 ) )
+						{
+							swAppendedNew = true;
+						}
+					}
+				}
+			}
+			// FINALIZE. Every completed record marks its TILE-COVERAGE bit (appends are done in
+			// program order for this thread; cross-thread visibility is the same relaxed model the
+			// rest of the protocol uses - a same-dispatch under-covered serve is transient and the
+			// refinement validator converges it). Ticketed evaluators (swMyTicket valid) counted
+			// themselves via the pre-walk CAS; EXACTLY the holder of ticket K'-1 flips BUILT.
+			// Refinement fragments (no ticket, BUILT cell, tile already covered) resolve the
+			// revoke/converge outcome - and ONLY they: a ticketed straggler or a tile-miss fill-in
+			// legitimately appends (poisoning on those would revoke every freshly built cell /
+			// every newly joined tile).
+			// ONLY a tile-miss record certifies its tile: it is a FULL-TILE evaluation (every fragment
+			// of the tile records that dispatch), so the union provably holds that tile's contributors.
+			// Warm-phase ticket winners must NOT set bits - K' wave-order tickets cluster, and a
+			// shadow-boundary tile certified by K' lit fragments served an EMPTY union to its shadowed
+			// pixels (the persistent max|diff|=1.0 verify class).
+			if( swTileMissRec )
+			{
+				// PEND (never LIVE directly): stamp PENDFRAME FIRST so concurrent probers stop
+				// promoting this frame, THEN pend the bit - the promotion in a later frame makes
+				// it servable only after every recorder of this dispatch has finalized its appends
+				uint swTbDummy;
+				InterlockedExchange( u_Contrib[ ( uint )recordSlot + SW_CONTRIB_TILEPFR ], ( uint )g_surfA.y & 0x7FFFu, swTbDummy );
+				InterlockedOr( u_Contrib[ ( uint )recordSlot + SW_CONTRIB_TILEPEND ], swTileBit, swTbDummy );
+			}
+			const uint swEvNow = u_Contrib[ ( uint )recordSlot + 2 ];
+			if( ( swEvNow & SW_CONTRIB_BUILT ) != 0u && swMyTicket == 0xFFFFFFFFu && !swTileMissRec )
+			{
+				// REFINEMENT outcome on a BUILT cell: a NEW contributor means the served union was
+				// incomplete for this view - REVOKE serving (POISON) until a later eval converges
+				// (appends nothing new), which restores BUILT service with a fresh flip stamp.
+				if( swAppendedNew )
+				{
+					uint pz2;
+					InterlockedOr( u_Contrib[ ( uint )recordSlot + 2 ], SW_CONTRIB_POISON, pz2 );
+				}
+				else if( ( swEvNow & SW_CONTRIB_POISON ) != 0u
+						 && u_Contrib[ ( uint )recordSlot + 3 ] <= ( uint )SW_CONTRIB_K )
+				{
+					// converged: this full eval found every contributor already recorded
+					uint pz3;
+					InterlockedAnd( u_Contrib[ ( uint )recordSlot + 2 ], ~SW_CONTRIB_POISON, pz3 );
+				}
+				int swCovS = 0;
+				[unroll] for( int cs2 = 0; cs2 < SW_SCAN_CHORDS; cs2++ )
+				{
+					swCovS += SoftPopcount32( swGrid[cs2] & swDiskMask[cs2] );
+				}
+				if( swCovS * 100 >= swDiskBits * 99 )
+				{
+					swCovS = swDiskBits;		// plain-walk umbra rounding, matched exactly
+				}
+				u_Term[ uint2( px + g_tile.zw ) ] = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovS / ( float )swDiskBits : 0.0 );
+				return;
+			}
+			if( swMyTicket != 0xFFFFFFFFu
+					&& swMyTicket + 1u == ( uint )g_surfCost.z
+					&& u_Contrib[ ( uint )recordSlot + 3 ] <= ( uint )SW_CONTRIB_K )
+			{
+				uint dummy;
+				// stamp the flip FRAME (bits 16-30) with the BUILT bit so serving defers one frame
+				// (no pool release: the claim counter is per-frame now and resets on the CPU)
+				InterlockedOr( u_Contrib[ ( uint )recordSlot + 2 ], SW_CONTRIB_BUILT | ( ( ( uint )g_surfA.y & 0x7FFFu ) << 16 ), dummy );
+			}
+			int swCovR = 0;
+			[unroll] for( int cr = 0; cr < SW_SCAN_CHORDS; cr++ )
+			{
+				swCovR += SoftPopcount32( swGrid[cr] & swDiskMask[cr] );
+			}
+			if( swCovR * 100 >= swDiskBits * 99 )
+			{
+				swCovR = swDiskBits;			// plain-walk umbra rounding, matched exactly
+			}
+			u_Term[ uint2( px + g_tile.zw ) ] = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 );
+			return;
+		}
+		}	// keyLo != sentinel
+		}	// cell coords in range
+	}
+#endif	// SW_CONTRIB_CACHE
 
 #if SW_SURF_CACHE
 	// SURFACE-FOLD CACHE probe: world-anchored texel lookup. BUILT texel -> term = 1 - saturate(

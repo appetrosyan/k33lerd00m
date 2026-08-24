@@ -4951,6 +4951,14 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 	}
 	if( wantBins )
 	{
+		if( softShadowTermPass != NULL )
+		{
+			// per-VIEW tick for the contributor cache's frame-stamp defer + per-frame claim budget:
+			// tr.frameCount does NOT advance in minimal-init paths (the gate), so the cache keeps its
+			// own view counter (measured: a dead tick froze claims at the first frame's budget and
+			// pinned every flip-frame stamp to "now", starving the serve path)
+			softShadowTermPass->ContribNewView();
+		}
 		softTileBinPass->BeginView( target, viewDef,
 									( nvrhi::ITexture* )globalImages->currentDepthImage->GetTextureID() );
 		for( const viewLight_t* vLight = viewDef->viewLights; vLight != NULL; vLight = vLight->next )

@@ -2621,6 +2621,18 @@ int R_SoftShadowGate( const char* arg )
 					wdev->waitForIdle();
 				}
 			}
+			// CONTRIBUTOR-CACHE warm: like the surf cache above, the contrib cache must be WARM before
+			// the probes - its per-cell record->flip transitions legitimately change the term between
+			// consecutive frames (the state machine settling), which the temporal probe would read as
+			// jitter. A few settle frames let visible cells claim + record + flip; the probes then
+			// compare stable serve-vs-serve frames, which is the honest test of the cached term.
+			if( cvarSystem->GetCVarInteger( "r_softShadowContribCache" ) != 0 )
+			{
+				for( int wf = 0; wf < 8; wf++ )
+				{
+					GateRenderFrame( rw, &rv );
+				}
+			}
 			// ALWAYS retain this render's edge records (the exact caster triangles the shader consumed)
 			// via the capture hook - the defect arbiter float64-traces against them. Diagnostic mode
 			// additionally writes the full .cap for offline interrogation.
@@ -3041,6 +3053,28 @@ int R_SoftShadowGate( const char* arg )
 			{
 				GateRenderFrame( rw, &rv );
 			}
+			// contributor-cache settle + steady-state snapshot: on a STATIC bench scene every visible
+			// cell must claim/record/flip within a few frames, after which recording evals must be ZERO
+			// (the whole point of the cache). Snapshot the cumulative counters here; the delta over the
+			// timed frames is the steady-state leak detector (recording delta > 0 = a record-path leak
+			// paying the 2-3x walk every frame - the exact overhead class that made the live probe
+			// net-negative).
+			uint32_t csWarm[20] = {};
+			uint64_t swCALWarm = 0, swCFRWarm = 0;
+			bool csWarmOk = false;
+			if( cvarSystem->GetCVarInteger( "r_softShadowContribCache" ) != 0 )
+			{
+				for( int wf = 0; wf < 12; wf++ )
+				{
+					GateRenderFrame( rw, &rv );
+				}
+				csWarmOk = backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetContribStats( csWarm );
+				if( csWarmOk )
+				{
+					swCALWarm = backEnd.GetSoftShadowTermPass()->m_ContribActiveLights;
+					swCFRWarm = backEnd.GetSoftShadowTermPass()->m_ContribFragments;
+				}
+			}
 			const int t0 = Sys_Microseconds();
 			int benchRecords = 0, benchDropped = 0;
 			int benchSoftLights = 0, benchTermLights = 0, benchBinnedLights = 0;
@@ -3189,6 +3223,61 @@ int R_SoftShadowGate( const char* arg )
 						common->Printf( "[softgate] BENCH %-14s STALL frame %2d: gpu %.1f wall %.1f soft %.1f ms (+%.1f over median) class=%s\n",
 										cap.name.c_str(), bf.idx, bf.gpu, bf.wall, bf.soft,
 										( gpuOut ? bf.gpu - gMed : bf.wall - wMed ), cls );
+					}
+				}
+			}
+			// contributor-cache steady-state (delta over the TIMED frames, post-settle): on a static
+			// scene steady recording MUST be 0 - any recording here is a per-frame leak re-paying the
+			// 2-3x record walk. PASS/FAIL is the unit-level invariant for the overhead-reduction loop.
+			if( csWarmOk )
+			{
+				uint32_t csEnd[20] = {};
+				if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetContribStats( csEnd ) )
+				{
+					const uint32_t dServe  = csEnd[1] - csWarm[1];
+					const uint32_t dRecord = csEnd[2] - csWarm[2];
+					const uint32_t dClaim  = csEnd[3] - csWarm[3];
+					const uint32_t dRefine = csEnd[10] - csWarm[10];
+					// refinement records ARE steady-state by design (1/64 validator); the leak verdict is
+					// on recording BEYOND them
+					common->Printf( "[softgate] BENCH %-14s CONTRIB steady-state: serves %u/frame | recording %u/frame (refine %u/frame) | claims %u/frame -> %s\n",
+									cap.name.c_str(), dServe / benchFrames, dRecord / benchFrames, dRefine / benchFrames, dClaim / benchFrames,
+									dRecord <= dRefine + 64 * benchFrames ? "PASS (refinement only)" : "FAIL (steady-state RECORD LEAK)" );
+					common->Printf( "[softgate] BENCH %-14s CONTRIB cumulative (incl. warm): serves %u | recordings %u | cells claimed %u\n",
+									cap.name.c_str(), csEnd[1], csEnd[2], csEnd[3] );
+					const uint64_t swStT = backEnd.GetSoftShadowTermPass()->m_ContribStaticTris;
+					const uint64_t swTtT = backEnd.GetSoftShadowTermPass()->m_ContribTotalTris;
+					common->Printf( "[softgate] BENCH %-14s CONTRIB diag deltas: budget-blocked %u/frame | probe-exhausted %u/frame | built-unservable %u/frame | STATIC share %.1f%% | active lights %.1f/frame | frags %.0fk/frame\n",
+									cap.name.c_str(), ( csEnd[7] - csWarm[7] ) / benchFrames, ( csEnd[8] - csWarm[8] ) / benchFrames,
+									( csEnd[9] - csWarm[9] ) / benchFrames,
+									swTtT > 0 ? 100.0 * ( double )swStT / ( double )swTtT : 0.0,
+									( double )( backEnd.GetSoftShadowTermPass()->m_ContribActiveLights - swCALWarm ) / benchFrames,
+									( double )( backEnd.GetSoftShadowTermPass()->m_ContribFragments - swCFRWarm ) / benchFrames / 1000.0 );
+					// serve-verify (r_softShadowContribCache 2): the decisive correctness number for the
+					// fast loop - served-vs-plain term mismatches over the timed frames
+					if( csEnd[4] - csWarm[4] > 0 )
+					{
+						float swVMaxD;
+						memcpy( &swVMaxD, &csEnd[6], sizeof( float ) );
+						const uint32_t dCmp = csEnd[4] - csWarm[4];
+						const uint32_t dMis = csEnd[5] - csWarm[5];
+						common->Printf( "[softgate] BENCH %-14s CONTRIB VERIFY: compares %u | mismatches %u (%.5f%%) | max|diff| %.6f\n",
+										cap.name.c_str(), dCmp, dMis, 100.0 * dMis / dCmp, swVMaxD );
+						common->Printf( "[softgate] BENCH %-14s CONTRIB VERIFY split: serve-DARKER %u | serve-LIGHTER %u | on-spill %u | on-tile %u\n",
+										cap.name.c_str(), csEnd[16] - csWarm[16], csEnd[17] - csWarm[17],
+										csEnd[18] - csWarm[18], csEnd[19] - csWarm[19] );
+					}
+					// serve-work attribution: what an average SERVE actually walks. Compare vs the plain
+					// walk's ~55-107 MT survivors/fragment - if union+dyn FillTris approach that, the
+					// serve is not saving work and the term ms will show it.
+					if( dServe > 0 )
+					{
+						common->Printf( "[softgate] BENCH %-14s CONTRIB serve-work: union entries %.1f | union FillTri %.1f | dyn FillTri %.1f | umbra-out %.1f%% (per serve)\n",
+										cap.name.c_str(),
+										( double )( csEnd[12] - csWarm[12] ) / dServe,
+										( double )( csEnd[13] - csWarm[13] ) / dServe,
+										( double )( csEnd[14] - csWarm[14] ) / dServe,
+										100.0 * ( double )( csEnd[15] - csWarm[15] ) / dServe );
 					}
 				}
 			}
@@ -3440,6 +3529,21 @@ int R_SoftShadowGate( const char* arg )
 						"missing corpus or aborted init; a run that probes 0 lights verifies nothing)\n",
 						( int )all.size(), capsRun, lightsRun );
 		return 124;		// distinct SETUP-fail code, below the 125 defect clamp and the 126 watchdog abort
+	}
+	// contributor-cache health/verify report (r_softShadowContribCache): serve/record volumes, and in
+	// serve-verify mode (=2) the decisive number - served-vs-plain term mismatches with the max |diff|
+	{
+		uint32_t cs[20] = {};
+		if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetContribStats( cs ) && ( cs[1] | cs[2] | cs[3] ) != 0 )
+		{
+			float maxDiff;
+			memcpy( &maxDiff, &cs[6], sizeof( float ) );
+			common->Printf( "[softgate] CONTRIB: serves %u | recording evals %u | cells claimed %u | pool now %u | VERIFY compares %u mismatches %u (%.4f%%) max|diff| %.6f\n",
+							cs[1], cs[2], cs[3], cs[0], cs[4], cs[5],
+							cs[4] ? 100.0 * cs[5] / cs[4] : 0.0, cs[4] ? maxDiff : 0.0f );
+			common->Printf( "[softgate] CONTRIB diag: budget-blocked %u | probe-exhausted %u | built-unservable %u | refine records %u\n",
+							cs[7], cs[8], cs[9], cs[10] );
+		}
 	}
 	common->Printf( "[softgate] TOTAL DEFECTS: %d across %d captures, %d lights -> %s\n",
 					( int )all.size(), capsRun, lightsRun, all.empty() ? "PASS" : "FAIL" );

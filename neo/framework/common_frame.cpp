@@ -1182,6 +1182,26 @@ void idCommonLocal::Frame()
 										ssum / sn, ss[sn / 2], ss[Min( sn - 1, ( sn * 99 ) / 100 )], ss[sn - 1] );
 						s_probeSoft.Clear();
 					}
+					// contributor-cache health (r_softShadowContribCache): cumulative serve/record volumes -
+					// a low serve share explains a flat term ms instantly (fragments still walking plain)
+					{
+						uint32_t ccs[20] = {};
+						if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetContribStats( ccs ) && ( ccs[1] | ccs[2] ) != 0 )
+						{
+							const double cctot = ( double )ccs[1] + ( double )ccs[2];
+							const uint64_t st = backEnd.GetSoftShadowTermPass()->m_ContribStaticTris;
+							const uint64_t tt = backEnd.GetSoftShadowTermPass()->m_ContribTotalTris;
+							const uint64_t cfr = backEnd.GetSoftShadowTermPass()->m_ContribFragments;
+							common->Printf( "[softprobe] CONTRIB: serves %u (%.0f%% of cache events, %.1f%% of %llu frags) | recording evals %u | cells claimed %u | verify mismatches %u | STATIC share of stream %.1f%% (the cache's ceiling)\n",
+											ccs[1], cctot > 0 ? 100.0 * ccs[1] / cctot : 0.0,
+											cfr > 0 ? 100.0 * ccs[1] / ( double )cfr : 0.0, ( unsigned long long )cfr,
+											ccs[2], ccs[3], ccs[5],
+											tt > 0 ? 100.0 * ( double )st / ( double )tt : 0.0 );
+							common->Printf( "[softprobe] CONTRIB diag: budget-blocked %u | probe-exhausted %u | built-unservable %u | refine records %u | active lights %llu\n",
+											ccs[7], ccs[8], ccs[9], ccs[10],
+											( unsigned long long )backEnd.GetSoftShadowTermPass()->m_ContribActiveLights );
+						}
+					}
 					com_softShadowFrameProbe.SetInteger( 0 );
 					s_probeFrame = 0;
 					s_probeMs.Clear();

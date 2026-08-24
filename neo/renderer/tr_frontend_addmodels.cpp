@@ -101,12 +101,42 @@ int fe_softDynGeomMoved = 0;						// of the dynamic records: static light but mo
 // There is no entityHasMoved field; lastModifiedFrameNum vs the frame count is the move proxy.
 static bool R_SoftCasterIsStatic( const idRenderEntityLocal* entityDef, const viewLight_t* vLight )
 {
-	if( vLight == NULL || vLight->lightHasMoved )
+	if( vLight == NULL )
 	{
 		return false;
 	}
 	const idRenderModel* m = ( entityDef != NULL ) ? entityDef->parms.hModel : NULL;
-	if( m == NULL || ( !m->IsStaticWorldModel() && m->IsDynamicModel() != DM_STATIC ) )
+	if( m == NULL )
+	{
+		return false;
+	}
+	// LINGER classification (r_softShadowContribLinger > 0): a light+entity pair unmodified for
+	// >= linger frames is cacheable regardless of movement history - the sticky lightHasMoved and
+	// the static-model-only rule capped the cacheable share at ~29% of the live stream while most
+	// of it is geometrically still. lastModifiedFrameNum ticks on every UpdateLightDef/
+	// UpdateEntityDef, so anything animating/moving reclassifies the moment it changes; the
+	// fingerprint/generation machinery then re-records (bounded, exact - just slower while moving).
+	// DM_CONTINUOUS models (beams/particles: view-dependent geometry with no entity update) can
+	// never linger-qualify.
+	extern idCVar r_softShadowContribLinger;
+	const int swLinger = r_softShadowContribLinger.GetInteger();
+	if( swLinger > 0 )
+	{
+		if( m->IsDynamicModel() == DM_CONTINUOUS )
+		{
+			return false;
+		}
+		if( vLight->lightDef == NULL || tr.frameCount - vLight->lightDef->lastModifiedFrameNum < swLinger )
+		{
+			return false;
+		}
+		return tr.frameCount - entityDef->lastModifiedFrameNum >= swLinger;
+	}
+	if( vLight->lightHasMoved )
+	{
+		return false;
+	}
+	if( !m->IsStaticWorldModel() && m->IsDynamicModel() != DM_STATIC )
 	{
 		return false;
 	}
@@ -2401,8 +2431,14 @@ void R_AddModels()
 			// otherwise silently scramble every cached residual list. The walk mask is a commutative
 			// union, so on its own this reorder is bit-exact (same argument as the depth-order block
 			// above; runs AFTER it, so the partition wins and depth order is moot with the cache on).
+			// the CONTRIBUTOR cache needs the same static-first partition: without it the wedge chain
+			// stays in collection order and the static prefix truncates at the first dynamic caster
+			// (measured on the cap0007 bench with surf cache off: contrib serves saved almost nothing
+			// because most static casters sat past the truncation point).
 			extern idCVar r_softShadowSurfCache;
-			if( r_softShadowSurfCache.GetBool() && vLight->softShadowWedges != NULL && vLight->lightDef != NULL )
+			extern idCVar r_softShadowContribCache;
+			if( ( r_softShadowSurfCache.GetBool() || r_softShadowContribCache.GetInteger() != 0 )
+					&& vLight->softShadowWedges != NULL && vLight->lightDef != NULL )
 			{
 				struct SwSRun { drawSurf_t* head; drawSurf_t* tail; bool isStatic; uint64_t key; };
 				std::vector<SwSRun> runs;
@@ -2709,7 +2745,10 @@ void R_AddModels()
 				// fold misses; folding the light origin + cache params drops the cache on any of them.
 				{
 					extern idCVar r_softShadowSurfCache, r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
-					if( r_softShadowSurfCache.GetBool() && nCasStatic > 0 && nStaticTris > 0 )
+					extern idCVar r_softShadowContribCache;
+					// the contributor cache needs the same static-prefix count + fingerprint/generation
+					// plumbing (its keys carry the generation; its serve walks the dynamic suffix)
+					if( ( r_softShadowSurfCache.GetBool() || r_softShadowContribCache.GetInteger() != 0 ) && nCasStatic > 0 && nStaticTris > 0 )
 					{
 						// CAMERA-INVARIANT static-set fingerprint. The old hash folded the VIEW-CULLED static
 						// counts (nCasStatic/nStaticTris/swSurfFold), so every camera move re-fingerprinted the

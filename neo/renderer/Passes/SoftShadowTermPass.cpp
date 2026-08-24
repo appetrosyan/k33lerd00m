@@ -97,6 +97,7 @@ void SoftShadowTermPass::EnsurePipeline()
 	macros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );			// same rule for the surf-cache axis
 	macros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );			// and the grid axis (order MUST match shaders.cfg: after SURF_CACHE)
 	macros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );			// and the scanline axis
+	macros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );		// and the contributor-cache axis
 	macros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, sfx.c_str(), macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
@@ -137,6 +138,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		cntMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
+		cntMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
 		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
@@ -173,6 +175,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		surfMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "1" ) );
 		surfMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
+		surfMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		m_ShaderSurf = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfcache" ) + sfx ).c_str(), surfMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderSurf != nullptr )
@@ -200,6 +203,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		gridMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "1" ) );
 		gridMacros.Append( shaderMacro_t( "SW_SURF_GRID", "1" ) );
 		gridMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+		gridMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		gridMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		swTermGrid().shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfgrid" ) + sfx ).c_str(), gridMacros, true, LAYOUT_DRAW_VERT ) );
 		if( swTermGrid().shader != nullptr && m_LayoutSurf != nullptr )
@@ -223,6 +227,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		scanMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
 		scanMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
 		scanMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+		scanMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		scanMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		m_ShaderScan = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "scanline" ) + sfx ).c_str(), scanMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderScan != nullptr )
@@ -231,6 +236,44 @@ void SoftShadowTermPass::EnsurePipeline()
 			pn.bindingLayouts = { m_Layout };		// identical bindings to the shipped path
 			pn.CS = m_ShaderScan;
 			m_PipelineScan = m_Device->createComputePipeline( pn );
+		}
+	}
+
+	// CONTRIBUTOR CACHE permutation (SW_CONTRIB_CACHE=1, r_softShadowContribCache; scanline is forced
+	// inside the shader). Evaluate-once union: the first K fragments per (world cell, light) record
+	// their solo contributors, later fragments walk the recorded 7-17-triangle union + live dynamics.
+	// Base bindings + the table UAV at u2; separate layout/pipeline keeps every other path untouched.
+	{
+		idList<shaderMacro_t> conMacros;
+		conMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );
+		conMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+		conMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
+		conMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+		conMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "1" ) );
+		conMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		m_ShaderContrib = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "contrib" ) + sfx ).c_str(), conMacros, true, LAYOUT_DRAW_VERT ) );
+		if( m_ShaderContrib != nullptr )
+		{
+			nvrhi::BindingLayoutDesc lc2 = ld;
+			lc2.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 2 ) );	// u2 : contributor table
+			m_LayoutContrib = m_Device->createBindingLayout( lc2 );
+			nvrhi::ComputePipelineDesc pc2;
+			pc2.bindingLayouts = { m_LayoutContrib };
+			pc2.CS = m_ShaderContrib;
+			m_PipelineContrib = m_Device->createComputePipeline( pc2 );
+
+			extern idCVar r_softShadowContribCap;
+			nvrhi::BufferDesc cbd;
+			// header (16 uints: pool occupancy + stats) + cap slots x (4 + 64 entries + 3 tile-coverage
+			// words: live mask, pending mask, pend-frame) uints - must match SW_CONTRIB_STRIDE in
+			// softterm.cs.hlsl
+			cbd.byteSize = ( uint64_t )( 24 + ( uint64_t )r_softShadowContribCap.GetInteger() * 71 ) * sizeof( uint32_t );
+			cbd.structStride = sizeof( uint32_t );
+			cbd.canHaveUAVs = true;
+			cbd.initialState = nvrhi::ResourceStates::UnorderedAccess;
+			cbd.keepInitialState = true;
+			cbd.debugName = "SoftShadowTerm/ContribTable";
+			m_ContribBuffer = m_Device->createBuffer( cbd );
 		}
 	}
 
@@ -297,8 +340,8 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 		if( m_BuiltSamples != 0 && m_BuiltSamples != want )
 		{
 			m_PipelineTried = false;
-			m_Pipeline = m_PipelineCnt = m_PipelineSurf = m_PipelineScan = swTermGrid().pipeline = nullptr;
-			m_Shader = m_ShaderCnt = m_ShaderSurf = m_ShaderScan = swTermGrid().shader = nullptr;
+			m_Pipeline = m_PipelineCnt = m_PipelineSurf = m_PipelineScan = m_PipelineContrib = swTermGrid().pipeline = nullptr;
+			m_Shader = m_ShaderCnt = m_ShaderSurf = m_ShaderScan = m_ShaderContrib = swTermGrid().shader = nullptr;
 		}
 	}
 	EnsurePipeline();
@@ -496,8 +539,18 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// FUBINI SCANLINE (r_softShadowScanline): replaces the sampled walk with the interval bit-grid. Loses to
 	// the counting (measurement) and surf-cache permutations; A/B lever against the shipped 16-sample path.
 	extern idCVar r_softShadowScanline;
-	extern idCVar r_softShadowScanline;
 	const bool scan = r_softShadowScanline.GetBool() && m_PipelineScan != nullptr && !m_WalkCntEnabled && !surf;
+	// CONTRIBUTOR CACHE (r_softShadowContribCache): scanline-only (the record/serve paths fill the
+	// Fubini grid; the sampled walk's skip-on-hit loop cannot observe solo contributions). Loses to
+	// the counting and surf permutations; requires a static prefix (something to cache) and a light
+	// key. Every fall-through inside the permutation is the exact walk.
+	extern idCVar r_softShadowContribCache;
+	// generation source: the per-light surfCache param is NULL for surf-cold lights (the surf gate),
+	// but the invalidation bookkeeping lives on the ALWAYS-constructed global cache object
+	SoftShadowSurfCache* swGenSrc = ( surfCache != NULL ) ? surfCache : backEnd.GetSoftShadowSurfCache();
+	const bool contrib = r_softShadowContribCache.GetBool() && scan && m_PipelineContrib != nullptr
+						 && m_ContribBuffer != nullptr && vLight->softStaticCasterCount > 0
+						 && vLight->lightDef != NULL && swGenSrc != NULL;
 	// SURF-CACHE GRID (r_softShadowSurfCacheGrid): route the cached-hit path to the Fubini bit-grid pipeline.
 	// Only when the surf permutation is already selected AND the grid buffer exists (built in grid mode).
 	extern idCVar r_softShadowSurfCacheGrid;
@@ -538,6 +591,29 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		cb.aa[2] = r_softShadowSurfCacheForceWalk.GetFloat();	// DEBUG probe-tax isolation -> g_aa.z (1 = force-walk, 2 = skip-probe)
 		extern idCVar r_softShadowSurfCacheTileDyn;
 		cb.aa[3] = r_softShadowSurfCacheTileDyn.GetFloat();		// tile the hit-path dynamic walk -> g_aa.w (0 = old untiled)
+	}
+	else if( contrib )
+	{
+		// contributor-cache fields (the contrib permutation reuses the surf CB slots; the two
+		// permutations are mutually exclusive, so the meanings cannot collide at runtime)
+		extern idCVar r_softShadowContribG, r_softShadowContribEvalK, r_softShadowContribPool, r_softShadowContribCap;
+		cb.surfParams[0] = r_softShadowContribG.GetFloat();							// cell size G
+		cb.surfParams[1] = ( r_softShadowContribCache.GetInteger() == 2 ) ? 1.0f : 0.0f;	// SERVE-VERIFY mode
+		cb.surfCost[2] = r_softShadowContribEvalK.GetInteger();						// eval threshold K'
+		cb.surfCost[3] = r_softShadowContribCap.GetInteger();						// table capacity (slots)
+		cb.surfA[1] = ( int )( m_ContribTick & 0x7FFF );							// flip-frame stamp (serve-defer race fix; own tick - tr.frameCount is dead in minimal-init)
+		cb.surfA[2] = vLight->softStaticCasterCount;								// dynamic caster suffix start
+		cb.surfA[3] = vLight->lightDef->index & 0x1FFF;								// light key
+		cb.aa[1] = ( float )swGenSrc->GetLightGeneration( vLight->lightDef->index );	// per-light generation (invalidation)
+		cb.aa[2] = ( float )r_softShadowContribPool.GetInteger();					// recording-pool budget (incremental warm-up)
+		extern idCVar r_softShadowContribRefine;
+		cb.aa[3] = ( float )r_softShadowContribRefine.GetInteger();					// refinement divisor (1-in-N; 0 = off)
+		// diagnosis accumulators: the cache can only accelerate the STATIC prefix - the static share
+		// of the stream bounds its ceiling (measure-first before widening the classification)
+		m_ContribStaticTris += ( uint64_t )vLight->softStaticTriCount;
+		m_ContribTotalTris  += ( uint64_t )( vLight->softEdgeCount * 2 / 3 );	// 3 float4 per tri, 2 per edge record
+		m_ContribActiveLights++;
+		m_ContribFragments  += ( uint64_t )cb.rect[2] * ( uint64_t )cb.rect[3];	// dispatched contrib-kernel threads
 	}
 
 	// lit classifier grid (r_softShadowClassify): built at flatten into the joint buffer. base < 0 = none.
@@ -598,11 +674,33 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		// t6 = residual pool (scalar) OR the static bit-grid (grid mode); same register, same layout.
 		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_SRV( 6, surfGrid ? surfCache->GetGridBuffer() : surfCache->GetPool() ) );
 	}
-	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, cnt ? m_LayoutCnt : ( surf ? m_LayoutSurf : m_Layout ) );
+	else if( contrib )
+	{
+		if( !m_ContribCleared )
+		{
+			// lazy one-time clear: empty keys are the probe's vacancy sentinel, so the table must
+			// start zeroed. Generations handle set-change invalidation from then on.
+			commandList->clearBufferUInt( m_ContribBuffer, 0 );
+			m_ContribCleared = true;
+		}
+		if( m_ContribClaimFrame != m_ContribTick )
+		{
+			// per-FRAME claim budget: header[0] counts claims THIS FRAME and resets here. The old
+			// held-until-flip ticket model clogged (sub-K cells held tickets forever, pool pinned at
+			// budget, warm-up never settled and probe pairs kept straddling transitions). A per-frame
+			// budget keeps warm-up incremental with no clog; steady recording load stays bounded by
+			// how many cells are below K, which geometry bounds.
+			m_ContribClaimFrame = m_ContribTick;
+			const uint32_t zero = 0;
+			commandList->writeBuffer( m_ContribBuffer, &zero, sizeof( zero ), 0 );
+		}
+		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_ContribBuffer ) );
+	}
+	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, cnt ? m_LayoutCnt : ( surf ? m_LayoutSurf : ( contrib ? m_LayoutContrib : m_Layout ) ) );
 
 	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;
-	cs.pipeline = cnt ? m_PipelineCnt : ( surfGrid ? swTermGrid().pipeline : ( surf ? m_PipelineSurf : ( scan ? m_PipelineScan : m_Pipeline ) ) );
+	cs.pipeline = cnt ? m_PipelineCnt : ( surfGrid ? swTermGrid().pipeline : ( surf ? m_PipelineSurf : ( contrib ? m_PipelineContrib : ( scan ? m_PipelineScan : m_Pipeline ) ) ) );
 	cs.bindings = { set };
 	commandList->setComputeState( cs );
 	commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
@@ -653,6 +751,33 @@ void SoftShadowTermPass::BlurView( nvrhi::ICommandList* commandList )
 	// hand the blur atlas to the interaction pass as an SRV.
 	commandList->setTextureState( m_BlurTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
 	commandList->commitBarriers();
+}
+
+bool SoftShadowTermPass::GetContribStats( uint32_t out[20] )
+{
+	if( m_ContribBuffer == nullptr || !m_ContribCleared )
+	{
+		return false;
+	}
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = 20 * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowTerm/ContribStatsReadback";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_ContribBuffer, 0, 20 * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	void* p = m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( p == nullptr )
+	{
+		return false;
+	}
+	memcpy( out, p, 20 * sizeof( uint32_t ) );
+	m_Device->unmapBuffer( staging );
+	return true;
 }
 
 bool SoftShadowTermPass::GetWalkStats( uint32_t out[20] )
