@@ -1484,6 +1484,10 @@ bool DeviceManager_VK::CreateDeviceAndSwapChain()
 	deviceDesc.numInstanceExtensions = vecInstanceExt.size();
 	deviceDesc.deviceExtensions = vecDeviceExt.data();
 	deviceDesc.numDeviceExtensions = vecDeviceExt.size();
+	// timer-query budget: renderLog holds MRB one-shots (21x3) + shadow-gen segments (48x3) + the
+	// per-pass summed segment pool (64x3) = ~400 live queries; the nvrhi default 256 Sys_Errors at
+	// init ("Insufficient query pool space"). Cheap to over-provision.
+	deviceDesc.maxTimerQueries = 1024;
 
 	m_NvrhiDevice = nvrhi::vulkan::createDevice( deviceDesc );
 

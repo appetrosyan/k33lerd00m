@@ -111,6 +111,20 @@ private:
 	int							shadowGenCount[NUM_FRAME_DATA];		// segments issued this cycle, per parity
 	int							shadowGenActive;					// index of the open segment, or -1
 
+	// pooled accumulating timers for the per-pass MAIN blocks (all MRB_* except MRB_GPU_TIME, which
+	// stays a dedicated whole-frame span). The old one-query-per-block "first open wins" scheme
+	// silently dropped every later occurrence of a block in the frame - with a GUI/2D view rendered
+	// before the world view, the trivial first view claimed the slot and the ENTIRE 3D view's passes
+	// went untimed (measured: depth "0.03 ms" at 1440p, interactions "0.24 ms" at 220 lights, while
+	// 85-148 ms/frame sat unattributed). Segments are summed per block kind in FetchGPUTimers, so
+	// every occurrence is counted - same proven mechanism as the shadow-gen pool above.
+	static const int MAX_PASS_SEGMENTS = 64;
+	idStaticList<nvrhi::TimerQueryHandle, MAX_PASS_SEGMENTS* NUM_FRAME_DATA> passSegQueries;
+	idStaticList<uint8, MAX_PASS_SEGMENTS* NUM_FRAME_DATA> passSegKind;	// renderLogMainBlock_t of each segment
+	int							passSegCount[NUM_FRAME_DATA];		// segments issued this cycle, per parity
+	int							passSegActive;						// index of the open segment, or -1
+	int							passSegDropped;						// segments lost to pool exhaustion (whole run)
+
 public:
 	idRenderLog();
 

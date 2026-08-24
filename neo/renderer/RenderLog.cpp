@@ -138,6 +138,18 @@ void idRenderLog::Init()
 		shadowGenCount[i] = 0;
 	}
 	shadowGenActive = -1;
+
+	for( int i = 0; i < MAX_PASS_SEGMENTS * NUM_FRAME_DATA; i++ )
+	{
+		passSegQueries.Append( deviceManager->GetDevice()->createTimerQuery() );
+		passSegKind.Append( 0 );
+	}
+	for( int i = 0; i < NUM_FRAME_DATA; i++ )
+	{
+		passSegCount[i] = 0;
+	}
+	passSegActive = -1;
+	passSegDropped = 0;
 }
 
 void idRenderLog::Shutdown()
@@ -152,6 +164,11 @@ void idRenderLog::Shutdown()
 	for( int i = 0; i < MAX_SHADOWGEN_SEGMENTS * NUM_FRAME_DATA; i++ )
 	{
 		shadowGenQueries[i].Reset();
+	}
+
+	for( int i = 0; i < MAX_PASS_SEGMENTS * NUM_FRAME_DATA; i++ )
+	{
+		passSegQueries[i].Reset();
 	}
 }
 
@@ -179,6 +196,30 @@ void idRenderLog::OpenMainBlock( renderLogMainBlock_t block )
 	{
 		mainBlock = block;
 
+		if( block != MRB_GPU_TIME )
+		{
+			// per-pass blocks go through the SUMMED segment pool: every occurrence in the frame is
+			// timed and accumulated per kind (see the header - the old first-open-wins slot dropped
+			// every later occurrence, untiming the whole 3D view behind a GUI view). One segment
+			// open at a time; main blocks do not nest (GPU_TIME is the only enclosing block and it
+			// keeps the dedicated slot below).
+			if( passSegActive >= 0 )
+			{
+				return;			// unexpected nesting: keep the outer segment, leave this one untimed
+			}
+			int seg = passSegCount[frameParity];
+			if( seg >= MAX_PASS_SEGMENTS )
+			{
+				passSegDropped++;	// pool exhausted: numbers under-report, surfaced in FetchGPUTimers
+				return;
+			}
+			int idx = seg + frameParity * MAX_PASS_SEGMENTS;
+			passSegKind[idx] = ( uint8 )block;
+			commandList->beginTimerQuery( passSegQueries[idx] );
+			passSegActive = idx;
+			return;
+		}
+
 		int timerIndex = mainBlock + frameParity * MRB_TOTAL;
 
 		// SRS - Only issue a new start timer query if timer slot unused
@@ -204,6 +245,18 @@ void idRenderLog::CloseMainBlock( int _block )
 		if( _block != -1 )
 		{
 			block = renderLogMainBlock_t( _block );
+		}
+
+		if( block != MRB_GPU_TIME )
+		{
+			// close the open pooled per-pass segment (see OpenMainBlock)
+			if( passSegActive >= 0 )
+			{
+				commandList->endTimerQuery( passSegQueries[passSegActive] );
+				passSegCount[frameParity]++;
+				passSegActive = -1;
+			}
+			return;
 		}
 
 		int timerIndex = block + frameParity * MRB_TOTAL;
@@ -274,105 +327,69 @@ void idRenderLog::FetchGPUTimers( backEndCounters_t& pc )
 	frameCounter++;
 	frameParity = ( frameParity + 1 ) % NUM_FRAME_DATA;
 
+	// GARBAGE-READ GUARD: a query slot at this parity is only guaranteed WRITTEN once a full
+	// parity cycle has passed. Reading a never-written query returns garbage timestamps
+	// (measured: a fabricated "20.9 s GPU frame" at 0.7 ms wall on the first bench frame,
+	// polluting every mean). Until primed, report zeros - consumers treat gpuMicroSec==0 as
+	// "timer invalid this frame", which is the truth.
+	const bool primed = ( frameCounter > ( uint64 )NUM_FRAME_DATA );
+
+	// whole-frame span: dedicated one-shot slot (the only block that encloses others)
+	{
+		const int timerIndex = MRB_GPU_TIME + frameParity * MRB_TOTAL;
+		pc.gpuMicroSec = 0;
+		if( timerUsed[timerIndex] && primed )
+		{
+			pc.gpuMicroSec = uint64( deviceManager->GetDevice()->getTimerQueryTime( timerQueries[ timerIndex ] ) * 1000000.0 );
+		}
+	}
 	for( int i = 0; i < MRB_TOTAL; i++ )
 	{
-		int timerIndex = i + frameParity * MRB_TOTAL;
-
-		if( timerUsed[timerIndex] )
-		{
-			double time = deviceManager->GetDevice()->getTimerQueryTime( timerQueries[ timerIndex ] );
-			time *= 1000000.0; // seconds -> microseconds
-
-			switch( i )
-			{
-				case MRB_GPU_TIME:
-					pc.gpuMicroSec = time;
-					break;
-
-				case MRB_BEGIN_DRAWING_VIEW:
-					pc.gpuBeginDrawingMicroSec = time;
-					break;
-
-				case MRB_FILL_DEPTH_BUFFER:
-					pc.gpuDepthMicroSec = time;
-					break;
-
-				case MRB_FILL_HIZ_BUFFER:
-					pc.gpuHiZMicroSec = time;
-					break;
-
-				case MRB_FILL_GEOMETRY_BUFFER:
-					pc.gpuGeometryMicroSec = time;
-					break;
-
-				case MRB_SSAO_PASS:
-					pc.gpuScreenSpaceAmbientOcclusionMicroSec = time;
-					break;
-
-				case MRB_AMBIENT_PASS:
-					pc.gpuAmbientPassMicroSec = time;
-					break;
-
-				case MRB_SHADOW_ATLAS_PASS:
-					pc.gpuShadowAtlasPassMicroSec = time;
-					break;
-
-				case MRB_DRAW_INTERACTIONS:
-					pc.gpuInteractionsMicroSec = time;
-					break;
-
-				case MRB_DRAW_SHADER_PASSES:
-					pc.gpuShaderPassMicroSec = time;
-					break;
-
-				case MRB_FOG_ALL_LIGHTS:
-					pc.gpuFogAllLightsMicroSec = time;
-					break;
-
-				case MRB_BLOOM:
-					pc.gpuBloomMicroSec = time;
-					break;
-
-				case MRB_DRAW_SHADER_PASSES_POST:
-					pc.gpuShaderPassPostMicroSec = time;
-					break;
-
-				case MRB_MOTION_VECTORS:
-					pc.gpuMotionVectorsMicroSec = time;
-					break;
-
-				case MRB_TAA:
-					pc.gpuTemporalAntiAliasingMicroSec = time;
-					break;
-
-				case MRB_TONE_MAP_PASS:
-					pc.gpuToneMapPassMicroSec = time;
-					break;
-
-				case MRB_POSTPROCESS:
-					pc.gpuPostProcessingMicroSec = time;
-					break;
-
-				case MRB_DRAW_GUI:
-					pc.gpuDrawGuiMicroSec = time;
-					break;
-
-				case MRB_CRT_POSTPROCESS:
-					pc.gpuCrtPostProcessingMicroSec = time;
-					break;
-
-				default:
-					break;
-			}
-		}
-
-		// reset timer
-		timerUsed[timerIndex] = false;
+		timerUsed[i + frameParity * MRB_TOTAL] = false;
 	}
 
-	// sum the pooled shadow-generation segments for this parity, grouped by kind
+	// per-pass blocks: sum this parity's pooled segments per kind - every occurrence in the frame
+	// counts (a GUI view AND the world view, a pass that runs twice), so sum-of-passes is honestly
+	// comparable against the whole-frame span and "unattributed" means exactly that.
+	double passSum[MRB_TOTAL] = {};
+	if( glConfig.timerQueryAvailable && primed )
+	{
+		for( int seg = 0; seg < passSegCount[frameParity]; seg++ )
+		{
+			const int idx = seg + frameParity * MAX_PASS_SEGMENTS;
+			passSum[passSegKind[idx]] += deviceManager->GetDevice()->getTimerQueryTime( passSegQueries[idx] ) * 1000000.0;
+		}
+	}
+	passSegCount[frameParity] = 0;
+	passSegActive = -1;
+	if( passSegDropped > 0 )
+	{
+		common->Warning( "idRenderLog: %d per-pass timer segments dropped (pool exhausted) - pass times under-report", passSegDropped );
+		passSegDropped = 0;
+	}
+
+	pc.gpuBeginDrawingMicroSec                = uint64( passSum[MRB_BEGIN_DRAWING_VIEW] );
+	pc.gpuDepthMicroSec                       = uint64( passSum[MRB_FILL_DEPTH_BUFFER] );
+	pc.gpuHiZMicroSec                         = uint64( passSum[MRB_FILL_HIZ_BUFFER] );
+	pc.gpuGeometryMicroSec                    = uint64( passSum[MRB_FILL_GEOMETRY_BUFFER] );
+	pc.gpuScreenSpaceAmbientOcclusionMicroSec = uint64( passSum[MRB_SSAO_PASS] );
+	pc.gpuAmbientPassMicroSec                 = uint64( passSum[MRB_AMBIENT_PASS] );
+	pc.gpuShadowAtlasPassMicroSec             = uint64( passSum[MRB_SHADOW_ATLAS_PASS] );
+	pc.gpuInteractionsMicroSec                = uint64( passSum[MRB_DRAW_INTERACTIONS] );
+	pc.gpuShaderPassMicroSec                  = uint64( passSum[MRB_DRAW_SHADER_PASSES] );
+	pc.gpuFogAllLightsMicroSec                = uint64( passSum[MRB_FOG_ALL_LIGHTS] );
+	pc.gpuBloomMicroSec                       = uint64( passSum[MRB_BLOOM] );
+	pc.gpuShaderPassPostMicroSec              = uint64( passSum[MRB_DRAW_SHADER_PASSES_POST] );
+	pc.gpuMotionVectorsMicroSec               = uint64( passSum[MRB_MOTION_VECTORS] );
+	pc.gpuTemporalAntiAliasingMicroSec        = uint64( passSum[MRB_TAA] );
+	pc.gpuToneMapPassMicroSec                 = uint64( passSum[MRB_TONE_MAP_PASS] );
+	pc.gpuPostProcessingMicroSec              = uint64( passSum[MRB_POSTPROCESS] );
+	pc.gpuDrawGuiMicroSec                     = uint64( passSum[MRB_DRAW_GUI] );
+	pc.gpuCrtPostProcessingMicroSec           = uint64( passSum[MRB_CRT_POSTPROCESS] );
+	// sum the pooled shadow-generation segments for this parity, grouped by kind (same primed
+	// guard: never-written queries read garbage)
 	uint64 shadowGen[RLS_TOTAL] = {};
-	if( glConfig.timerQueryAvailable )
+	if( glConfig.timerQueryAvailable && primed )
 	{
 		for( int seg = 0; seg < shadowGenCount[frameParity]; seg++ )
 		{

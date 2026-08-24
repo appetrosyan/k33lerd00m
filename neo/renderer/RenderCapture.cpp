@@ -3047,9 +3047,28 @@ int R_SoftShadowGate( const char* arg )
 			// GRANULAR GPU attribution (accumulated over the timed frames): the soft path split into
 			// its phases via the RLS_SOFT_* timer kinds, so the walk (term) is isolated from bin/pos/read.
 			double gPos = 0, gBin = 0, gTerm = 0, gRead = 0, gGpu = 0;
+			// REST attribution (plan Step 0a): the non-soft per-pass GPU timers, so caps where "rest"
+			// dominates (cap0001/0002: soft 11-13 ms but rest ~100 ms) get a named breakdown instead of
+			// one opaque number. All fields already exist in backEndCounters_t; this only accumulates.
+			double gDepth = 0, gHiZ = 0, gGeom = 0, gSSAO = 0, gAmbient = 0, gAtlas = 0, gInter = 0,
+				   gShaderPass = 0, gFog = 0, gPost = 0, gCpuBE = 0;
 			int    gN = 0;
+			// per-frame samples (index, gpu, wall, soft): the means hide outliers (one pipeline-compile
+			// /stall frame of seconds pollutes a 24-frame mean by 100+ ms - cap0000 measured GPU 884 ms
+			// mean at wall 18 ms/frame, impossible steady-state). Outliers (> 2x median) are reported
+			// PER FRAME with a CLASS, because the fix differs: a PREDICTABLE engine stall (pipeline
+			// compile, blocking readback, sync bug) spikes the GPU timers and recurs at the same frame
+			// index across runs - ours to fix; an EXTERNAL stall (OS/compositor preemption) inflates
+			// wall over a clean GPU timeline at a random index - environment, not a code defect.
+			struct swBenchFrame_t
+			{
+				int    idx;
+				double gpu, wall, soft;
+			};
+			std::vector<swBenchFrame_t> swFrames;
 			for( int f = 0; f < benchFrames; f++ )
 			{
+				const int64 wf0 = Sys_Microseconds();
 				// pipelined like the game loop: frontend builds frame f while the GPU draws f-1
 				rw->RenderScene( &rv );
 				// sample the stream counters BEFORE SwapCommandBuffers resets tr.pc for the next frame
@@ -3057,7 +3076,9 @@ int R_SoftShadowGate( const char* arg )
 				benchDropped = Max( benchDropped, tr.pc.c_softShadowDroppedEdges );
 				const emptyCommand_t* cmd = tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );
 				tr.RenderCommandBuffers( cmd );
-				if( backEnd.pc.gpuMicroSec > 0 )		// GPU timer queries valid this frame
+				// valid AND sane: > 5 s "GPU frames" are stale cross-frame begin/end pairings (see the
+				// timer-artifact stall class below) - excluding them keeps the means honest.
+				if( backEnd.pc.gpuMicroSec > 0 && backEnd.pc.gpuMicroSec < 5000000 )
 				{
 					// granular soft phases carried on idle shadow timer kinds during the bench
 					// (RenderBackend swDiag): shadowmap=softpos, rtmask=tile-bin, stencil=term/walk.
@@ -3066,8 +3087,30 @@ int R_SoftShadowGate( const char* arg )
 					gTerm += backEnd.pc.gpuStencilShadowMicroSec;
 					gRead += backEnd.pc.gpuSoftShadowMicroSec;	// interaction term-atlas READ
 					gGpu  += backEnd.pc.gpuMicroSec;
+					// non-soft passes (REST attribution)
+					gDepth      += backEnd.pc.gpuDepthMicroSec;
+					gHiZ        += backEnd.pc.gpuHiZMicroSec;
+					gGeom       += backEnd.pc.gpuGeometryMicroSec;
+					gSSAO       += backEnd.pc.gpuScreenSpaceAmbientOcclusionMicroSec;
+					gAmbient    += backEnd.pc.gpuAmbientPassMicroSec;
+					gAtlas      += backEnd.pc.gpuShadowAtlasPassMicroSec;
+					gInter      += backEnd.pc.gpuInteractionsMicroSec;
+					gShaderPass += backEnd.pc.gpuShaderPassMicroSec + backEnd.pc.gpuShaderPassPostMicroSec;
+					gFog        += backEnd.pc.gpuFogAllLightsMicroSec;
+					gPost       += backEnd.pc.gpuBloomMicroSec + backEnd.pc.gpuMotionVectorsMicroSec
+								   + backEnd.pc.gpuTemporalAntiAliasingMicroSec + backEnd.pc.gpuToneMapPassMicroSec
+								   + backEnd.pc.gpuPostProcessingMicroSec + backEnd.pc.gpuDrawGuiMicroSec
+								   + backEnd.pc.gpuCrtPostProcessingMicroSec;
+					gCpuBE      += backEnd.pc.cpuTotalMicroSec;
 					gN++;
 				}
+				swBenchFrame_t bf;
+				bf.idx  = f;
+				bf.gpu  = backEnd.pc.gpuMicroSec / 1000.0;		// 0 when the timer query was invalid this frame
+				bf.wall = ( Sys_Microseconds() - wf0 ) / 1000.0;
+				bf.soft = ( backEnd.pc.gpuShadowMapMicroSec + backEnd.pc.gpuRTShadowMaskMicroSec
+							+ backEnd.pc.gpuStencilShadowMicroSec + backEnd.pc.gpuSoftShadowMicroSec ) / 1000.0;
+				swFrames.push_back( bf );
 				// PATH PROVENANCE, sampled from the backend counters of the frame just rendered:
 				// which evaluation path each soft light's term actually took. term < total or
 				// binned < total is not an error (slot budget, ineligible lights) but it must be
@@ -3094,6 +3137,56 @@ int R_SoftShadowGate( const char* arg )
 				const double soft = ( gPos + gBin + gTerm + gRead ) * iv;
 				common->Printf( "[softgate] BENCH %-14s GPU %.2f ms | soft %.2f (softpos %.2f + tilebin %.2f + TERM/walk %.2f + read %.2f) | rest %.2f ms\n",
 								cap.name.c_str(), gGpu * iv, soft, gPos * iv, gBin * iv, gTerm * iv, gRead * iv, gGpu * iv - soft );
+				// REST breakdown (plan Step 0a): name the non-soft GPU ms. interactions here EXCLUDES the
+				// soft phases (they ride the split-out shadow timer kinds above). unattr = GPU total minus
+				// everything named - a large unattr means a pass without a timer kind, itself a finding.
+				const double named = ( gDepth + gHiZ + gGeom + gSSAO + gAmbient + gAtlas + gInter + gShaderPass + gFog + gPost ) * iv + soft;
+				common->Printf( "[softgate] BENCH %-14s rest: depth %.2f + hiz %.2f + geom %.2f + ssao %.2f + ambient %.2f + shadowatlas %.2f + interactions %.2f + shaderpass %.2f + fog %.2f + post %.2f | unattr %.2f | cpuBE %.2f ms\n",
+								cap.name.c_str(), gDepth * iv, gHiZ * iv, gGeom * iv, gSSAO * iv, gAmbient * iv, gAtlas * iv,
+								gInter * iv, gShaderPass * iv, gFog * iv, gPost * iv, gGpu * iv - named, gCpuBE * iv );
+				// per-frame steady-state + STALL DEFECTS. Medians are the honest per-frame cost; every
+				// stalled frame (> 2x median, > +1 ms) is a DEFECT with its own class and attack, never
+				// background noise to average away:
+				//   gpu-soft   - GPU spike, mostly inside the soft phase timers -> our soft-path stall
+				//   gpu-engine - GPU spike outside soft (pipeline compile between passes, sync bug) -> ours
+				//   cpu/extern - wall spike over a CLEAN GPU timeline -> CPU-side or OS/compositor
+				// PREDICTABLE stalls recur at the SAME idx across runs (re-run to confirm); external ones move.
+				{
+					std::vector<double> gs, ws;
+					for( const swBenchFrame_t& bf : swFrames )
+					{
+						if( bf.gpu > 0 )
+						{
+							gs.push_back( bf.gpu );
+						}
+						ws.push_back( bf.wall );
+					}
+					std::sort( gs.begin(), gs.end() );
+					std::sort( ws.begin(), ws.end() );
+					const double gMed = gs.empty() ? 0.0 : gs[ gs.size() / 2 ];
+					const double wMed = ws.empty() ? 0.0 : ws[ ws.size() / 2 ];
+					common->Printf( "[softgate] BENCH %-14s steady-state: GPU median %.2f (mean %.2f) | WALL median %.2f (mean %.2f) ms\n",
+									cap.name.c_str(), gMed, gGpu * iv, wMed, ms );
+					for( const swBenchFrame_t& bf : swFrames )
+					{
+						const bool gpuOut  = ( bf.gpu > 0 ) && ( bf.gpu > 2.0 * gMed ) && ( bf.gpu > gMed + 1.0 );
+						const bool wallOut = ( bf.wall > 2.0 * wMed ) && ( bf.wall > wMed + 1.0 );
+						if( !gpuOut && !wallOut )
+						{
+							continue;
+						}
+						// physically impossible sample (GPU seconds at sub-100ms wall): the GPU_TIME
+						// begin timestamp is STALE from before the bench (load/warm-up frames never
+						// fetched, so the parity slot holds an old begin) paired with a fresh end.
+						// An INSTRUMENT defect, distinct from a frame stall - named as such.
+						const char* cls = ( bf.gpu > 5000.0 && bf.wall < 100.0 ) ? "timer-artifact (stale cross-frame begin pairing)"
+										  : !gpuOut ? "cpu/extern (GPU clean)"
+										  : ( ( bf.soft > 0.5 * ( bf.gpu - gMed ) ) ? "gpu-soft (soft-phase stall)" : "gpu-engine (outside soft: compile/sync)" );
+						common->Printf( "[softgate] BENCH %-14s STALL frame %2d: gpu %.1f wall %.1f soft %.1f ms (+%.1f over median) class=%s\n",
+										cap.name.c_str(), bf.idx, bf.gpu, bf.wall, bf.soft,
+										( gpuOut ? bf.gpu - gMed : bf.wall - wMed ), cls );
+					}
+				}
 			}
 			// surface-fold cache path split from the LAST bench frame (r_softShadowSurfCache):
 			// hit% is THE cache-health number - a low rate explains a high TERM ms instantly
@@ -3128,7 +3221,7 @@ int R_SoftShadowGate( const char* arg )
 			// real cull cascade per walked fragment, confirming the CPU attribution's cull-collapse
 			// finding on the actual GPU path. Slots [4]=tight tests [5]=tight culls [6]=MT survivors
 			// [7]=fragments walked (the binned walker fills tight/mtTri only).
-			uint32_t walk[16] = {};
+			uint32_t walk[20] = {};
 			if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetWalkStats( walk ) && walk[7] > 0 )
 			{
 				const double f = ( double )walk[7];			// fragments that ran the walk (this frame)
@@ -3157,6 +3250,17 @@ int R_SoftShadowGate( const char* arg )
 				common->Printf( "[softgate] BENCH %-14s survivors@MT: %.0f%% HIT (contribute) / %.0f%% block-NOTHING | %.0f hit + %.0f miss per frag\n",
 								cap.name.c_str(), mtotS > 0 ? 100.0 * hitS / mtotS : 0.0, mtotS > 0 ? 100.0 * missS / mtotS : 0.0,
 								hitS / f, missS / f );
+				// TILE-CLASS census (Lever B decision data): of the threads reaching the tile dispatch,
+				// how many land in FLAT tiles (umbra sentinel / empty list = zero walk iterations - the only
+				// ones a penumbra-tile compaction could delete) vs LISTED/SPILL tiles that actually walk.
+				const double cUmb = walk[16], cEmpty = walk[17], cSpill = walk[18], cList = walk[19];
+				const double cTot = cUmb + cEmpty + cSpill + cList;
+				if( cTot > 0 )
+				{
+					common->Printf( "[softgate] BENCH %-14s tile-census: FLAT %.0f%% (umbra-tile %.0f%% + empty-list %.0f%%) | WALKING %.0f%% (listed %.0f%% + spill %.0f%%) of %.0f tile-dispatch threads\n",
+									cap.name.c_str(), 100.0 * ( cUmb + cEmpty ) / cTot, 100.0 * cUmb / cTot, 100.0 * cEmpty / cTot,
+									100.0 * ( cList + cSpill ) / cTot, 100.0 * cList / cTot, 100.0 * cSpill / cTot, cTot );
+				}
 			}
 			// ---- MOTION A/B (com_softShadowGateBenchMotion N): the surf-cache proof --------------------
 			// Run N frames of camera motion (shake/rotate/move/combo segments) TWICE - cache OFF then ON -
@@ -3287,6 +3391,21 @@ int R_SoftShadowGate( const char* arg )
 		}
 
 		R_SoftShadowClearCapturedCasters();
+
+		// PER-CAP ISOLATION (measurement-integrity fix): free the world after EVERY capture, even on
+		// the same map. Reusing the world across caps poisoned every cap after the first: the freed +
+		// re-added bench lights get handles past the interactionTable built at load (a second
+		// GenerateAllInteractions segfaults, see above), so those lights fall to PER-FRAME dynamic
+		// interaction creation - measured cap0001 in-corpus GPU 136 ms / cpuBE 193 ms vs 9.6 / 0.3 ms
+		// solo, a fabricated 14x "rest" that sat unattributed. The reload costs seconds per cap and
+		// buys numbers that cannot cross-contaminate; the gate is an instrument, correctness first.
+		if( rw != NULL )
+		{
+			R_SoftShadowClearBenchCasters();
+			renderSystem->FreeRenderWorld( rw );
+			rw = NULL;
+			loadedMap.Clear();
+		}
 	}
 
 	if( rw != NULL )
