@@ -1950,6 +1950,16 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 
 	uint swMask = 0u;
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+#if SW_SCANLINE
+	// Fubini scanline port for the SPILL/cluster path - same exact 1D-interval union as the tile-list
+	// walker (SW_SCANLINE there). Before this, spill fragments stayed on 16-sample coverage while
+	// listed fragments ran the scanline: two algorithms in one frame (and the contributor cache's
+	// scanline serve measured 15.7% term mismatches against the sampled spill reference).
+	uint swGrid[SW_SCAN_CHORDS];
+	uint swDiskMask[SW_SCAN_CHORDS];
+	int  swDiskBits = 0;
+	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = 0u; swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftPopcount32( swDiskMask[gi] ); }
+#endif
 	SW_BKT_DECL
 	for( int li = 0; li < swListCount; li++ )
 	{
@@ -1997,6 +2007,15 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 			float  coneR = swR * ( cd + triRad ) / swDistPL;
 			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
 			SW_BKT_SURV
+#if SW_SCANLINE
+			SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini interval union
+			{
+				// UMBRA EARLY-OUT + rounding, identical to the tile-list scanline walker
+				int swCovE = 0;
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
+				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+			}
+#else
 			float3 edge1 = v1 - v0;
 			float3 edge2 = v2 - v0;
 			float3 sp = swP - v0;
@@ -2025,9 +2044,18 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 			}
 #endif	// SW_FP16_LOOP
 			if( swMask == swAll ) { break; }
+#endif	// SW_SCANLINE
 		}
+#if !SW_SCANLINE
 		if( swMask == swAll ) { break; }
+#endif
 	}
+#if SW_SCANLINE
+	int swCovC = 0;
+	for( int cmc = 0; cmc < SW_SCAN_CHORDS; cmc++ ) { swCovC += SoftPopcount32( swGrid[cmc] & swDiskMask[cmc] ); }
+	SW_BKT_FLUSH( swMask, swAll );
+	return swDiskBits > 0 ? ( float )swCovC / ( float )swDiskBits : 0.0f;
+#endif
 	if( swMask != 0u && swMask != swAll )
 	{
 		uint filled = swMask;
