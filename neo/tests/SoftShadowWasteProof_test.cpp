@@ -690,3 +690,469 @@ STUDY_TEST( SoftShadowCellUnion, sizes )
 	std::printf( "    [cellunion] exactness spot-checks (G=8): %ld checked, %ld FAILED\n", exactChecked, exactFailed );
 	CHECK( exactFailed == 0 );
 }
+
+// EVALUATE-ONCE-PRUNE-AFTER, held-out validation (study). The runtime design under test: the FIRST
+// full walk(s) in a texel RECORD which triangles actually contributed (ground truth, no heuristic);
+// every later walk in that texel iterates only the recorded set. The one exactness question is
+// whether a LATER receiver ever needs a contributor the first evaluation did not see. This measures
+// exactly that, per texel size G: per cell, the sampled receivers are SPLIT - the union is built
+// from the even half ("first evaluations") and the odd half ("later fragments") is walked BOTH ways,
+// exact vs pruned. Reported: held-out contributor miss rate, and the thing that actually matters -
+// the COVERAGE error distribution at held-out receivers (max + mean + count over one grid quantum).
+//
+// Run:  CAP=/path/to/foo.cap [PRUNEG=8] ./rbdoom3bfg_tests @study:SoftShadowPruneHoldout
+
+STUDY_TEST( SoftShadowPruneHoldout, coverage )
+{
+	using namespace swproof;
+
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL )
+	{
+		std::printf( "    [pruneho] CAP unset; skipping (set it to a .cap)\n" );
+		CHECK( true );
+		return;
+	}
+	Cap cap;
+	if( !LoadCap( path, cap ) )
+	{
+		std::printf( "    [pruneho] cannot load %s\n", path );
+		CHECK( false );
+		return;
+	}
+
+	const int   MAX_RECV_PER_LIGHT = 4000;	// dense pool: the K-sweep needs many receivers per cell
+	const char* genv = std::getenv( "PRUNEG" );
+	const float G = genv ? ( float )std::atof( genv ) : 8.0f;
+	const char* kenv = std::getenv( "PRUNEK" );
+	const int   TRAIN_K = kenv ? std::atoi( kenv ) : 0;		// 0 = half-split (legacy); N = train on first N receivers per cell, test the rest
+
+	auto F4 = [&]( size_t j ) -> const float*
+	{
+		return ( j & 1 ) ? cap.edges[j >> 1].e1 : cap.edges[j >> 1].e0;
+	};
+
+	long   holdoutN = 0;			// held-out receivers evaluated
+	long   missP = 0;				// held-out receivers with >= 1 contributor outside the trained union
+	long   errQuantum = 0;			// held-out receivers whose pruned coverage differs by > 1 grid bit
+	double errMax = 0, errSum = 0;
+	long   cellsN = 0, trainedTot = 0;
+
+	for( size_t li = 0; li < cap.lights.size(); li++ )
+	{
+		const capLight_t& L = cap.lights[li];
+		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
+		{
+			continue;
+		}
+		const size_t base4 = ( size_t )L.firstEdge * 2;
+		const size_t nTris = ( ( size_t )L.edgeCount * 2 ) / 3;
+		if( nTris == 0 )
+		{
+			continue;
+		}
+
+		std::vector<float3> recvPts;
+		for( const capReceiver_t& r : cap.receivers )
+		{
+			if( r.lightIndex != ( uint32_t )li )
+			{
+				continue;
+			}
+			const uint32_t tc = r.numIndex / 3;
+			for( uint32_t t = 0; t < tc; t++ )
+			{
+				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
+				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
+				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+				float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+				float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+				float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
+				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+			}
+		}
+		if( recvPts.empty() )
+		{
+			continue;
+		}
+		const size_t stride = std::max( ( size_t )1, recvPts.size() / MAX_RECV_PER_LIGHT );
+
+		const float3 Lp( L.origin[0], L.origin[1], L.origin[2] );
+		const float  swR = std::fmax( L.penumbraSize, 1e-2f );
+		const float  swEps = SW_NEAR_EPS;
+
+		// exact per-P walk into a fresh grid over an arbitrary tri set; returns coverage and
+		// (optionally) appends contributing tri indices
+		auto WalkSet = [&]( const float3 & P, const uint32_t* set, size_t setN, bool full,
+							std::vector<uint32_t>* contribOut ) -> float
+		{
+			softFrame_t F = SoftShadow_Frame( P, Lp );
+			uint32_t diskMask[SW_SCAN_CHORDS];
+			int diskBits = 0;
+			for( int m = 0; m < SW_SCAN_CHORDS; m++ )
+			{
+				diskMask[m] = SoftScan_Run( -SW_SCAN_HC[m], SW_SCAN_HC[m] );
+				diskBits += __builtin_popcount( diskMask[m] );
+			}
+			uint32_t grid[SW_SCAN_CHORDS] = {};
+			const size_t n = full ? nTris : setN;
+			for( size_t i = 0; i < n; i++ )
+			{
+				const size_t t = full ? i : set[i];
+				const float* r0 = F4( base4 + t * 3 + 0 );
+				const float* r1 = F4( base4 + t * 3 + 1 );
+				const float* r2 = F4( base4 + t * 3 + 2 );
+				if( contribOut != NULL )
+				{
+					uint32_t solo[SW_SCAN_CHORDS] = {};
+					SoftScan_FillTri( solo, float3( r0[0], r0[1], r0[2] ), float3( r1[0], r1[1], r1[2] ), float3( r2[0], r2[1], r2[2] ), P, F, swR, swEps );
+					if( MaskedBits( solo, diskMask ) > 0 )
+					{
+						contribOut->push_back( ( uint32_t )t );
+						for( int m = 0; m < SW_SCAN_CHORDS; m++ )
+						{
+							grid[m] |= solo[m];
+						}
+					}
+				}
+				else
+				{
+					SoftScan_FillTri( grid, float3( r0[0], r0[1], r0[2] ), float3( r1[0], r1[1], r1[2] ), float3( r2[0], r2[1], r2[2] ), P, F, swR, swEps );
+				}
+			}
+			return diskBits > 0 ? ( float )MaskedBits( grid, diskMask ) / ( float )diskBits : 0.0f;
+		};
+
+		// bucket by cell, split train/test alternately
+		struct cellHo_t
+		{
+			std::vector<float3> train, test;
+		};
+		std::unordered_map<uint64_t, cellHo_t> cells;
+		size_t si = 0;
+		for( size_t s = 0; s < recvPts.size(); s += stride, si++ )
+		{
+			const float3 P = recvPts[s];
+			const int64_t cx = ( int64_t )std::floor( P.x / G ), cy = ( int64_t )std::floor( P.y / G ), cz = ( int64_t )std::floor( P.z / G );
+			const uint64_t key = ( ( uint64_t )( cx & 0x1FFFFF ) << 42 ) | ( ( uint64_t )( cy & 0x1FFFFF ) << 21 ) | ( uint64_t )( cz & 0x1FFFFF );
+			cellHo_t& acc = cells[key];
+			if( TRAIN_K > 0 )
+			{
+				// K-sweep mode: SPREAD-selected training - take the first K arrivals as train (the
+				// receiver stream interleaves surface positions, approximating a spatial spread),
+				// everything after is held out
+				( ( ( int )acc.train.size() < TRAIN_K ) ? acc.train : acc.test ).push_back( P );
+			}
+			else
+			{
+				( ( si & 1 ) ? acc.test : acc.train ).push_back( P );
+			}
+		}
+
+		for( auto& kv : cells )
+		{
+			if( kv.second.train.empty() || kv.second.test.empty() )
+			{
+				continue;
+			}
+			// TRAIN: full walks recording contributors (the "first evaluation")
+			std::vector<uint32_t> uni;
+			for( const float3& P : kv.second.train )
+			{
+				WalkSet( P, NULL, 0, true, &uni );
+			}
+			std::sort( uni.begin(), uni.end() );
+			uni.erase( std::unique( uni.begin(), uni.end() ), uni.end() );
+			trainedTot += ( long )uni.size();
+			cellsN++;
+			// TEST: held-out receivers, exact vs pruned
+			for( const float3& P : kv.second.test )
+			{
+				std::vector<uint32_t> exactContrib;
+				const float covExact = WalkSet( P, NULL, 0, true, &exactContrib );
+				const float covPruned = WalkSet( P, uni.data(), uni.size(), false, NULL );
+				holdoutN++;
+				bool missed = false;
+				for( uint32_t t : exactContrib )
+				{
+					if( !std::binary_search( uni.begin(), uni.end(), t ) )
+					{
+						missed = true;
+						break;
+					}
+				}
+				missP += missed;
+				const float err = std::fabs( covExact - covPruned );
+				errMax = std::fmax( errMax, ( double )err );
+				errSum += err;
+				errQuantum += ( err > 1.0f / 200.0f );	// > ~1 grid bit of the ~200-bit disk
+			}
+		}
+	}
+
+	if( holdoutN == 0 )
+	{
+		std::printf( "    [pruneho] no cells with both train and test receivers\n" );
+		CHECK( true );
+		return;
+	}
+	std::printf( "    [pruneho] G=%.0f K=%d cells %ld | trained-union mean %.1f | HELD-OUT %ld receivers: contributor-miss %.2f%% | coverage err mean %.5f max %.4f | >1-bit errors %.2f%%\n",
+				 G, TRAIN_K, cellsN, cellsN ? ( double )trainedTot / cellsN : 0.0, holdoutN,
+				 100.0 * missP / holdoutN, errSum / holdoutN, errMax, 100.0 * errQuantum / holdoutN );
+	CHECK( true );		// a measurement, not a gate: the numbers decide the design
+}
+
+// PER-CELL KEEP TEST (study): the PROVABLY SOUND per-cell contributor test the live reduced-set
+// build needs. A triangle can contribute at P (partial occlusion of the light sphere S(L,R) -
+// solo masked bits > 0 implies it) only if P lies inside the triangle's OUTER penumbra volume:
+// for each edge, the plane through the edge tangent to S with the tangent point toward the
+// triangle interior bounds the region - beyond it, the whole sphere is visible past that edge.
+// Keep(cell, tri) = the cell AABB is NOT entirely beyond any edge's outer plane. Under-keep is
+// the fatal direction and the SOUNDNESS ASSERT below is the executable proof check: on every
+// (cell, tri) pair of every capture, keep must be a SUPERSET of the sampled contributor union.
+// The enumerated over-keep modes (each safe, each measurable): sphere >= per-P disk orientation,
+// chord-grid discretisation (yspan), per-plane box rejection vs full feasibility, cell AABB >=
+// the actual receiver surface, and the omitted slab bound (v1 keeps slab-clipped tris).
+//
+// Run:  CAP=/path/to/foo.cap ./rbdoom3bfg_tests @study:SoftShadowKeepTest
+
+STUDY_TEST( SoftShadowKeepTest, soundness )
+{
+	using namespace swproof;
+
+	const char* path = std::getenv( "CAP" );
+	if( path == NULL )
+	{
+		std::printf( "    [keeptest] CAP unset; skipping (set it to a .cap)\n" );
+		CHECK( true );
+		return;
+	}
+	Cap cap;
+	if( !LoadCap( path, cap ) )
+	{
+		std::printf( "    [keeptest] cannot load %s\n", path );
+		CHECK( false );
+		return;
+	}
+
+	const int   MAX_RECV_PER_LIGHT = 600;
+	const char* genv = std::getenv( "KEEPG" );
+	const float G = genv ? ( float )std::atof( genv ) : 16.0f;
+
+	auto F4 = [&]( size_t j ) -> const float*
+	{
+		return ( j & 1 ) ? cap.edges[j >> 1].e1 : cap.edges[j >> 1].e0;
+	};
+
+	// KEEP TEST: T can contribute for some P in the box only if some segment P -> (disk point)
+	// crosses T; every such segment lies in H = conv(box UNION ball(L,R)). So keep(cell,T) iff
+	// T intersects H, decided by SEPARATING-AXIS with support functions:
+	//   an axis d separates iff max_T(d) < min_H(d), where min_H(d) = min(min_box(d), dot(L,d)-R).
+	// SOUND BY CONSTRUCTION: any separating axis proves T disjoint from H, hence no contribution
+	// anywhere in the box. The finite axis set only ever OVER-keeps (enumerated slack mode):
+	// axes = 3 box normals, the tri normal, 9 tri-edge x box-axis crosses, and L->boxCenter.
+	// (Two earlier per-edge tangent-plane constructions were REFUTED by this study's soundness
+	// assert - thousands of dropped real contributors each; the assert is the executable proof.)
+	auto Keep = [&]( int /*variant*/, const float3 & bMin, const float3 & bMax, const float3 & Lp, float R,
+					 const float3 & v0, const float3 & v1, const float3 & v2 ) -> bool
+	{
+		const float3 V[3] = { v0, v1, v2 };
+		float3 axes[14];
+		int nAxes = 0;
+		axes[nAxes++] = float3( 1, 0, 0 );
+		axes[nAxes++] = float3( 0, 1, 0 );
+		axes[nAxes++] = float3( 0, 0, 1 );
+		const float3 nt = cross( v1 - v0, v2 - v0 );
+		if( dot( nt, nt ) > 1e-12f )
+		{
+			axes[nAxes++] = nt;
+		}
+		const float3 be[3] = { float3( 1, 0, 0 ), float3( 0, 1, 0 ), float3( 0, 0, 1 ) };
+		for( int e = 0; e < 3; e++ )
+		{
+			const float3 ed = V[( e + 1 ) % 3] - V[e];
+			for( int b = 0; b < 3; b++ )
+			{
+				const float3 ax = cross( ed, be[b] );
+				if( dot( ax, ax ) > 1e-12f )
+				{
+					axes[nAxes++] = ax;
+				}
+			}
+		}
+		// one extra heuristic axis: from box centre toward the light (splits far side cleanly)
+		{
+			const float3 bc = ( bMin + bMax ) * 0.5f;
+			const float3 ax = Lp - bc;
+			if( dot( ax, ax ) > 1e-12f )
+			{
+				axes[nAxes++] = ax;
+			}
+		}
+		for( int a = 0; a < nAxes && a < 14; a++ )
+		{
+			const float3 d = axes[a];
+			const float dLen = std::sqrt( dot( d, d ) );
+			// triangle interval
+			float tMin = 1e30f, tMax = -1e30f;
+			for( int k = 0; k < 3; k++ )
+			{
+				const float p = dot( d, V[k] );
+				tMin = std::fmin( tMin, p );
+				tMax = std::fmax( tMax, p );
+			}
+			// H = conv(box, ball) interval
+			float bMinP = 1e30f, bMaxP = -1e30f;
+			for( int c = 0; c < 8; c++ )
+			{
+				const float3 pc( ( c & 1 ) ? bMax.x : bMin.x, ( c & 2 ) ? bMax.y : bMin.y, ( c & 4 ) ? bMax.z : bMin.z );
+				const float p = dot( d, pc );
+				bMinP = std::fmin( bMinP, p );
+				bMaxP = std::fmax( bMaxP, p );
+			}
+			const float lP = dot( d, Lp );
+			const float hMin = std::fmin( bMinP, lP - R * dLen );
+			const float hMax = std::fmax( bMaxP, lP + R * dLen );
+			if( tMax < hMin || tMin > hMax )
+			{
+				return false;		// separated: provably no contribution anywhere in the box
+			}
+		}
+		return true;
+	};
+
+	long cellsN = 0, violations = 0, violations1 = 0;
+	double keepTot = 0, keepTot1 = 0, unionTot = 0, trisTot = 0;
+	std::vector<int> keepSizes;
+
+	for( size_t li = 0; li < cap.lights.size(); li++ )
+	{
+		const capLight_t& L = cap.lights[li];
+		if( L.penumbraSize <= 0.0f || L.edgeCount == 0 )
+		{
+			continue;
+		}
+		const size_t base4 = ( size_t )L.firstEdge * 2;
+		const size_t nTris = ( ( size_t )L.edgeCount * 2 ) / 3;
+		if( nTris == 0 )
+		{
+			continue;
+		}
+
+		std::vector<float3> recvPts;
+		for( const capReceiver_t& r : cap.receivers )
+		{
+			if( r.lightIndex != ( uint32_t )li )
+			{
+				continue;
+			}
+			const uint32_t tc = r.numIndex / 3;
+			for( uint32_t t = 0; t < tc; t++ )
+			{
+				const uint32_t i0 = cap.recvIdx[r.firstIndex + t * 3 + 0];
+				const uint32_t i1 = cap.recvIdx[r.firstIndex + t * 3 + 1];
+				const uint32_t i2 = cap.recvIdx[r.firstIndex + t * 3 + 2];
+				float3 p0( cap.recvVerts[i0 * 3], cap.recvVerts[i0 * 3 + 1], cap.recvVerts[i0 * 3 + 2] );
+				float3 p1( cap.recvVerts[i1 * 3], cap.recvVerts[i1 * 3 + 1], cap.recvVerts[i1 * 3 + 2] );
+				float3 p2( cap.recvVerts[i2 * 3], cap.recvVerts[i2 * 3 + 1], cap.recvVerts[i2 * 3 + 2] );
+				recvPts.push_back( ( p0 + p1 + p2 ) * ( 1.0f / 3.0f ) );
+			}
+		}
+		if( recvPts.empty() )
+		{
+			continue;
+		}
+		const size_t stride = std::max( ( size_t )1, recvPts.size() / MAX_RECV_PER_LIGHT );
+
+		const float3 Lp( L.origin[0], L.origin[1], L.origin[2] );
+		const float  swR = std::fmax( L.penumbraSize, 1e-2f );
+		const float  swEps = SW_NEAR_EPS;
+
+		// bucket sampled receivers into G cells; collect per-cell contributor unions AND the
+		// RECORDED receiver AABB (used as the keep box - removes the key-reconstruction as a
+		// suspect and is the tighter, honest bound for the sampled receivers)
+		struct cellU_t
+		{
+			std::vector<uint32_t> tris;
+			float3 mn{ 1e30f, 1e30f, 1e30f }, mx{ -1e30f, -1e30f, -1e30f };
+		};
+		std::unordered_map<uint64_t, cellU_t> cells;
+		for( size_t s = 0; s < recvPts.size(); s += stride )
+		{
+			const float3 P = recvPts[s];
+			softFrame_t F = SoftShadow_Frame( P, Lp );
+			uint32_t diskMask[SW_SCAN_CHORDS];
+			for( int m = 0; m < SW_SCAN_CHORDS; m++ )
+			{
+				diskMask[m] = SoftScan_Run( -SW_SCAN_HC[m], SW_SCAN_HC[m] );
+			}
+			const int64_t cx = ( int64_t )std::floor( P.x / G ), cy = ( int64_t )std::floor( P.y / G ), cz = ( int64_t )std::floor( P.z / G );
+			const uint64_t key = ( ( uint64_t )( cx & 0x1FFFFF ) << 42 ) | ( ( uint64_t )( cy & 0x1FFFFF ) << 21 ) | ( uint64_t )( cz & 0x1FFFFF );
+			cellU_t& acc = cells[key];
+			acc.mn = float3( std::fmin( acc.mn.x, P.x ), std::fmin( acc.mn.y, P.y ), std::fmin( acc.mn.z, P.z ) );
+			acc.mx = float3( std::fmax( acc.mx.x, P.x ), std::fmax( acc.mx.y, P.y ), std::fmax( acc.mx.z, P.z ) );
+			for( size_t t = 0; t < nTris; t++ )
+			{
+				const float* r0 = F4( base4 + t * 3 + 0 );
+				const float* r1 = F4( base4 + t * 3 + 1 );
+				const float* r2 = F4( base4 + t * 3 + 2 );
+				uint32_t solo[SW_SCAN_CHORDS] = {};
+				SoftScan_FillTri( solo, float3( r0[0], r0[1], r0[2] ), float3( r1[0], r1[1], r1[2] ), float3( r2[0], r2[1], r2[2] ), P, F, swR, swEps );
+				if( MaskedBits( solo, diskMask ) > 0 )
+				{
+					acc.tris.push_back( ( uint32_t )t );
+				}
+			}
+		}
+
+		for( auto& kv : cells )
+		{
+			std::sort( kv.second.tris.begin(), kv.second.tris.end() );
+			kv.second.tris.erase( std::unique( kv.second.tris.begin(), kv.second.tris.end() ), kv.second.tris.end() );
+
+			const float3 bMin = kv.second.mn;
+			const float3 bMax = kv.second.mx;
+
+			int keepN = 0;
+			std::vector<uint8_t> kept2( nTris, 0 );
+			for( size_t t = 0; t < nTris; t++ )
+			{
+				const float* r0 = F4( base4 + t * 3 + 0 );
+				const float* r1 = F4( base4 + t * 3 + 1 );
+				const float* r2 = F4( base4 + t * 3 + 2 );
+				const float3 a( r0[0], r0[1], r0[2] ), b( r1[0], r1[1], r1[2] ), c( r2[0], r2[1], r2[2] );
+				kept2[t] = Keep( 2, bMin, bMax, Lp, swR, a, b, c ) ? 1 : 0;
+				keepN += kept2[t];
+			}
+			// SOUNDNESS: every sampled contributor must be kept by the two-sided rule
+			for( uint32_t t : kv.second.tris )
+			{
+				if( !kept2[t] )
+				{
+					violations++;
+				}
+			}
+			cellsN++;
+			keepTot += keepN;
+			unionTot += ( double )kv.second.tris.size();
+			trisTot += ( double )nTris;
+			keepSizes.push_back( keepN );
+		}
+	}
+
+	if( cellsN == 0 )
+	{
+		std::printf( "    [keeptest] no cells\n" );
+		CHECK( true );
+		return;
+	}
+	std::sort( keepSizes.begin(), keepSizes.end() );
+	std::printf( "    [keeptest] G=%.0f cells %ld | two-sided KEEP mean %.1f med %d p90 %d max %d of %.0f tris/light | sampled-union mean %.1f | over-keep x%.1f | SOUNDNESS violations %ld\n",
+				 G, cellsN, keepTot / cellsN, keepSizes[keepSizes.size() / 2], keepSizes[( size_t )( keepSizes.size() * 0.90 )],
+				 keepSizes.back(), trisTot / cellsN, unionTot / cellsN,
+				 unionTot > 0 ? keepTot / unionTot : 0.0, violations );
+	( void )violations1;
+	( void )keepTot1;
+
+	CHECK( violations == 0 );
+}
