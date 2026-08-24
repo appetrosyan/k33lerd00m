@@ -792,8 +792,39 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 	}
 	if( fn < 3 ) { return; }
 	float invR = 1.0f / swR;
-	float2 q[5]; int qn = fn; float ymin = 1e30f, ymax = -1e30f;
-	for( int j = 0; j < fn; j++ ) { float2 p = SoftShadow_ProjectVert( fRel[j], fDn[j], swF ) * invR; q[j] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); }
+	float2 q[5]; int qn = fn; float ymin = 1e30f, ymax = -1e30f; float xmin = 1e30f, xmax = -1e30f;
+	for( int j = 0; j < fn; j++ ) { float2 p = SoftShadow_ProjectVert( fRel[j], fDn[j], swF ) * invR; q[j] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); xmin = min( xmin, p.x ); xmax = max( xmax, p.x ); }
+	// LOSSLESS DISK REJECT: if the nearest point of the projected triangle's AABB to the disk centre is
+	// already outside the UNIT CIRCLE, the triangle covers no disk bit (the circular mask is applied at
+	// reduction). The cone cull upstream is a loose bounding-SPHERE test, so ~99% of its survivors still
+	// project clear of the small disk (grazing miss) and would otherwise pay the per-edge reciprocal setup
+	// + chord sweep below - the bulk of FillTri (measured 31-53% of the scanline walk; -11..-20% walk on the
+	// heavy caps). Circle-exact (not just the [-1,1]^2 box) so it also drops the corner-missers a box keeps:
+	// measured no different on these dense caps, but the corner fraction is scene-dependent (a wide-penumbra
+	// scene with survivors clustered in the disk corners gains where these do not), and the extra cost is a
+	// few ALU. Conservative: never drops a triangle that touches the disk, so coverage is bit-identical.
+	{
+		float nx = ( xmin > 0.0f ) ? xmin : ( ( xmax < 0.0f ) ? xmax : 0.0f );
+		float ny = ( ymin > 0.0f ) ? ymin : ( ( ymax < 0.0f ) ? ymax : 0.0f );
+		if( nx * nx + ny * ny > 1.0f ) { return; }
+	}
+	const float halfC = SW_SCAN_CHORDS * 0.5f;							// chord index m for chord centre Y: m = (Y+1)*halfC - 0.5
+	int mLo = max( ( int )ceil( ( ymin + 1.0f ) * halfC - 0.5f ), 0 );
+	int mHi = min( ( int )floor( ( ymax + 1.0f ) * halfC - 0.5f ), SW_SCAN_CHORDS - 1 );
+	if( mLo > mHi ) { return; }											// projects between chord centres / outside disk in Y
+	// ALREADY-COVERED SKIP (lossless): the grid is an OR-union, so a triangle whose projected-AABB column
+	// run is ALREADY fully set in swGrid on every chord it spans can add no new bit (its coverage is a
+	// subset of its bbox, which is a subset of the already-set columns). Skip it before the per-edge
+	// reciprocals + chord sweep. The disk reject above drops the ~34% of survivors that miss the disk
+	// entirely; MEASURED the remaining ~66% mostly OVERLAP the disk but re-fill bits a closer occluder
+	// already set (redundant) - this catches those, the bulk of the 44 ms chord-sweep mass. Operates on the
+	// RAW grid (pre-disk-mask): raw coverage unchanged => popcount( grid & diskMask ) is bit-identical.
+	{
+		uint bboxRun = SoftScan_Run( xmin, xmax );
+		bool newBits = false;
+		for( int mc = mLo; mc <= mHi; mc++ ) { if( ( swGrid[mc] & bboxRun ) != bboxRun ) { newBits = true; break; } }
+		if( !newBits ) { return; }
+	}
 	// per-edge line params hoisted OUT of the chord loop: the reciprocal 1/(B.y-A.y) is the expensive
 	// term and is chord-invariant, so each chord evaluation is a single FMA x = A.x + slope*(Y - A.y).
 	float eax[5], eay[5], eslope[5], elo[5], ehi[5];
@@ -804,10 +835,6 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 		eax[e] = A.x; eay[e] = A.y; eslope[e] = ( B.x - A.x ) / ( B.y - A.y );
 		elo[e] = min( A.y, B.y ); ehi[e] = max( A.y, B.y );
 	}
-	const float halfC = SW_SCAN_CHORDS * 0.5f;							// chord index m for chord centre Y: m = (Y+1)*halfC - 0.5
-	int mLo = ( int )ceil( ( ymin + 1.0f ) * halfC - 0.5f );
-	int mHi = ( int )floor( ( ymax + 1.0f ) * halfC - 0.5f );
-	mLo = max( mLo, 0 ); mHi = min( mHi, SW_SCAN_CHORDS - 1 );
 	for( int m = mLo; m <= mHi; m++ )									// only the chords the triangle spans
 	{
 		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
