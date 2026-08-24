@@ -394,9 +394,11 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 #ifdef __cplusplus
 	#define SW_EDGEBUF_PARAM , SoftEdgeBuffer t_SoftEdges
 	#define SW_TILEBUF_PARAM , SoftTileBuffer t_SoftTiles
+	#define SW_UNROLL							// C++ (test) build: HLSL loop attributes have no C++ form
 #else
 	#define SW_EDGEBUF_PARAM
 	#define SW_TILEBUF_PARAM
+	#define SW_UNROLL [unroll]
 #endif
 
 // SW_ATTRIB: op-count instrumentation for the CPU walk-attribution study. TEXTUALLY EMPTY in HLSL
@@ -1456,7 +1458,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			// >=99%-occluded fragment to exact umbra (return 1) - the <1% residual is discretisation noise and
 			// reads as black regardless, so the visible penumbra gradient is untouched.
 			int swCovE = 0;
-			[unroll] for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
+			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
 			if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 		}
 #else
