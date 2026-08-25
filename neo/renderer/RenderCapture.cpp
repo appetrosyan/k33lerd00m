@@ -2183,7 +2183,8 @@ void GateCreateStaticInteractionsForLight( idRenderWorld* world, qhandle_t light
 		{
 			idRenderEntityLocal* edef = eref->entity;
 			seen++;
-			if( edef->parms.hModel != NULL && idStr::Icmp( edef->parms.hModel->Name(), "_softShadowCapturedCasters" ) == 0 )
+			if( edef->parms.hModel != NULL && ( idStr::Icmp( edef->parms.hModel->Name(), "_softShadowCapturedCasters" ) == 0
+					|| idStr::Cmpn( edef->parms.hModel->Name(), "_softBenchCaster_", 17 ) == 0 ) )
 			{
 				// leave the replayed caster soup DYNAMIC: its non-manifold triangles have no silEdges and
 				// _white makes no static light tris, so a forced static interaction resolves to EMPTY -
@@ -2494,6 +2495,35 @@ int R_SoftShadowGate( const char* arg )
 			d.kind = GATE_SETUP;
 			all.push_back( d );
 			continue;
+		}
+
+		// ---- capture filter (com_softShadowGateCaps): substring whitelist, BEFORE any world/light
+		// setup so a filtered sweep of the heavy caps costs seconds, not the full-corpus minutes.
+		// Skipped caps never reach capsRun++, so the totals denominator counts only what actually ran.
+		{
+			const char* swFilt = cvarSystem->GetCVarString( "com_softShadowGateCaps" );
+			if( swFilt != NULL && swFilt[0] != '\0' )
+			{
+				bool swMatch = false;
+				for( const char* p = swFilt; !swMatch; )
+				{
+					const char* c = strchr( p, ',' );
+					idStr tok = c != NULL ? idStr( p, 0, ( int )( c - p ) ) : idStr( p );
+					tok.StripLeading( ' ' );
+					tok.StripTrailingWhitespace();
+					swMatch = !tok.IsEmpty() && cap.name.Find( tok.c_str(), false ) >= 0;
+					if( c == NULL )
+					{
+						break;
+					}
+					p = c + 1;
+				}
+				if( !swMatch )
+				{
+					common->Printf( "[softgate] SKIP %s (filter)\n", cap.name.c_str() );
+					continue;
+				}
+			}
 		}
 
 		// ---- world ----------------------------------------------------------------------------
@@ -3286,9 +3316,34 @@ int R_SoftShadowGate( const char* arg )
 			cvarSystem->SetCVarInteger( "r_useShadowMapping", launchMapping );
 			cvarSystem->SetCVarInteger( "r_shadowMapPCSSAnalyticContact", launchContact );
 			cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", launchPenumbra );
+			// RE-FIRE the surf-cache load burst for THIS cap's scene (task #87): TakeLoadWarm keys on
+			// world pointer identity and fired (if at all) BEFORE the bench lights above existed, so
+			// bench-only runs served ~0% (cap0012: 0 hits of 4M frags) - the burst had warmed a light
+			// set that no longer exists. Forgetting the burst world makes the first warm-up frame
+			// re-run WarmMapBurst over the bench lights + their just-built static chains; the timed
+			// frames start after the warm-ups, so the one heavy burst frame never pollutes the numbers.
+			{
+				extern idCVar r_softShadowSurfCache;
+				if( r_softShadowSurfCache.GetBool() && backEnd.GetSoftShadowSurfCache() != NULL )
+				{
+					backEnd.GetSoftShadowSurfCache()->ResetLoadWarm();
+				}
+			}
 			for( int wu = 0; wu < 3; wu++ )		// warm-up: caches, atlas, pipelines
 			{
 				GateRenderFrame( rw, &rv );
+			}
+			// TABLE CENSUS after the warm-ups, before the timed loop (harness-audit finding #2/#3
+			// adjudicator): built vs requested-unbuilt vs empty tells build-truncation apart from a
+			// GC wipe apart from seed starvation in ONE line, instead of inferring from hit%%.
+			{
+				uint32_t tc[4] = {};
+				if( backEnd.GetSoftShadowSurfCache() != NULL && backEnd.GetSoftShadowSurfCache()->IsActive()
+						&& backEnd.GetSoftShadowSurfCache()->GetTableCensus( tc ) )
+				{
+					common->Printf( "[softgate] BENCH %-14s surf table-census post-warm: built %u | requested-unbuilt %u | empty %u | walk-always/other %u\n",
+									cap.name.c_str(), tc[0], tc[1], tc[2], tc[3] );
+				}
 			}
 			// contributor-cache settle + steady-state snapshot: on a STATIC bench scene every visible
 			// cell must claim/record/flip within a few frames, after which recording evals must be ZERO
@@ -3337,6 +3392,12 @@ int R_SoftShadowGate( const char* arg )
 				double gpu, wall, soft;
 			};
 			std::vector<swBenchFrame_t> swFrames;
+			// fail-fast (com_softShadowGateBenchAbortMs): the cache is fully pre-warmed above (load
+			// burst + warm-up frames), so a cap still sustaining over-threshold WALL frames here will
+			// not improve - abandon it after 5 consecutive slow frames instead of waiting out the loop.
+			const int swAbortMs = cvarSystem->GetCVarInteger( "com_softShadowGateBenchAbortMs" );
+			int swSlowStreak = 0;
+			bool swAborted = false;
 			for( int f = 0; f < benchFrames; f++ )
 			{
 				const int64 wf0 = Sys_Microseconds();
@@ -3390,15 +3451,29 @@ int R_SoftShadowGate( const char* arg )
 				benchSoftLights   = Max( benchSoftLights,   backEnd.pc.c_softLightsTotal );
 				benchTermLights   = Max( benchTermLights,   backEnd.pc.c_softLightsTerm );
 				benchBinnedLights = Max( benchBinnedLights, backEnd.pc.c_softLightsBinned );
+				if( swAbortMs > 0 )
+				{
+					swSlowStreak = ( bf.wall > swAbortMs ) ? swSlowStreak + 1 : 0;
+					if( swSlowStreak >= 5 )
+					{
+						swAborted = true;
+						common->Printf( "[softgate] BENCH %s ABORT: %d frames > %dms sustained (cache pre-warmed - not improving)\n",
+										cap.name.c_str(), swSlowStreak, swAbortMs );
+						break;
+					}
+				}
 			}
 			tr.SwapCommandBuffers( NULL, NULL, NULL, NULL, NULL, NULL );	// drain the last frame
-			const double ms = ( Sys_Microseconds() - t0 ) / 1000.0 / benchFrames;
+			// frames ACTUALLY run: the abort break shortens the loop; every mean below must divide by
+			// this, never the requested benchFrames.
+			const int framesRun = Max( 1, ( int )swFrames.size() );
+			const double ms = ( Sys_Microseconds() - t0 ) / 1000.0 / framesRun;
 			// stream accounting from the LAST bench frame: dropped>0 means the frame BUDGET silently
 			// erased whole lights' soft shadows - such a bench time is a lie (faster because shadows
 			// are missing), so the drop count must be printed next to the ms it taints.
-			common->Printf( "[softgate] BENCH %-14s %6.2f ms/frame (%4.0f FPS) over %d frames, %d map lights, "
+			common->Printf( "[softgate] BENCH %-14s %6.2f ms/frame (%4.0f FPS) over %d frames%s, %d map lights, "
 							"%d soft records (%d dropped), %d soft lights (%d term, %d binned)\n",
-							cap.name.c_str(), ms, 1000.0 / ms, benchFrames, ( int )mapLights.size(),
+							cap.name.c_str(), ms, 1000.0 / ms, framesRun, swAborted ? " (ABORTED)" : "", ( int )mapLights.size(),
 							benchRecords, benchDropped, benchSoftLights, benchTermLights, benchBinnedLights );
 			// granular GPU phase attribution (us->ms), averaged over frames with a valid timer query.
 			// soft = pos + bin + term + read; the rest of gpu is everything non-soft.
@@ -3478,18 +3553,18 @@ int R_SoftShadowGate( const char* arg )
 					// refinement records ARE steady-state by design (1/64 validator); the leak verdict is
 					// on recording BEYOND them
 					common->Printf( "[softgate] BENCH %-14s CONTRIB steady-state: serves %u/frame | recording %u/frame (refine %u/frame) | claims %u/frame -> %s\n",
-									cap.name.c_str(), dServe / benchFrames, dRecord / benchFrames, dRefine / benchFrames, dClaim / benchFrames,
-									dRecord <= dRefine + 64 * benchFrames ? "PASS (refinement only)" : "FAIL (steady-state RECORD LEAK)" );
+									cap.name.c_str(), dServe / framesRun, dRecord / framesRun, dRefine / framesRun, dClaim / framesRun,
+									dRecord <= dRefine + 64 * framesRun ? "PASS (refinement only)" : "FAIL (steady-state RECORD LEAK)" );
 					common->Printf( "[softgate] BENCH %-14s CONTRIB cumulative (incl. warm): serves %u | recordings %u | cells claimed %u\n",
 									cap.name.c_str(), csEnd[1], csEnd[2], csEnd[3] );
 					const uint64_t swStT = backEnd.GetSoftShadowTermPass()->m_ContribStaticTris;
 					const uint64_t swTtT = backEnd.GetSoftShadowTermPass()->m_ContribTotalTris;
 					common->Printf( "[softgate] BENCH %-14s CONTRIB diag deltas: budget-blocked %u/frame | probe-exhausted %u/frame | built-unservable %u/frame | STATIC share %.1f%% | active lights %.1f/frame | frags %.0fk/frame\n",
-									cap.name.c_str(), ( csEnd[7] - csWarm[7] ) / benchFrames, ( csEnd[8] - csWarm[8] ) / benchFrames,
-									( csEnd[9] - csWarm[9] ) / benchFrames,
+									cap.name.c_str(), ( csEnd[7] - csWarm[7] ) / framesRun, ( csEnd[8] - csWarm[8] ) / framesRun,
+									( csEnd[9] - csWarm[9] ) / framesRun,
 									swTtT > 0 ? 100.0 * ( double )swStT / ( double )swTtT : 0.0,
-									( double )( backEnd.GetSoftShadowTermPass()->m_ContribActiveLights - swCALWarm ) / benchFrames,
-									( double )( backEnd.GetSoftShadowTermPass()->m_ContribFragments - swCFRWarm ) / benchFrames / 1000.0 );
+									( double )( backEnd.GetSoftShadowTermPass()->m_ContribActiveLights - swCALWarm ) / framesRun,
+									( double )( backEnd.GetSoftShadowTermPass()->m_ContribFragments - swCFRWarm ) / framesRun / 1000.0 );
 					// serve-verify (r_softShadowContribCache 2): the decisive correctness number for the
 					// fast loop - served-vs-plain term mismatches over the timed frames
 					if( csEnd[4] - csWarm[4] > 0 )
@@ -3533,6 +3608,36 @@ int R_SoftShadowGate( const char* arg )
 						backEnd.GetSoftShadowSurfCache()->GetPrewarmState( swCur, swCap, swPend );
 						common->Printf( "[softgate] BENCH %-14s surf: hit %u (%.1f%%) miss %u walkalways %u anchor-rej %u | prewarm cursor %d/%d pending %d\n",
 										cap.name.c_str(), ss[0], 100.0 * ss[0] / tot, ss[1], ss[2], ss[3], swCur, swCap, swPend );
+						// MISS SPLIT (task #87 built-vs-read attribution): empty/overflow = warm/key
+						// defect (the built-but-not-read class), requested = build-budget lag, stale-gen
+						// = invalidation churn. Separates "never seeded", "seeded not built", "built
+						// then invalidated every frame", and "built under a key the read never derives".
+						uint32_t mr[4] = {};
+						if( ss[1] > 0 && backEnd.GetSoftShadowSurfCache()->GetMissReasons( mr ) )
+						{
+							common->Printf( "[softgate] BENCH %-14s surf miss-split: stale-gen %u | requested-unbuilt %u | empty-slot %u | probe-overflow %u\n",
+											cap.name.c_str(), mr[0], mr[1], mr[2], mr[3] );
+						}
+						// PER-LIGHT hit/miss rings (lightKey&15): names WHICH lights own the miss bucket.
+						// An all-or-nothing light (never seeded/streamed) reads hit 0 / miss large; a
+						// healthy light reads a high hit share. Ring collisions possible past 16 lights -
+						// read as attribution hints, not exact per-light truth.
+						uint32_t pl[32] = {};
+						if( ss[1] > 0 && backEnd.GetSoftShadowSurfCache()->GetPerLightStats( pl ) )
+						{
+							idStr swPlLine;
+							for( int r = 0; r < 16; r++ )
+							{
+								const uint32_t h = pl[r * 2], m = pl[r * 2 + 1];
+								if( h + m == 0 )
+								{
+									continue;
+								}
+								swPlLine += va( " %d:%u/%u(%.0f%%)", r, h, m, 100.0 * h / ( double )( h + m ) );
+							}
+							common->Printf( "[softgate] BENCH %-14s surf by-light ring:hit/miss(hit%%):%s\n",
+											cap.name.c_str(), swPlLine.c_str() );
+						}
 					}
 				}
 			}
