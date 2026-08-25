@@ -145,7 +145,10 @@ void SoftShadowTermPass::EnsurePipeline()
 		cntMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "1" ) );
 		cntMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
-		cntMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
+		// SCANLINE=1: the counting permutation must instrument the SHIPPED path. It compiled the dead
+		// sampled walk (=0) until 2026-08-25, so every "walk counter" run measured a path the game
+		// never executes - the counters now attribute FillTri (fill/reject/skip/fold/sweep, slots 20-26).
+		cntMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
 		cntMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		cntMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
@@ -165,7 +168,7 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineCnt = m_Device->createComputePipeline( pc );
 
 			nvrhi::BufferDesc wc;
-			wc.byteSize = 20 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census
+			wc.byteSize = 28 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106)
 			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
 			wc.canHaveUAVs = true;
 			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -813,20 +816,20 @@ bool SoftShadowTermPass::GetContribStats( uint32_t out[20] )
 	return true;
 }
 
-bool SoftShadowTermPass::GetWalkStats( uint32_t out[20] )
+bool SoftShadowTermPass::GetWalkStats( uint32_t out[28] )
 {
 	if( !m_WalkCntEnabled || m_WalkCntBuffer == nullptr )
 	{
 		return false;
 	}
 	nvrhi::BufferDesc sbd;
-	sbd.byteSize = 20 * sizeof( uint32_t );
+	sbd.byteSize = 28 * sizeof( uint32_t );
 	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
 	sbd.debugName = "SoftShadowTerm/WalkCountersReadback";
 	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
 	nvrhi::CommandListHandle cl = m_Device->createCommandList();
 	cl->open();
-	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 20 * sizeof( uint32_t ) );
+	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 28 * sizeof( uint32_t ) );
 	cl->close();
 	m_Device->executeCommandList( cl );
 	m_Device->waitForIdle();
@@ -835,7 +838,7 @@ bool SoftShadowTermPass::GetWalkStats( uint32_t out[20] )
 	{
 		return false;
 	}
-	memcpy( out, p, 20 * sizeof( uint32_t ) );
+	memcpy( out, p, 28 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
 	return true;
 }

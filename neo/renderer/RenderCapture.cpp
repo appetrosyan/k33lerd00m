@@ -84,6 +84,9 @@ static const SoftPin s_softTestConfig[] =
 	{ "r_softShadowContinuous",  "0" },
 	{ "r_useTemporalAA",         "0" },
 	{ "r_softShadowDebugShader", "0" },
+	// per-light emitter derivation OFF: gate/repro lights are reconstructed from the .cap's stored
+	// per-light penumbraSize via the r_shadowPenumbraSize global, which must pass through exactly
+	{ "r_shadowPenumbraAuto",    "0" },
 };
 
 void R_SoftShadowPinTestConfig( bool verbose )
@@ -360,6 +363,13 @@ const ReproRes s_reproResList[] = { { 1920, 1080, "1080p" }, { 2560, 1440, "1440
 int s_reproResIdx   = 0;
 int s_reproResCount = 2;		// 1080p + 1440p by default; 4K appended when r_softShadowRepro4K is set (arm time)
 
+// RECAPTURE MODE (softShadowRecapture). Reuses the exact repro load->goto->settle path, but at the settle
+// stage OVERWRITES each cap in place via `capture` instead of running the A/B shot - regenerating the .cap
+// with the current writer (v7 live-light tail). One resolution (the corpus 1440p), no A/B, clean exit.
+bool  s_reproRecapture = false;
+// When set, `capture` overwrites this exact base instead of allocating the next free capNNNN. Empty = normal.
+idStr s_forcedCaptureBase;
+
 // central-band mean luminance of an RGBA8 frame (fade-in / all-dark guard)
 double R_CentralLuma( const std::vector<uint8_t>& img, int w, int h )
 {
@@ -605,7 +615,15 @@ void R_SoftShadowReproTick()
 				// position the REAL player view at the captured camera via setviewpos (instant teleport, applied
 				// over the goto's live frames), then the shot freezes + renders through game->Draw. Running the
 				// actual game render is the point - a renderer-only bypass can pass while the shipped path fails.
-				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowGoto %s\n", cap.c_str() ) );
+				// RECAPTURE-FROM-VIEW EXCEPTION: a cinematic .cap stores a cutscene render camera parked in a dark
+				// fully-penumbral corner where the gate has no valid (fully-lit) pixels and the RT oracle goes
+				// degenerate - ungateable. r_softShadowRecaptureFromSaveView regenerates it from the SAVE's natural
+				// player viewpoint instead (a real gameplay eye), turning a dead cinematic cap into a testable one.
+				extern idCVar r_softShadowRecaptureFromSaveView;
+				if( !( s_reproRecapture && r_softShadowRecaptureFromSaveView.GetBool() ) )
+				{
+					cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowGoto %s\n", cap.c_str() ) );
+				}
 				s_reproWait = REPRO_SETTLE; s_reproState = RS_SETTLE;
 			}
 			else if( ++s_reproWait > REPRO_LOAD_TIMEOUT )
@@ -618,12 +636,25 @@ void R_SoftShadowReproTick()
 		case RS_SETTLE:
 			if( --s_reproWait <= 0 )
 			{
-				cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowReproShot %s\n", cap.c_str() ) );
+				if( s_reproRecapture )
+				{
+					// Overwrite this cap in place with the current writer: the loaded save restored the EXACT
+					// live light state (script-moved / retinted cutscene lights), so `capture` stamps the v7
+					// live-light tail that a pre-v7 cap lacks. Unfreeze so CaptureGameSave sees a live player.
+					s_forcedCaptureBase = idStr( "cap/" ) + R_ReproSlot( cap );
+					cvarSystem->SetCVarInteger( "g_stopTime", 0 );
+					cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "capture\n" );
+				}
+				else
+				{
+					cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "softShadowReproShot %s\n", cap.c_str() ) );
+				}
 				s_reproState = RS_SHOTWAIT;
 			}
 			break;
 		case RS_SHOTWAIT:
-			s_reproState = RS_NEXT;		// the shot command ran this frame; advance next tick
+			s_forcedCaptureBase.Clear();	// the shot/capture ran this frame; drop the in-place overwrite target
+			s_reproState = RS_NEXT;			// advance next tick
 			break;
 		case RS_NEXT:
 			s_reproIdx++;
@@ -657,8 +688,30 @@ void R_SoftShadowRepro_f( const idCmdArgs& args )
 	for( int i = 1; i < args.Argc(); i++ ) { s_reproCaps.Append( idStr( args.Argv( i ) ) ); }
 	extern idCVar r_softShadowRepro4K;
 	s_reproResCount = r_softShadowRepro4K.GetBool() ? 3 : 2;		// 1080p+1440p, +4K opt-in
+	s_reproRecapture = false;
 	s_reproResIdx = 0; s_reproIdx = 0; s_reproState = RS_SETRES; s_reproFails = 0;
 	common->Printf( "[repro] armed %d capture(s) x %d resolution(s)\n", s_reproCaps.Num(), s_reproResCount );
+}
+
+// RECAPTURE: regenerate each given .cap in place at the corpus resolution (1440p), reusing the repro
+// load->goto->settle path but writing the .cap with the current writer instead of running the A/B shot.
+// The point is to stamp the v7 live-light tail onto pre-v7 caps (whose script-moved cutscene lights the
+// static-map reconstruction cannot recover) so the gate stops reporting them as SETUP defects. Recapture is
+// a normal maintenance step - re-run it whenever the .cap format or the capture path changes.
+void R_SoftShadowRecapture_f( const idCmdArgs& args )
+{
+	if( args.Argc() < 2 )
+	{
+		common->Warning( "usage: softShadowRecapture <cap1.cap> [cap2 ...] - restore each embedded save, reposition, overwrite the .cap in place with the current writer (v7 tail), then quit" );
+		return;
+	}
+	s_reproCaps.Clear();
+	for( int i = 1; i < args.Argc(); i++ ) { s_reproCaps.Append( idStr( args.Argv( i ) ) ); }
+	s_reproRecapture = true;
+	s_reproResCount = 2;			// index 1..<2 == 1440p only (the corpus resolution)
+	s_reproResIdx = 1; s_reproIdx = 0; s_reproState = RS_SETRES; s_reproFails = 0;
+	s_forcedCaptureBase.Clear();
+	common->Printf( "[recap] armed %d capture(s) for in-place regeneration at 1440p\n", s_reproCaps.Num() );
 }
 
 // One-shot capture of a live soft-shadow view, reconstructable headless. See RenderCapture.h. The capture is
@@ -667,6 +720,7 @@ void R_SoftShadowRepro_f( const idCmdArgs& args )
 // halves fire on the next main view and disarm.
 
 idCVar r_softShadowRepro4K( "r_softShadowRepro4K", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "softShadowRepro: also reproduce every capture at 3840x2160 (in addition to 1080p + 1440p). Off by default - 4K is slow and a headless box may lack the VRAM." );
+idCVar r_softShadowRecaptureFromSaveView( "r_softShadowRecaptureFromSaveView", "0", CVAR_RENDERER | CVAR_BOOL | CVAR_NEW, "softShadowRecapture: regenerate each cap from the embedded save's NATURAL player viewpoint instead of the stored (cinematic) render camera. Use to rescue ungateable cutscene captures parked in dark penumbral corners." );
 
 extern idCVar r_shadowPenumbraSize;
 
@@ -801,6 +855,11 @@ bool ReadImageRGBA8( idImage* img, std::vector<uint8_t>& out, int& w, int& h )
 
 void NextCaptureBaseName( idStr& out )
 {
+	if( !s_forcedCaptureBase.IsEmpty() )
+	{
+		out = s_forcedCaptureBase;
+		return;
+	}
 	for( int i = 0; i <= 9999; i++ )
 	{
 		idStr candidate = va( "cap/cap%04i.cap", i );
@@ -886,7 +945,13 @@ void R_CaptureFrontendView( const viewDef_t* viewDef )
 		L.origin[0] = vLight->globalLightOrigin.x;
 		L.origin[1] = vLight->globalLightOrigin.y;
 		L.origin[2] = vLight->globalLightOrigin.z;
-		L.penumbraSize = r_shadowPenumbraSize.GetFloat();
+		// per-light resolved emitter radius (task #105): captures taken live embed each light's actual
+		// radius (authored key / auto heuristic / global); gate replay pins auto off + sets the global
+		// to this stored value per light, so fixtures replay at exactly their captured size
+		{
+			extern float R_SoftPenumbraRadius( const idRenderLightLocal* lightDef );
+			L.penumbraSize = R_SoftPenumbraRadius( vLight->lightDef );
+		}
 		L.scissor[0] = vLight->scissorRect.x1; L.scissor[1] = vLight->scissorRect.y1;
 		L.scissor[2] = vLight->scissorRect.x2; L.scissor[3] = vLight->scissorRect.y2;
 		L.firstEdge = it->second.first;
@@ -2706,7 +2771,13 @@ int R_SoftShadowGate( const char* arg )
 			swgate::GateImg mask1, rt, anaA, anaB, depthA;
 
 			// R0 - interaction-coverage mask: shadows skipped, term==1 exactly where this light's
-			// interaction draws. Everything outside is excluded from every probe.
+			// interaction draws. Everything outside is excluded from every probe. The mask is deliberately
+			// TIGHT (only high-confidence fully-lit-and-unshadowed pixels): loosening it to the light's full
+			// geometric reach folds the whole penumbra into the tested region and surfaces thousands of
+			// penumbra-level analytic-vs-RT disagreements that this gate is not meant to adjudicate (measured
+			// 180 -> 6029). A cinematic camera parked in a fully-penumbral dark corner therefore has NO valid
+			// pixels here and cannot be gated - that is a bad capture, recreated via softShadowRecapture from
+			// a gameplay viewpoint, not a reason to widen the mask.
 			cvarSystem->SetCVarInteger( "r_skipShadows", 1 );
 			cvarSystem->SetCVarInteger( "r_useRTShadows", 0 );
 			cvarSystem->SetCVarInteger( "r_useSoftShadowVolumes", 1 );
@@ -3121,6 +3192,9 @@ int R_SoftShadowGate( const char* arg )
 				{
 					idStr ppm = va( "softgate_%s_L%d.ppm", cap.name.c_str(), li );
 					GateWritePPM( ppm.c_str(), anaA, valid, defectPx );
+					// the RT reference next to it: profile ana vs rt through a defect offline
+					idStr rtppm = va( "softgate_%s_L%d_rt.ppm", cap.name.c_str(), li );
+					GateWritePPM( rtppm.c_str(), rt, valid, defectPx );
 				}
 			}
 
@@ -3473,39 +3547,98 @@ int R_SoftShadowGate( const char* arg )
 								spillStats[0] > ( uint32_t )SoftTileBinPass::SPILL_ELEMENTS ? "EXHAUSTED" : "fits",
 								spillStats[1], spillStats[2] );
 			}
-			// GPU per-fragment walk counters (r_softShadowWalkCounters): the shipped TILE-LIST path's
-			// real cull cascade per walked fragment, confirming the CPU attribution's cull-collapse
-			// finding on the actual GPU path. Slots [4]=tight tests [5]=tight culls [6]=MT survivors
-			// [7]=fragments walked (the binned walker fills tight/mtTri only).
-			uint32_t walk[20] = {};
+			// ---- ONE-PASS ATTRIBUTION -------------------------------------------------------------
+			// The walk counters used to print only when the user remembered r_softShadowWalkCounters,
+			// costing a second multi-minute launch. Instead: AFTER the timed loop (ms already computed)
+			// and AFTER the last-bench-frame pass-stat reads above (stream/surf/spill/contrib), force
+			// the cvar on and render 2 extra UNTIMED frames through the COUNTING permutation, restore,
+			// then print. The timed numbers are untouched; if the cvar was already on, the timed frames
+			// were counting frames and we read them directly (today's behaviour, the override).
+			{
+				extern idCVar r_softShadowWalkCounters;
+				if( !r_softShadowWalkCounters.GetBool() )
+				{
+					r_softShadowWalkCounters.SetBool( true );
+					for( int cf = 0; cf < 2; cf++ )
+					{
+						GateRenderFrame( rw, &rv );
+					}
+					r_softShadowWalkCounters.SetBool( false );
+					// GetWalkStats stays valid: m_WalkCntEnabled snapshots the cvar per VIEW, and the
+					// last rendered view (counting frame 2) snapshotted it ON.
+				}
+			}
+			// GPU per-fragment walk counters: the shipped (scanline) walk's real cull cascade per
+			// walked fragment. The counting permutation is SW_SCANLINE=1 = the shipped algorithm; the
+			// surf/contrib CACHE pipelines are structurally bypassed in counting mode, so every number
+			// below attributes the PLAIN walk (tile-list, spill/cluster, unbinned-full paths - all
+			// instrumented). Slots: [0/1] caster+cluster sphere tests/culls, [2/3] coarse v0, [4/5]
+			// tight cone, [6] survivors reaching FillTri, [7] fragments walked.
+			uint32_t walk[28] = {};
 			if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetWalkStats( walk ) && walk[7] > 0 )
 			{
+				// SCANLINE FillTri attribution (task #106, slots 20-26): where the chord-sweep walk spends
+				// its per-triangle work, per walked fragment. fills = FillTri entered (post cone cull);
+				// rejects = clip/disk/chord early-outs; skips = already-covered (with the skip-test + fold
+				// loop iteration counts = the skip path's per-chord ALU); sweeps = tris paying the per-edge
+				// setup + chord rows (rows = SoftScan_Run + envelope updates).
+				{
+					const double f = ( double )walk[7];
+					common->Printf( "[softgate] BENCH %-14s walk-scan/frag: fills %.1f -> rejects %.1f | skips %.1f (test-iters %.1f, fold-iters %.1f) | sweep-tris %.1f, sweep-rows %.1f\n",
+									cap.name.c_str(), walk[20] / f, walk[21] / f, walk[22] / f, walk[23] / f, walk[24] / f, walk[25] / f, walk[26] / f );
+				}
+				// LIT-EARLY-OUT execution proof (slot 27): fragments the intensity cut skipped at T > 0.
+				// Nonzero = the r_softShadowLitEarlyOut path actually ran under this config (a 0-defect
+				// sweep with this at 0 would be vacuous).
+				if( walk[27] > 0 )
+				{
+					common->Printf( "[softgate] BENCH %-14s lit-early-out: %u frags skipped (T > 0 path EXECUTED)\n",
+									cap.name.c_str(), walk[27] );
+				}
 				const double f = ( double )walk[7];			// fragments that ran the walk (this frame)
-				// binned FaceCoverageList fills tight/mtTri (slots 4/5/6); spilled ClusterList adds
-				// caster/coarse (0..3). Report both so the cull-collapse (spill) tail is visible.
-				common->Printf( "[softgate] BENCH %-14s walk/frag: tile-list cone-tests %.0f (cull %.0f%%) -> MT survivors %.1f (x16=%.0f sample-tests) | spill coarse-tests %.0f | %u frags\n",
+				// Cull cascade, all plain-walk paths (tile-list fills tight/mtTri; spill/cluster fills
+				// caster+coarse+tight+mtTri; unbinned-full fills all). "FillTri survivors" replaces the
+				// old "x16 sample-tests" phrasing - the counting permutation is scanline, there are no
+				// per-sample ray tests to multiply by.
+				common->Printf( "[softgate] BENCH %-14s walk/frag: cone-tests %.0f (cull %.0f%%) -> FillTri survivors %.1f | sphere-tests %.0f (cull %.0f%%), coarse-tests %.0f (cull %.0f%%) | %u frags\n",
 								cap.name.c_str(), walk[4] / f,
 								100.0 * walk[5] / ( double )( walk[4] ? walk[4] : 1 ),
-								walk[6] / f, 16.0 * walk[6] / f, walk[2] / f, walk[7] );
-				// Walk WORK split by FINAL swMask: lit (mask 0 = binned-but-blocks-nothing), penumbra
-				// (0<mask<all = the irreducible partial-cover walk), umbra (mask all = already early-outs).
-				// survivors = triangles reaching the 16-sample MT (the dominant per-fragment cost).
+								walk[6] / f,
+								walk[0] / f, 100.0 * walk[1] / ( double )( walk[0] ? walk[0] : 1 ),
+								walk[2] / f, 100.0 * walk[3] / ( double )( walk[2] ? walk[2] : 1 ),
+								walk[7] );
+				// Walk WORK split by FINAL COVERAGE (scanline: lit = coverage 0, umbra = >=0.99 - the
+				// walkers' rounding band - else penumbra; umbra-sentinel tiles bucket as umbra with 0
+				// survivors). The old mask-based flush filed every scanline fragment as lit (100/0/0).
+				// survivors = triangles surviving the cone cull into FillTri (the per-fragment cost).
 				const double litF = walk[8],  litS = walk[9];
 				const double penF = walk[10], penS = walk[11];
 				const double umbF = walk[12], umbS = walk[13];
 				const double totS = litS + penS + umbS;
 				const double tf   = litF + penF + umbF;
-				common->Printf( "[softgate] BENCH %-14s walk-buckets: frags lit/pen/umb %.0f/%.0f/%.0f%% | survivor-WORK lit/pen/umb %.0f/%.0f/%.0f%% (%.0f/%.0f/%.0f surv per-frag)\n",
+				common->Printf( "[softgate] BENCH %-14s walk-buckets(final-coverage): frags lit/pen/umb %.0f/%.0f/%.0f%% | survivor-WORK lit/pen/umb %.0f/%.0f/%.0f%% (%.0f/%.0f/%.0f surv per-frag) | bucketed %.0f of %u frags\n",
 								cap.name.c_str(),
 								tf > 0 ? 100.0 * litF / tf : 0.0, tf > 0 ? 100.0 * penF / tf : 0.0, tf > 0 ? 100.0 * umbF / tf : 0.0,
 								totS > 0 ? 100.0 * litS / totS : 0.0, totS > 0 ? 100.0 * penS / totS : 0.0, totS > 0 ? 100.0 * umbS / totS : 0.0,
-								litF > 0 ? litS / litF : 0.0, penF > 0 ? penS / penF : 0.0, umbF > 0 ? umbS / umbF : 0.0 );
-				// Where the actual walk goes: of survivors reaching the 16-sample MT, how many CONTRIBUTE
-				// (set >=1 mask bit) vs are tested and block NOTHING (the wasted survivors).
+								litF > 0 ? litS / litF : 0.0, penF > 0 ? penS / penF : 0.0, umbF > 0 ? umbS / umbF : 0.0,
+								tf, walk[7] );
+				// Survivor outcome. Slots 14/15 (MT hit / block-nothing) belong to the SAMPLED walk only -
+				// the scanline path never runs the per-sample MT loop, so when they are zero the truthful
+				// split is FillTri's own outcome classes (reject = survived the cone cull but provably adds
+				// no coverage; skip = its span is already covered; sweep = pays the chord walk).
 				const double hitS = walk[14], missS = walk[15], mtotS = hitS + missS;
-				common->Printf( "[softgate] BENCH %-14s survivors@MT: %.0f%% HIT (contribute) / %.0f%% block-NOTHING | %.0f hit + %.0f miss per frag\n",
-								cap.name.c_str(), mtotS > 0 ? 100.0 * hitS / mtotS : 0.0, mtotS > 0 ? 100.0 * missS / mtotS : 0.0,
-								hitS / f, missS / f );
+				if( mtotS > 0 )
+				{
+					common->Printf( "[softgate] BENCH %-14s survivors@MT: %.0f%% HIT (contribute) / %.0f%% block-NOTHING | %.0f hit + %.0f miss per frag (sampled-walk path)\n",
+									cap.name.c_str(), 100.0 * hitS / mtotS, 100.0 * missS / mtotS,
+									hitS / f, missS / f );
+				}
+				else if( walk[20] > 0 )
+				{
+					const double fl = ( double )walk[20];
+					common->Printf( "[softgate] BENCH %-14s survivors@FillTri: %.0f%% sweep (pay chord walk) / %.0f%% reject (add nothing) / %.0f%% skip (already covered) of %.1f fills/frag\n",
+									cap.name.c_str(), 100.0 * walk[25] / fl, 100.0 * walk[21] / fl, 100.0 * walk[22] / fl, fl / f );
+				}
 				// TILE-CLASS census (Lever B decision data): of the threads reaching the tile dispatch,
 				// how many land in FLAT tiles (umbra sentinel / empty list = zero walk iterations - the only
 				// ones a penumbra-tile compaction could delete) vs LISTED/SPILL tiles that actually walk.
@@ -3513,7 +3646,11 @@ int R_SoftShadowGate( const char* arg )
 				const double cTot = cUmb + cEmpty + cSpill + cList;
 				if( cTot > 0 )
 				{
-					common->Printf( "[softgate] BENCH %-14s tile-census: FLAT %.0f%% (umbra-tile %.0f%% + empty-list %.0f%%) | WALKING %.0f%% (listed %.0f%% + spill %.0f%%) of %.0f tile-dispatch threads\n",
+					// empty-list at 1 decimal: count-0 tiles are REAL (a scissor tile whose survivors all
+					// culled at tile grain with no umbra proof - the bin writes count 0, the walker runs 0
+					// iterations) but rare, and the integer print rounded a genuine sub-0.5% share to a
+					// suspicious-looking flat 0%.
+					common->Printf( "[softgate] BENCH %-14s tile-census: FLAT %.0f%% (umbra-tile %.0f%% + empty-list %.1f%%) | WALKING %.0f%% (listed %.0f%% + spill %.0f%%) of %.0f tile-dispatch threads\n",
 									cap.name.c_str(), 100.0 * ( cUmb + cEmpty ) / cTot, 100.0 * cUmb / cTot, 100.0 * cEmpty / cTot,
 									100.0 * ( cList + cSpill ) / cTot, 100.0 * cList / cTot, 100.0 * cSpill / cTot, cTot );
 				}

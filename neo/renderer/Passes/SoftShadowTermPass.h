@@ -72,11 +72,14 @@ public:
 				   SoftShadowSurfCache* surfCache,
 				   int& outOfsX, int& outOfsY );
 
-	// Walk-attribution GPU counters (r_softShadowWalkCounters): read the 8-uint counter buffer the
-	// COUNTING permutation accumulated this frame - slots 0..6 = SW_WALKIDX_* (caster/coarse/tight
-	// tests+culls, mtTri), 7 = fragments that ran the walk. Blocking readback (waitForIdle), bench-only.
-	// Returns false when counters were not enabled / buffer absent.
-	bool GetWalkStats( uint32_t out[20] );	// 0..7 attrib, 8/9 lit frags/survivors, 10/11 penumbra, 12/13 umbra, 14/15 hit/miss, 16..19 tile-class census (umbra-sentinel / empty-list / spill / listed threads)
+	// Walk-attribution GPU counters (r_softShadowWalkCounters; the gate bench also forces 2 untimed
+	// counting frames after the timed loop, so one bench run always yields these): read the 28-uint
+	// counter buffer the COUNTING permutation (SW_SCANLINE=1 = the shipped algorithm; surf/contrib
+	// cache pipelines bypassed) accumulated this frame. Slots 0..6 = SW_WALKIDX_* fed by ALL plain
+	// walkers - tile-list (tight+mtTri), spill/cluster (sphere->caster slots + coarse + tight +
+	// mtTri), unbinned-full (all); 7 = fragments that ran the walk. Blocking readback (waitForIdle),
+	// bench-only. Returns false when counters were not enabled / buffer absent.
+	bool GetWalkStats( uint32_t out[28] );	// 0..7 attrib, 8-13 buckets by FINAL COVERAGE (lit cov==0 / penumbra / umbra cov>=0.99 incl. umbra-sentinel tiles; frags + FillTri survivors each), 14/15 MT hit/miss (SAMPLED walk only - stay 0 under scanline, the bench prints the FillTri outcome split instead), 16..19 tile-class census (umbra-sentinel / empty-list / spill / listed threads), 20..26 scanline FillTri attribution (fill/reject/skip/skipIter/foldIter/sweepTri/sweepIter), 27 lit-early-out skips at T>0 (path-execution proof)
 	bool GetContribStats( uint32_t out[20] );	// contrib-cache header: [0] recording pool [1] serves [2] recording evals [3] claimed cells [4] verify compares [5] verify mismatches [6] max |diff| (float bits) [7] budget-blocked [8] probe-exhausted [9] BUILT-unservable [10] refinement records
 
 	// once per rendered VIEW, before the AddLight loop: advances the contributor cache's own frame

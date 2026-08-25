@@ -211,6 +211,8 @@ void  R_ShadowConflictTick();
 // freezes, A/Bs scanline-vs-sampled at one identical pose, diffs in-engine with a differential canary, then
 // quits. Driven by R_SoftShadowReproTick (frame loop); the per-capture score is the synchronous _Shot.
 void  R_SoftShadowRepro_f( const idCmdArgs& args );
+// RECAPTURE: `softShadowRecapture <cap...>` regenerates each cap in place (v7 tail) via the same load/goto path.
+void  R_SoftShadowRecapture_f( const idCmdArgs& args );
 void  R_SoftShadowReproShot_f( const idCmdArgs& args );
 void  R_SoftShadowReproTick();
 void  R_SoftShadowSpawnCasters_f( const idCmdArgs& args );	// reproduce a capture's dynamic casters (the rock)
