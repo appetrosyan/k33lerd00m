@@ -55,6 +55,13 @@ struct SoftBlurCB
 // conservative common limit; RDNA3 reports 16384. Exceeding it just disables the pass for the view.
 static const int SW_TERM_MAX_TEX_DIM = 16384;
 
+// Atlas grid snapshot (r_softShadowTermSlotCols/Rows, clamped to SW_TERM_MAX_TEX_DIM): file-scope
+// statics, NOT class members - growing SoftShadowTermPass shifts its heap layout (the
+// idImageManager-class landmine, see SwTermGridStatics below). BeginView snapshots the cvars once
+// per view; AddLight reads the same snapshot. 0 = no atlas built yet.
+static int swTermAtlasCols = 0;
+static int swTermAtlasRows = 0;
+
 // SURF-CACHE GRID permutation kept OFF the class layout (not members): growing SoftShadowTermPass shifts
 // its heap layout and can surface a latent init-time heap fault (the idImageManager-class landmine). They
 // must ALSO outlive normal static teardown: a file-scope nvrhi handle runs its destructor at PROGRAM EXIT,
@@ -381,11 +388,40 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 	// slot offset (absolute pixels, like the tile bins)
 	const int screenW = viewDef->viewport.x2 + 1;
 	const int screenH = viewDef->viewport.y2 + 1;
-	if( screenW <= 0 || screenH <= 0
-			|| screenW * SLOT_COLS > SW_TERM_MAX_TEX_DIM
-			|| screenH * SLOT_ROWS > SW_TERM_MAX_TEX_DIM )
+	if( screenW <= 0 || screenH <= 0 || screenW > SW_TERM_MAX_TEX_DIM || screenH > SW_TERM_MAX_TEX_DIM )
 	{
 		return false;						// exotic resolution: leave every light on the in-shader integral
+	}
+
+	// snapshot the grid cvars for this view, clamped so the atlas never exceeds the device limit
+	{
+		extern idCVar r_softShadowTermSlotCols;
+		extern idCVar r_softShadowTermSlotRows;
+		int cols = r_softShadowTermSlotCols.GetInteger();
+		int rows = r_softShadowTermSlotRows.GetInteger();
+		const int maxCols = SW_TERM_MAX_TEX_DIM / screenW;
+		const int maxRows = SW_TERM_MAX_TEX_DIM / screenH;
+		if( cols > maxCols || rows > maxRows )
+		{
+			static bool warned = false;
+			if( !warned )
+			{
+				warned = true;
+				common->Warning( "SoftShadowTerm: slot grid %dx%d clamped to %dx%d (%dx%d screen, %d max texture dim)",
+								 cols, rows, ( cols > maxCols ) ? maxCols : cols, ( rows > maxRows ) ? maxRows : rows,
+								 screenW, screenH, SW_TERM_MAX_TEX_DIM );
+			}
+			cols = ( cols > maxCols ) ? maxCols : cols;
+			rows = ( rows > maxRows ) ? maxRows : rows;
+		}
+		if( cols != swTermAtlasCols || rows != swTermAtlasRows )
+		{
+			// grid changed mid-run: force the atlas (and matching blur atlas) to rebuild below
+			m_TermTexture = nullptr;
+			m_BlurTexture = nullptr;
+			swTermAtlasCols = cols;
+			swTermAtlasRows = rows;
+		}
 	}
 
 	// GROW-only: subviews (mirrors) have smaller viewports than the main view; resizing per view
@@ -396,8 +432,8 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 		const int newW = ( m_SlotW > screenW ) ? m_SlotW : screenW;
 		const int newH = ( m_SlotH > screenH ) ? m_SlotH : screenH;
 		nvrhi::TextureDesc td;
-		td.width = newW * SLOT_COLS;
-		td.height = newH * SLOT_ROWS;
+		td.width = newW * swTermAtlasCols;
+		td.height = newH * swTermAtlasRows;
 		td.format = nvrhi::Format::R16_FLOAT;	// term is k/16, exactly representable in fp16 (see header)
 		td.isUAV = true;
 		td.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -418,8 +454,8 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 	if( m_BlurActive && m_BlurTexture == nullptr )
 	{
 		nvrhi::TextureDesc td;
-		td.width = m_SlotW * SLOT_COLS;
-		td.height = m_SlotH * SLOT_ROWS;
+		td.width = m_SlotW * swTermAtlasCols;
+		td.height = m_SlotH * swTermAtlasRows;
 		td.format = nvrhi::Format::R16_FLOAT;
 		td.isUAV = true;
 		td.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -476,8 +512,8 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// rect on a shelf. Total lit area across a frame's soft lights is ~3-7x screen (measured), so a
 	// COLS*ROWS-screen atlas holds far more than COLS*ROWS lights when scissors are sub-screen - the
 	// "many small lights" rooms that previously spilled the excess onto the wave64 in-shader integral.
-	const int atlasW = m_SlotW * SLOT_COLS;
-	const int atlasH = m_SlotH * SLOT_ROWS;
+	const int atlasW = m_SlotW * swTermAtlasCols;
+	const int atlasH = m_SlotH * swTermAtlasRows;
 	const int rw = px2 - px1 + 1;
 	const int rh = py2 - py1 + 1;
 	if( rw > atlasW || rh > atlasH )

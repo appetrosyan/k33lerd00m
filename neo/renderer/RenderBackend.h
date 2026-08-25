@@ -450,7 +450,7 @@ private:
 		int ofsX, ofsY;
 	};
 	idStaticList<softTileBinResult_t, 256>	softTileBins;
-	idStaticList<softTermResult_t, 12>		softTerms;		// 12 = SoftShadowTermPass::SLOT_COLS * SLOT_ROWS
+	idStaticList<softTermResult_t, 64>		softTerms;		// covers the max r_softShadowTermSlotCols*Rows grid (8*12) minus packer headroom; overflow lights keep the in-shader integral
 	nvrhi::CommandListHandle		softComputeCL;			// async-queue command list, created lazily
 	void							DispatchSoftShadowComputePhases();
 	HdrGuiCompositePass*			hdrGuiCompositePass;

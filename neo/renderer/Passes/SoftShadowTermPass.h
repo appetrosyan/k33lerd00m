@@ -101,17 +101,15 @@ public:
 	// r_softShadowTermBlur > 0. Call before the interaction pass Loads the term.
 	void BlurView( nvrhi::ICommandList* commandList );
 
-	// Atlas slot grid: SLOT_COLS x SLOT_ROWS screen-size R16F slots. R16F is BIT-EXACT for the
-	// face-coverage term, not merely tolerable: the term is always popcount/SW_FACE_SAMPLES = k/16
-	// (k=0..16), plus the early-outs writing exactly 0.0 and 1.0 - every k/16 is k*2^-4, which fp16
-	// represents exactly (<=4 mantissa bits), and the interaction reads it via Load (no filtering,
-	// no bleed). So the anaTerm-hash A/B stays identical while the atlas HALVES (~235 MB -> ~118 MB
-	// at 1440p) and the per-pixel term write + interaction read bandwidth halve - a real win on
-	// bandwidth-bound / lower-VRAM hardware. 12 slots covers the measured "up to ~a dozen" soft
-	// lights per frame; lights beyond the budget keep the in-shader integral.
-	// ponytail: fixed grid of full-screen slots; pack scissor-sized rects instead if VRAM ever bites.
-	static const int SLOT_COLS = 4;
-	static const int SLOT_ROWS = 3;
+	// Atlas slot grid: r_softShadowTermSlotCols x r_softShadowTermSlotRows screen-size R16F slots
+	// (runtime cvars, defaults 4x3; snapshotted per view in BeginView, clamped to the device texture
+	// limit). R16F is BIT-EXACT for the face-coverage term, not merely tolerable: the term is always
+	// popcount/SW_FACE_SAMPLES = k/16 (k=0..16), plus the early-outs writing exactly 0.0 and 1.0 -
+	// every k/16 is k*2^-4, which fp16 represents exactly (<=4 mantissa bits), and the interaction
+	// reads it via Load (no filtering, no bleed). So the anaTerm-hash A/B stays identical while the
+	// atlas HALVES (~235 MB -> ~118 MB at 1440p) and the per-pixel term write + interaction read
+	// bandwidth halve - a real win on bandwidth-bound / lower-VRAM hardware. The scissor packer
+	// shelves light rects into the grid area; lights beyond the budget keep the in-shader integral.
 
 private:
 	void EnsurePipeline();
@@ -179,7 +177,7 @@ private:
 	int								m_SlotH = 0;
 	int								m_Cursor = 0;	// lights packed this view (provenance / debug only)
 	// Shelf packer state (reset per view): lights are placed scissor-sized, left-to-right on shelves
-	// that grow downward, so the atlas holds far more than SLOT_COLS*SLOT_ROWS lights when scissors
+	// that grow downward, so the atlas holds far more than cols*rows lights when scissors
 	// are sub-screen (the measured "many small lights" case). Replaces the fixed full-screen grid.
 	int								m_ShelfX = 0;	// next free x on the current shelf
 	int								m_ShelfY = 0;	// current shelf top
