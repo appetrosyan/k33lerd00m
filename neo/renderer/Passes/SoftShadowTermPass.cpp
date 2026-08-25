@@ -39,7 +39,10 @@ struct SoftTermCB
 	int		surfA[4];		// surface-fold cache: table cap (slots), queue cap (uints), static caster count, light key
 	float	aa[4];			// x = r_softShadowAA per-sample analytic-AA half-width (0 = off); y/z/w unused
 	int		surfCost[4];	// x = surf-cache cost gate (r_softShadowSurfCacheMinCost): min tile occluders to cache
-	float	misc[4];		// x = r_softShadowMinDnRatio: projection dn-clamp (grazing grain fix)
+	float	misc[4];		// x = r_softShadowMinDnRatio: projection dn-clamp (grazing grain fix);
+							// yzw = view origin (cache-economics tiers 1/3)
+	float	econ[4];		// cache economics (task #112): x = near-exact radius SQUARED, y = tier-1
+							// gate base margin, z/w reserved. Mirrors g_econ in softterm.cs.hlsl.
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -614,7 +617,18 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.surfCost[3] = r_softShadowScanRotate.GetInteger();	// GATE POSITIVE CONTROL: 1 re-injects the scanline rotation grain (ants) so GateGrain can be validated
 	extern idCVar r_softShadowMinDnRatio;
 	cb.misc[0] = r_softShadowMinDnRatio.GetFloat();			// projection dn-clamp: grazing-grain fix (distPL/dn near-contact amplification)
-	cb.misc[1] = cb.misc[2] = cb.misc[3] = 0.0f;
+	// cache economics (task #112): view origin + per-fragment near-exact radius + tier-1 gate margin.
+	// Both cvars default 0 = the whole block is inert (byte-identical serve behavior).
+	cb.misc[1] = viewDef->renderView.vieworg.x;
+	cb.misc[2] = viewDef->renderView.vieworg.y;
+	cb.misc[3] = viewDef->renderView.vieworg.z;
+	{
+		extern idCVar r_softShadowNearRadius, r_softShadowSurfCacheGateMargin;
+		const float swNearR = r_softShadowNearRadius.GetFloat();
+		cb.econ[0] = swNearR * swNearR;
+		cb.econ[1] = r_softShadowSurfCacheGateMargin.GetFloat();
+		cb.econ[2] = cb.econ[3] = 0.0f;
+	}
 	cb.surfA[0] = 0;
 	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
 	if( surf )

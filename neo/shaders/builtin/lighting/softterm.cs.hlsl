@@ -258,7 +258,13 @@ cbuffer c_Term : register( b0 )
 	int4	g_surfCost;			// x = surf-cache COST GATE (r_softShadowSurfCacheMinCost): tiles with fewer
 								//   than x occluders bypass the cache entirely (no probe, no build request) -
 								//   we only pay the lookup where the walk is dear enough to beat it. 0 = gate off.
-	float4	g_misc;				// x = r_softShadowMinDnRatio: projection dn-clamp (grazing grain fix). y/z/w unused.
+	float4	g_misc;				// x = r_softShadowMinDnRatio: projection dn-clamp (grazing grain fix).
+								// yzw = VIEW ORIGIN (cache-economics tiers 1/3: proximity policy)
+	float4	g_econ;				// cache economics (task #112): x = near-exact radius SQUARED
+								//   (r_softShadowNearRadius; 0 = off) - fragments closer than this to the
+								//   view NEVER use the cache (full accuracy + zero popping where visible);
+								//   y = tier-1 serve/walk gate base margin (r_softShadowSurfCacheGateMargin;
+								//   0 = off = always serve on hit, today's behavior); z/w reserved.
 };
 // *INDENT-ON*
 
@@ -1167,6 +1173,17 @@ void main( uint3 tid : SV_DispatchThreadID )
 			swCostWorth = ( swCgCnt == SW_TILE_SPILL ) || ( swCgCnt >= ( uint )g_surfCost.x && swCgCnt < SW_TILE_SPILL );
 		}
 	}
+	// TIER-3 PROXIMITY (task #112): fragments closer than r_softShadowNearRadius to the view NEVER
+	// use the cache - proximal shadows get the exact walk (full accuracy) and cannot pop (no cached
+	// state dependency where it is most visible). Skips the 16-slot probe too. 0 = off.
+	if( g_econ.x > 0.0f )
+	{
+		const float3 swCamD = swP - float3( g_misc.y, g_misc.z, g_misc.w );
+		if( dot( swCamD, swCamD ) < g_econ.x )
+		{
+			swCostWorth = false;
+		}
+	}
 	if( g_surfA.x > 0 && g_surfA.z > 0 && swPos.w != 0.0f && swCostWorth )
 	{
 		// GEOMETRIC dominant axis from softpos.normal.w - NOT the normal-mapped shading .xyz. The prewarm
@@ -1354,6 +1371,31 @@ void main( uint3 tid : SV_DispatchThreadID )
 							[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCovG += SoftScan_PC( swGrid[cm] & SW_SCAN_MASK[cm] ); }
 							float swTermC = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovG / ( float )swDiskBits : 0.0 );
 #else
+							// TIER-1 ECONOMICS GATE (task #112): serve only when it is provably cheaper
+							// than the direct walk. Both costs are in-register: direct = this fragment's
+							// tile-list length (spill/untiled -> effectively unbounded, always serve);
+							// serve = residual count + a probe/overhead constant. The dynamic share
+							// cancels (walked either way). Margin scales with view distance: near the
+							// exact-radius boundary serving must win decisively (2x), far away any
+							// positive margin serves. Fail -> fall through to the exact walk, counted
+							// as walk-always. g_econ.y = 0 disables (today's always-serve).
+							if( g_econ.y > 0.0f )
+							{
+								const float swDirectC = ( swHitListCount >= 0 ) ? ( float )swHitListCount : 1e6f;
+								float swMargin = g_econ.y;
+								if( g_econ.x > 0.0f )
+								{
+									const float3 swCamD1 = swP - float3( g_misc.y, g_misc.z, g_misc.w );
+									const float swRn = sqrt( g_econ.x );
+									swMargin = lerp( 2.0f * g_econ.y, g_econ.y,
+													 saturate( ( length( swCamD1 ) - swRn ) / ( 4.0f * swRn ) ) );
+								}
+								if( ( float )resCnt + 16.0f >= swMargin * swDirectC )
+								{
+									swStatIdx = 2u;		// gated walk: direct computation is cheaper here
+									break;				// exact fall-through walk (same as walk-always)
+								}
+							}
 							const float occEx = SoftShadow_FaceCoverageSurfResidual(
 													swP, g_lightR.xyz, max( g_lightR.w, 1e-2 ), g_range.x,
 													( int )resOfs, ( int )resCnt,

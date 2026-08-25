@@ -633,6 +633,17 @@ void main( uint3 tid : SV_DispatchThreadID )
 		u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// WALK-ALWAYS -> FREE the slot (empty key). Was code 3: measured 77% of the table = dead weight oversubscribing it -> collision-misses. Empty reads as miss = exact walk (same result), keeps load low so BUILT records stay reachable. //		// umbra-straddle / too-curved fold: WALK-ALWAYS (exact)
 		return;
 	}
+	// TIER-2 ECONOMICS (task #112): foldCnt IS the walk work a serve removes (the residuals are
+	// walked either way) - a texel that folded fewer than MinROI occluders can never pay for its
+	// probe+serve, so FREE the slot per the walk-always precedent above (empty = miss = exact walk,
+	// table load stays low; the residual-pool reservation leaks like the pool-full case, cache clear
+	// reclaims). QUEUE-mode only: g_seed.z carries the ROI threshold there (WarmLight sets it per
+	// build window); in scan mode the lane is unrelated, so scan builds are ungated. 0 = off.
+	if( g_seed.x == 0 && ( uint )g_seed.z > 0u && foldCnt < ( uint )g_seed.z )
+	{
+		u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;
+		return;
+	}
 	u_SurfTable[ sBase + 3 ] = resOfs;
 	u_SurfTable[ sBase + 4 ] = ( resCount & 0xFFFFu ) | ( min( foldCnt, 0xFFFFu ) << 16 );	// lo: residual walked, hi: folded saving
 	u_SurfTable[ sBase + 5 ] = f32tof16( F[0] ) | ( f32tof16( F[1] ) << 16 );
