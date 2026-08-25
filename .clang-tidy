@@ -1,0 +1,3 @@
+# Legacy idTech 4 style trips these constantly; not worth churning the sources.
+# Everything else (defaults, clang-analyzer-*, clang-diagnostic-*) stays active.
+Checks: '-readability-misleading-indentation,-bugprone-integer-division'
