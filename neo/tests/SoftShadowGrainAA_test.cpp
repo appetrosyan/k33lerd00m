@@ -137,9 +137,14 @@ STUDY_TEST( SoftShadowGrainAA, gate_grain_reproduced_on_grazing_patch )
 	const int W = 96, H = 96;
 	const float fx = 0.22f, fy = 0.05f, x0 = -6.0f, y0 = -2.0f;
 
-	// RT reference (computed ONCE - fix-independent). valid = penumbra by the truth.
+	// RT reference (computed ONCE - fix-independent). valid = penumbra by the truth (error metrics only).
+	// The DETECTOR gets a dense all-valid mask instead: in the engine gate `valid` is the light's
+	// interaction-REGION mask (dense), and GateGrain's masked local statistics assume that semantic -
+	// a sparse penumbra mask starves the median/mean windows and blinds the probe (measured: this very
+	// positive control went ANT=0). The whole synthetic patch is "in region".
 	GateImg rt( W, H, 1.0f );
 	std::vector<uint8_t> valid( ( size_t )W * H, 0 );
+	std::vector<uint8_t> allValid( ( size_t )W * H, 1 );
 	for( int j = 0; j < H; j++ )
 		for( int i = 0; i < W; i++ )
 		{
@@ -177,7 +182,7 @@ STUDY_TEST( SoftShadowGrainAA, gate_grain_reproduced_on_grazing_patch )
 				ana.t[j * W + i] = a;
 			}
 		std::vector<GateDefect> defects;
-		GateGrain( ana, rt, valid, nullptr, cfg, defects );
+		GateGrain( ana, rt, allValid, nullptr, cfg, defects );
 		int ant = 0, step = 0;
 		for( const GateDefect& d : defects ) { if( d.kind == GATE_ANT ) { ant++; } else if( d.kind == GATE_STEP ) { step++; } }
 		// faithfulness to the independent ray truth: mean + max |ana - rt| over penumbra (a LOSSY fix would
@@ -216,7 +221,7 @@ STUDY_TEST( SoftShadowGrainAA, gate_grain_reproduced_on_grazing_patch )
 		GateImg ana( W, H, 1.0f );
 		for( int j = 0; j < H; j++ )
 			for( int i = 0; i < W; i++ ) { g_swMinDnR = 0; g_swMinDnAbs = 0; ana.t[j * W + i] = ScanOcc( float3( x0 + i * fx, y0 + j * fy, 0.0f ), occ, L, r ); }
-		std::vector<GateDefect> d2; GateGrain( ana, rtHi, valid, nullptr, cfg, d2 );
+		std::vector<GateDefect> d2; GateGrain( ana, rtHi, allValid, nullptr, cfg, d2 );
 		int ant = 0; for( const GateDefect& d : d2 ) { if( d.kind == GATE_ANT ) { ant++; } }
 		std::printf( "[grainAA] exact vs RT@64rays: ANT=%d (vs %d at 24 rays)\n", ant, antExact );
 	}

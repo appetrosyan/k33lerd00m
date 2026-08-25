@@ -234,7 +234,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// The term reads this grid and ORs it with the fragment's live dynamic grid (softterm.cs SW_SURF_GRID).
 	{
 		SwGridWord swGrid[SW_SCAN_CHORDS];
-		[unroll] for( int gz = 0; gz < SW_SCAN_CHORDS; gz++ ) { swGrid[gz] = SwGridZero(); }
+		float2 swEnv[SW_SCAN_CHORDS];		// envelope required by the FillTri signature; the topology cache does not persist it (task #90 fill paths only)
+		[unroll] for( int gz = 0; gz < SW_SCAN_CHORDS; gz++ ) { swGrid[gz] = SwGridZero(); swEnv[gz] = SwEnvZero(); }
 		const softFrame_t frG = SoftShadow_Frame( Pc, swL );
 		const float sinAG = saturate( swR / frG.distPL );
 		const float cosAG = sqrt( 1.0f - sinAG * sinAG );
@@ -257,7 +258,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const float3 v0 = t_SoftEdges[ bG + 0 ].xyz;
 				const float3 v1 = t_SoftEdges[ bG + 1 ].xyz;
 				const float3 v2 = t_SoftEdges[ bG + 2 ].xyz;
-				SoftScan_FillTri( swGrid, v0, v1, v2, Pc, frG, swR, epsG );	// OR the tri's bit-runs in (topology only)
+				SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, Pc, frG, swR, epsG );	// OR the tri's bit-runs in (topology only)
 				gridFold++;
 			}
 		}

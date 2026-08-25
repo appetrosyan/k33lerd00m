@@ -157,6 +157,176 @@ static float ScanlineBitGridCov( float3 P, float3 L, float swR, const float* rv,
 	return tot ? ( float )cov / ( float )tot : 0.0f;
 }
 
+// FRACTIONAL-ENDPOINT coverage (task #90 fix): identical fill to ScanlineBitGridCov, but instead of counting
+// discrete bits it integrates the EXACT covered length per chord. The bit-grid quantises each chord's covered
+// interval to whole columns (endpoints snap to floor/ceil), so as the receiver shifts sub-column the coverage
+// VALUE terraces in 1/K steps - the residual scanline "ants"/STEP grain. Here each chord also tracks the exact
+// interval envelope [envLo,envHi]; where the merged run is CONTIGUOUS (one run, no interior hole - the dominant
+// penumbra case) the coverage is the exact clamped length (lossless, no quantum); where it has holes it falls
+// back to the discrete popcount (rare). Continuous Fubini integral: coverage = sum_m len_m / sum_m (2 hc_m).
+static float ScanlineBitGridCovFrac( float3 P, float3 L, float swR, const float* rv, const uint32_t* ri, uint32_t numIdx, int M, int K )
+{
+	const softFrame_t f = SoftShadow_Frame( P, L );
+	const float R = swR, eps = SW_NEAR_EPS;
+	if( M > 64 ) { M = 64; } if( K > 32 ) { K = 32; }
+	uint32_t grid[64] = {};
+	float envLo[64], envHi[64];
+	for( int m = 0; m < M; m++ ) { envLo[m] = 1e30f; envHi[m] = -1e30f; }
+	const int nT = ( int )( numIdx / 3 );
+	for( int t = 0; t < nT; t++ )
+	{
+		float3 v[3], rel[3]; float dn[3];
+		for( int j = 0; j < 3; j++ ) { uint32_t gi = ri[t * 3 + j]; v[j] = float3( rv[gi * 3], rv[gi * 3 + 1], rv[gi * 3 + 2] ); rel[j] = v[j] - P; dn[j] = dot( rel[j], f.nrm ); }
+		float2 q[4]; int qn = 0;
+		for( int e = 0; e < 3 && qn < 4; e++ )
+		{
+			const int i = e, jj = ( e + 1 ) % 3;
+			const bool ai = dn[i] >= eps, bi = dn[jj] >= eps;
+			if( ai && qn < 4 ) { q[qn++] = SoftShadow_ProjectVert( rel[i], dn[i], f ); }
+			if( ai != bi && qn < 4 ) { float tt = ( eps - dn[i] ) / ( dn[jj] - dn[i] ); float3 rc = rel[i] + ( rel[jj] - rel[i] ) * tt; q[qn++] = SoftShadow_ProjectVert( rc, eps, f ); }
+		}
+		if( qn < 3 ) { continue; }
+		for( int m = 0; m < M; m++ )
+		{
+			const float Y = -R + ( ( float )m + 0.5f ) / M * 2.0f * R;
+			float xlo = 1e30f, xhi = -1e30f; bool any = false;
+			for( int e = 0; e < qn; e++ )
+			{
+				const float2 A = q[e], B = q[( e + 1 ) % qn];
+				if( ( A.y <= Y ) != ( B.y <= Y ) ) { const float tt = ( Y - A.y ) / ( B.y - A.y ); const float x = A.x + ( B.x - A.x ) * tt; xlo = std::fmin( xlo, x ); xhi = std::fmax( xhi, x ); any = true; }
+			}
+			if( !any ) { continue; }
+			envLo[m] = std::fmin( envLo[m], xlo );			// exact envelope of the union along this chord
+			envHi[m] = std::fmax( envHi[m], xhi );
+			int c0 = ( int )std::floor( ( xlo + R ) / ( 2.0f * R ) * K );	// discrete grid too: detects interior holes
+			int c1 = ( int )std::ceil( ( xhi + R ) / ( 2.0f * R ) * K ) - 1;
+			if( c0 < 0 ) { c0 = 0; } if( c1 > K - 1 ) { c1 = K - 1; }
+			if( c1 < c0 ) { continue; }
+			grid[m] |= ( c1 - c0 + 1 >= 32 ) ? 0xFFFFFFFFu : ( ( ( 1u << ( c1 - c0 + 1 ) ) - 1u ) << c0 );
+		}
+	}
+	float cov = 0.0f, tot = 0.0f;
+	for( int m = 0; m < M; m++ )
+	{
+		const float Y = -R + ( ( float )m + 0.5f ) / M * 2.0f * R;
+		const float hc = std::sqrt( std::fmax( 0.0f, R * R - Y * Y ) );
+		tot += 2.0f * hc;
+		if( grid[m] == 0u ) { continue; }
+		const uint32_t g = grid[m];
+		const int pc = SoftPopcount32( g );
+		const int lo = firstbitlow( g ), hi = firstbithigh( g );
+		const bool contig = ( pc == hi - lo + 1 );
+		if( contig )
+		{
+			const float a = std::fmax( envLo[m], -hc ), b = std::fmin( envHi[m], hc );	// exact clamped run length
+			cov += std::fmax( 0.0f, b - a );
+		}
+		else
+		{
+			// interior holes: no exact envelope for the gaps -> discrete estimate for this chord only
+			int inDisk = 0;
+			for( int c = 0; c < K; c++ ) { const float x = -R + ( ( float )c + 0.5f ) / K * 2.0f * R; if( std::fabs( x ) <= hc && ( g & ( 1u << c ) ) ) { inDisk++; } }
+			cov += ( float )inDisk / K * 2.0f * R;
+		}
+	}
+	return tot > 0.0f ? cov / tot : 0.0f;
+}
+
+// Brute-force EXACT disk coverage: project the occluder to the same disk frame, then sample the light disk
+// on a dense NxN grid and count points inside the projected union. Reference for the fractional reduction -
+// independent of the chord/column machinery (no bit grid at all).
+static float BruteDiskCov( float3 P, float3 L, float swR, const float* rv, const uint32_t* ri, uint32_t numIdx, int N )
+{
+	const softFrame_t f = SoftShadow_Frame( P, L );
+	const float R = swR, eps = SW_NEAR_EPS;
+	const int nT = ( int )( numIdx / 3 );
+	std::vector<std::array<float2, 3>> tris;
+	for( int t = 0; t < nT; t++ )
+	{
+		float3 rel[3]; float dn[3]; float2 pr[3]; bool ok = true;
+		for( int j = 0; j < 3; j++ )
+		{
+			uint32_t gi = ri[t * 3 + j];
+			rel[j] = float3( rv[gi * 3], rv[gi * 3 + 1], rv[gi * 3 + 2] ) - P;
+			dn[j] = dot( rel[j], f.nrm );
+			if( dn[j] < eps ) { ok = false; break; }			// near-clipped tri: skip (this geometry has none)
+			pr[j] = SoftShadow_ProjectVert( rel[j], dn[j], f );
+		}
+		if( ok ) { tris.push_back( { pr[0], pr[1], pr[2] } ); }
+	}
+	int inDisk = 0, occ = 0;
+	for( int iy = 0; iy < N; iy++ )
+		for( int ix = 0; ix < N; ix++ )
+		{
+			const float x = -R + ( ( float )ix + 0.5f ) / N * 2.0f * R;
+			const float y = -R + ( ( float )iy + 0.5f ) / N * 2.0f * R;
+			if( x * x + y * y > R * R ) { continue; }
+			inDisk++;
+			bool hit = false;
+			for( const auto& T : tris )
+			{
+				// point-in-triangle via sign of the three edge cross products (consistent winding not assumed)
+				const float d0 = ( T[1].x - T[0].x ) * ( y - T[0].y ) - ( T[1].y - T[0].y ) * ( x - T[0].x );
+				const float d1 = ( T[2].x - T[1].x ) * ( y - T[1].y ) - ( T[2].y - T[1].y ) * ( x - T[1].x );
+				const float d2 = ( T[0].x - T[2].x ) * ( y - T[2].y ) - ( T[0].y - T[2].y ) * ( x - T[2].x );
+				const bool neg = ( d0 < 0 ) || ( d1 < 0 ) || ( d2 < 0 );
+				const bool pos = ( d0 > 0 ) || ( d1 > 0 ) || ( d2 > 0 );
+				if( !( neg && pos ) ) { hit = true; break; }
+			}
+			if( hit ) { occ++; }
+		}
+	return inDisk ? ( float )occ / ( float )inDisk : 0.0f;
+}
+
+// THE ENDPOINT-GRAIN DEFECT + FIX (task #90). A partial occluder edge, receiver swept sub-column: the
+// discrete bit-grid coverage TERRACES (endpoints snap to columns => the residual scanline STEP/ants grain),
+// the fractional-endpoint coverage is SMOOTH and matches a fine-grid (K=1024) reference. Both use the SHIPPED
+// bit-grid fill; the fix is purely the reduction. Isolated, fast, GPU-path-shaped (mirrors softwedge_coverage).
+TEST( SoftScanEndpoint, fractional_endpoints_kill_the_step )
+{
+	// L above, receiver plane at z=0, a big occluder quad at z=50 whose RIGHT edge falls inside the light
+	// disk -> a partial-coverage penumbra edge whose projected column slides as the receiver moves.
+	const float3 L = float3( 0.0f, 0.0f, 100.0f );
+	const float  R = 20.0f;
+	const float  xR = 3.0f;					// occluder right edge (left half-plane occluded)
+	const float  verts[12] =
+	{
+		-200.0f, -200.0f, 50.0f,
+		xR,      -200.0f, 50.0f,
+		xR,       200.0f, 50.0f,
+		-200.0f,  200.0f, 50.0f,
+	};
+	const uint32_t idx[6] = { 0, 1, 2, 0, 2, 3 };
+	const int M = 16, K = 32;				// shipped default grid
+
+	int   nSamp = 0;
+	float maxStepDisc = 0.0f, maxStepFrac = 0.0f, maxFracErr = 0.0f;
+	float prevDisc = -1.0f, prevFrac = -1.0f;
+	for( int s = 0; s <= 200; s++ )
+	{
+		const float px = -2.0f + ( float )s / 200.0f * 4.0f;		// sweep receiver across ~4 units, sub-column steps
+		const float3 P = float3( px, 0.0f, 0.0f );
+		const float disc = ScanlineBitGridCov(     P, L, R, verts, idx, 6, M, K );
+		const float frac = ScanlineBitGridCovFrac( P, L, R, verts, idx, 6, M, K );
+		const float ref  = BruteDiskCov(           P, L, R, verts, idx, 6, 192 );	// brute-force disk-sample truth
+		if( disc <= 0.001f || disc >= 0.999f ) { prevDisc = disc; prevFrac = frac; continue; }	// only the penumbra band
+		maxFracErr = std::fmax( maxFracErr, std::fabs( frac - ref ) );
+		if( prevDisc >= 0.0f )
+		{
+			maxStepDisc = std::fmax( maxStepDisc, std::fabs( disc - prevDisc ) );
+			maxStepFrac = std::fmax( maxStepFrac, std::fabs( frac - prevFrac ) );
+		}
+		prevDisc = disc; prevFrac = frac; nSamp++;
+	}
+	std::printf( "[endpoint] penumbra samples %d  maxStep disc %.5f frac %.5f  |frac-ref1024| max %.5f\n",
+				 nSamp, maxStepDisc, maxStepFrac, maxFracErr );
+
+	CHECK( nSamp > 20 );										// the sweep actually crosses the penumbra
+	CHECK( maxStepDisc > 0.004f );								// DEFECT present: the discrete grid terraces (X quantum)
+	CHECK( maxStepFrac < 0.5f * maxStepDisc );					// FIX: fractional endpoints remove the X step
+	CHECK_NEAR( maxFracErr, 0.0f, 0.03f );						// FIX tracks truth (residual = orthogonal Y-chord quantum, M=16)
+}
+
 // GRID-OR fold study support (task #49): build the 8x32 bit-grid ONCE at a texel-centre C, then re-score it
 // at arbitrary fragments P WITHOUT rebuilding - the whole point of caching. Also records the occluder DEPTH
 // FRACTION phi = dn/distPL per contributing vertex; the intra-texel drift is a depth-DEPENDENT disk-space

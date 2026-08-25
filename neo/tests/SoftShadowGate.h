@@ -115,6 +115,11 @@ struct GateCfg
 	int   grainRtMedPasses = 2;		// edge-PRESERVING median passes that denoise the noisy 512-ray gate RT (kills per-pixel ray noise, KEEPS real edges - a box blur would erase edges and mint false grain there)
 	int   grainHpR     = 1;			// high-pass neighbourhood radius (both ana and denoised-RT)
 	int   grainMinArea1080 = 24;	// grain cluster smaller than this (after a 1px dilation) is texture/isolated - not counted
+	int   grainRegGuard = 2;		// REGISTRATION guard (px): the denoised-RT "flat here" test looks at the max RT
+	//								   high-pass within this radius, not the single pixel. A real feature present in
+	//								   BOTH images but displaced a pixel or two (point-sampled analytic onset vs the
+	//								   ray-threshold + median-eroded RT onset) is registration error, not grain -
+	//								   the same misregistration immunity GateAgreement gets from its dilated guards.
 	int   ResScale( int at1080, int W, int H ) const
 	{
 		double s = ( double )W * H / ( 1920.0 * 1080.0 );
@@ -297,6 +302,44 @@ inline std::vector<float> GateBoxMean( const std::vector<float>& s, int W, int H
 	return b;
 }
 
+// MASKED variants for the grain probe: pixels outside the VALID mask carry no information there -
+// outside the light's screen-space interaction region the analytic term image is 0 BY CONSTRUCTION
+// (the light is not drawn) while the RT full render is lit, so unmasked local statistics manufacture a
+// 1.0->0.0 cliff at every region boundary and mint phantom STEP chains along the whole scissor edge
+// (measured: a single 503-px "defect" that was exactly the region border column). Valid-only median +
+// normalized-convolution mean; a pixel with no valid neighbourhood passes its own value through
+// (zero high-pass, never flagged).
+inline std::vector<float> GateMedian3Masked( const std::vector<float>& s, const std::vector<uint8_t>& m, int W, int H )
+{
+	std::vector<float> out( s.size(), 0.0f );
+	for( int y = 0; y < H; y++ )
+		for( int x = 0; x < W; x++ )
+		{
+			size_t i = ( size_t )y * W + x;
+			float v[9]; int n = 0;
+			for( int dy = -1; dy <= 1; dy++ )
+				for( int dx = -1; dx <= 1; dx++ )
+				{
+					int xx = x + dx, yy = y + dy;
+					if( xx >= 0 && xx < W && yy >= 0 && yy < H && m[( size_t )yy * W + xx] ) { v[n++] = s[( size_t )yy * W + xx]; }
+				}
+			if( n == 0 ) { out[i] = s[i]; continue; }
+			for( int a = 1; a < n; a++ ) { float k = v[a]; int b = a - 1; while( b >= 0 && v[b] > k ) { v[b + 1] = v[b]; b--; } v[b + 1] = k; }
+			out[i] = v[n / 2];
+		}
+	return out;
+}
+inline std::vector<float> GateBoxMeanMasked( const std::vector<float>& s, const std::vector<uint8_t>& m, int W, int H, int r )
+{
+	std::vector<float> sm( s.size() ), mm( s.size() );
+	for( size_t i = 0; i < s.size(); i++ ) { const float mv = m[i] ? 1.0f : 0.0f; sm[i] = s[i] * mv; mm[i] = mv; }
+	const std::vector<float> smB = GateBoxMean( sm, W, H, r );
+	const std::vector<float> mmB = GateBoxMean( mm, W, H, r );
+	std::vector<float> out( s.size() );
+	for( size_t i = 0; i < s.size(); i++ ) { out[i] = ( mmB[i] > 1e-6f ) ? smB[i] / mmB[i] : s[i]; }
+	return out;
+}
+
 // ------------------------------------------------------------------ probe: high-frequency term deviation
 // The Fubini scanline term carries high-frequency structure that the true (converged) field does NOT:
 // a SPATIALLY STABLE per-pixel speckle ("ants", the discrete grid's rotation-decorrelated discretisation
@@ -315,24 +358,50 @@ inline void GateGrain( const GateImg& ana, const GateImg& rt, const std::vector<
 {
 	const int W = ana.W, H = ana.H;
 	if( W <= 0 || H <= 0 || rt.W != W || rt.H != H || ( int )valid.size() != W * H ) { return; }
-	const std::vector<float> anaMed  = GateMedian3( ana.t, W, H );					// median: survives edges, kills speckle
-	const std::vector<float> anaMean = GateBoxMean( ana.t, W, H, cfg.grainHpR );		// total analytic HF energy
+	const std::vector<float> anaMed  = GateMedian3Masked( ana.t, valid, W, H );				// median: survives edges, kills speckle
+	const std::vector<float> anaMean = GateBoxMeanMasked( ana.t, valid, W, H, cfg.grainHpR );	// total analytic HF energy
 	// edge-PRESERVING denoise of the noisy RT: repeated median removes per-pixel ray noise but KEEPS real
 	// edges, so hpR reflects genuine structure. A box blur would smear a true edge into a ramp -> hpR ~ 0
 	// there -> a matching analytic edge falsely flagged as grain (a real feature present in BOTH is NOT a
 	// defect). This is what makes the RT the frequency reference the user asked for (high-ray = smooth
 	// noise, real structure intact) without tracing more rays.
 	std::vector<float> rtS = rt.t;
-	for( int p = 0; p < cfg.grainRtMedPasses; p++ ) { rtS = GateMedian3( rtS, W, H ); }
-	const std::vector<float> rtSMean = GateBoxMean( rtS, W, H, cfg.grainHpR );
+	for( int p = 0; p < cfg.grainRtMedPasses; p++ ) { rtS = GateMedian3Masked( rtS, valid, W, H ); }
+	const std::vector<float> rtSMean = GateBoxMeanMasked( rtS, valid, W, H, cfg.grainHpR );
+	// truth high-pass field, then a MAX filter over the registration guard window: "the truth is flat
+	// here" must hold for the whole neighbourhood a real-but-offset edge could occupy, or a 1-2px
+	// analytic-vs-reference onset displacement (point-sampled analytic starts the ramp where occlusion
+	// becomes nonzero; the 512-ray + median-denoised RT cannot resolve that fringe) mints phantom
+	// STEP chains along every shallow shadow contour. Mirrors GateAgreement's dilated-guard immunity.
+	std::vector<float> rtHp( ( size_t )W * H, 0.0f );
+	for( size_t i = 0; i < rtHp.size(); i++ ) { rtHp[i] = std::fabs( rtS[i] - rtSMean[i] ); }
+	if( cfg.grainRegGuard > 0 )
+	{
+		const int rg = cfg.grainRegGuard;
+		std::vector<float> tmp( rtHp.size() );
+		for( int y = 0; y < H; y++ )		// separable max filter, horizontal then vertical
+			for( int x = 0; x < W; x++ )
+			{
+				float m = 0.0f;
+				for( int dx = -rg; dx <= rg; dx++ ) { int xx = x + dx; if( xx >= 0 && xx < W ) { m = std::fmax( m, rtHp[( size_t )y * W + xx] ); } }
+				tmp[( size_t )y * W + x] = m;
+			}
+		for( int y = 0; y < H; y++ )
+			for( int x = 0; x < W; x++ )
+			{
+				float m = 0.0f;
+				for( int dy = -rg; dy <= rg; dy++ ) { int yy = y + dy; if( yy >= 0 && yy < H ) { m = std::fmax( m, tmp[( size_t )yy * W + x] ); } }
+				rtHp[( size_t )y * W + x] = m;
+			}
+	}
 	std::vector<uint8_t> grainMask( ( size_t )W * H, 0 ), stepMask( ( size_t )W * H, 0 );
 	for( size_t i = 0; i < grainMask.size(); i++ )
 	{
 		if( !valid[i] ) { continue; }
 		if( crease != nullptr && ( *crease )[i] ) { continue; }		// real geometry edge: HF legitimate
 		const float hpMean = std::fabs( ana.t[i] - anaMean[i] );	// any analytic high-frequency energy
-		const float hpR    = std::fabs( rtS[i]   - rtSMean[i] );	// true (denoised) high-frequency energy
-		if( hpMean < cfg.grainAnaT || hpR > cfg.grainRtT ) { continue; }	// no analytic HF, or truth also structured -> not a defect
+		const float hpR    = rtHp[i];								// true (denoised) HF energy, registration-guarded
+		if( hpMean < cfg.grainAnaT || hpR > cfg.grainRtT ) { continue; }	// no analytic HF, or truth structured nearby -> not a defect
 		const float hpMed = std::fabs( ana.t[i] - anaMed[i] );		// per-pixel component (survives-not-the-median)
 		if( hpMed >= cfg.grainAnaT ) { grainMask[i] = 1; }			// speckle -> ANT
 		else { stepMask[i] = 1; }									// coherent HF the truth lacks -> STEP (NOT discounted)

@@ -432,6 +432,8 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 		unsigned long long coarseTest, coarseCull;	// per-triangle v0-sphere coarse tests / rejects
 		unsigned long long tightTest, tightCull;	// per-triangle centroid-sphere tight tests / rejects
 		unsigned long long mtTri;					// triangles reaching the Moller-Trumbore + 16-sample loop
+		// scanline path (task #106 attribution): FillTri component counts
+		unsigned long long scanFill, scanReject, scanSkip, scanSkipIter, scanFoldIter, scanSweepTri, scanSweepIter;
 	};
 	extern swAttrib_t g_swAttrib;
 	extern bool       g_swAttribOn;
@@ -439,6 +441,7 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	#define SW_BKT_DECL
 	#define SW_BKT_SURV
 	#define SW_BKT_FLUSH( mask, all )
+	#define SW_BKT_FLUSH_COV( c )
 #elif defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
 	// GPU counting permutation (softterm.cs built with -D SW_GPU_WALK_COUNTERS=1, bound only under
 	// r_softShadowWalkCounters). The counting shader declares u_WalkCnt (register u1) BEFORE this
@@ -451,6 +454,15 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	#define SW_WALKIDX_tightTest	4
 	#define SW_WALKIDX_tightCull	5
 	#define SW_WALKIDX_mtTri		6
+	// scanline FillTri attribution (task #106): where the chord-sweep walk actually spends its work.
+	// Slots 20..26 of the 28-uint counter buffer (7..19 are the frag/bucket/census slots in softterm main).
+	#define SW_WALKIDX_scanFill		20	// FillTri invocations (post caster/cone cull)
+	#define SW_WALKIDX_scanReject	21	// FillTri early-outs: slab clip / degenerate / disk reject / chord-span miss
+	#define SW_WALKIDX_scanSkip		22	// already-covered skips taken
+	#define SW_WALKIDX_scanSkipIter	23	// chord iterations of the skip TEST loop (SwGridHas)
+	#define SW_WALKIDX_scanFoldIter	24	// chord iterations of the envelope FOLD on skip (envelope-only ALU)
+	#define SW_WALKIDX_scanSweepTri	25	// tris paying per-edge params + chord sweep
+	#define SW_WALKIDX_scanSweepIter 26	// chord rows swept (SoftScan_Run + SwEnvAdd count)
 	#define SW_ATTRIB_ADD( field, n ) InterlockedAdd( u_WalkCnt[ SW_WALKIDX_##field ], ( uint )( n ) )
 	// Walk-bucketing by FINAL swMask (lit / penumbra / umbra): count this fragment's MT survivors into a
 	// local, flush to the bucket's slots at the walk's return so the walk WORK splits three ways. Slots
@@ -458,11 +470,19 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	#define SW_BKT_DECL   uint swSurvLocal = 0u;
 	#define SW_BKT_SURV   swSurvLocal++;
 	#define SW_BKT_FLUSH( mask, all )  do { uint swBkt = ( ( mask ) == 0u ) ? 8u : ( ( ( mask ) == ( all ) ) ? 12u : 10u ); InterlockedAdd( u_WalkCnt[ swBkt ], 1u ); InterlockedAdd( u_WalkCnt[ swBkt + 1u ], swSurvLocal ); } while( 0 )
+	// SCANLINE bucket flush: classify by the fragment's FINAL COVERAGE. The scanline walk never sets
+	// swMask, so the mask-based flush above filed EVERY scanline fragment under "lit" (measured
+	// 100/0/0 on every cap - a reporting artifact, not a walk property). Thresholds mirror the term
+	// contract: coverage <= 0 -> lit (term 1.0), >= 0.99 -> umbra (the walkers' >=99% early-out /
+	// rounding band), else penumbra. Every scanline walker exit - including the umbra early-out
+	// returns - must flush EXACTLY ONCE so the buckets sum to the walked-fragment count (slot 7).
+	#define SW_BKT_FLUSH_COV( c )  do { const float swCvC = ( c ); uint swBktC = ( swCvC <= 0.0f ) ? 8u : ( ( swCvC >= 0.99f ) ? 12u : 10u ); InterlockedAdd( u_WalkCnt[ swBktC ], 1u ); InterlockedAdd( u_WalkCnt[ swBktC + 1u ], swSurvLocal ); } while( 0 )
 #else
 	#define SW_ATTRIB_ADD( field, n )
 	#define SW_BKT_DECL
 	#define SW_BKT_SURV
 	#define SW_BKT_FLUSH( mask, all )
+	#define SW_BKT_FLUSH_COV( c )
 #endif
 
 // swCentreLit > 0.5: the caller GUARANTEES the light-disk centre is visible from swP (AAM penumbra-ring
@@ -805,6 +825,10 @@ SW_FUNC uint SwGridSpan( SwGridWord g )
 	uint hi = ( g.y != 0u ) ? ( 32u + ( uint )firstbithigh( g.y ) ) : ( uint )firstbithigh( g.x );
 	return hi - lo + 1u;
 }
+// first / last set column (callers must guarantee SwGridNZ)
+SW_FUNC int SwGridLoCol( SwGridWord g ) { return ( g.x != 0u ) ? ( int )firstbitlow( g.x ) : ( 32 + ( int )firstbitlow( g.y ) ); }
+SW_FUNC int SwGridHiCol( SwGridWord g ) { return ( g.y != 0u ) ? ( 32 + ( int )firstbithigh( g.y ) ) : ( int )firstbithigh( g.x ); }
+SW_FUNC SwGridWord SwGridColBit( int c ) { return ( c < 32 ) ? uint2( 1u << ( uint )c, 0u ) : uint2( 0u, 1u << ( uint )( c - 32 ) ); }
 #else
 SW_FUNC uint SoftScan_PC( SwGridWord g )       { return SoftPopcount32( g ); }
 SW_FUNC SwGridWord SwGridZero()                { return 0u; }
@@ -822,6 +846,10 @@ SW_FUNC uint SwGridSpan( SwGridWord g )
 	if( g == 0u ) { return 0u; }
 	return ( uint )firstbithigh( g ) - ( uint )firstbitlow( g ) + 1u;
 }
+// first / last set column (callers must guarantee SwGridNZ)
+SW_FUNC int SwGridLoCol( SwGridWord g ) { return ( int )firstbitlow( g ); }
+SW_FUNC int SwGridHiCol( SwGridWord g ) { return ( int )firstbithigh( g ); }
+SW_FUNC SwGridWord SwGridColBit( int c ) { return 1u << ( uint )c; }
 #endif
 // unit-disk half-chord widths: hc_m = sqrt( 1 - y_m^2 ), y_m = -1 + (m+0.5)*(2/SW_SCAN_CHORDS)
 #if SW_SCAN_CHORDS == 4
@@ -856,6 +884,52 @@ static const float SW_SCAN_HC[8] =
 	0.99215674f, 0.92696970f, 0.78062475f, 0.48412292f,
 };
 #endif
+// COMPILE-TIME disk mask + bit count (register diet, task #106): the circular chord mask depends only
+// on the chord count - identical for every fragment and every light - so it must never occupy
+// per-thread registers or an init loop. The shaderstats conviction: the term kernel sat at 256 VGPRs
+// with thousands of spilled registers and 32-77KB scratch/thread; every per-thread array byte counts.
+// Generated for SW_SCAN_BITS == 32 (masks match the runtime SoftScan_Run(-hc,+hc) bit-for-bit;
+// 16-chord diskBits 420 cross-checked against live prints). Regenerate if the column width changes
+// (the 64-column A/B bought 3 of 176 defects and was reverted).
+#if SW_SCAN_BITS != 32
+	#error SW_SCAN_MASK tables are generated for 32 columns - regenerate for this SW_SCAN_BITS
+#endif
+#if SW_SCAN_CHORDS == 4
+static const uint SW_SCAN_MASK[4] =
+{
+	0x07ffffe0u, 0xffffffffu, 0xffffffffu, 0x07ffffe0u,
+};
+#define SW_SCAN_DISKBITS 108
+#elif SW_SCAN_CHORDS == 8
+static const uint SW_SCAN_MASK[8] =
+{
+	0x00ffff00u, 0x1ffffff8u, 0x7ffffffeu, 0xffffffffu,
+	0xffffffffu, 0x7ffffffeu, 0x1ffffff8u, 0x00ffff00u,
+};
+#define SW_SCAN_DISKBITS 208
+#elif SW_SCAN_CHORDS == 32
+static const uint SW_SCAN_MASK[32] =
+{
+	0x000ff000u, 0x007ffe00u, 0x01ffff80u, 0x03ffffc0u,
+	0x0ffffff0u, 0x1ffffff8u, 0x1ffffff8u, 0x3ffffffcu,
+	0x7ffffffeu, 0x7ffffffeu, 0xffffffffu, 0xffffffffu,
+	0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+	0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+	0xffffffffu, 0xffffffffu, 0x7ffffffeu, 0x7ffffffeu,
+	0x3ffffffcu, 0x1ffffff8u, 0x1ffffff8u, 0x0ffffff0u,
+	0x03ffffc0u, 0x01ffff80u, 0x007ffe00u, 0x000ff000u,
+};
+#define SW_SCAN_DISKBITS 832
+#else
+static const uint SW_SCAN_MASK[16] =
+{
+	0x003ffc00u, 0x03ffffc0u, 0x0ffffff0u, 0x3ffffffcu,
+	0x7ffffffeu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+	0xffffffffu, 0xffffffffu, 0xffffffffu, 0x7ffffffeu,
+	0x3ffffffcu, 0x0ffffff0u, 0x03ffffc0u, 0x003ffc00u,
+};
+#define SW_SCAN_DISKBITS 420
+#endif
 // [aN,bN] in disk-normalised [-1,1] -> a contiguous run of set columns across SW_SCAN_BITS columns,
 // packed one bit per column into SwGridWord (64-bit: word .x = columns 0..31, .y = 32..63). Empty if b<a.
 SW_FUNC SwGridWord SoftScan_Run( float aN, float bN )
@@ -877,61 +951,168 @@ SW_FUNC SwGridWord SoftScan_Run( float aN, float bN )
 	return ( w >= 32u ) ? 0xffffffffu : ( ( ( 1u << w ) - 1u ) << ( uint )c0 );
 #endif
 }
+// FRACTIONAL-ENDPOINT ENVELOPE (task #90, kills the residual X-endpoint scanline grain). Per chord, the
+// exact union interval [minA,maxB] of everything FILLED into the raw grid, in disk-normalised [-1,1].
+// SoftScan_Run snaps interval endpoints to whole columns, so coverage terraces ~1/SW_SCAN_BITS as the
+// receiver shifts sub-column; the reduction (SoftScan_ReduceCov) instead uses the exact clamped interval
+// length where the envelope is a faithful description of the chord, falling back to the discrete popcount
+// otherwise. Empty sentinel = (+2,-2). Updated only in the FILL path (after the already-covered skip), so
+// it never defeats that skip's walk saving (a skipped triangle can under-record the envelope by at most a
+// sub-column sliver inside an already-set column - bounded by the old quantum).
+SW_FUNC float2 SwEnvZero()                                  { return float2( 2.0f, -2.0f ); }		// (minA, maxB) empty sentinel
+SW_FUNC float  SwEnvLo( float2 e )                           { return e.x; }
+SW_FUNC float  SwEnvHi( float2 e )                           { return e.y; }
+// VALUE-RETURN form, not `inout float2`: the C++ test build defines `inout` empty, so scalar inout params
+// silently mutate a copy there (arrays survive via pointer decay). e = SwEnvAdd( e, ... ) at call sites.
+SW_FUNC float2 SwEnvAdd( float2 e, float a, float b )        { return float2( min( e.x, a ), max( e.y, b ) ); }
+SW_FUNC float2 SwEnvUnion( float2 e, float2 o )              { return float2( min( e.x, o.x ), max( e.y, o.y ) ); }	// union of two envelopes
+// THE reduction: grid+envelope -> covered mask-bit sum (numerator of coverage; denominator stays
+// popcount(diskMask) summed at init). Single shared body for every walk site (term CS + PS walkers + the
+// C++ test build) so plain/cached/spill paths can never disagree.
+//
+// FORM: discrete popcount MINUS the two sub-column out-rounding slivers at the union's OUTER endpoints.
+// Two earlier forms both regressed the gate (181 -> 194 -> 205 STEP/ANT) and are kept as negative
+// controls in SoftShadowEnvReduce_test.cpp; their lessons:
+//   1. NO ALIAS: a correction may only be applied where the envelope endpoint's column IS the masked
+//      grid's first/last set column. An envelope endpoint whose run the disk mask deleted (or that
+//      disagrees with the bits for any reason) then simply matches no column and contributes nothing -
+//      the clamp-alias over-shadow (bridging two disjoint runs across a masked gap) is structurally
+//      impossible, with no contiguity test at all.
+//   2. NO ESTIMATOR FLIP: the exact-length-on-contiguous-chords / popcount-on-holes hybrid regressed
+//      WORSE than pure discrete on real scenes, because multi-occluder chords flip between the two
+//      estimators pixel-to-pixel and every flip jumps by the discrete out-rounding (~1-2 bits) - new
+//      high-frequency STEP/ANT. This form is ONE formula for every chord state: it equals the discrete
+//      popcount everywhere except the outer-endpoint slivers, which shrink CONTINUOUSLY as the receiver
+//      moves - so it can never jump relative to the discrete baseline, and a single-run chord (the
+//      dominant penumbra case, both endpoint columns match) reduces to the exact interval length.
+// Interior hole boundaries keep the discrete quantum (bounded, rarer); the swept silhouette edge that
+// causes the visible grain is an outer endpoint.
+SW_FUNC float SoftScan_ReduceCov( SwGridWord swGrid[SW_SCAN_CHORDS], float2 swEnv[SW_SCAN_CHORDS], const SwGridWord swDiskMask[SW_SCAN_CHORDS] )
+{
+	float swCov = 0.0f;
+	SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ )
+	{
+		const SwGridWord swG = swGrid[cm] & swDiskMask[cm];
+		float c = ( float )SoftScan_PC( swG );
+		if( SwGridNZ( swG ) )
+		{
+			const int first = SwGridLoCol( swG ), last = SwGridHiCol( swG );
+			const float la = ( swEnv[cm].x + 1.0f ) * ( SW_SCAN_BITS * 0.5f );	// endpoints in column space
+			const float lb = ( swEnv[cm].y + 1.0f ) * ( SW_SCAN_BITS * 0.5f );
+			if( ( int )floor( la ) == first ) { c -= la - ( float )first; }			// left out-rounding sliver
+			if( ( int )floor( lb ) == last )  { c -= ( float )( last + 1 ) - lb; }	// right out-rounding sliver
+			c = max( c, 0.0f );
+		}
+		swCov += c;
+	}
+	return swCov;
+}
+// EXACT 2D intersection primitives for the projected-triangle-vs-unit-disk cull (task #106). The
+// bounding-sphere/cone cascade is CONSERVATIVE machinery inherited from the sampled-walk era; measured
+// on the shipped scanline path it passes 85% of triangles into FillTri where 92-98% then reject - after
+// paying the clip + projection. The question "does this triangle's projection intersect the disk" is
+// PRECISE and cheap: for the common all-in-slab triangle the projection IS the triangle of the three
+// projected vertices, and triangle-vs-circle is closed-form. Convex-convex: they intersect iff the
+// circle centre is inside the triangle, or some edge segment passes within radius 1 of the centre
+// (segment endpoints cover the vertex-inside-circle case via t-clamp). Exact, no slack.
+SW_FUNC bool SoftScan_SegDisk( float2 a, float2 b )
+{
+	const float2 d = b - a;
+	const float t = saturate( -dot( a, d ) / max( dot( d, d ), 1e-20f ) );
+	const float2 p = a + t * d;
+	return dot( p, p ) <= 1.0f;
+}
+SW_FUNC bool SoftScan_TriDisk( float2 a, float2 b, float2 c )
+{
+	const float c0 = ( b.x - a.x ) * ( -a.y ) - ( b.y - a.y ) * ( -a.x );	// origin side of each edge
+	const float c1 = ( c.x - b.x ) * ( -b.y ) - ( c.y - b.y ) * ( -b.x );
+	const float c2 = ( a.x - c.x ) * ( -c.y ) - ( a.y - c.y ) * ( -c.x );
+	if( ( c0 <= 0.0f && c1 <= 0.0f && c2 <= 0.0f ) || ( c0 >= 0.0f && c1 >= 0.0f && c2 >= 0.0f ) )
+	{
+		return true;	// disk centre inside the triangle (either winding)
+	}
+	return SoftScan_SegDisk( a, b ) || SoftScan_SegDisk( b, c ) || SoftScan_SegDisk( c, a );
+}
 // project a SLAB-clipped triangle to the UNIT light disk and OR its per-chord bit-run into swGrid. The
 // run is raw (disk-bbox columns [0,31]); the circular disk mask is applied ONCE at reduction, not per
 // triangle. Only the chords the triangle's projected y-extent spans are touched (most triangles cover a
 // couple of chords), which is the bulk of the per-triangle saving over walking all SW_SCAN_CHORDS.
-SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 v0, float3 v1, float3 v2,
+SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS], float3 v0, float3 v1, float3 v2,
 		float3 swP, softFrame_t swF, float swR, float swEps )
 {
+	SW_ATTRIB_ADD( scanFill, 1 );										// attribution (task #106): FillTri entered
 	float3 rel[3]; float dn[3];
 	rel[0] = v0 - swP; rel[1] = v1 - swP; rel[2] = v2 - swP;
 	dn[0] = dot( rel[0], swF.nrm ); dn[1] = dot( rel[1], swF.nrm ); dn[2] = dot( rel[2], swF.nrm );
-	// Clip the triangle to the depth SLAB [swEps, distPL] BEFORE projecting: only geometry BETWEEN the
-	// receiver and the light occludes it. The old code clipped ONLY the near plane (dn >= swEps), so large
-	// world triangles that straddle or sit BEYOND the light survived the conservative cone cull and still
-	// projected into the disk - painting false self-shadow across lit surfaces (the broad scanline
-	// over-darkening). Every other coverage path clips this same slab, and the sampled MT path enforces it
-	// with tt <= 1. Two-plane Sutherland-Hodgman in (rel,dn) space -> up to 5 verts.
-	float3 nRel[4]; float nDn[4]; int nn = 0;							// after near clip (dn >= swEps)
-	for( int e = 0; e < 3; e++ )
-	{
-		int i = e, k = ( e + 1 ) % 3;
-		bool ai = dn[i] >= swEps, bi = dn[k] >= swEps;
-		if( ai && nn < 4 ) { nRel[nn] = rel[i]; nDn[nn] = dn[i]; nn++; }
-		if( ( ai != bi ) && nn < 4 ) { float t = ( swEps - dn[i] ) / ( dn[k] - dn[i] ); nRel[nn] = rel[i] + ( rel[k] - rel[i] ) * t; nDn[nn] = swEps; nn++; }
-	}
-	if( nn < 3 ) { return; }
-	float3 fRel[5]; float fDn[5]; int fn = 0;							// after far clip (dn <= distPL = the light)
-	for( int e = 0; e < nn; e++ )
-	{
-		int i = e, k = ( e + 1 ) % nn;
-		bool ai = nDn[i] <= swF.distPL, bi = nDn[k] <= swF.distPL;
-		if( ai && fn < 5 ) { fRel[fn] = nRel[i]; fDn[fn] = nDn[i]; fn++; }
-		if( ( ai != bi ) && fn < 5 ) { float t = ( swF.distPL - nDn[i] ) / ( nDn[k] - nDn[i] ); fRel[fn] = nRel[i] + ( nRel[k] - nRel[i] ) * t; fDn[fn] = swF.distPL; fn++; }
-	}
-	if( fn < 3 ) { return; }
 	float invR = 1.0f / swR;
-	float2 q[5]; int qn = fn; float ymin = 1e30f, ymax = -1e30f; float xmin = 1e30f, xmax = -1e30f;
-	for( int j = 0; j < fn; j++ ) { float2 p = SoftShadow_ProjectVert( fRel[j], fDn[j], swF ) * invR; q[j] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); xmin = min( xmin, p.x ); xmax = max( xmax, p.x ); }
-	// LOSSLESS DISK REJECT: if the nearest point of the projected triangle's AABB to the disk centre is
-	// already outside the UNIT CIRCLE, the triangle covers no disk bit (the circular mask is applied at
-	// reduction). The cone cull upstream is a loose bounding-SPHERE test, so ~99% of its survivors still
-	// project clear of the small disk (grazing miss) and would otherwise pay the per-edge reciprocal setup
-	// + chord sweep below - the bulk of FillTri (measured 31-53% of the scanline walk; -11..-20% walk on the
-	// heavy caps). Circle-exact (not just the [-1,1]^2 box) so it also drops the corner-missers a box keeps:
-	// measured no different on these dense caps, but the corner fraction is scene-dependent (a wide-penumbra
-	// scene with survivors clustered in the disk corners gains where these do not), and the extra cost is a
-	// few ALU. Conservative: never drops a triangle that touches the disk, so coverage is bit-identical.
+	float2 q[5]; int qn; float ymin, ymax, xmin, xmax;
+	// EXACT-FIRST CULL (task #106): the attribution counters convicted the old ordering - 92-98% of the
+	// triangles entering here reject, each AFTER paying the two clip loops + up-to-5-vert projection. When
+	// no vertex straddles the depth slab (the overwhelmingly common case) the projection of the triangle
+	// IS the triangle of its three projected vertices, so the EXACT triangle-vs-disk test runs FIRST on
+	// three projections and no clip arrays. Stricter than the old bbox-vs-circle reject: corner-bbox
+	// triangles that MISS the circle no longer OR raw bits - their true coverage is zero, so dropping
+	// their sub-column out-rounding leakage into the mask boundary is the MORE exact term (gate-verified).
+	// Contrib-cache note (default off): the record path's "record on ANY raw bits" margin thins to
+	// disk-touching triangles only - re-verify the CONTINUITY class if the cache ships enabled.
+	const bool swIn0 = ( dn[0] >= swEps ) && ( dn[0] <= swF.distPL );
+	const bool swIn1 = ( dn[1] >= swEps ) && ( dn[1] <= swF.distPL );
+	const bool swIn2 = ( dn[2] >= swEps ) && ( dn[2] <= swF.distPL );
+	if( swIn0 && swIn1 && swIn2 )
 	{
-		float nx = ( xmin > 0.0f ) ? xmin : ( ( xmax < 0.0f ) ? xmax : 0.0f );
-		float ny = ( ymin > 0.0f ) ? ymin : ( ( ymax < 0.0f ) ? ymax : 0.0f );
-		if( nx * nx + ny * ny > 1.0f ) { return; }
+		q[0] = SoftShadow_ProjectVert( rel[0], dn[0], swF ) * invR;
+		q[1] = SoftShadow_ProjectVert( rel[1], dn[1], swF ) * invR;
+		q[2] = SoftShadow_ProjectVert( rel[2], dn[2], swF ) * invR;
+		if( !SoftScan_TriDisk( q[0], q[1], q[2] ) ) { SW_ATTRIB_ADD( scanReject, 1 ); return; }	// exact: zero true coverage
+		qn = 3;
+		ymin = min( q[0].y, min( q[1].y, q[2].y ) ); ymax = max( q[0].y, max( q[1].y, q[2].y ) );
+		xmin = min( q[0].x, min( q[1].x, q[2].x ) ); xmax = max( q[0].x, max( q[1].x, q[2].x ) );
+	}
+	else
+	{
+		// SLAB STRADDLER (the near-contact / light-crossing minority): clip to [swEps, distPL] BEFORE
+		// projecting - only geometry BETWEEN the receiver and the light occludes it. The old code clipped
+		// ONLY the near plane (dn >= swEps), so large world triangles that straddle or sit BEYOND the
+		// light survived the conservative cone cull and still projected into the disk - painting false
+		// self-shadow across lit surfaces. Two-plane Sutherland-Hodgman in (rel,dn) space -> up to 5 verts.
+		float3 nRel[4]; float nDn[4]; int nn = 0;						// after near clip (dn >= swEps)
+		for( int e = 0; e < 3; e++ )
+		{
+			int i = e, k = ( e + 1 ) % 3;
+			bool ai = dn[i] >= swEps, bi = dn[k] >= swEps;
+			if( ai && nn < 4 ) { nRel[nn] = rel[i]; nDn[nn] = dn[i]; nn++; }
+			if( ( ai != bi ) && nn < 4 ) { float t = ( swEps - dn[i] ) / ( dn[k] - dn[i] ); nRel[nn] = rel[i] + ( rel[k] - rel[i] ) * t; nDn[nn] = swEps; nn++; }
+		}
+		if( nn < 3 ) { SW_ATTRIB_ADD( scanReject, 1 ); return; }
+		float3 fRel[5]; float fDn[5]; int fn = 0;						// after far clip (dn <= distPL = the light)
+		for( int e = 0; e < nn; e++ )
+		{
+			int i = e, k = ( e + 1 ) % nn;
+			bool ai = nDn[i] <= swF.distPL, bi = nDn[k] <= swF.distPL;
+			if( ai && fn < 5 ) { fRel[fn] = nRel[i]; fDn[fn] = nDn[i]; fn++; }
+			if( ( ai != bi ) && fn < 5 ) { float t = ( swF.distPL - nDn[i] ) / ( nDn[k] - nDn[i] ); fRel[fn] = nRel[i] + ( nRel[k] - nRel[i] ) * t; fDn[fn] = swF.distPL; fn++; }
+		}
+		if( fn < 3 ) { SW_ATTRIB_ADD( scanReject, 1 ); return; }
+		qn = fn; ymin = 1e30f; ymax = -1e30f; xmin = 1e30f; xmax = -1e30f;
+		// constant-trip + predication: q must only ever be indexed by compile-time constants or it is
+		// demoted to scratch for BOTH branches (the clip scratch arrays fRel/fDn are branch-local and rare)
+		SW_UNROLL for( int j = 0; j < 5; j++ )
+		{
+			if( j >= fn ) { continue; }
+			float2 p = SoftShadow_ProjectVert( fRel[j], fDn[j], swF ) * invR;
+			q[j] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); xmin = min( xmin, p.x ); xmax = max( xmax, p.x );
+		}
+		// clipped-polygon disk reject (bbox nearest point vs unit circle - conservative, cheap for <=5 verts)
+		{
+			float nx = ( xmin > 0.0f ) ? xmin : ( ( xmax < 0.0f ) ? xmax : 0.0f );
+			float ny = ( ymin > 0.0f ) ? ymin : ( ( ymax < 0.0f ) ? ymax : 0.0f );
+			if( nx * nx + ny * ny > 1.0f ) { SW_ATTRIB_ADD( scanReject, 1 ); return; }
+		}
 	}
 	const float halfC = SW_SCAN_CHORDS * 0.5f;							// chord index m for chord centre Y: m = (Y+1)*halfC - 0.5
 	int mLo = max( ( int )ceil( ( ymin + 1.0f ) * halfC - 0.5f ), 0 );
 	int mHi = min( ( int )floor( ( ymax + 1.0f ) * halfC - 0.5f ), SW_SCAN_CHORDS - 1 );
-	if( mLo > mHi ) { return; }											// projects between chord centres / outside disk in Y
+	if( mLo > mHi ) { SW_ATTRIB_ADD( scanReject, 1 ); return; }			// projects between chord centres / outside disk in Y
 	// ALREADY-COVERED SKIP (lossless): the grid is an OR-union, so a triangle whose projected-AABB column
 	// run is ALREADY fully set in swGrid on every chord it spans can add no new bit (its coverage is a
 	// subset of its bbox, which is a subset of the already-set columns). Skip it before the per-edge
@@ -939,24 +1120,69 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 v
 	// entirely; MEASURED the remaining ~66% mostly OVERLAP the disk but re-fill bits a closer occluder
 	// already set (redundant) - this catches those, the bulk of the 44 ms chord-sweep mass. Operates on the
 	// RAW grid (pre-disk-mask): raw coverage unchanged => popcount( grid & diskMask ) is bit-identical.
+	// ENVELOPE FOLD ON SKIP (task #90): bit-lossless is no longer value-lossless - a skipped triangle
+	// can extend a chord's union SUB-COLUMN inside an already-set OUTER column, and the reduction's
+	// endpoint slivers read the envelope there. The first fix WALKED such triangles to keep the envelope
+	// exact - a 10x PLAYTEST REGRESSION: on wide-coverage fragments (umbra, the formerly cheapest case)
+	// nearly every redundant triangle touches an outer column, so the skip - the bulk of the chord-sweep
+	// saving - never fired. Instead, fold the skipped triangle's CONTINUOUS projected bbox edges into the
+	// envelope on the chords whose outer set column its bbox touches: the true intervals lie within
+	// [xmin,xmax], so env stays a safe outer bound (only ever moves TOWARD the discrete baseline, never
+	// past the truth), and the dominant redundant case - a coplanar triangle sharing the silhouette edge
+	// (xmin == recorded min) - keeps the envelope EXACT. No chord sweep, no per-edge projection - the
+	// skip keeps its full walk saving. (Inside the skip, bboxRun is a subset of the set bits, so xmin/
+	// xmax cannot lie outside the outer columns' span.)
 	{
 		SwGridWord bboxRun = SoftScan_Run( xmin, xmax );
 		bool newBits = false;
-		for( int mc = mLo; mc <= mHi; mc++ ) { if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; break; } }
-		if( !newBits ) { return; }
+		int skipIt = 0;
+		// CONSTANT-TRIP loops with span predication (register diet, task #106): runtime loop bounds
+		// with per-chord indexing demoted swGrid/swEnv to SCRATCH MEMORY (dynamically-indexed private
+		// arrays; shaderstats: 32-77KB scratch/thread, 4-5 waves/SIMD) - every chord access was a
+		// memory round-trip. Unrolled constant indices keep the arrays in registers; the predicated
+		// off-span iterations are near-free next to that.
+		SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
+		{
+			if( mc < mLo || mc > mHi || newBits ) { continue; }
+			skipIt++;
+			if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; }
+		}
+		SW_ATTRIB_ADD( scanSkipIter, skipIt );
+		if( !newBits )
+		{
+			SW_ATTRIB_ADD( scanSkip, 1 );
+			if( SwGridNZ( bboxRun ) )
+			{
+				SW_ATTRIB_ADD( scanFoldIter, mHi - mLo + 1 );
+				SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
+				{
+					if( mc < mLo || mc > mHi || !SwGridNZ( swGrid[mc] ) ) { continue; }
+					if( SwGridNZ( bboxRun & SwGridColBit( SwGridLoCol( swGrid[mc] ) ) ) ) { swEnv[mc].x = min( swEnv[mc].x, xmin ); }
+					if( SwGridNZ( bboxRun & SwGridColBit( SwGridHiCol( swGrid[mc] ) ) ) ) { swEnv[mc].y = max( swEnv[mc].y, xmax ); }
+				}
+			}
+			return;
+		}
 	}
+	SW_ATTRIB_ADD( scanSweepTri, 1 );
+	SW_ATTRIB_ADD( scanSweepIter, mHi - mLo + 1 );
 	// per-edge line params hoisted OUT of the chord loop: the reciprocal 1/(B.y-A.y) is the expensive
 	// term and is chord-invariant, so each chord evaluation is a single FMA x = A.x + slope*(Y - A.y).
 	float eax[5], eay[5], eslope[5], elo[5], ehi[5];
-	for( int e = 0; e < 5; e++ )
+	SW_UNROLL for( int e = 0; e < 5; e++ )
 	{
 		if( e >= qn ) { eax[e] = 0; eay[e] = 0; eslope[e] = 0; elo[e] = 1e30f; ehi[e] = -1e30f; continue; }
-		float2 A = q[e], B = q[( e + 1 ) % qn];
+		float2 A = q[e], B;
+		// branch (not %qn / select) so every q index is a COMPILE-TIME constant under the unroll -
+		// one dynamic q access anywhere demotes the whole array to scratch (see the chord loops)
+		if( e + 1 < qn ) { B = q[e + 1]; }
+		else { B = q[0]; }
 		eax[e] = A.x; eay[e] = A.y; eslope[e] = ( B.x - A.x ) / ( B.y - A.y );
 		elo[e] = min( A.y, B.y ); ehi[e] = max( A.y, B.y );
 	}
-	for( int m = mLo; m <= mHi; m++ )									// only the chords the triangle spans
+	SW_UNROLL for( int m = 0; m < SW_SCAN_CHORDS; m++ )					// constant-trip + span predication (see the skip loop)
 	{
+		if( m < mLo || m > mHi ) { continue; }
 		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
 		float xlo = 1e30f, xhi = -1e30f; bool any = false;
 		for( int e2 = 0; e2 < 5; e2++ )
@@ -970,6 +1196,7 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 v
 		if( any )
 		{
 			swGrid[m] |= SoftScan_Run( xlo, xhi );
+			swEnv[m] = SwEnvAdd( swEnv[m], xlo, xhi );	// exact fractional endpoints for this chord's union
 		}
 	}
 }
@@ -980,7 +1207,7 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 v
 // tris - but one polygon, zero per-triangle records, no per-tri cull/FillTri overhead. `corner[8]` are the
 // 8 world-space box corners in the bit convention (index bit0=x, bit1=y, bit2=z; 0=min side). From the
 // silhouette on, the body is FillTri verbatim (slab clip -> project -> per-chord x-span OR) over N<=6 verts.
-SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 corner[8],
+SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS], float3 corner[8],
 		float3 swP, softFrame_t swF, float swR, float swEps )
 {
 	// 6 faces, each 4 corner indices wound outward-CCW, so cross(edge1,edge2) is the OUTWARD normal.
@@ -1023,8 +1250,8 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 c
 		for( int fb = 0; fb < 6; fb++ )
 		{
 			float3 a0 = corner[BF[fb][0]], a1 = corner[BF[fb][1]], a2 = corner[BF[fb][2]], a3 = corner[BF[fb][3]];
-			SoftScan_FillTri( swGrid, a0, a1, a2, swP, swF, swR, swEps );
-			SoftScan_FillTri( swGrid, a0, a2, a3, swP, swF, swR, swEps );
+			SoftScan_FillTri( swGrid, swEnv, a0, a1, a2, swP, swF, swR, swEps );
+			SoftScan_FillTri( swGrid, swEnv, a0, a2, a3, swP, swF, swR, swEps );
 		}
 		return;
 	}
@@ -1080,8 +1307,28 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 c
 	{
 		SwGridWord bboxRun = SoftScan_Run( xmin, xmax );
 		bool newBits = false;
-		for( int mc = mLo; mc <= mHi; mc++ ) { if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; break; } }
-		if( !newBits ) { return; }
+		// constant-trip + span predication: see the FillTri skip loop - one dynamic swGrid/swEnv index
+		// anywhere in the kernel demotes the arrays to scratch for every path
+		SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
+		{
+			if( mc < mLo || mc > mHi || newBits ) { continue; }
+			if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; }
+		}
+		if( !newBits )
+		{
+			// envelope fold on skip: see the FillTri skip - fold the continuous bbox edges into touched
+			// outer endpoints instead of walking; the skip keeps its full saving
+			if( SwGridNZ( bboxRun ) )
+			{
+				SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
+				{
+					if( mc < mLo || mc > mHi || !SwGridNZ( swGrid[mc] ) ) { continue; }
+					if( SwGridNZ( bboxRun & SwGridColBit( SwGridLoCol( swGrid[mc] ) ) ) ) { swEnv[mc].x = min( swEnv[mc].x, xmin ); }
+					if( SwGridNZ( bboxRun & SwGridColBit( SwGridHiCol( swGrid[mc] ) ) ) ) { swEnv[mc].y = max( swEnv[mc].y, xmax ); }
+				}
+			}
+			return;
+		}
 	}
 	float eax[12], eay[12], eslope[12], elo[12], ehi[12];
 	for( int e4 = 0; e4 < 12; e4++ )
@@ -1091,8 +1338,9 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 c
 		eax[e4] = A.x; eay[e4] = A.y; eslope[e4] = ( B.x - A.x ) / ( B.y - A.y );
 		elo[e4] = min( A.y, B.y ); ehi[e4] = max( A.y, B.y );
 	}
-	for( int m = mLo; m <= mHi; m++ )
+	SW_UNROLL for( int m = 0; m < SW_SCAN_CHORDS; m++ )					// constant-trip + span predication (see FillTri)
 	{
+		if( m < mLo || m > mHi ) { continue; }
 		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
 		float xlo = 1e30f, xhi = -1e30f; bool any = false;
 		for( int e5 = 0; e5 < 12; e5++ )
@@ -1106,6 +1354,7 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 c
 		if( any )
 		{
 			swGrid[m] |= SoftScan_Run( xlo, xhi );
+			swEnv[m] = SwEnvAdd( swEnv[m], xlo, xhi );	// exact fractional endpoints (box silhouette chord)
 		}
 	}
 }
@@ -1113,6 +1362,24 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 c
 // TOPOLOGY-ONLY fill: for callers that use the grid for SET membership (contrib-cache contribution
 // tests, the surf-grid build/serve) and reduce by popcount, not the exact-length coverage. Discards the
 // exact edges so the call site needs no throwaway arrays.
+#ifdef __cplusplus
+// Envelope-less overloads for the C++ test TUs that predate the fractional envelope and reduce by
+// popcount only (GrainAA, WasteProof, FillBox parity). Discards the envelope; bit-grid identical.
+SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 v0, float3 v1, float3 v2,
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	float2 e[SW_SCAN_CHORDS];
+	for( int i = 0; i < SW_SCAN_CHORDS; i++ ) { e[i] = SwEnvZero(); }
+	SoftScan_FillTri( swGrid, e, v0, v1, v2, swP, swF, swR, swEps );
+}
+SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 corner[8],
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	float2 e[SW_SCAN_CHORDS];
+	for( int i = 0; i < SW_SCAN_CHORDS; i++ ) { e[i] = SwEnvZero(); }
+	SoftScan_FillBox( swGrid, e, corner, swP, swF, swR, swEps );
+}
+#endif
 #endif // SW_SCANLINE
 
 #ifndef SW_FACE_SAMPLES
@@ -1336,9 +1603,9 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 	// frame mixed exact interval unions with sampled coverage - the playtest-visible "ants" that
 	// the per-light gate (which never contends) structurally cannot reproduce.
 	SwGridWord swGrid[SW_SCAN_CHORDS];
-	SwGridWord swDiskMask[SW_SCAN_CHORDS];
-	int  swDiskBits = 0;
-	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftScan_PC( swDiskMask[gi] ); }
+	const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array, no init loop)
+	float2 swEnv[SW_SCAN_CHORDS];		// fractional-endpoint envelope (task #90): exact union interval per chord
+	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
 #endif
 	SW_BKT_DECL
 #if SW_FACE_PROFILE
@@ -1413,12 +1680,12 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			swProbe += cd; continue;		// TIMING PROBE ONLY: + per-triangle cone culls, no setup/samples
 #endif
 #if SW_SCANLINE
-			SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini interval union
+			SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );	// Fubini interval union
 			{
 				// UMBRA EARLY-OUT + rounding, identical to the tile-list/cluster scanline walkers
 				int swCovE = 0;
-				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] ); }
-				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+				if( swCovE * 100 >= swDiskBits * 99 ) { SW_BKT_FLUSH_COV( 1.0f ); return 1.0f; }
 			}
 #else
 			float3 edge1 = v1 - v0;
@@ -1467,11 +1734,11 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 	}
 #if SW_SCANLINE
 	{
-		SW_BKT_FLUSH( swMask, swAll );
 		{
-		int swCov = 0;
-		SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
-		return swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0f;
+		float swCov = 0.0f;
+		swCov = SoftScan_ReduceCov( swGrid, swEnv, SW_SCAN_MASK );	// fractional endpoints on single-run chords (task #90)
+		SW_BKT_FLUSH_COV( swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f );	// bucket by FINAL coverage (swMask is dead here)
+		return swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f;
 	}
 	}
 #endif
@@ -1613,9 +1880,9 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
 #if SW_SCANLINE
 	SwGridWord swGrid[SW_SCAN_CHORDS];			// Fubini scanline grid: SW_SCAN_CHORDS chords x 32 bits, OR-unioned
-	SwGridWord swDiskMask[SW_SCAN_CHORDS];		// circular disk mask per chord (fragment-invariant, hoisted)
-	int  swDiskBits = 0;
-	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftScan_PC( swDiskMask[gi] ); }
+	const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array, no init loop)
+	float2 swEnv[SW_SCAN_CHORDS];		// fractional-endpoint envelope (task #90): exact union interval per chord
+	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
 #endif
 	SW_BKT_DECL
 #if SW_LIT_EARLYOUT
@@ -1649,7 +1916,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 					float4 bcv = t_SoftEdges[ bbB + bk ];
 					bcornerB[bk] = float3( bcv.x, bcv.y, bcv.z );
 				}
-				SoftScan_FillBox( swGrid, bcornerB, swP, swF, swR, swEps );
+				SoftScan_FillBox( swGrid, swEnv, bcornerB, swP, swF, swR, swEps );
 #endif
 				continue;
 			}
@@ -1743,7 +2010,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		continue;													// TIMING PROBE: + per-triangle cone culls
 #endif
 #if SW_SCANLINE
-		SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini: fill interval bit-runs, union by OR
+		SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );	// Fubini: fill interval bit-runs, union by OR
 #if SW_FACE_PROFILE == 3
 		swProbe += ( float )SoftScan_PC( swGrid[0] );	// TIMING PROBE: walk + cull + SoftScan_FillTri, skip the umbra-check
 		continue;
@@ -1758,8 +2025,8 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			// >=99%-occluded fragment to exact umbra (return 1) - the <1% residual is discretisation noise and
 			// reads as black regardless, so the visible penumbra gradient is untouched.
 			int swCovE = 0;
-			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] ); }
-			if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+			if( swCovE * 100 >= swDiskBits * 99 ) { SW_BKT_FLUSH_COV( 1.0f ); return 1.0f; }
 		}
 #else
 		float3 edge1 = v1 - v0;
@@ -1805,11 +2072,11 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 #if SW_SCANLINE
 	// Fubini coverage from the OR-unioned interval grid; no morphological crack-close (interval fill leaves
 	// no interior sample gaps, unlike point sampling).
-	SW_BKT_FLUSH( swMask, swAll );
 	{
-		int swCov = 0;
-		SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
-		return swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0f;
+		float swCov = 0.0f;
+		swCov = SoftScan_ReduceCov( swGrid, swEnv, SW_SCAN_MASK );	// fractional endpoints on single-run chords (task #90)
+		SW_BKT_FLUSH_COV( swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f );	// bucket by FINAL coverage (swMask is dead here)
+		return swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f;
 	}
 #else
 	if( swMask != 0u && swMask != swAll )
@@ -2258,24 +2525,28 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 	// listed fragments ran the scanline: two algorithms in one frame (and the contributor cache's
 	// scanline serve measured 15.7% term mismatches against the sampled spill reference).
 	SwGridWord swGrid[SW_SCAN_CHORDS];
-	SwGridWord swDiskMask[SW_SCAN_CHORDS];
-	int  swDiskBits = 0;
-	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftScan_PC( swDiskMask[gi] ); }
+	const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array, no init loop)
+	float2 swEnv[SW_SCAN_CHORDS];		// fractional-endpoint envelope (task #90): exact union interval per chord
+	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
 #endif
 	SW_BKT_DECL
 	for( int li = 0; li < swListCount; li++ )
 	{
 		const int se = ( int )t_SoftTiles[ swListBase + li ];		// ABSOLUTE cluster-record offset
 		float4 q0 = t_SoftEdges[ se + 0 ];							// ( centre.xyz, radius )
+		// cluster-sphere cull = this walker's caster-level cascade stage: counted into the caster
+		// slots (0/1) so the SPILL path's cascade is visible - it read as silent zeros before
+		// (cap0009: "cone-tests 0" while scanFill=239/frag, the whole walk uncounted).
+		SW_ATTRIB_ADD( casterTest, 1 );
 		{
 			float3 crc  = float3( q0.x, q0.y, q0.z ) - swP;
 			float  ccd  = dot( crc, swF.nrm );
 			float  crad = q0.w;
-			if( ccd + crad < swEps ) { continue; }
-			if( ccd - crad > swDistPL ) { continue; }
+			if( ccd + crad < swEps ) { SW_ATTRIB_ADD( casterCull, 1 ); continue; }
+			if( ccd - crad > swDistPL ) { SW_ATTRIB_ADD( casterCull, 1 ); continue; }
 			float3 cperp = crc - ccd * swF.nrm;
 			float  cconeR = swR * ( ccd + crad ) / swDistPL;
-			if( dot( cperp, cperp ) > ( cconeR + crad ) * ( cconeR + crad ) ) { continue; }
+			if( dot( cperp, cperp ) > ( cconeR + crad ) * ( cconeR + crad ) ) { SW_ATTRIB_ADD( casterCull, 1 ); continue; }
 		}
 		float4 q1 = t_SoftEdges[ se + 1 ];							// ( firstTri, numTris, 0, 0 ) - survivors only
 		const int swTriFirst = ( int )q1.x;
@@ -2284,15 +2555,16 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 		{
 			const int b = swFirstElem + t * 3;
 			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, v0-radius ) - coarse reject reads ONLY this
+			SW_ATTRIB_ADD( coarseTest, 1 );
 			{
 				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
 				float  cd0 = dot( rc0, swF.nrm );
 				float  vr0 = r0.w;
-				if( cd0 + vr0 < swEps ) { continue; }
-				if( cd0 - vr0 > swDistPL ) { continue; }
+				if( cd0 + vr0 < swEps ) { SW_ATTRIB_ADD( coarseCull, 1 ); continue; }
+				if( cd0 - vr0 > swDistPL ) { SW_ATTRIB_ADD( coarseCull, 1 ); continue; }
 				float3 pp0 = rc0 - cd0 * swF.nrm;
 				float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
-				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { SW_ATTRIB_ADD( coarseCull, 1 ); continue; }
 			}
 			float4 r1 = t_SoftEdges[ b + 1 ];
 			float4 r2 = t_SoftEdges[ b + 2 ];
@@ -2303,19 +2575,21 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 			float3 rc   = tcen - swP;
 			float  cd   = dot( rc, swF.nrm );
 			float  triRad = r1.w;	// centroid radius (tight): exact original bound => bit-exact gate
-			if( cd + triRad < swEps ) { continue; }
-			if( cd - triRad > swDistPL ) { continue; }
+			SW_ATTRIB_ADD( tightTest, 1 );
+			if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+			if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
 			float3 perp = rc - cd * swF.nrm;
 			float  coneR = swR * ( cd + triRad ) / swDistPL;
-			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+			SW_ATTRIB_ADD( mtTri, 1 );	// survivor: pays FillTri (scanline) / the sample test (sampled)
 			SW_BKT_SURV
 #if SW_SCANLINE
-			SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini interval union
+			SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );	// Fubini interval union
 			{
 				// UMBRA EARLY-OUT + rounding, identical to the tile-list scanline walker
 				int swCovE = 0;
-				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] ); }
-				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+				if( swCovE * 100 >= swDiskBits * 99 ) { SW_BKT_FLUSH_COV( 1.0f ); return 1.0f; }
 			}
 #else
 			float3 edge1 = v1 - v0;
@@ -2353,11 +2627,11 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 #endif
 	}
 #if SW_SCANLINE
-	SW_BKT_FLUSH( swMask, swAll );
 	{
-		int swCov = 0;
-		SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
-		return swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0f;
+		float swCov = 0.0f;
+		swCov = SoftScan_ReduceCov( swGrid, swEnv, SW_SCAN_MASK );	// fractional endpoints on single-run chords (task #90)
+		SW_BKT_FLUSH_COV( swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f );	// bucket by FINAL coverage (swMask is dead here)
+		return swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f;
 	}
 #endif
 	if( swMask != 0u && swMask != swAll )

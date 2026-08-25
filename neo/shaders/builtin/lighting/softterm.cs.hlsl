@@ -273,6 +273,17 @@ float SwTermQuant( float t )
 	return ( lv > 0 ) ? ( round( saturate( t ) * ( float )lv ) / ( float )lv ) : t;
 }
 
+// C1 LIT-EARLY-OUT HOIST (r_softShadowLitEarlyOut = g_surfParams.z): the skip below the threshold
+// writes term 1.0; without a ramp the first non-skipped fragment jumps straight to its full
+// occlusion - a visible step along the iso-intensity contour. Scale the OCCLUSION by a
+// smoothstep(T, 2T, intensity) factor so coverage fades in continuously from the skip boundary.
+// swHoist == 1.0 must return the ORIGINAL value bit-exactly (T=0 stays byte-identical), hence the
+// branch instead of the algebraically-equal 1-(1-t), which reassociates the rounding.
+float SwHoistTerm( float swTerm, float swHoist )
+{
+	return ( swHoist < 1.0f ) ? ( 1.0f - swHoist * ( 1.0f - swTerm ) ) : swTerm;
+}
+
 #if SW_SURF_CACHE
 // Wave-aggregated per-frame path counter (see SW_SURF_STAT): sum the active lanes in each class and
 // commit ONE atomic per wave per class, instead of one InterlockedAdd per fragment on a single global
@@ -330,6 +341,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// pixel inside the scissor - on the exact-zero boundary its own interpolated falloff sample
 	// can disagree with ours in the last bit, and 1.0 x (a contribution of exactly ~0) is the
 	// value the falloff-first FS path produces there anyway.
+	float swHoist = 1.0f;	// lit-early-out C1 hoist factor (1.0 = untouched; see SwHoistTerm)
 	if( g_flags.x != 0 )
 	{
 		bool swSkip = ( swPos.w == 0.0f );				// never rasterised: no receiver here
@@ -348,7 +360,20 @@ void main( uint3 tid : SV_DispatchThreadID )
 				// is multiplied by a near-zero contribution, so skipping the walk (-> term 1.0, no far
 				// penumbra) is visually lossless. Cut where the light's falloff*projection product is below
 				// the threshold, not just exactly zero. 0 reproduces the exact <=0 behaviour.
-				swSkip = ( max( max( swProj.x * swFall.x, swProj.y * swFall.y ), swProj.z * swFall.z ) <= g_surfParams.z );
+				const float swInt = max( max( swProj.x * swFall.x, swProj.y * swFall.y ), swProj.z * swFall.z );
+				swSkip = ( swInt <= g_surfParams.z );
+#if SW_GPU_WALK_COUNTERS
+				if( swSkip && g_surfParams.z > 0.0f )
+				{
+					InterlockedAdd( u_WalkCnt[ 27 ], 1u );	// lit-early-out fired above exact-zero (gate-execution proof)
+				}
+#endif
+				// C1 HOIST above the cut: fade the occlusion in over [T, 2T] (see SwHoistTerm).
+				// T <= 0 keeps swHoist at 1.0 (smoothstep(0,0,x) is degenerate; exact path untouched).
+				if( !swSkip && g_surfParams.z > 0.0f )
+				{
+					swHoist = smoothstep( g_surfParams.z, 2.0f * g_surfParams.z, swInt );
+				}
 			}
 		}
 		// BACK-FACING RECEIVER early-out: the interaction masks BOTH diffuse and specular by
@@ -459,7 +484,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const uint swPCnt = t_SoftTiles[ swPSlot ];
 				if( swPCnt == SW_TILE_UMBRA )
 				{
-					u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;
+					u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );
 					return;
 				}
 				if( swPCnt <= ( uint )g_flags.w )
@@ -686,13 +711,12 @@ void main( uint3 tid : SV_DispatchThreadID )
 			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
 			const float swRC = max( g_lightR.w, 1e-2 );
 			SwGridWord swGrid[SW_SCAN_CHORDS];
-			SwGridWord swDiskMask[SW_SCAN_CHORDS];
-			int  swDiskBits = 0;
+			float2 swEnv[SW_SCAN_CHORDS];		// fractional-endpoint envelope (task #90)
+			const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array)
 			[unroll] for( int gm = 0; gm < SW_SCAN_CHORDS; gm++ )
 			{
 				swGrid[gm] = SwGridZero();
-				swDiskMask[gm] = SoftScan_Run( -SW_SCAN_HC[gm], SW_SCAN_HC[gm] );
-				swDiskBits += SoftScan_PC( swDiskMask[gm] );
+				swEnv[gm] = SwEnvZero();
 			}
 			// BIT-PARITY RULE: every path must FillTri exactly the tris the plain walk would - the
 			// per-tri cone cull is only approximately conservative at float boundaries, so a path
@@ -729,11 +753,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
 				if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
 				swUFill++;
-				SoftScan_FillTri( swGrid, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+				SoftScan_FillTri( swGrid, swEnv, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
 				int swCovE = 0;
 				[unroll] for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ )
 				{
-					swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] );
+					swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] );
 				}
 				if( swCovE * 100 >= swDiskBits * 99 )
 				{
@@ -766,9 +790,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 					bcorner[4] = t_SoftEdges[ bb + 4 ].xyz; bcorner[5] = t_SoftEdges[ bb + 5 ].xyz;
 					bcorner[6] = t_SoftEdges[ bb + 6 ].xyz; bcorner[7] = t_SoftEdges[ bb + 7 ].xyz;
 					swDFill++;
-					SoftScan_FillBox( swGrid, bcorner, swP, swFC, swRC, SW_NEAR_EPS );
+					SoftScan_FillBox( swGrid, swEnv, bcorner, swP, swFC, swRC, SW_NEAR_EPS );
 					int swCovB = 0;
-					[unroll] for( int fmb = 0; fmb < SW_SCAN_CHORDS; fmb++ ) { swCovB += SoftScan_PC( swGrid[fmb] & swDiskMask[fmb] ); }
+					[unroll] for( int fmb = 0; fmb < SW_SCAN_CHORDS; fmb++ ) { swCovB += SoftScan_PC( swGrid[fmb] & SW_SCAN_MASK[fmb] ); }
 					if( swCovB * 100 >= swDiskBits * 99 ) { break; }
 					continue;
 				}
@@ -791,11 +815,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
 				if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
 				swDFill++;
-				SoftScan_FillTri( swGrid, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+				SoftScan_FillTri( swGrid, swEnv, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
 				int swCovD = 0;
 				[unroll] for( int fm2 = 0; fm2 < SW_SCAN_CHORDS; fm2++ )
 				{
-					swCovD += SoftScan_PC( swGrid[fm2] & swDiskMask[fm2] );
+					swCovD += SoftScan_PC( swGrid[fm2] & SW_SCAN_MASK[fm2] );
 				}
 				if( swCovD * 100 >= swDiskBits * 99 )
 				{
@@ -850,11 +874,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
 					if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
 					swDFill++;
-					SoftScan_FillTri( swGrid, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+					SoftScan_FillTri( swGrid, swEnv, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
 					int swCovS2 = 0;
 					[unroll] for( int fm3 = 0; fm3 < SW_SCAN_CHORDS; fm3++ )
 					{
-						swCovS2 += SoftScan_PC( swGrid[fm3] & swDiskMask[fm3] );
+						swCovS2 += SoftScan_PC( swGrid[fm3] & SW_SCAN_MASK[fm3] );
 					}
 					if( swCovS2 * 100 >= swDiskBits * 99 )
 					{
@@ -871,11 +895,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			{
 				SwContribDiag( 15u );
 			}
-			int swCov = 0;
-			[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ )
-			{
-				swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] );
-			}
+			float swCov = SoftScan_ReduceCov( swGrid, swEnv, SW_SCAN_MASK );	// fractional endpoints (task #90)
 			// match the plain walk's >=99% umbra rounding EXACTLY (it returns coverage 1.0 there);
 			// without it plain-vs-cached frames flicker the last coverage bit (TEMPORAL defects)
 			if( swCov * 100 >= swDiskBits * 99 )
@@ -930,10 +950,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 					InterlockedAdd( u_Contrib[ swTermServe < swTermPlain ? 16 : 17 ], 1u );
 					InterlockedAdd( u_Contrib[ ( swServeListCount < 0 ) ? 18 : 19 ], 1u );
 				}
-				u_Term[ uint2( px + g_tile.zw ) ] = swTermPlain;
+				u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( swTermPlain, swHoist );
 				return;
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( swTermServe );
+			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( SwHoistTerm( swTermServe, swHoist ) );
 			return;
 		}
 
@@ -954,13 +974,12 @@ void main( uint3 tid : SV_DispatchThreadID )
 			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
 			const float swRC = max( g_lightR.w, 1e-2 );
 			SwGridWord swGrid[SW_SCAN_CHORDS];
-			SwGridWord swDiskMask[SW_SCAN_CHORDS];
-			int  swDiskBits = 0;
+			float2 swEnv[SW_SCAN_CHORDS];		// fractional-endpoint envelope (task #90)
+			const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array)
 			[unroll] for( int gm = 0; gm < SW_SCAN_CHORDS; gm++ )
 			{
 				swGrid[gm] = SwGridZero();
-				swDiskMask[gm] = SoftScan_Run( -SW_SCAN_HC[gm], SW_SCAN_HC[gm] );
-				swDiskBits += SoftScan_PC( swDiskMask[gm] );
+				swEnv[gm] = SwEnvZero();
 			}
 			[loop] for( int rl2 = 0; rl2 < swServeListCount; rl2++ )
 			{
@@ -985,7 +1004,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 					{
 						solo[sm] = SwGridZero();
 					}
-					SoftScan_FillTri( solo, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+					// the MAIN envelope takes the tri's exact endpoints directly: the solo grid merges into
+					// swGrid unconditionally below, so a separate per-solo envelope (+2 float2[CHORDS] of
+					// register state in the record path - a spill risk) is pure redundancy
+					SoftScan_FillTri( solo, swEnv, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
 					// record on ANY RAW solo bits, not only in-disk-mask bits: a tri whose intervals
 					// land just outside the disk at every evaluated pixel becomes a contributor under
 					// a sub-pixel view displacement - the dominant frozen-union CONTINUITY class
@@ -1054,7 +1076,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 					{
 						solo2[sm3] = SwGridZero();
 					}
-					SoftScan_FillTri( solo2, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
+					// main envelope updated directly (solo2 merges unconditionally; see the tile-list record)
+					SoftScan_FillTri( solo2, swEnv, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
 					SwGridWord soloRaw2 = SwGridZero();				// ANY raw bits (see the tile-list record)
 					[unroll] for( int sm4 = 0; sm4 < SW_SCAN_CHORDS; sm4++ )
 					{
@@ -1099,16 +1122,12 @@ void main( uint3 tid : SV_DispatchThreadID )
 					InterlockedAnd( u_Contrib[ ( uint )recordSlot + 2 ], ~SW_CONTRIB_POISON, pz3 );
 				}
 			}
-			int swCovR = 0;
-			[unroll] for( int cr = 0; cr < SW_SCAN_CHORDS; cr++ )
-			{
-				swCovR += SoftScan_PC( swGrid[cr] & swDiskMask[cr] );
-			}
+			float swCovR = SoftScan_ReduceCov( swGrid, swEnv, SW_SCAN_MASK );	// fractional endpoints (task #90)
 			if( swCovR * 100 >= swDiskBits * 99 )
 			{
 				swCovR = swDiskBits;			// plain-walk umbra rounding, matched exactly
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 ) );
+			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( SwHoistTerm( 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 ), swHoist ) );
 			return;
 		}
 		}	// keyLo != sentinel
@@ -1246,16 +1265,15 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// SW_SURF_GRID cached path: reads the per-chord grid PERSISTED in t_SurfGrid. The
 							// buffer element is SwGridWord too (softsurf_build writes the same width), so the
 							// cache tracks the live grid resolution automatically.
+								float2 swEnv[SW_SCAN_CHORDS];		// envelope required by the FillTri signature; grid-mode serve stays discrete (task #90 follow-up), so this is unused here
 							SwGridWord swGrid[SW_SCAN_CHORDS];
-							SwGridWord swDiskMask[SW_SCAN_CHORDS];
-							int  swDiskBits = 0;
+							const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array)
 							{
 								const uint gBaseR = slot * ( uint )SW_SCAN_CHORDS;
 								[unroll] for( int gr = 0; gr < SW_SCAN_CHORDS; gr++ )
 								{
 									swGrid[gr]     = t_SurfGrid[ gBaseR + gr ];
-									swDiskMask[gr] = SoftScan_Run( -SW_SCAN_HC[gr], SW_SCAN_HC[gr] );
-									swDiskBits    += SoftScan_PC( swDiskMask[gr] );
+										swEnv[gr]  = SwEnvZero();		// grid-mode static envelope not cached yet (task #90 follow-up); reduction stays discrete here
 								}
 							}
 #else
@@ -1293,7 +1311,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 										if( hCnt == SW_TILE_UMBRA )
 										{
 											SW_SURF_STAT( 0u );
-											u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;	// whole tile provably umbra (as the miss path)
+											u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );	// whole tile provably umbra (as the miss path)
 											return;
 										}
 										if( hCnt <= ( uint )g_flags.w )		// normal list (exclude spill/corrupt sentinels)
@@ -1330,10 +1348,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 								const int se = ( int )t_SoftTiles[ swHitListBase + ld ];
 								if( se < swHitDynTri ) { continue; }		// dynamic tris only (static already gridded)
 								const int bd = g_range.x + se * 3;
-								SoftScan_FillTri( swGrid, t_SoftEdges[ bd + 0 ].xyz, t_SoftEdges[ bd + 1 ].xyz, t_SoftEdges[ bd + 2 ].xyz, swP, swFP, swRP, SW_NEAR_EPS );
+								SoftScan_FillTri( swGrid, swEnv, t_SoftEdges[ bd + 0 ].xyz, t_SoftEdges[ bd + 1 ].xyz, t_SoftEdges[ bd + 2 ].xyz, swP, swFP, swRP, SW_NEAR_EPS );
 							}
 							int swCovG = 0;
-							[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCovG += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
+							[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCovG += SoftScan_PC( swGrid[cm] & SW_SCAN_MASK[cm] ); }
 							float swTermC = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovG / ( float )swDiskBits : 0.0 );
 #else
 							const float occEx = SoftShadow_FaceCoverageSurfResidual(
@@ -1363,7 +1381,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 								swTermC = 1.0f;		// COST-CLASS: hit -> full bright (non-hit classes tinted at the fall-through write)
 							}
 							SW_SURF_STAT( 0u );		// cached HIT
-							u_Term[ uint2( px + g_tile.zw ) ] = swTermC;
+							u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( swTermC, swHoist );
 							return;
 						}
 						if( code == 3u )
@@ -1448,9 +1466,12 @@ void main( uint3 tid : SV_DispatchThreadID )
 		{
 #if SW_GPU_WALK_COUNTERS
 			InterlockedAdd( u_WalkCnt[ 16 ], 1u );	// TILE-CLASS census: umbra-sentinel thread (zero walk iterations)
+			InterlockedAdd( u_WalkCnt[ 12 ], 1u );	// bucket: umbra fragment (sentinel exit never reaches a walker's
+													// flush; without this the buckets under-count slot 7 by exactly
+													// the sentinel threads and the lit/pen/umb split lies)
 #endif
 			// whole tile provably in umbra: the integral saturates to 1 for every receiver here
-			u_Term[ uint2( px + g_tile.zw ) ] = 0.0f;
+			u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );
 			return;
 		}
 		if( swCnt == SW_TILE_SPILL )
@@ -1493,5 +1514,5 @@ void main( uint3 tid : SV_DispatchThreadID )
 		return;
 	}
 #endif
-	u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( 1.0 - saturate( swOcc ) );
+	u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( SwHoistTerm( 1.0 - saturate( swOcc ), swHoist ) );
 }

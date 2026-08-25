@@ -6,8 +6,11 @@
 #define SOFTSCAN_WORD_INC
 
 #ifndef SW_SCAN_BITS
-	#define SW_SCAN_BITS 32		// 32 = uint (one word), 64 = uint2. With the exact-float endpoint path the
-	//							   bitmask is only a HOLE DETECTOR (topology), so 32 is enough and cheaper.
+	#define SW_SCAN_BITS 32		// 32 = uint (one word), 64 = uint2. With the fractional-envelope reduction
+	//							   the bitmask carries topology (holes) + the interior quantum; 64 was A/B'd
+	//							   against the gate corpus (2026-08-25) and bought only 3 of 176 defects while
+	//							   doubling the grid registers - the residual defects were detector artifacts
+	//							   (region-boundary statistics), fixed in GateGrain, gate 0 at 32.
 #endif
 
 #if SW_SCAN_BITS > 32

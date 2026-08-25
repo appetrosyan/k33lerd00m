@@ -363,8 +363,9 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 			idList<idVec4>& outTris, idList<idVec4>& outCasters, idList<idVec4>& outRecvTris,
 			int& outStaticCasters, int& outStaticTris, int& outRecvTriCount, uint64_t& outFingerprint );
 	extern uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraSize );
+	extern float R_SoftPenumbraRadius( const idRenderLightLocal* lightDef );	// per-light emitter radius (task #105)
 
-	const float penumbra = r_shadowPenumbraSize.GetFloat();
+	const float penumbra = R_SoftPenumbraRadius( light );
 
 	// CHEAP skip: static-set signature unchanged and this light is fully warm -> nothing to do (no
 	// face collection). This is what makes the per-light scan affordable.
