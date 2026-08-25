@@ -284,6 +284,12 @@ static bool R_SoftCasterIsStatic( const idRenderEntityLocal* entityDef, const vi
 			return false;
 		}
 	}
+	// BENCH REPLAY soup: classifies STATIC (DM_STATIC, never updated) - and since the task-#87
+	// stream alignment the WARM collectors ingest _softBenchCaster_* too (and honor
+	// r_softShadowBenchExcludeWorld), so the warm stream and the view's static prefix agree: a
+	// cache HIT serves the same geometry the view walks. (An interim fix forced the soup DYNAMIC,
+	// which zeroed every bench light's static count and disabled serving outright - the serve
+	// precondition is softStaticCasterCount > 0.)
 	// LINGER classification (r_softShadowContribLinger > 0): a light+entity pair unmodified for
 	// >= linger frames is cacheable regardless of movement history - the sticky lightHasMoved and
 	// the static-model-only rule capped the cacheable share at ~29% of the live stream while most

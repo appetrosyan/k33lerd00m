@@ -991,6 +991,44 @@ size (r_softShadowSurfCacheTexel). Depth cap guards degenerate/huge tris; any re
 still shed safely by the shader clamp.
 ====================
 */
+// WARM-DIAGNOSTIC counters (one-shot, task #87 "instrument the misses"): every rejection site in the
+// warm collector chain tallies here; WarmMapBurst resets before its light loop and prints ONE summary
+// line after (no per-frame streaming - burst-scoped only). Attributes "0 lights streamed" to its cause
+// instead of another read-the-code guess cycle.
+enum
+{
+	SWD_ENTERED = 0,	// R_BuildLightStaticSoftStream entered (past null/moved/penumbra)
+	SWD_MOVED,			// early-out: light NULL / lightHasMoved / penumbra<=0
+	SWD_INTER,			// interactions iterated
+	SWD_I_EMPTY,		// interaction empty / null entity
+	SWD_I_DEFER,		// deferred, not bench soup -> skipped
+	SWD_I_NOTSTREAM,	// entity neither world nor bench soup
+	SWD_I_NOSHADOW,		// entity noShadow / suppressShadowInLightID
+	SWD_I_HASSHAD,		// !HasShadows (non-deferred) -> skipped
+	SWD_I_SOUP,			// bench-soup entity accepted (deferred or not)
+	SWD_S_CULL,			// surface culled to light bounds
+	SWD_S_RECV,			// receiver tris emitted (count of tris)
+	SWD_S_CASTSKIP,		// surface skipped for casting (role or !SurfaceCastsShadow)
+	SWD_S_COLLECT0,		// R_CollectPenumbraFaces returned nothing
+	SWD_CASTERS,		// caster tris emitted (count of tris)
+	SWD_RET_FALSE,		// stream returned false (no casters collected)
+	SWD_COUNT
+};
+static uint32 s_swWarmDiag[SWD_COUNT];
+void R_SoftWarmDiagReset()
+{
+	memset( s_swWarmDiag, 0, sizeof( s_swWarmDiag ) );
+}
+void R_SoftWarmDiagPrint()
+{
+	common->Printf( "[softsurf] warm-diag: entered %u (moved/pen0 %u) | inter %u: empty %u defer %u notstream %u noshadow %u hasshad %u soup %u | surf: cull %u recvtris %u castskip %u collect0 %u | castertris %u ret-false %u\n",
+					s_swWarmDiag[SWD_ENTERED], s_swWarmDiag[SWD_MOVED], s_swWarmDiag[SWD_INTER],
+					s_swWarmDiag[SWD_I_EMPTY], s_swWarmDiag[SWD_I_DEFER], s_swWarmDiag[SWD_I_NOTSTREAM],
+					s_swWarmDiag[SWD_I_NOSHADOW], s_swWarmDiag[SWD_I_HASSHAD], s_swWarmDiag[SWD_I_SOUP],
+					s_swWarmDiag[SWD_S_CULL], s_swWarmDiag[SWD_S_RECV], s_swWarmDiag[SWD_S_CASTSKIP],
+					s_swWarmDiag[SWD_S_COLLECT0], s_swWarmDiag[SWD_CASTERS], s_swWarmDiag[SWD_RET_FALSE] );
+}
+
 static void R_SeedEmitRecvTri( idList<idVec4>& out, const idVec3& a, const idVec3& b, const idVec3& c,
 		float g, int depth )
 {
@@ -1003,8 +1041,10 @@ static void R_SeedEmitRecvTri( idList<idVec4>& out, const idVec3& a, const idVec
 	else				{ au = a.x; av = a.y; bu = b.x; bv = b.y; cu = c.x; cv = c.y; }
 	const float spanU = ( Max( au, Max( bu, cu ) ) - Min( au, Min( bu, cu ) ) ) / g;
 	const float spanV = ( Max( av, Max( bv, cv ) ) - Min( av, Min( bv, cv ) ) ) / g;
-	// subdivide to <=12 texels (SW_SEED_MAX_SPAN is 16) so the shader clamp never sheds coverage
-	if( depth < 6 && ( spanU > 12.0f || spanV > 12.0f ) )
+	// subdivide to <=96 texels (SW_SEED_MAX_SPAN is 128 since task #87) so the shader clamp never sheds
+	// coverage; the old <=12 split was sized for the span-16 clamp and cost up to 4096 sub-tris per big
+	// polygon at burst time for no coverage gain
+	if( depth < 6 && ( spanU > 96.0f || spanV > 96.0f ) )
 	{
 		const idVec3 ab = ( a + b ) * 0.5f, bc = ( b + c ) * 0.5f, ca = ( c + a ) * 0.5f;
 		R_SeedEmitRecvTri( out, a, ab, ca, g, depth + 1 );
@@ -1053,6 +1093,7 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 	outFingerprint = 0;
 	if( light == NULL || light->lightHasMoved || penumbraSize <= 0.0f )
 	{
+		s_swWarmDiag[SWD_MOVED]++;
 		return false;
 	}
 
@@ -1060,38 +1101,98 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 	extern idCVar r_softShadowSurfCacheTexel;
 	const float seedG = Max( 1.0f, ( float )r_softShadowSurfCacheTexel.GetInteger() );	// seed texel size
 	idList<int> staticEnts;
+	s_swWarmDiag[SWD_ENTERED]++;
+	// CANDIDATE SET = interaction-chain entities PLUS a direct sweep of bench-soup entityDefs.
+	// The soup x bench-light pairs sit PAST the interactionTable (the soup is spawned after
+	// GenerateAllInteractions), so the frontend gives them FRAME-TEMPORARY dynamic interactions that
+	// never persist in light->firstInteraction - a chain-based collector structurally cannot see them
+	// (warm-diag receipt: soup 0 with 27 soup entities present, castertris 0, ret-false 220). The
+	// direct sweep bypasses interactions entirely; the per-surface R_CullModelBoundsToLight below
+	// still scopes every soup entity to this light. In-game (no soup entities) the sweep matches
+	// nothing and the behavior is identical.
+	idList<const idRenderEntityLocal*> swEnts;
 	for( const idInteraction* inter = light->firstInteraction; inter != NULL; inter = inter->lightNext )
 	{
-		if( inter->IsEmpty() || inter->IsDeferred() || inter->entityDef == NULL )
+		s_swWarmDiag[SWD_INTER]++;
+		if( inter->IsEmpty() || inter->entityDef == NULL )
 		{
+			s_swWarmDiag[SWD_I_EMPTY]++;
 			continue;
 		}
-		const idRenderEntityLocal* ent = inter->entityDef;
+		if( inter->IsDeferred() )
+		{
+			s_swWarmDiag[SWD_I_DEFER]++;	// soup arrives via the direct sweep; deferred chains skip
+			continue;
+		}
+		if( !inter->HasShadows() )
+		{
+			s_swWarmDiag[SWD_I_HASSHAD]++;
+			continue;
+		}
+		swEnts.Append( inter->entityDef );
+	}
+	if( light->world != NULL )
+	{
+		for( int swSe = 0; swSe < light->world->entityDefs.Num(); swSe++ )
+		{
+			const idRenderEntityLocal* swSd = light->world->entityDefs[swSe];
+			if( swSd == NULL || swSd->parms.hModel == NULL
+					|| idStr::Cmpn( swSd->parms.hModel->Name(), "_softBenchCaster_", 17 ) != 0 )
+			{
+				continue;
+			}
+			s_swWarmDiag[SWD_I_SOUP]++;
+			swEnts.Append( swSd );
+		}
+	}
+	for( int swE = 0; swE < swEnts.Num(); swE++ )
+	{
+		const idRenderEntityLocal* ent = swEnts[swE];
 		const idRenderModel* model = ent->parms.hModel;
 		if( model == NULL || model->NumSurfaces() <= 0 )
 		{
+			s_swWarmDiag[SWD_I_EMPTY]++;
 			continue;
 		}
 		// WORLD-MODEL ONLY. Broadening to DM_STATIC was measured NET-NEGATIVE on the cinematic (moving
 		// props churned invalidations, hit 10%->2%) AND did not reduce never-seeded (97% unchanged), which
 		// proved the miss cause is cw-drift on angled receivers, not receiver-surface set. See [[grid-or-fold-study]].
-		if( !model->IsStaticWorldModel() )
+		// BENCH-SOUP exception (task #87 stream alignment), ROLE-SPLIT (the first cut skipped world
+		// entities wholesale under ExcludeWorld and cratered the cache to 0.0% hit / 100% empty-slot:
+		// the SEED claims RECEIVER texels, and the world is still the RECEIVER set even when the bench
+		// excludes it from CASTING - the crates cast, the floors receive). So: world participates
+		// ALWAYS (its receiver surfaces key the texels the serve probes); the soup participates as an
+		// immobile DM_STATIC caster+receiver; under r_softShadowBenchExcludeWorld the world's CASTER
+		// role alone is dropped. In-game (world-only, ExcludeWorld 0) is byte-identical.
+		const bool swIsWorld = model->IsStaticWorldModel();
+		const bool swBenchSoup = idStr::Cmpn( model->Name(), "_softBenchCaster_", 17 ) == 0;
+		bool swCastsRole = true;
 		{
-			continue;
+			extern idCVar r_softShadowBenchExcludeWorld;
+			if( !swIsWorld && !swBenchSoup )
+			{
+				s_swWarmDiag[SWD_I_NOTSTREAM]++;
+				continue;					// neither world nor bench soup: not part of the static stream
+			}
+			if( swBenchSoup )
+			{
+				s_swWarmDiag[SWD_I_SOUP]++;
+			}
+			if( swIsWorld && r_softShadowBenchExcludeWorld.GetBool() )
+			{
+				swCastsRole = false;		// world under bench exclusion: receiver-only
+			}
 		}
 		if( ent->parms.noShadow )
 		{
+			s_swWarmDiag[SWD_I_NOSHADOW]++;
 			continue;
 		}
 		if( ent->parms.suppressShadowInLightID && ent->parms.suppressShadowInLightID == light->parms.lightId )
 		{
+			s_swWarmDiag[SWD_I_NOSHADOW]++;
 			continue;
 		}
-		if( !inter->HasShadows() )
-		{
-			continue;
-		}
-
 		bool entContributed = false;
 		for( int c = 0; c < model->NumSurfaces(); c++ )
 		{
@@ -1109,6 +1210,7 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 			}
 			if( R_CullModelBoundsToLight( light, tri->bounds, ent->modelRenderMatrix ) )
 			{
+				s_swWarmDiag[SWD_S_CULL]++;
 				continue;	// this surface is outside the light volume (neither receives nor casts here)
 			}
 			// RECEIVER stream (for the prewarm SEED): the term reads the cache at RECEIVER fragments, so
@@ -1116,7 +1218,12 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 			// warm builds populated caster texels the receiver reads never hit (~0% cache hit). Emit this
 			// lit surface's world-space triangles independent of whether it casts; the build still walks
 			// only the casters collected below.
-			if( shader->ReceivesLighting() && tri->verts != NULL && tri->indexes != NULL )
+			// swBenchSoup: the reconstructed bench objects wear "_default", whose ReceivesLighting() is
+			// FALSE (all-ambient stages) - yet their pixels ARE probed by the term CS, so skipping them
+			// here left every soup-surface texel permanently unseeded (measured: recvtris constant
+			// 480,608 = world-only across caps with 106-229 spawned objects, the dominant empty-slot
+			// class on the heavy caps). In-game (no soup) this clause is dead.
+			if( ( shader->ReceivesLighting() || swBenchSoup ) && tri->verts != NULL && tri->indexes != NULL )
 			{
 				for( int i = 0; i + 3 <= tri->numIndexes; i += 3 )
 				{
@@ -1127,11 +1234,13 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 					// subdivide big receiver tris so the seed claims the WHOLE footprint, not a clamped corner
 					R_SeedEmitRecvTri( outRecvTris, w0, w1, w2, seedG, 0 );
 				}
+				s_swWarmDiag[SWD_S_RECV] += ( uint32 )( tri->numIndexes / 3 );
 			}
-			if( !shader->SurfaceCastsShadow() )
+			if( !swCastsRole || !shader->SurfaceCastsShadow() )
 			{
+				s_swWarmDiag[SWD_S_CASTSKIP]++;
 				continue;	// receivers are seeded above; only casters go into the walk stream
-			}
+			}				// (!swCastsRole: bench ExcludeWorld - the world receives but does not cast)
 
 			idVec4* faceElems = NULL;
 			int     nElems = 0;
@@ -1149,8 +1258,10 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 				{
 					Mem_Free( faceElems );
 				}
+				s_swWarmDiag[SWD_S_COLLECT0]++;
 				continue;
 			}
+			s_swWarmDiag[SWD_CASTERS] += ( uint32 )( nElems / 3 );
 
 			// per-surface caster record: world-space bounding sphere over its emitted verts
 			idVec3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
@@ -1185,6 +1296,7 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 	outRecvTriCount = outRecvTris.Num() / 3;
 	if( outStaticTris == 0 || outStaticCasters == 0 )
 	{
+		s_swWarmDiag[SWD_RET_FALSE]++;
 		return false;
 	}
 
@@ -1226,7 +1338,15 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 	idList<int> staticEnts;
 	for( const idInteraction* inter = light->firstInteraction; inter != NULL; inter = inter->lightNext )
 	{
-		if( inter->IsEmpty() || inter->IsDeferred() || inter->entityDef == NULL )
+		if( inter->IsEmpty() || inter->entityDef == NULL )
+		{
+			continue;
+		}
+		// deferred accepted for the bench soup only - MUST match R_BuildLightStaticSoftStream (see the
+		// enumeration-only rationale there) or the signature disagrees with the stream
+		if( inter->IsDeferred()
+				&& ( inter->entityDef->parms.hModel == NULL
+					 || idStr::Cmpn( inter->entityDef->parms.hModel->Name(), "_softBenchCaster_", 17 ) != 0 ) )
 		{
 			continue;
 		}
@@ -1236,9 +1356,16 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 		{
 			continue;
 		}
-		if( !model->IsStaticWorldModel() )		// MUST match R_BuildLightStaticSoftStream's gate
 		{
-			continue;
+			// MUST match R_BuildLightStaticSoftStream's gate (incl. the bench-soup / ExcludeWorld
+			// exception, task #87 stream alignment) or the signature disagrees with the stream and
+			// every warm skips/rebuilds spuriously.
+			extern idCVar r_softShadowBenchExcludeWorld;
+			const bool swBenchSoup = idStr::Cmpn( model->Name(), "_softBenchCaster_", 17 ) == 0;
+			if( model->IsStaticWorldModel() ? r_softShadowBenchExcludeWorld.GetBool() : !swBenchSoup )
+			{
+				continue;
+			}
 		}
 		if( ent->parms.noShadow )
 		{
@@ -1248,10 +1375,10 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 		{
 			continue;
 		}
-		if( !inter->HasShadows() )
+		if( !inter->IsDeferred() && !inter->HasShadows() )
 		{
-			continue;
-		}
+			continue;	// deferred (bench-soup) interactions have no computed shadow state yet - HasShadows()
+		}				// is meaningless there; the surface-level SurfaceCastsShadow gate below still applies
 		bool casts = false;
 		for( int c = 0; c < model->NumSurfaces() && !casts; c++ )
 		{
