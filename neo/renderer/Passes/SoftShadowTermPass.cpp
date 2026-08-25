@@ -39,6 +39,7 @@ struct SoftTermCB
 	int		surfA[4];		// surface-fold cache: table cap (slots), queue cap (uints), static caster count, light key
 	float	aa[4];			// x = r_softShadowAA per-sample analytic-AA half-width (0 = off); y/z/w unused
 	int		surfCost[4];	// x = surf-cache cost gate (r_softShadowSurfCacheMinCost): min tile occluders to cache
+	float	misc[4];		// x = r_softShadowMinDnRatio: projection dn-clamp (grazing grain fix)
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -90,7 +91,13 @@ void SoftShadowTermPass::EnsurePipeline()
 	const int sv = r_softShadowSamples.GetInteger();
 	m_BuiltSamples = ( sv == 8 || sv == 32 ) ? sv : 16;
 	const char* samplesStr = ( m_BuiltSamples == 8 ) ? "8" : ( ( m_BuiltSamples == 32 ) ? "32" : "16" );
-	const idStr sfx = idStr( "s" ) + samplesStr;
+	// SW_SCAN_CHORDS permutation (r_softShadowScanChords): Fubini penumbra chord count. Distinct
+	// nameOutSuffix per chord count (FindShader dedups by name+suffix, ignores macros - see samples).
+	extern idCVar r_softShadowScanChords;
+	const int cv = r_softShadowScanChords.GetInteger();
+	m_BuiltChords = ( cv == 4 || cv == 8 || cv == 32 ) ? cv : 16;
+	const char* chordsStr = ( m_BuiltChords == 4 ) ? "4" : ( ( m_BuiltChords == 8 ) ? "8" : ( ( m_BuiltChords == 32 ) ? "32" : "16" ) );
+	const idStr sfx = idStr( "s" ) + samplesStr + "c" + chordsStr;
 
 	idList<shaderMacro_t> macros;
 	macros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// shipped permutation (must be explicit now the cfg declares {0,1})
@@ -99,6 +106,7 @@ void SoftShadowTermPass::EnsurePipeline()
 	macros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );			// and the scanline axis
 	macros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );		// and the contributor-cache axis
 	macros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		macros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, sfx.c_str(), macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
 	{
@@ -140,6 +148,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		cntMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		cntMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
 		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
 		// blob path (LoadShader keys the .bin on shader.name only) - it forces a separate entry whose
@@ -177,6 +186,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		surfMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		surfMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		m_ShaderSurf = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfcache" ) + sfx ).c_str(), surfMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderSurf != nullptr )
 		{
@@ -205,6 +215,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		gridMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
 		gridMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		gridMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		gridMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		swTermGrid().shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfgrid" ) + sfx ).c_str(), gridMacros, true, LAYOUT_DRAW_VERT ) );
 		if( swTermGrid().shader != nullptr && m_LayoutSurf != nullptr )
 		{
@@ -229,6 +240,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		scanMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
 		scanMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		scanMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		scanMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		m_ShaderScan = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "scanline" ) + sfx ).c_str(), scanMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderScan != nullptr )
 		{
@@ -251,6 +263,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		conMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
 		conMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "1" ) );
 		conMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		conMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		m_ShaderContrib = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "contrib" ) + sfx ).c_str(), conMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderContrib != nullptr )
 		{
@@ -335,9 +348,12 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 	// toggle). Nulling the handles + m_PipelineTried forces EnsurePipeline to recompile the count variant.
 	{
 		extern idCVar r_softShadowSamples;
+		extern idCVar r_softShadowScanChords;
 		const int sv = r_softShadowSamples.GetInteger();
 		const int want = ( sv == 8 || sv == 32 ) ? sv : 16;
-		if( m_BuiltSamples != 0 && m_BuiltSamples != want )
+		const int cvc = r_softShadowScanChords.GetInteger();
+		const int wantC = ( cvc == 4 || cvc == 8 || cvc == 32 ) ? cvc : 16;
+		if( ( m_BuiltSamples != 0 && m_BuiltSamples != want ) || ( m_BuiltChords != 0 && m_BuiltChords != wantC ) )
 		{
 			m_PipelineTried = false;
 			m_Pipeline = m_PipelineCnt = m_PipelineSurf = m_PipelineScan = m_PipelineContrib = swTermGrid().pipeline = nullptr;
@@ -532,9 +548,19 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// EXPENSIVE lights. A cheap light gains nothing from the cache but still pays the tax, so route it to the
 	// shipped (cheap) pipeline instead - we don't pay the permutation cost where it can't be recouped. Gate on
 	// the light's STATIC caster count (what the cache removes). 0 = off (every warmed light uses surf).
+	// PLAYER-PROXIMITY exactness (r_softShadowNearRadius): a light near the view origin is forced off
+	// every cache (contrib + surf) onto the plain exact scanline atlas fill. The caches can serve a
+	// stale/under-covered union on a moving camera (the "area fully lit / skipped shadow" defect); the
+	// atlas walk is always exact and, if the atlas overflows, the in-shader integral is exact too - so a
+	// near light can never be starved. Far lights keep the cache. 0 = off.
+	extern idCVar r_softShadowNearRadius;
+	const float swNearR = r_softShadowNearRadius.GetFloat();
+	const bool nearPlayer = ( swNearR > 0.0f ) && ( vLight != NULL ) &&
+							( ( vLight->globalLightOrigin - viewDef->renderView.vieworg ).LengthSqr() <= swNearR * swNearR );
 	extern idCVar r_softShadowSurfCacheMinLight;
 	const int swLightStatic = ( vLight != NULL ) ? vLight->softStaticCasterCount : 0;
 	const bool surf = ( surfCache != NULL ) && surfCache->IsActive() && m_PipelineSurf != nullptr && !m_WalkCntEnabled
+					  && !nearPlayer
 					  && swLightStatic >= r_softShadowSurfCacheMinLight.GetInteger();
 	// FUBINI SCANLINE (r_softShadowScanline): replaces the sampled walk with the interval bit-grid. Loses to
 	// the counting (measurement) and surf-cache permutations; A/B lever against the shipped 16-sample path.
@@ -549,6 +575,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// but the invalidation bookkeeping lives on the ALWAYS-constructed global cache object
 	SoftShadowSurfCache* swGenSrc = ( surfCache != NULL ) ? surfCache : backEnd.GetSoftShadowSurfCache();
 	const bool contrib = r_softShadowContribCache.GetBool() && scan && m_PipelineContrib != nullptr
+						 && !nearPlayer
 						 && m_ContribBuffer != nullptr && vLight->softStaticCasterCount > 0
 						 && vLight->lightDef != NULL && swGenSrc != NULL;
 	// SURF-CACHE GRID (r_softShadowSurfCacheGrid): route the cached-hit path to the Fubini bit-grid pipeline.
@@ -560,8 +587,9 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.surfParams[0] = 0.0f;
 	cb.surfParams[1] = 0.0f;
 	// z = intensity lit early-out threshold: skip the walk where the light's falloff*projection is
-	// below this (-> term 1.0), cutting the far penumbra the light barely reaches. 0 = exact.
-	cb.surfParams[2] = r_softShadowLitEarlyOut.GetFloat();
+	// below this (-> term 1.0), cutting the far penumbra the light barely reaches. 0 = exact. Forced
+	// exact (0) for near-player lights so the guarantee can never blank their far penumbra.
+	cb.surfParams[2] = nearPlayer ? 0.0f : r_softShadowLitEarlyOut.GetFloat();
 	// w = rotation-hash world grid: snap swP to this grid before the sample-rotation hash so TAA
 	// jitter can't flip the 1/16 quantum per frame (temporal-stability fix). 0 = exact per-position.
 	cb.surfParams[3] = r_softShadowRotGrid.GetFloat();
@@ -572,7 +600,13 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.surfCost[0] = r_softShadowSurfCacheMinCost.GetInteger();	// cost gate: min tile occluders to engage the cache
 	extern idCVar r_softShadowCullBeforeLoad;
 	cb.surfCost[1] = r_softShadowCullBeforeLoad.GetBool() ? 1 : 0;	// cull-before-load runtime toggle (walk reads g_surfCost.y)
-	cb.surfCost[2] = cb.surfCost[3] = 0;
+	extern idCVar r_softShadowTermLevels;
+	cb.surfCost[2] = r_softShadowTermLevels.GetInteger();	// DIAGNOSTIC: quantize the stored term to N levels (0 = off)
+	extern idCVar r_softShadowScanRotate;
+	cb.surfCost[3] = r_softShadowScanRotate.GetInteger();	// GATE POSITIVE CONTROL: 1 re-injects the scanline rotation grain (ants) so GateGrain can be validated
+	extern idCVar r_softShadowMinDnRatio;
+	cb.misc[0] = r_softShadowMinDnRatio.GetFloat();			// projection dn-clamp: grazing-grain fix (distPL/dn near-contact amplification)
+	cb.misc[1] = cb.misc[2] = cb.misc[3] = 0.0f;
 	cb.surfA[0] = 0;
 	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
 	if( surf )

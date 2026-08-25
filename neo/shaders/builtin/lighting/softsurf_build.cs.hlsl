@@ -51,7 +51,7 @@ RWStructuredBuffer<uint>	u_SurfTable	: register( u0 );	// texel records, 8 uints
 // GRID mode reuses register u1 (the residual pool is unused in grid mode) for the parallel Fubini grid
 // buffer - so the binding LAYOUT is identical to the scalar build (u0 table, u1, u2 queue), nothing to
 // strip/desync. SW_SCAN_CHORDS words per slot.
-RWStructuredBuffer<uint>	u_SurfGrid	: register( u1 );
+RWStructuredBuffer<SwGridWord>	u_SurfGrid	: register( u1 );	// per-chord grid word (uint or uint2, see SW_SCAN_BITS)
 #else
 RWStructuredBuffer<uint>	u_SurfPool	: register( u1 );	// [0] alloc counter, then residual tri indices
 #endif
@@ -233,8 +233,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// fixed-size and represents umbra/silhouette/tilt directly, so a claimed slot is ALWAYS kept (BUILT).
 	// The term reads this grid and ORs it with the fragment's live dynamic grid (softterm.cs SW_SURF_GRID).
 	{
-		uint swGrid[SW_SCAN_CHORDS];
-		[unroll] for( int gz = 0; gz < SW_SCAN_CHORDS; gz++ ) { swGrid[gz] = 0u; }
+		SwGridWord swGrid[SW_SCAN_CHORDS];
+		[unroll] for( int gz = 0; gz < SW_SCAN_CHORDS; gz++ ) { swGrid[gz] = SwGridZero(); }
 		const softFrame_t frG = SoftShadow_Frame( Pc, swL );
 		const float sinAG = saturate( swR / frG.distPL );
 		const float cosAG = sqrt( 1.0f - sinAG * sinAG );
@@ -257,7 +257,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const float3 v0 = t_SoftEdges[ bG + 0 ].xyz;
 				const float3 v1 = t_SoftEdges[ bG + 1 ].xyz;
 				const float3 v2 = t_SoftEdges[ bG + 2 ].xyz;
-				SoftScan_FillTri( swGrid, v0, v1, v2, Pc, frG, swR, epsG );	// OR the tri's bit-runs in
+				SoftScan_FillTri( swGrid, v0, v1, v2, Pc, frG, swR, epsG );	// OR the tri's bit-runs in (topology only)
 				gridFold++;
 			}
 		}

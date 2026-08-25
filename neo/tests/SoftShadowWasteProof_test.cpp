@@ -49,6 +49,7 @@ version. See <http://www.gnu.org/licenses/>.
 // the namespace keeps the two variants from colliding (no ODR violation). The SW_ATTRIB globals the
 // include declares extern are defined inside the namespace below.
 #define SW_SCANLINE 1
+#define SW_SCAN_BITS 32			// this CPU emulation uses uint32_t grids; pin the word to 32-bit (SwGridWord = uint). The algorithm is width-agnostic; the GPU ships 64-bit. See softscan_word.inc.hlsl.
 #define inout						// HLSL inout on FillTri's grid param: C++ array params decay to pointers, so mutation semantics match
 namespace swproof
 {

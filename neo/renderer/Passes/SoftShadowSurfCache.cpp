@@ -233,13 +233,15 @@ bool SoftShadowSurfCache::EnsureResources()
 		bd.debugName = "SoftShadowSurfCache/Queue";
 		m_Queue = m_Device->createBuffer( bd );
 
-		// GRID mode: parallel per-slot Fubini bit-grid (SW_SCAN_CHORDS = 8 uints/slot), allocated only when
-		// r_softShadowSurfCacheGrid is set. The scalar path never touches it. Written by the grid build
-		// (u3), read by the surfgrid term (t7). No clear needed: the build writes the grid before marking
-		// the slot BUILT, and the term reads it only for BUILT slots.
+		// GRID mode: parallel per-slot Fubini bit-grid, allocated only when r_softShadowSurfCacheGrid is
+		// set. The scalar path never touches it. Written by the grid build (u3), read by the surfgrid term
+		// (t7). No clear needed: the build writes the grid before marking the slot BUILT, and the term
+		// reads it only for BUILT slots. SIZED for the MAX config the shader can compile: SW_SCAN_CHORDS up
+		// to 32 x SwGridWord up to uint2 (2 words). The shader indexes at its COMPILED chord stride, so a
+		// larger allocation only leaves unused tail - never an overflow.
 		if( grid && swGrid().pipeline != nullptr )
 		{
-			bd.byteSize = ( uint64_t )m_TableCap * 8 * sizeof( uint32_t );
+			bd.byteSize = ( uint64_t )m_TableCap * 32 /*max chords*/ * 2 /*max words (uint2)*/ * sizeof( uint32_t );
 			bd.debugName = "SoftShadowSurfCache/Grid";
 			swGrid().buffer = m_Device->createBuffer( bd );
 			swGrid().bufferCap = m_TableCap;

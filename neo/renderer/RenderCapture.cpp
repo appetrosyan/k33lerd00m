@@ -2998,6 +2998,10 @@ int R_SoftShadowGate( const char* arg )
 						return GateTruthVisibility( idVec3( wp[0], wp[1], wp[2] ), gLightOrg, diskR, cap, li );
 					};
 					GateAgreement( anaA, rt, valid, cfg, defects, &defectPx, &crease, truthAt );
+					// HIGH-FREQUENCY GRAIN ("ants"): a frequency test, not a value diff - flag analytic
+					// high-pass energy where the denoised (high-ray-equivalent) RT is flat. Catches the
+					// spatially-stable scanline speckle the value-based agreement judge is blind to.
+					GateGrain( anaA, rt, valid, &crease, cfg, defects );
 				}
 
 				// continuity needs the capture matrices to hold for THIS render: unproject->reproject

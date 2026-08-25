@@ -58,6 +58,11 @@ inline float max( float a, float b ) { if( a != a ) { return b; } if( b != b ) {
 inline float min( float a, float b ) { if( a != a ) { return b; } if( b != b ) { return a; } return a < b ? a : b; }
 inline int   max( int a, int b ) { return a > b ? a : b; }
 inline int   min( int a, int b ) { return a < b ? a : b; }
+inline float clamp( float x, float lo, float hi ) { return min( max( x, lo ), hi ); }
+// HLSL bit intrinsics used by SwGridContig (SoftShadowGate exact-coverage reduction). Return the 0-based
+// bit position (from LSB) of the lowest / highest set bit; -1 if none (callers guard the zero case).
+inline int firstbitlow( unsigned int x )  { if( x == 0u ) { return -1; } int i = 0; while( !( x & 1u ) ) { x >>= 1; i++; } return i; }
+inline int firstbithigh( unsigned int x ) { if( x == 0u ) { return -1; } int i = -1; while( x ) { x >>= 1; i++; } return i; }
 inline float abs( float x ) { return x < 0.0f ? -x : x; }
 inline float sqrt( float x ) { return std::sqrt( x ); }
 inline float atan2( float y, float x ) { return std::atan2( y, x ); }
@@ -87,5 +92,8 @@ struct SoftTileBuffer
 	unsigned int operator[]( int i ) const { return p[i]; }
 };
 typedef unsigned int uint;
+// minimal uint2 so the SwGridWord typedef (softscan_word.inc.hlsl) parses on the CPU test shim. The
+// scanline grid code that operates on it is under #if SW_SCANLINE (GPU-only), so no ops are needed here.
+struct uint2 { uint x, y; uint2() : x( 0 ), y( 0 ) {} uint2( uint X, uint Y ) : x( X ), y( Y ) {} };
 
 #endif // __HLSL_COMPAT_H__

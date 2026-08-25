@@ -13,6 +13,8 @@ the Free Software Foundation, either version 3 of the License, or
 ===========================================================================
 */
 
+#include "softscan_word.inc.hlsl"		// SW_SCAN_BITS + SwGridWord typedef (the SoftScan_* helpers build on it)
+
 // Analytic soft shadows by LIGHT-DISK COVERAGE. From the receiver, the caster's silhouette loop projects
 // onto the area light's disk; the occluded fraction is area( disk INTERSECT projected-silhouette ) / area.
 // That is a signed sum of per-edge circle-triangle areas around the loop: it is winding-correct, so it is
@@ -298,10 +300,19 @@ SW_FUNC softFrame_t SoftShadow_Frame( float3 swP, float3 swL )
 	return f;
 }
 
+// PROJECTION dn-CLAMP ratio (grazing-grain fix, r_softShadowMinDnRatio). distPL/dn amplifies near-contact
+// occluders (small dn): the projected-position swP-gradient grows ~1/dn^2, so on a grazing receiver those
+// occluders' projected intervals swing incoherently per pixel = real high-frequency coverage the exact
+// scanline resolves as grain (the 16-sample path averages it away). Clamping dn to a min fraction of
+// distPL caps the amplification. Small approximation (softens only the sharpest contact hardening), so it
+// is RUNTIME-toggle-able: each pass's main() writes this static from its cvar BEFORE the walk; 0 = exact
+// (default here, so any path that does not set it stays lossless). HLSL statics are per-invocation mutable.
+static float g_swMinDnR = 0.0f;
 // central projection of a receiver-relative point onto the light plane (depth dn along nrm precomputed)
 SW_FUNC float2 SoftShadow_ProjectVert( float3 rel, float dn, softFrame_t f )
 {
-	return float2( ( f.distPL / dn ) * dot( rel, f.u ), ( f.distPL / dn ) * dot( rel, f.v ) );
+	float dnc = max( dn, f.distPL * g_swMinDnR );
+	return float2( ( f.distPL / dnc ) * dot( rel, f.u ), ( f.distPL / dnc ) * dot( rel, f.v ) );
 }
 
 // caster bounding-sphere cull: wholly behind the receiver, wholly beyond the light, or (when fully in
@@ -754,30 +765,117 @@ SW_FUNC int SoftPopcount32( uint x )
 	#define SW_SCANLINE 0
 #endif
 #if SW_SCANLINE
-#define SW_SCAN_CHORDS 8
-#define SW_SCAN_BITS   32
+// CHORD COUNT (r_softShadowScanChords, SW_SCAN_CHORDS permutation): the number of horizontal chords
+// the Fubini grid discretises the light disk into. This is the penumbra LEVEL count along the chord
+// axis - too few chords terraces the penumbra (playtest banding, worst at the sparse extreme chords).
+// Quality lever: 4 = coarse (validates the banding by worsening it), 16 = default, 32 = visually lossless.
+#ifndef SW_SCAN_CHORDS
+	#define SW_SCAN_CHORDS 16
+#endif
+// X-AXIS RESOLUTION: columns per chord. The occluder run endpoints quantize to this grid; too few
+// columns terraces the coverage VALUE as endpoints snap (the residual scanline "ants" grain + banding,
+// measured chord-count-INVARIANT so it is purely this X quantum). Grain amplitude ~ 1/SW_SCAN_BITS per
+// endpoint. The grid is a per-chord bit-run union, so the width IS the coverage precision floor.
+// SW_SCAN_BITS is the SINGLE switch (in softscan_word.inc.hlsl, included above): 32 -> uint word (the
+// historical grid), 64 -> uint2 (halves the quantum). SwGridWord is the typedef; the helpers below build
+// on it plus SoftPopcount32. Reverting is one line in softscan_word.inc.hlsl.
+#if SW_SCAN_BITS > 32
+SW_FUNC uint SoftScan_PC( SwGridWord g )       { return SoftPopcount32( g.x ) + SoftPopcount32( g.y ); }
+SW_FUNC SwGridWord SwGridZero()                { return uint2( 0u, 0u ); }
+SW_FUNC bool SwGridHas( SwGridWord g, SwGridWord run ) { return !any( ( g & run ) != run ); }	// g contains run
+SW_FUNC bool SwGridNZ( SwGridWord g )          { return any( g != uint2( 0u, 0u ) ); }			// any bit set
+// set bits form ONE contiguous run (no interior hole): popcount == span from lowest to highest set bit.
+SW_FUNC bool SwGridContig( SwGridWord g )
+{
+	if( !SwGridNZ( g ) ) { return true; }
+	uint lo = ( g.x != 0u ) ? ( uint )firstbitlow( g.x )  : ( 32u + ( uint )firstbitlow( g.y ) );
+	uint hi = ( g.y != 0u ) ? ( 32u + ( uint )firstbithigh( g.y ) ) : ( uint )firstbithigh( g.x );
+	return SoftScan_PC( g ) == ( int )( hi - lo + 1u );
+}
+SW_FUNC uint SwGridSpan( SwGridWord g )
+{
+	if( !SwGridNZ( g ) ) { return 0u; }
+	uint lo = ( g.x != 0u ) ? ( uint )firstbitlow( g.x )  : ( 32u + ( uint )firstbitlow( g.y ) );
+	uint hi = ( g.y != 0u ) ? ( 32u + ( uint )firstbithigh( g.y ) ) : ( uint )firstbithigh( g.x );
+	return hi - lo + 1u;
+}
+#else
+SW_FUNC uint SoftScan_PC( SwGridWord g )       { return SoftPopcount32( g ); }
+SW_FUNC SwGridWord SwGridZero()                { return 0u; }
+SW_FUNC bool SwGridHas( SwGridWord g, SwGridWord run ) { return ( g & run ) == run; }
+SW_FUNC bool SwGridNZ( SwGridWord g )          { return g != 0u; }
+SW_FUNC bool SwGridContig( SwGridWord g )
+{
+	if( g == 0u ) { return true; }
+	uint lo = ( uint )firstbitlow( g ), hi = ( uint )firstbithigh( g );
+	return SoftScan_PC( g ) == ( int )( hi - lo + 1u );
+}
+// column span from lowest to highest set bit (>= popcount; equal iff contiguous).
+SW_FUNC uint SwGridSpan( SwGridWord g )
+{
+	if( g == 0u ) { return 0u; }
+	return ( uint )firstbithigh( g ) - ( uint )firstbitlow( g ) + 1u;
+}
+#endif
 // unit-disk half-chord widths: hc_m = sqrt( 1 - y_m^2 ), y_m = -1 + (m+0.5)*(2/SW_SCAN_CHORDS)
-static const float SW_SCAN_HC[SW_SCAN_CHORDS] =
+#if SW_SCAN_CHORDS == 4
+static const float SW_SCAN_HC[4] =
+{
+	0.66143783f, 0.96824584f, 0.96824584f, 0.66143783f,
+};
+#elif SW_SCAN_CHORDS == 32
+static const float SW_SCAN_HC[32] =
+{
+	0.24803919f, 0.42274216f, 0.53673638f, 0.62421826f,
+	0.69526861f, 0.75454353f, 0.80464957f, 0.84721511f,
+	0.88333088f, 0.91376197f, 0.93906120f, 0.95963453f,
+	0.97578094f, 0.98771754f, 0.99559577f, 0.99951160f,
+	0.99951160f, 0.99559577f, 0.98771754f, 0.97578094f,
+	0.95963453f, 0.93906120f, 0.91376197f, 0.88333088f,
+	0.84721511f, 0.80464957f, 0.75454353f, 0.69526861f,
+	0.62421826f, 0.53673638f, 0.42274216f, 0.24803919f,
+};
+#elif SW_SCAN_CHORDS == 16
+static const float SW_SCAN_HC[16] =
+{
+	0.34798527f, 0.58296119f, 0.72618438f, 0.82679728f,
+	0.89921841f, 0.94991776f, 0.98226460f, 0.99804496f,
+	0.99804496f, 0.98226460f, 0.94991776f, 0.89921841f,
+	0.82679728f, 0.72618438f, 0.58296119f, 0.34798527f,
+};
+#else
+static const float SW_SCAN_HC[8] =
 {
 	0.48412292f, 0.78062475f, 0.92696970f, 0.99215674f,
 	0.99215674f, 0.92696970f, 0.78062475f, 0.48412292f,
 };
-// [aN,bN] in disk-normalised [-1,1] -> a contiguous 32-bit column run (empty if b<a)
-SW_FUNC uint SoftScan_Run( float aN, float bN )
+#endif
+// [aN,bN] in disk-normalised [-1,1] -> a contiguous run of set columns across SW_SCAN_BITS columns,
+// packed one bit per column into SwGridWord (64-bit: word .x = columns 0..31, .y = 32..63). Empty if b<a.
+SW_FUNC SwGridWord SoftScan_Run( float aN, float bN )
 {
 	int c0 = ( int )floor( ( aN + 1.0f ) * ( 0.5f * SW_SCAN_BITS ) );
 	int c1 = ( int )ceil( ( bN + 1.0f ) * ( 0.5f * SW_SCAN_BITS ) ) - 1;
 	c0 = max( c0, 0 );
 	c1 = min( c1, SW_SCAN_BITS - 1 );
-	if( c1 < c0 ) { return 0u; }
+	if( c1 < c0 ) { return SwGridZero(); }
+#if SW_SCAN_BITS > 32
+	uint2 r = uint2( 0u, 0u );
+	int l0 = max( c0, 0 ), l1 = min( c1, 31 );				// low word: columns 0..31
+	if( l1 >= l0 ) { uint w = ( uint )( l1 - l0 + 1 ); r.x = ( w >= 32u ) ? 0xffffffffu : ( ( ( 1u << w ) - 1u ) << ( uint )l0 ); }
+	int h0 = max( c0 - 32, 0 ), h1 = min( c1 - 32, 31 );	// high word: columns 32..63
+	if( h1 >= h0 ) { uint w = ( uint )( h1 - h0 + 1 ); r.y = ( w >= 32u ) ? 0xffffffffu : ( ( ( 1u << w ) - 1u ) << ( uint )h0 ); }
+	return r;
+#else
 	uint w = ( uint )( c1 - c0 + 1 );
 	return ( w >= 32u ) ? 0xffffffffu : ( ( ( 1u << w ) - 1u ) << ( uint )c0 );
+#endif
 }
 // project a SLAB-clipped triangle to the UNIT light disk and OR its per-chord bit-run into swGrid. The
 // run is raw (disk-bbox columns [0,31]); the circular disk mask is applied ONCE at reduction, not per
 // triangle. Only the chords the triangle's projected y-extent spans are touched (most triangles cover a
 // couple of chords), which is the bulk of the per-triangle saving over walking all SW_SCAN_CHORDS.
-SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, float3 v1, float3 v2,
+SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 v0, float3 v1, float3 v2,
 		float3 swP, softFrame_t swF, float swR, float swEps )
 {
 	float3 rel[3]; float dn[3];
@@ -836,9 +934,9 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 	// already set (redundant) - this catches those, the bulk of the 44 ms chord-sweep mass. Operates on the
 	// RAW grid (pre-disk-mask): raw coverage unchanged => popcount( grid & diskMask ) is bit-identical.
 	{
-		uint bboxRun = SoftScan_Run( xmin, xmax );
+		SwGridWord bboxRun = SoftScan_Run( xmin, xmax );
 		bool newBits = false;
-		for( int mc = mLo; mc <= mHi; mc++ ) { if( ( swGrid[mc] & bboxRun ) != bboxRun ) { newBits = true; break; } }
+		for( int mc = mLo; mc <= mHi; mc++ ) { if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; break; } }
 		if( !newBits ) { return; }
 	}
 	// per-edge line params hoisted OUT of the chord loop: the reciprocal 1/(B.y-A.y) is the expensive
@@ -863,9 +961,16 @@ SW_FUNC void SoftScan_FillTri( inout uint swGrid[SW_SCAN_CHORDS], float3 v0, flo
 				xlo = min( xlo, x ); xhi = max( xhi, x ); any = true;
 			}
 		}
-		if( any ) { swGrid[m] |= SoftScan_Run( xlo, xhi ); }
+		if( any )
+		{
+			swGrid[m] |= SoftScan_Run( xlo, xhi );
+		}
 	}
 }
+
+// TOPOLOGY-ONLY fill: for callers that use the grid for SET membership (contrib-cache contribution
+// tests, the surf-grid build/serve) and reduce by popcount, not the exact-length coverage. Discards the
+// exact edges so the call site needs no throwaway arrays.
 #endif // SW_SCANLINE
 
 #ifndef SW_FACE_SAMPLES
@@ -1088,10 +1193,10 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 	// budget in a contended frame (many soft lights: cutscene closeups) fell back here, so the
 	// frame mixed exact interval unions with sampled coverage - the playtest-visible "ants" that
 	// the per-light gate (which never contends) structurally cannot reproduce.
-	uint swGrid[SW_SCAN_CHORDS];
-	uint swDiskMask[SW_SCAN_CHORDS];
+	SwGridWord swGrid[SW_SCAN_CHORDS];
+	SwGridWord swDiskMask[SW_SCAN_CHORDS];
 	int  swDiskBits = 0;
-	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = 0u; swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftPopcount32( swDiskMask[gi] ); }
+	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftScan_PC( swDiskMask[gi] ); }
 #endif
 	SW_BKT_DECL
 #if SW_FACE_PROFILE
@@ -1170,7 +1275,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			{
 				// UMBRA EARLY-OUT + rounding, identical to the tile-list/cluster scanline walkers
 				int swCovE = 0;
-				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] ); }
 				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 			}
 #else
@@ -1220,10 +1325,12 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 	}
 #if SW_SCANLINE
 	{
-		int swCovF = 0;
-		for( int cmf = 0; cmf < SW_SCAN_CHORDS; cmf++ ) { swCovF += SoftPopcount32( swGrid[cmf] & swDiskMask[cmf] ); }
 		SW_BKT_FLUSH( swMask, swAll );
-		return swDiskBits > 0 ? ( float )swCovF / ( float )swDiskBits : 0.0f;
+		{
+		int swCov = 0;
+		SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
+		return swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0f;
+	}
 	}
 #endif
 	// Morphological CLOSE: seal INTERIOR tessellation cracks without touching the penumbra. A sample ray that
@@ -1363,10 +1470,10 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 	uint swMask = 0u;
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
 #if SW_SCANLINE
-	uint swGrid[SW_SCAN_CHORDS];			// Fubini scanline grid: SW_SCAN_CHORDS chords x 32 bits, OR-unioned
-	uint swDiskMask[SW_SCAN_CHORDS];		// circular disk mask per chord (fragment-invariant, hoisted)
+	SwGridWord swGrid[SW_SCAN_CHORDS];			// Fubini scanline grid: SW_SCAN_CHORDS chords x 32 bits, OR-unioned
+	SwGridWord swDiskMask[SW_SCAN_CHORDS];		// circular disk mask per chord (fragment-invariant, hoisted)
 	int  swDiskBits = 0;
-	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = 0u; swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftPopcount32( swDiskMask[gi] ); }
+	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftScan_PC( swDiskMask[gi] ); }
 #endif
 	SW_BKT_DECL
 #if SW_LIT_EARLYOUT
@@ -1476,7 +1583,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 #if SW_SCANLINE
 		SoftScan_FillTri( swGrid, v0, v1, v2, swP, swF, swR, swEps );	// Fubini: fill interval bit-runs, union by OR
 #if SW_FACE_PROFILE == 3
-		swProbe += ( float )swGrid[0];	// TIMING PROBE: walk + cull + SoftScan_FillTri, skip the umbra-check
+		swProbe += ( float )SoftScan_PC( swGrid[0] );	// TIMING PROBE: walk + cull + SoftScan_FillTri, skip the umbra-check
 		continue;
 #endif
 		{															// UMBRA EARLY-OUT (coverage threshold, not all-bits-exact)
@@ -1489,7 +1596,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			// >=99%-occluded fragment to exact umbra (return 1) - the <1% residual is discretisation noise and
 			// reads as black regardless, so the visible penumbra gradient is untouched.
 			int swCovE = 0;
-			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
+			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] ); }
 			if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 		}
 #else
@@ -1537,9 +1644,11 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 	// Fubini coverage from the OR-unioned interval grid; no morphological crack-close (interval fill leaves
 	// no interior sample gaps, unlike point sampling).
 	SW_BKT_FLUSH( swMask, swAll );
-	int swCov = 0;
-	for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCov += SoftPopcount32( swGrid[cm] & swDiskMask[cm] ); }
-	return swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0f;
+	{
+		int swCov = 0;
+		SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
+		return swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0f;
+	}
 #else
 	if( swMask != 0u && swMask != swAll )
 	{
@@ -1986,10 +2095,10 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 	// walker (SW_SCANLINE there). Before this, spill fragments stayed on 16-sample coverage while
 	// listed fragments ran the scanline: two algorithms in one frame (and the contributor cache's
 	// scanline serve measured 15.7% term mismatches against the sampled spill reference).
-	uint swGrid[SW_SCAN_CHORDS];
-	uint swDiskMask[SW_SCAN_CHORDS];
+	SwGridWord swGrid[SW_SCAN_CHORDS];
+	SwGridWord swDiskMask[SW_SCAN_CHORDS];
 	int  swDiskBits = 0;
-	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = 0u; swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftPopcount32( swDiskMask[gi] ); }
+	for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swDiskMask[gi] = SoftScan_Run( -SW_SCAN_HC[gi], SW_SCAN_HC[gi] ); swDiskBits += SoftScan_PC( swDiskMask[gi] ); }
 #endif
 	SW_BKT_DECL
 	for( int li = 0; li < swListCount; li++ )
@@ -2043,7 +2152,7 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 			{
 				// UMBRA EARLY-OUT + rounding, identical to the tile-list scanline walker
 				int swCovE = 0;
-				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] ); }
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] ); }
 				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 			}
 #else
@@ -2082,10 +2191,12 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 #endif
 	}
 #if SW_SCANLINE
-	int swCovC = 0;
-	for( int cmc = 0; cmc < SW_SCAN_CHORDS; cmc++ ) { swCovC += SoftPopcount32( swGrid[cmc] & swDiskMask[cmc] ); }
 	SW_BKT_FLUSH( swMask, swAll );
-	return swDiskBits > 0 ? ( float )swCovC / ( float )swDiskBits : 0.0f;
+	{
+		int swCov = 0;
+		SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
+		return swDiskBits > 0 ? ( float )swCov / ( float )swDiskBits : 0.0f;
+	}
 #endif
 	if( swMask != 0u && swMask != swAll )
 	{

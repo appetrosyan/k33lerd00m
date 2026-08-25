@@ -37,6 +37,7 @@ version. See <http://www.gnu.org/licenses/>.
 #define SW_TILE_SPILL	0xFFFFFFFDu	// overflowed tile spilled its FULL list: slot+1/+2 = ( span offset, count )
 
 // *INDENT-OFF*
+#include "softscan_word.inc.hlsl"		// SwGridWord typedef - needed by t_SurfGrid below, before the coverage include
 // Declared BEFORE the include: the coverage functions read these globals directly (HLSL).
 StructuredBuffer<float4>	t_SoftEdges	: register( t0 );	// softShadowEdge_t stream (float4 pairs), whole joint buffer
 StructuredBuffer<uint>		t_SoftTiles	: register( t1 );	// per-tile triangle lists (softtile_bin.cs.hlsl)
@@ -63,7 +64,7 @@ RWStructuredBuffer<uint>	u_SurfTable	: register( u2 );
 // GRID mode reuses register t6 (the residual pool is excluded in grid mode) for the parallel static
 // Fubini grid buffer - so the binding LAYOUT is identical to the scalar surf permutation (u2 table + t6),
 // no extra slot to strip/desync. SW_SCAN_CHORDS words per slot.
-StructuredBuffer<uint>		t_SurfGrid	: register( t6 );
+StructuredBuffer<SwGridWord>	t_SurfGrid	: register( t6 );	// per-chord grid word (uint or uint2, see SW_SCAN_BITS)
 #else
 StructuredBuffer<uint>		t_SurfPool	: register( t6 );	// read before the include: the residual walk consumes it
 #endif
@@ -257,8 +258,20 @@ cbuffer c_Term : register( b0 )
 	int4	g_surfCost;			// x = surf-cache COST GATE (r_softShadowSurfCacheMinCost): tiles with fewer
 								//   than x occluders bypass the cache entirely (no probe, no build request) -
 								//   we only pay the lookup where the walk is dear enough to beat it. 0 = gate off.
+	float4	g_misc;				// x = r_softShadowMinDnRatio: projection dn-clamp (grazing grain fix). y/z/w unused.
 };
 // *INDENT-ON*
+
+// TERM-LEVEL DIAGNOSTIC (r_softShadowTermLevels -> g_surfCost.z): quantize the visibility term to
+// N levels before it is stored in the R16F atlas. This isolates the ATLAS-STORAGE / term-precision
+// hypothesis for the penumbra banding: coarsen N and, if the banding worsens/matches the observed,
+// the term's own level count is what shows through (the R16F format holds ~190 Fubini levels, but
+// 190 levels can still band on a wide grazing penumbra). 0 = off (full precision, shipped).
+float SwTermQuant( float t )
+{
+	const int lv = g_surfCost.z;
+	return ( lv > 0 ) ? ( round( saturate( t ) * ( float )lv ) / ( float )lv ) : t;
+}
 
 #if SW_SURF_CACHE
 // Wave-aggregated per-frame path counter (see SW_SURF_STAT): sum the active lanes in each class and
@@ -388,6 +401,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 
 	const float3 swL = g_lightR.xyz;
 	const float  swR = max( g_lightR.w, 1e-2 );
+	g_swMinDnR = g_misc.x;			// projection dn-clamp (r_softShadowMinDnRatio): grazing-grain fix; 0 = exact
+
+
 
 	// per-fragment sample-set rotation: the SAME world-position hash the interaction PS computes
 	// (interactionSM.ps.hlsl) - swP is bit-identical by the position G-buffer design, so the angle
@@ -402,7 +418,17 @@ void main( uint3 tid : SV_DispatchThreadID )
 	float3 swRotP = swP;
 	if( g_surfParams.w > 0.0f ) { swRotP = round( swP / g_surfParams.w ) * g_surfParams.w; }
 	const float swRotHash = dot( swRotP, float3( 12.9898, 78.233, 37.719 ) );
-	const float swRotAng = ( swRotHash - floor( swRotHash ) ) * 6.28318531;
+	float swRotAng = ( swRotHash - floor( swRotHash ) ) * 6.28318531;
+#if SW_SCANLINE
+	// FUBINI is rotation-INVARIANT in the continuous limit, so the per-fragment rotation adds no
+	// signal - it only decorrelates the discrete grid's (32-col x N-chord) DISCRETISATION error into
+	// per-pixel NOISE (the "ants", scanline-only; the sampled path averages its rotation over the 16
+	// samples so it reads smooth). Zero it: the residual error becomes a SMOOTH function of world
+	// position (spatially coherent, sub-visible) and temporally stable per world point.
+	// g_surfCost.w (r_softShadowScanRotate) != 0 re-injects the old rotation: a POSITIVE CONTROL that
+	// deliberately reproduces the grain so the gate's GateGrain detector can be validated to fire.
+	if( g_surfCost.w == 0 ) { swRotAng = 0.0f; }
+#endif
 
 #if SW_CONTRIB_CACHE
 	// ---- CONTRIBUTOR CACHE (see the declaration block above for the design + slot layout) ----
@@ -659,14 +685,14 @@ void main( uint3 tid : SV_DispatchThreadID )
 			SwContribDiag( 1u );									// stat: serve hit (wave-aggregated)
 			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
 			const float swRC = max( g_lightR.w, 1e-2 );
-			uint swGrid[SW_SCAN_CHORDS];
-			uint swDiskMask[SW_SCAN_CHORDS];
+			SwGridWord swGrid[SW_SCAN_CHORDS];
+			SwGridWord swDiskMask[SW_SCAN_CHORDS];
 			int  swDiskBits = 0;
 			[unroll] for( int gm = 0; gm < SW_SCAN_CHORDS; gm++ )
 			{
-				swGrid[gm] = 0u;
+				swGrid[gm] = SwGridZero();
 				swDiskMask[gm] = SoftScan_Run( -SW_SCAN_HC[gm], SW_SCAN_HC[gm] );
-				swDiskBits += SoftPopcount32( swDiskMask[gm] );
+				swDiskBits += SoftScan_PC( swDiskMask[gm] );
 			}
 			// BIT-PARITY RULE: every path must FillTri exactly the tris the plain walk would - the
 			// per-tri cone cull is only approximately conservative at float boundaries, so a path
@@ -707,7 +733,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				int swCovE = 0;
 				[unroll] for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ )
 				{
-					swCovE += SoftPopcount32( swGrid[fm] & swDiskMask[fm] );
+					swCovE += SoftScan_PC( swGrid[fm] & swDiskMask[fm] );
 				}
 				if( swCovE * 100 >= swDiskBits * 99 )
 				{
@@ -750,7 +776,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				int swCovD = 0;
 				[unroll] for( int fm2 = 0; fm2 < SW_SCAN_CHORDS; fm2++ )
 				{
-					swCovD += SoftPopcount32( swGrid[fm2] & swDiskMask[fm2] );
+					swCovD += SoftScan_PC( swGrid[fm2] & swDiskMask[fm2] );
 				}
 				if( swCovD * 100 >= swDiskBits * 99 )
 				{
@@ -809,7 +835,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					int swCovS2 = 0;
 					[unroll] for( int fm3 = 0; fm3 < SW_SCAN_CHORDS; fm3++ )
 					{
-						swCovS2 += SoftPopcount32( swGrid[fm3] & swDiskMask[fm3] );
+						swCovS2 += SoftScan_PC( swGrid[fm3] & swDiskMask[fm3] );
 					}
 					if( swCovS2 * 100 >= swDiskBits * 99 )
 					{
@@ -829,7 +855,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			int swCov = 0;
 			[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ )
 			{
-				swCov += SoftPopcount32( swGrid[cm] & swDiskMask[cm] );
+				swCov += SoftScan_PC( swGrid[cm] & swDiskMask[cm] );
 			}
 			// match the plain walk's >=99% umbra rounding EXACTLY (it returns coverage 1.0 there);
 			// without it plain-vs-cached frames flicker the last coverage bit (TEMPORAL defects)
@@ -888,7 +914,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				u_Term[ uint2( px + g_tile.zw ) ] = swTermPlain;
 				return;
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = swTermServe;
+			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( swTermServe );
 			return;
 		}
 
@@ -908,14 +934,14 @@ void main( uint3 tid : SV_DispatchThreadID )
 			const int dynFirstTri = ( g_surfA.z < g_range.y ) ? ( int )t_SoftEdges[ g_flags.y + g_surfA.z * 2 + 1 ].x : 0x7FFFFFFF;
 			softFrame_t swFC = SoftShadow_Frame( swP, g_lightR.xyz );
 			const float swRC = max( g_lightR.w, 1e-2 );
-			uint swGrid[SW_SCAN_CHORDS];
-			uint swDiskMask[SW_SCAN_CHORDS];
+			SwGridWord swGrid[SW_SCAN_CHORDS];
+			SwGridWord swDiskMask[SW_SCAN_CHORDS];
 			int  swDiskBits = 0;
 			[unroll] for( int gm = 0; gm < SW_SCAN_CHORDS; gm++ )
 			{
-				swGrid[gm] = 0u;
+				swGrid[gm] = SwGridZero();
 				swDiskMask[gm] = SoftScan_Run( -SW_SCAN_HC[gm], SW_SCAN_HC[gm] );
-				swDiskBits += SoftPopcount32( swDiskMask[gm] );
+				swDiskBits += SoftScan_PC( swDiskMask[gm] );
 			}
 			[loop] for( int rl2 = 0; rl2 < swServeListCount; rl2++ )
 			{
@@ -935,23 +961,23 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const float3 ppv = rcv - cdv * swFC.nrm;
 					const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
 					if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
-					uint solo[SW_SCAN_CHORDS];
+					SwGridWord solo[SW_SCAN_CHORDS];
 					[unroll] for( int sm = 0; sm < SW_SCAN_CHORDS; sm++ )
 					{
-						solo[sm] = 0u;
+						solo[sm] = SwGridZero();
 					}
 					SoftScan_FillTri( solo, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
 					// record on ANY RAW solo bits, not only in-disk-mask bits: a tri whose intervals
 					// land just outside the disk at every evaluated pixel becomes a contributor under
 					// a sub-pixel view displacement - the dominant frozen-union CONTINUITY class
 					// (gate: 2717 defects evidence-only vs 52 with all serves re-validated)
-					uint soloRaw = 0u;
+					SwGridWord soloRaw = SwGridZero();
 					[unroll] for( int sm2b = 0; sm2b < SW_SCAN_CHORDS; sm2b++ )
 					{
 						soloRaw |= solo[sm2b];
 						swGrid[sm2b] |= solo[sm2b];
 					}
-					if( soloRaw != 0u && rt < dynFirstTri )
+					if( SwGridNZ( soloRaw ) && rt < dynFirstTri )
 					{
 						// ENTRIES ARE 1-BASED (rt+1): 0 marks a reserved-but-unstored slot, so concurrent
 						// serves can never read a torn entry (they skip 0s).
@@ -1004,19 +1030,19 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const float3 ppv = rcv - cdv * swFC.nrm;
 					const float  crv = swRC * ( cdv + trv ) / swFC.distPL;
 					if( dot( ppv, ppv ) > ( crv + trv ) * ( crv + trv ) ) { continue; }
-					uint solo2[SW_SCAN_CHORDS];
+					SwGridWord solo2[SW_SCAN_CHORDS];
 					[unroll] for( int sm3 = 0; sm3 < SW_SCAN_CHORDS; sm3++ )
 					{
-						solo2[sm3] = 0u;
+						solo2[sm3] = SwGridZero();
 					}
 					SoftScan_FillTri( solo2, r0.xyz, r1.xyz, r2.xyz, swP, swFC, swRC, SW_NEAR_EPS );
-					uint soloRaw2 = 0u;								// ANY raw bits (see the tile-list record)
+					SwGridWord soloRaw2 = SwGridZero();				// ANY raw bits (see the tile-list record)
 					[unroll] for( int sm4 = 0; sm4 < SW_SCAN_CHORDS; sm4++ )
 					{
 						soloRaw2 |= solo2[sm4];
 						swGrid[sm4] |= solo2[sm4];
 					}
-					if( soloRaw2 != 0u && rt2 < dynFirstTri )
+					if( SwGridNZ( soloRaw2 ) && rt2 < dynFirstTri )
 					{
 						const int swApR2 = SwContribAppend( ( uint )recordSlot, rt2 );
 						swAppendedNew = swAppendedNew || ( swApR2 == 1 );
@@ -1057,13 +1083,13 @@ void main( uint3 tid : SV_DispatchThreadID )
 			int swCovR = 0;
 			[unroll] for( int cr = 0; cr < SW_SCAN_CHORDS; cr++ )
 			{
-				swCovR += SoftPopcount32( swGrid[cr] & swDiskMask[cr] );
+				swCovR += SoftScan_PC( swGrid[cr] & swDiskMask[cr] );
 			}
 			if( swCovR * 100 >= swDiskBits * 99 )
 			{
 				swCovR = swDiskBits;			// plain-walk umbra rounding, matched exactly
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 );
+			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 ) );
 			return;
 		}
 		}	// keyLo != sentinel
@@ -1198,8 +1224,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// circular disk mask (fragment-invariant). Dynamic casters OR into swGrid below;
 							// coverage = popcount(swGrid & diskMask)/diskBits - the exact Fubini union (no
 							// bilinear F, no residual pool; umbra / silhouette / tilt represented as bits).
-							uint swGrid[SW_SCAN_CHORDS];
-							uint swDiskMask[SW_SCAN_CHORDS];
+							// SW_SURF_GRID cached path: reads the per-chord grid PERSISTED in t_SurfGrid. The
+							// buffer element is SwGridWord too (softsurf_build writes the same width), so the
+							// cache tracks the live grid resolution automatically.
+							SwGridWord swGrid[SW_SCAN_CHORDS];
+							SwGridWord swDiskMask[SW_SCAN_CHORDS];
 							int  swDiskBits = 0;
 							{
 								const uint gBaseR = slot * ( uint )SW_SCAN_CHORDS;
@@ -1207,7 +1236,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 								{
 									swGrid[gr]     = t_SurfGrid[ gBaseR + gr ];
 									swDiskMask[gr] = SoftScan_Run( -SW_SCAN_HC[gr], SW_SCAN_HC[gr] );
-									swDiskBits    += SoftPopcount32( swDiskMask[gr] );
+									swDiskBits    += SoftScan_PC( swDiskMask[gr] );
 								}
 							}
 #else
@@ -1285,7 +1314,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 								SoftScan_FillTri( swGrid, t_SoftEdges[ bd + 0 ].xyz, t_SoftEdges[ bd + 1 ].xyz, t_SoftEdges[ bd + 2 ].xyz, swP, swFP, swRP, SW_NEAR_EPS );
 							}
 							int swCovG = 0;
-							[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCovG += SoftPopcount32( swGrid[cm] & swDiskMask[cm] ); }
+							[unroll] for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ ) { swCovG += SoftScan_PC( swGrid[cm] & swDiskMask[cm] ); }
 							float swTermC = 1.0 - saturate( swDiskBits > 0 ? ( float )swCovG / ( float )swDiskBits : 0.0 );
 #else
 							const float occEx = SoftShadow_FaceCoverageSurfResidual(
@@ -1445,5 +1474,5 @@ void main( uint3 tid : SV_DispatchThreadID )
 		return;
 	}
 #endif
-	u_Term[ uint2( px + g_tile.zw ) ] = 1.0 - saturate( swOcc );
+	u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( 1.0 - saturate( swOcc ) );
 }

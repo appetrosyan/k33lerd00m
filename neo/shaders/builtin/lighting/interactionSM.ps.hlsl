@@ -74,6 +74,12 @@ StructuredBuffer<uint> t_SoftTiles : register( t13 VK_DESCRIPTOR_SET( 0 ) );
 Texture2D t_SoftTerm : register( t14 VK_DESCRIPTOR_SET( 0 ) );
 // Included AFTER t_SoftEdges: SoftShadow_WedgeOcclusion reads that global directly (HLSL), so the
 // declaration must be in scope at include time.
+// FUBINI EVERYWHERE (2026-08-25): force the in-shader coverage onto the exact Fubini scanline,
+// matching the compute term pass. Without it the interaction PS ran the 16-sample disk union - and
+// since scenes have 82+ soft lights vs a 12-slot term atlas, ~70 lights/frame fell HERE and banded
+// at the 1/16 quantum (playtest ants/terraces). Defined IN-SHADER, NOT via a shaders.cfg -D, so the
+// blob permutation key is unchanged (the renderprog requests this permutation without SW_SCANLINE).
+#define SW_SCANLINE 1
 #include "softwedge_coverage.inc.hlsl"
 #endif
 
@@ -169,6 +175,11 @@ void main( PS_IN fragment, out PS_OUT result )
 	// the pattern glued to surfaces under camera motion where screen-anchored noise swims.
 	float swRotHash = dot( swP, float3( 12.9898, 78.233, 37.719 ) );
 	float swRotAng = ( swRotHash - floor( swRotHash ) ) * 6.28318531;
+#if SW_SCANLINE
+	// Fubini is rotation-invariant; the per-fragment rotation only decorrelates the discrete grid's
+	// discretisation error into per-pixel grain ("ants"). Zero it (matches softterm.cs.hlsl).
+	swRotAng = 0.0f;
+#endif
 
 	// NO origin bias on the coverage rays: the analytic path traces the exact caster triangles from the
 	// exact interpolated receiver position, and the "phantom" shadows once blamed on self-intersection

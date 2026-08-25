@@ -289,3 +289,69 @@ TEST( SoftShadowGate, invalid_pixels_never_count )
 	GateTemporal( ana, rt, valid, cfg, d );
 	CHECK( d.empty() );
 }
+
+// GRAIN detector: a genuinely clean pair (analytic == smooth RT) mints no high-frequency defect.
+// Proves the detector's zero is believable before its fires are trusted.
+TEST( SoftShadowGate, grain_clean_pair_zero )
+{
+	GateCfg cfg = TestCfg();
+	GateImg rt = RampScene();
+	GateImg ana = rt;
+	std::vector<GateDefect> d;
+	GateGrain( ana, rt, AllValid(), nullptr, cfg, d );
+	CHECK( d.empty() );
+}
+
+// GRAIN: per-pixel speckle in the analytic term over a FLAT true field = ANT (does not survive the
+// median). The RT is smooth, so the high-frequency energy is spurious.
+TEST( SoftShadowGate, grain_speckle_over_flat_truth_is_ant )
+{
+	GateCfg cfg = TestCfg();
+	GateImg rt( W, H, 1.0f );		// flat lit truth
+	GateImg ana = rt;
+	// scatter isolated dark speckles (0.85) in a compact patch - each deviates from its 3x3 mean AND
+	// median (neighbours are 1.0), the grain signature
+	for( int y = 40; y < 60; y += 2 )
+		for( int x = 40; x < 80; x += 2 )
+		{
+			ana.At( x, y ) = 0.85f;
+		}
+	std::vector<GateDefect> d;
+	GateGrain( ana, rt, AllValid(), nullptr, cfg, d );
+	CHECK( Count( d, GATE_ANT ) >= 1 );		// the speckle field is caught (the patch boundary may also mint a STEP - real detail, not discounted)
+}
+
+// GRAIN classifier: a COHERENT sub-cliff step the smooth truth lacks = STEP (survives the median), NOT
+// discounted. A step edge is not per-pixel noise, but it is still analytic detail the truth does not have.
+TEST( SoftShadowGate, grain_coherent_step_over_flat_truth_is_step )
+{
+	GateCfg cfg = TestCfg();
+	GateImg rt( W, H, 1.0f );		// flat truth
+	GateImg ana = rt;
+	for( int y = 50; y < H; y++ )		// a hard 0.15 drop across the whole width
+		for( int x = 0; x < W; x++ )
+		{
+			ana.At( x, y ) = 0.85f;
+		}
+	std::vector<GateDefect> d;
+	GateGrain( ana, rt, AllValid(), nullptr, cfg, d );
+	CHECK( Count( d, GATE_STEP ) >= 1 );
+	CHECK( Count( d, GATE_ANT ) == 0 );
+}
+
+// GRAIN gate: analytic high-frequency that the TRUE field also has (both structured) is a real feature,
+// not a defect - the denoised-RT-flat test excludes it.
+TEST( SoftShadowGate, grain_real_feature_in_both_not_flagged )
+{
+	GateCfg cfg = TestCfg();
+	GateImg rt( W, H, 1.0f );
+	for( int y = 50; y < H; y++ )		// the step is in the TRUTH too
+		for( int x = 0; x < W; x++ )
+		{
+			rt.At( x, y ) = 0.85f;
+		}
+	GateImg ana = rt;					// analytic matches -> no spurious HF
+	std::vector<GateDefect> d;
+	GateGrain( ana, rt, AllValid(), nullptr, cfg, d );
+	CHECK( d.empty() );
+}

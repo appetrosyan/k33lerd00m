@@ -158,6 +158,7 @@ private:
 	nvrhi::BufferHandle				m_ConstantBuffer;
 	nvrhi::TextureHandle			m_TermTexture;
 	int								m_BuiltSamples = 0;		// SW_FACE_SAMPLES the pipelines were built for (r_softShadowSamples); rebuild on change
+	int								m_BuiltChords = 0;		// SW_SCAN_CHORDS the pipelines were built for (r_softShadowScanChords); rebuild on change
 	// TEMPORAL-STABILITY BLUR (r_softShadowTermBlur, softblur.cs.hlsl): a separate pipeline that
 	// Gaussian-blurs each packed light rect of the term atlas into m_BlurTexture with a radius scaled
 	// by the local penumbra width. Off by default; the interaction reads m_BlurTexture only when it ran.
