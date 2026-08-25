@@ -302,6 +302,13 @@ void SwSurfStat( uint idx )
 		if( c != 0u && WaveIsFirstLane() )
 		{
 			InterlockedAdd( u_SurfTable[ ( uint )g_surfA.x * 8u + v ], c );
+			if( v < 2u )
+			{
+				// PER-LIGHT hit/miss attribution (bench instrument): 16 rings of {hit,miss} pairs after
+				// the 8 global counters, keyed lightKey&15 (collisions acceptable at <=21 term lights).
+				// The dispatch is per-light, so g_surfA.w is wave-uniform - one extra atomic per wave.
+				InterlockedAdd( u_SurfTable[ ( uint )g_surfA.x * 8u + 8u + ( ( uint )g_surfA.w & 15u ) * 2u + v ], c );
+			}
 		}
 	}
 }
@@ -1203,7 +1210,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 		const float pw = ( d == 0 ) ? swP.x : ( ( d == 1 ) ? swP.y : swP.z );
 		const int   cu = ( int )floor( pu / g ) + 32768;
 		const int   cv = ( int )floor( pv / g ) + 32768;
-		const int   cw = ( int )floor( pw / g ) + 32768;
+		const int   cw = ( int )floor( ( pw + 0.5f * g ) / g ) + 32768;	// half-cell bias - MUST match the seed's kw (knife-edge fix, see softsurf_seed)
 		if( cu >= 0 && cu <= 65535 && cv >= 0 && cv <= 65535 && cw >= 0 && cw <= 65535 )
 		{
 			const uint keyLo = ( uint )cu | ( ( uint )cv << 16 );
@@ -1214,7 +1221,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			// entirely (gated-fragment SETUP still ran: normal Load + axis + key), fall straight to the walk
 			// -> measures the SETUP tax alone. 1 = run the full probe then force the exact walk (see code==2u
 			// below) -> measures SETUP + probe-loop. Delta of the two isolates the 16-slot table-probe memory.
-			if( keyLo != 0xFFFFFFFFu && g_aa.z < 1.5f )	// the far world-corner cell aliases the empty sentinel: never cached
+			if( keyLo < 0xFFFFFFFEu && ( g_aa.z < 1.5f || g_aa.z > 3.5f ) )	// the two far world-corner cells alias the empty/tombstone sentinels: never cached; modes 2/3 skip the probe, mode 4 runs it (real hits serve)
 			{
 				const uint capM = ( uint )g_surfA.x - 1u;	// capacity is a power of two (CPU-enforced)
 				const uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
@@ -1240,7 +1247,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						}
 						if( code == 2u )	// BUILT: consume
 						{
-							if( g_aa.z != 0.0f ) { swStatIdx = 2u; break; }	// DEBUG force-walk (g_aa.z==1): probe ran, key found -> take the exact walk instead of the cached hit (probe-tax isolation)
+							if( g_aa.z > 0.5f && g_aa.z < 1.5f ) { swStatIdx = 2u; break; }	// DEBUG force-walk (g_aa.z==1 ONLY): probe ran, key found -> take the exact walk instead of the cached hit (probe-tax isolation); modes 3/4 must serve real hits
 							// ANCHOR-PROXIMITY GUARD: two surfaces inside the same G-height slab share
 							// this key (floor + step, tabletop + crate base) and the record was built
 							// at the LOWER plane (min-anchor). A fragment far from the built plane
@@ -1471,6 +1478,182 @@ void main( uint3 tid : SV_DispatchThreadID )
 						break;						// claimed (by us or a racer): exact miss path this frame
 					}
 					slot = ( slot + 1u ) & capM;	// occupied by another key: linear probe
+				}
+			}
+			// FORCE-HIT CEILING (r_softShadowSurfCacheForceWalk 3/4, task #87): UNREALISTIC benchmark
+			// modes for latency attribution. Mode 3: probe skipped, EVERY gated fragment served as if
+			// built with ZERO static work (no grid loads, no residuals; the dynamic tile walk still
+			// runs) - the 100%-hit upper bound. Mode 4: the probe RAN above, real hits served normally
+			// (returned already), and only the fall-through fragments (miss/walk-always/anchor-reject)
+			// are force-hit - the delta vs mode 0 prices the misses' static walk, the delta vs mode 3
+			// prices the real serve. The image is wrong either way; only the frame time means anything.
+			if( g_aa.z > 2.5f )
+			{
+				int fhBase = 0, fhCount = -1, fhDyn = 0;
+				if( g_surfA.z >= g_range.y )
+				{
+					fhCount = 0;		// no dynamic casters at all
+				}
+				else
+				{
+					fhDyn = ( int )t_SoftEdges[ g_flags.y + g_surfA.z * 2 + 1 ].x;	// first dynamic tri
+					const int fTx = px.x / SW_TILE_SIZE - g_tile.x;
+					const int fTy = px.y / SW_TILE_SIZE - g_tile.y;
+					if( g_range.z >= 0 && fTx >= 0 && fTy >= 0 )
+					{
+						const int  fSlot = g_range.z + ( fTy * g_range.w + fTx ) * ( g_flags.w + 1 );
+						const uint fCnt  = t_SoftTiles[ fSlot ];
+						if( fCnt == SW_TILE_UMBRA )
+						{
+							SW_SURF_STAT( ( g_aa.z > 3.5f ) ? swStatIdx : 0u );	// mode 4 keeps the honest class split
+							u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );	// provable umbra: same as the real hit path
+							return;
+						}
+						if( fCnt <= ( uint )g_flags.w )		// normal list (exclude spill/corrupt sentinels)
+						{
+							fhBase  = fSlot + 1;
+							fhCount = ( int )fCnt;
+						}
+					}
+				}
+				if( fhCount >= 0 )
+				{
+#if SW_SURF_GRID
+					// zero static grid + dynamic tile fill: mirrors the grid hit path with the t_SurfGrid
+					// loads and all static bits gone
+					float2 fhEnv[SW_SCAN_CHORDS];
+					SwGridWord fhGrid[SW_SCAN_CHORDS];
+					[unroll] for( int fz = 0; fz < SW_SCAN_CHORDS; fz++ ) { fhGrid[fz] = SwGridZero(); fhEnv[fz] = SwEnvZero(); }
+					const softFrame_t fhFP = SoftShadow_Frame( swP, g_lightR.xyz );
+					const float fhRP = max( g_lightR.w, 1e-2 );
+					[loop] for( int fl = 0; fl < fhCount; fl++ )
+					{
+						const int fse = ( int )t_SoftTiles[ fhBase + fl ];
+						if( fse < fhDyn ) { continue; }		// dynamic tris only (static is "cached" = zero)
+						const int fbd = g_range.x + fse * 3;
+						SoftScan_FillTri( fhGrid, fhEnv, t_SoftEdges[ fbd + 0 ].xyz, t_SoftEdges[ fbd + 1 ].xyz, t_SoftEdges[ fbd + 2 ].xyz, swP, fhFP, fhRP, SW_NEAR_EPS );
+					}
+					int fhCov = 0;
+					[unroll] for( int fc = 0; fc < SW_SCAN_CHORDS; fc++ ) { fhCov += SoftScan_PC( fhGrid[fc] & SW_SCAN_MASK[fc] ); }
+					const float occFh = ( float )fhCov / ( float )SW_SCAN_DISKBITS;
+#else
+					const float occFh = SoftShadow_FaceCoverageSurfResidual(
+											swP, g_lightR.xyz, max( g_lightR.w, 1e-2 ), g_range.x,
+											0, 0,
+											g_flags.y, g_surfA.z, g_range.y,
+											fhBase, fhCount, fhDyn, swRotAng );
+#endif
+					if( g_aa.z > 3.5f )		// mode 4: honest class split (real hits already returned above)
+					{
+						SW_SURF_STAT( swStatIdx );
+						if( swStatIdx == 1u ) { SwSurfMissReason( swMissR ); }
+					}
+					else
+					{
+						SW_SURF_STAT( 0u );	// mode 3: counted as HIT, the bench line must read 100%
+					}
+					u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 1.0f - saturate( occFh ), swHoist );
+					return;
+				}
+				// spill/untiled tile: fall through to the exact walk (the real hit path does the same)
+			}
+			// AXIS-TIE INSTRUMENT (viz 5, task #87): an empty-slot miss whose texel IS built under a
+			// DIFFERENT dominant axis is the silent built-but-not-read class - the seed keys off the
+			// tri cross-product while the read keys off softpos's ddx/ddy axis, and near-45-degree
+			// geometry can disagree, which today reads as "never seeded". Under viz 5 ONLY, sub-reason
+			// 3 is REDEFINED to count found-under-other-axis (genuine probe-overflow folds into
+			// empty-slot). Costs two extra 16-probes per miss - instrument mode, never default.
+			if( ( int )g_surfParams.y == 5 && swStatIdx == 1u && swMissR != 0u && swMissR != 1u )
+			{
+				if( swMissR == 3u ) { swMissR = 2u; }
+				const uint capM5 = ( uint )g_surfA.x - 1u;
+				[loop] for( int da = 0; da < 3; da++ )
+				{
+					if( da == d ) { continue; }
+					const float pu5 = ( da == 0 ) ? swP.y : ( ( da == 1 ) ? swP.z : swP.x );
+					const float pv5 = ( da == 0 ) ? swP.z : ( ( da == 1 ) ? swP.x : swP.y );
+					const float pw5 = ( da == 0 ) ? swP.x : ( ( da == 1 ) ? swP.y : swP.z );
+					const int cu5 = ( int )floor( pu5 / g ) + 32768;
+					const int cv5 = ( int )floor( pv5 / g ) + 32768;
+					const int cw5 = ( int )floor( ( pw5 + 0.5f * g ) / g ) + 32768;	// half-cell bias - MUST match the seed's kw (same as the primary key above; unbiased here undercounted the alt-axis class)
+					if( cu5 < 0 || cu5 > 65535 || cv5 < 0 || cv5 > 65535 || cw5 < 0 || cw5 > 65535 ) { continue; }
+					const uint kLo5 = ( uint )cu5 | ( ( uint )cv5 << 16 );
+					const uint kHi5 = ( uint )cw5 | ( ( uint )da << 16 ) | ( ( uint )g_surfA.w << 19 );
+					const uint h5 = kLo5 * 0x9E3779B1u ^ kHi5 * 0x85EBCA77u;
+					uint s5 = h5 & capM5;
+					[loop] for( int p5 = 0; p5 < 16; p5++ )
+					{
+						const uint b5 = s5 * 8u;
+						if( u_SurfTable[ b5 ] == kLo5 && u_SurfTable[ b5 + 1u ] == kHi5 )
+						{
+							if( ( u_SurfTable[ b5 + 2u ] & 3u ) == 2u ) { swMissR = 3u; }	// BUILT under the other axis
+							break;
+						}
+						s5 = ( s5 + 1u ) & capM5;
+					}
+					if( swMissR == 3u ) { break; }
+				}
+			}
+			// KW-DRIFT INSTRUMENT (viz 6, task #87): an empty-slot miss whose texel IS built one cw cell
+			// up/down under the SAME axis is the slope-drift class - the seed anchors the TRIANGLE PLANE's
+			// height at the texel center while the serve keys the fragment's rasterized world height, and on
+			// tilted receivers the two straddle a cell boundary (kw off by one). Under viz 6 ONLY, sub-reason
+			// 3 is REDEFINED to count found-at-kw+-1 (genuine probe-overflow folds into empty-slot). Costs
+			// two extra 16-probes per miss - instrument mode, never default.
+			if( ( int )g_surfParams.y == 6 && swStatIdx == 1u && swMissR != 0u && swMissR != 1u )
+			{
+				if( swMissR == 3u ) { swMissR = 2u; }
+				const uint capM6 = ( uint )g_surfA.x - 1u;
+				[loop] for( int dw = -1; dw <= 1; dw += 2 )
+				{
+					const int cw6 = cw + dw;
+					if( cw6 < 0 || cw6 > 65535 ) { continue; }
+					const uint kHi6 = ( uint )cw6 | ( axis << 16 ) | ( ( uint )g_surfA.w << 19 );
+					const uint h6 = keyLo * 0x9E3779B1u ^ kHi6 * 0x85EBCA77u;
+					uint s6 = h6 & capM6;
+					[loop] for( int p6 = 0; p6 < 16; p6++ )
+					{
+						const uint b6 = s6 * 8u;
+						if( u_SurfTable[ b6 ] == keyLo && u_SurfTable[ b6 + 1u ] == kHi6 )
+						{
+							if( ( u_SurfTable[ b6 + 2u ] & 3u ) == 2u ) { swMissR = 3u; }	// BUILT one cell up/down
+							break;
+						}
+						s6 = ( s6 + 1u ) & capM6;
+					}
+					if( swMissR == 3u ) { break; }
+				}
+			}
+			// REGION-VS-BOUNDARY INSTRUMENT (viz 7, task #87): an empty-slot miss with a BUILT in-plane
+			// NEIGHBOR texel (cu+-1 / cv+-1, same axis/kw) sits at the EDGE of a seeded region - a seed
+			// rasterization/footprint shortfall. No built neighbor = the whole region is unseeded - a
+			// collector gap (surface class never emitted). Under viz 7 ONLY, sub-reason 3 is REDEFINED
+			// to count edge-of-seeded (genuine probe-overflow folds into empty-slot). 4 extra 16-probes
+			// per miss - instrument mode, never default.
+			if( ( int )g_surfParams.y == 7 && swStatIdx == 1u && swMissR != 0u && swMissR != 1u )
+			{
+				if( swMissR == 3u ) { swMissR = 2u; }
+				const uint capM7 = ( uint )g_surfA.x - 1u;
+				[loop] for( int nb = 0; nb < 4; nb++ )
+				{
+					const int cu7 = cu + ( ( nb == 0 ) ? -1 : ( ( nb == 1 ) ? 1 : 0 ) );
+					const int cv7 = cv + ( ( nb == 2 ) ? -1 : ( ( nb == 3 ) ? 1 : 0 ) );
+					if( cu7 < 0 || cu7 > 65535 || cv7 < 0 || cv7 > 65535 ) { continue; }
+					const uint kLo7 = ( uint )cu7 | ( ( uint )cv7 << 16 );
+					if( kLo7 == 0xFFFFFFFFu ) { continue; }
+					const uint h7 = kLo7 * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
+					uint s7 = h7 & capM7;
+					[loop] for( int p7 = 0; p7 < 16; p7++ )
+					{
+						const uint b7 = s7 * 8u;
+						if( u_SurfTable[ b7 ] == kLo7 && u_SurfTable[ b7 + 1u ] == keyHi )
+						{
+							if( ( u_SurfTable[ b7 + 2u ] & 3u ) == 2u ) { swMissR = 3u; }	// BUILT neighbor: edge of a seeded region
+							break;
+						}
+						s7 = ( s7 + 1u ) & capM7;
+					}
+					if( swMissR == 3u ) { break; }
 				}
 			}
 			SW_SURF_STAT( swStatIdx );			// fall-through: miss / walk-always / anchor-reject

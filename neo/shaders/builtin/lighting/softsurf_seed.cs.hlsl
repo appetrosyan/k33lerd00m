@@ -40,7 +40,13 @@ cbuffer c_SurfSeed : register( b0 )
 
 // max texels one triangle may claim; larger footprints are clamped (the un-seeded remainder is
 // picked up by the lazy fragment-claim path with its fragment anchor - correct, just less exact)
-#define SW_SEED_MAX_SPAN	16
+// 2026-08-26 (task #87): was 16 - at G=8 that seeds only a 128x128-unit corner of each triangle, and
+// since the runtime term is READ-ONLY (no lazy claims), the clamped remainder was PERMANENTLY
+// unbuildable: measured 0.0-1.5% serve hit on the big-room heavy caps (cap0006 1678 hits of 3.7M
+// frags) with the prewarm cursor complete - the fragments' keys were simply never planted. 128 spans
+// 1024x1024 units, covering any realistic BSP polygon; worst case 16k texel iterations for ONE seed
+// thread, paid once at the load burst.
+#define SW_SEED_MAX_SPAN	128
 
 // order-preserving float->uint encoding so the texel anchor can accumulate via InterlockedMin:
 // min in encoded space == min float. DETERMINISM: several different-plane triangles covering one
@@ -105,8 +111,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 	int hv = ( int )floor( mx.y / g );
 	if( hu - lu >= SW_SEED_MAX_SPAN )
 	{
-		hu = lu + SW_SEED_MAX_SPAN - 1;    // clamp: remainder falls back to the lazy path
-	}
+		hu = lu + SW_SEED_MAX_SPAN - 1;    // safety clamp only: the runtime term is read-only, so an
+	}									   // un-seeded remainder is PERMANENTLY unbuildable (see #define)
 	if( hv - lv >= SW_SEED_MAX_SPAN )
 	{
 		hv = lv + SW_SEED_MAX_SPAN - 1;
@@ -118,6 +124,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	const float slack = g * 0.71f;
 	const uint  capM = ( uint )g_caps.x - 1u;
 	const uint  curGen = ( uint )g_seed.w;		// per-light generation (matches term/build claim tag)
+	const float l0 = length( bb - a ), l1 = length( c - bb ), l2 = length( a - c );	// loop-invariant edge lengths
 
 	for( int cv = lv; cv <= hv; cv++ )
 	{
@@ -129,23 +136,27 @@ void main( uint3 tid : SV_DispatchThreadID )
 			const float e0 = wsign * ( ( bb.x - a.x ) * ( vc - a.y ) - ( bb.y - a.y ) * ( uc - a.x ) );
 			const float e1 = wsign * ( ( c.x - bb.x ) * ( vc - bb.y ) - ( c.y - bb.y ) * ( uc - bb.x ) );
 			const float e2 = wsign * ( ( a.x - c.x ) * ( vc - c.y ) - ( a.y - c.y ) * ( uc - c.x ) );
-			const float l0 = length( bb - a ), l1 = length( c - bb ), l2 = length( a - c );
 			if( e0 < -slack * l0 || e1 < -slack * l1 || e2 < -slack * l2 )
 			{
 				continue;			// texel does not touch the triangle
 			}
 			// anchor: the triangle plane's dominant-axis height at the texel center
 			const float h = ( ndv0 - nu * uc - nv * vc ) / nd;
-			const int ku = cu + 32768, kv = cv + 32768, kw = ( int )floor( h / g ) + 32768;
+			// kw HALF-CELL BIAS (0%-hit audit): Doom3 floors sit at multiples of 8/16 = exactly on
+			// G-cell boundaries. Unbiased floor(h/g) put the seed's plane-height and the serve's
+			// rasterized world-pos on a float knife edge (63.9999 vs 64.0 -> different cw -> the KEY
+			// differs -> systematic empty-slot on flat floors, the majority receiver). +g/2 moves the
+			// knife edge to mid-cell heights where geometry rarely sits. MUST match the serve's cw.
+			const int ku = cu + 32768, kv = cv + 32768, kw = ( int )floor( ( h + 0.5f * g ) / g ) + 32768;
 			if( ku < 0 || ku > 65535 || kv < 0 || kv > 65535 || kw < 0 || kw > 65535 )
 			{
 				continue;
 			}
 			const uint keyLo = ( uint )ku | ( ( uint )kv << 16 );
 			const uint keyHi = ( uint )kw | ( axis << 16 ) | ( ( uint )g_range.w << 19 );
-			if( keyLo == 0xFFFFFFFFu )
+			if( keyLo >= 0xFFFFFFFEu )
 			{
-				continue;			// empty-sentinel alias: never cached (lazy exact path)
+				continue;			// empty/tombstone-sentinel alias: never cached (lazy exact path)
 			}
 			const uint hh = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
 			uint slot = hh & capM;
