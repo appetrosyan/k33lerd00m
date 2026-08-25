@@ -186,7 +186,12 @@ void SoftShadowTermPass::EnsurePipeline()
 		surfMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// blob keys carry ALL axes
 		surfMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "1" ) );
 		surfMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
-		surfMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
+		// SW_SCANLINE 1 (task #102): the surf permutation historically compiled SAMPLED, silently
+		// reverting every surf-routed fragment (hit residual walk AND miss/walk-always/anchor-reject)
+		// to the legacy 16-sample walk - banding + grain the plain path had already fixed. The
+		// scanline+envelope serve keeps ONE exact algorithm per frame; the sampled body remains under
+		// #else in SoftShadow_FaceCoverageSurfResidual as the A/B baseline.
+		surfMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
 		surfMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		surfMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );

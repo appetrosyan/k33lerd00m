@@ -2125,6 +2125,152 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 	float  swSinA = saturate( swR / swDistPL );
 	float  swCosA = sqrt( 1.0f - swSinA * swSinA );
 	const float swEps = SW_NEAR_EPS;
+#if SW_SCANLINE
+	// FUBINI SCANLINE serve (task #102): the residual + dynamic union fills the same chord bit-grid +
+	// fractional-endpoint envelope as the plain walk and reduces with the v3 sliver form, so the grain
+	// fix rides into the cache path. No disk tables, no per-fragment rotation (the integral is
+	// rotation-invariant; rotating the DISCRETE grid was the ants bug), no morphological crack-close
+	// (interval fill has no interior gaps). swRotAng is accepted-and-ignored here for signature parity.
+	// The caller adds the folded bilerp F to the returned coverage fraction: the envelope reduction
+	// applies to the EXACT residual union only, and F occupies the same additive slot the sampled
+	// fraction held - the only approximation in the term remains the fold itself.
+	SwGridWord swGrid[SW_SCAN_CHORDS];
+	const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array)
+	float2 swEnv[SW_SCAN_CHORDS];				// fractional-endpoint envelope (task #90)
+	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
+	// ---- residual static occluders: SELF-CONTAINED verts in the pool (12 uints/tri), per-fragment cone
+	// cull identical to the sampled body, then the shared Fubini fill. ----
+	for( int li = 0; li < swResCount; li++ )
+	{
+		const int po = swResBase + li * 12;
+		float4 r0 = float4( asfloat( t_SurfPool[ po + 0 ] ), asfloat( t_SurfPool[ po + 1 ] ), asfloat( t_SurfPool[ po + 2 ] ), asfloat( t_SurfPool[ po + 3 ] ) );
+		float4 r1 = float4( asfloat( t_SurfPool[ po + 4 ] ), asfloat( t_SurfPool[ po + 5 ] ), asfloat( t_SurfPool[ po + 6 ] ), asfloat( t_SurfPool[ po + 7 ] ) );
+		float4 r2 = float4( asfloat( t_SurfPool[ po + 8 ] ), asfloat( t_SurfPool[ po + 9 ] ), asfloat( t_SurfPool[ po + 10 ] ), asfloat( t_SurfPool[ po + 11 ] ) );
+		float3 v0 = float3( r0.x, r0.y, r0.z );
+		float3 v1 = float3( r1.x, r1.y, r1.z );
+		float3 v2 = float3( r2.x, r2.y, r2.z );
+		float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+		float3 rc   = tcen - swP;
+		float  cd   = dot( rc, swF.nrm );
+		float  triRad = r1.w;
+		SW_ATTRIB_ADD( tightTest, 1 );
+		if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+		if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+		float3 perp = rc - cd * swF.nrm;
+		float  coneR = swR * ( cd + triRad ) / swDistPL;
+		if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+		SW_ATTRIB_ADD( mtTri, 1 );
+		SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );
+		{	// umbra early-out: same >=99% coverage threshold + exact-umbra rounding as the sibling walks
+			int swCovE = 0;
+			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+			if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+		}
+	}
+	// ---- dynamic casters: tiled walk (this fragment's tile list, dynamic tris only) with the sampled
+	// body's cull cascade; untiled all-caster fallback for spill/corrupt tiles. ----
+	if( swListCount >= 0 )
+	{
+		for( int ld = 0; ld < swListCount; ld++ )
+		{
+			const int se = ( int )t_SoftTiles[ swListBase + ld ];
+			if( se < swDynFirstTri ) { continue; }			// static tri: in F or the residual pool, not here
+			const int bb = swTriBase + se * 3;
+			float4 r0 = t_SoftEdges[ bb + 0 ];
+			{
+				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
+				float  cd0 = dot( rc0, swF.nrm );
+				float  vr0 = r0.w;
+				if( cd0 + vr0 < swEps ) { continue; }
+				if( cd0 - vr0 > swDistPL ) { continue; }
+				float3 pp0 = rc0 - cd0 * swF.nrm;
+				float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
+				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+			}
+			float4 r1 = t_SoftEdges[ bb + 1 ];
+			float4 r2 = t_SoftEdges[ bb + 2 ];
+			float3 v0 = float3( r0.x, r0.y, r0.z );
+			float3 v1 = float3( r1.x, r1.y, r1.z );
+			float3 v2 = float3( r2.x, r2.y, r2.z );
+			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+			float3 rc   = tcen - swP;
+			float  cd   = dot( rc, swF.nrm );
+			float  triRad = r1.w;
+			SW_ATTRIB_ADD( tightTest, 1 );
+			if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+			if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+			float3 perp = rc - cd * swF.nrm;
+			float  coneR = swR * ( cd + triRad ) / swDistPL;
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+			SW_ATTRIB_ADD( mtTri, 1 );
+			SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );
+			{
+				int swCovE = 0;
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+			}
+		}
+	}
+	else
+	{
+		for( int scc = swDynFirst; scc < swCasterCount; scc++ )
+		{
+			float4 c0 = t_SoftEdges[ swCasterBase + scc * 2 + 0 ];
+			float4 c1 = t_SoftEdges[ swCasterBase + scc * 2 + 1 ];
+			float3 dCv = float3( c0.x, c0.y, c0.z ) - swP;
+			SW_ATTRIB_ADD( casterTest, 1 );
+			if( SoftShadow_CullCaster( dCv, c0.w, swF, swSinA, swCosA, swEps ) )
+			{
+				SW_ATTRIB_ADD( casterCull, 1 );
+				continue;
+			}
+			const int swTriFirst = ( int )c1.x;
+			const int swTriEnd   = swTriFirst + ( int )c1.y;
+			for( int t = swTriFirst; t < swTriEnd; t++ )
+			{
+				const int b = swTriBase + t * 3;
+				float4 r0 = t_SoftEdges[ b + 0 ];
+				{
+					float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
+					float  cd0 = dot( rc0, swF.nrm );
+					float  vr0 = r0.w;
+					if( cd0 + vr0 < swEps ) { continue; }
+					if( cd0 - vr0 > swDistPL ) { continue; }
+					float3 pp0 = rc0 - cd0 * swF.nrm;
+					float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
+					if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+				}
+				float4 r1 = t_SoftEdges[ b + 1 ];
+				float4 r2 = t_SoftEdges[ b + 2 ];
+				float3 v0 = float3( r0.x, r0.y, r0.z );
+				float3 v1 = float3( r1.x, r1.y, r1.z );
+				float3 v2 = float3( r2.x, r2.y, r2.z );
+				float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+				float3 rc   = tcen - swP;
+				float  cd   = dot( rc, swF.nrm );
+				float  triRad = r1.w;
+				SW_ATTRIB_ADD( tightTest, 1 );
+				if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+				if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+				float3 perp = rc - cd * swF.nrm;
+				float  coneR = swR * ( cd + triRad ) / swDistPL;
+				if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
+				SW_ATTRIB_ADD( mtTri, 1 );
+				SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );
+				{
+					int swCovE = 0;
+					SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+					if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+				}
+			}
+		}
+	}
+	// Fubini coverage from the OR-unioned interval grid, v3 fractional-endpoint reduction (task #90).
+	{
+		const float swCov = SoftScan_ReduceCov( swGrid, swEnv, SW_SCAN_MASK );
+		return swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f;
+	}
+#else	// !SW_SCANLINE: legacy sampled body (A/B baseline)
 #if SW_FACE_SAMPLES == 8
 	const float2 swDisk[8] =
 	{
@@ -2416,6 +2562,7 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 		swMask = filled;
 	}
 	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
+#endif	// SW_SCANLINE
 }
 #endif	// SW_SURF_CACHE
 

@@ -115,7 +115,7 @@ void R_SoftShadowPinTestConfig( bool verbose )
 struct shadowConflict_t { const char* a; int aVal; const char* b; int bVal; const char* why; };
 static const shadowConflict_t s_shadowConflicts[] =
 {
-	{ "r_softShadowScanline",    1, "r_softShadowSurfCache",    1, "scanline is a SILENT NO-OP while the surf cache is on (the term selects the surf permutation, not scan)" },
+	{ "r_softShadowScanline",    0, "r_softShadowSurfCache",    1, "the surf permutation is scanline-ALWAYS (task #102): scanline 0 leaves the PLAIN path sampled while served fragments run Fubini - two algorithms in one frame (the fragmentation class that suppressed the caches)" },
 	{ "r_softShadowScanline",    1, "r_softShadowFaceCoverage", 0, "scanline lives in the face-coverage path; faceCoverage 0 makes it inert" },
 	{ "r_softShadowScanline",    1, "r_softShadowCompute",      0, "the scanline term needs the compute soft-shadow path (softShadowCompute 1)" },
 	{ "r_useSoftShadowVolumes",  1, "r_useRTShadows",           1, "RT and soft-shadow volumes are mutually exclusive - RT precedence silently disables the soft path" },
@@ -131,7 +131,7 @@ static const shadowInert_t s_shadowInert[] =
 {
 	{ "r_softShadowSamples",          "r_softShadowScanline",   1, "the scanline term rasterises exact chords and IGNORES the disk sample count" },
 	{ "r_softShadowSamples",          "r_useSoftShadowVolumes", 0, "the disk sample count only affects the analytic soft-shadow path" },
-	{ "r_softShadowScanline",         "r_softShadowSurfCache",  1, "scanline is ignored while the surf cache serves the term" },
+	{ "r_softShadowSamples",          "r_softShadowSurfCache",  1, "the surf permutation is scanline-always (task #102); the disk sample count only affects the legacy sampled A/B baseline" },
 	{ "r_softShadowSurfCacheGrid",    "r_softShadowSurfCache",  0, "the surf-cache grid mode is inert while the surf cache is off" },
 	{ "r_softShadowSurfCacheReduced", "r_softShadowSurfCache",  0, "reduced-set mode is inert while the surf cache is off" },
 	{ "r_rtShadowRays",               "r_useRTShadows",         0, "the RT ray count is inert while RT shadows are off" },
