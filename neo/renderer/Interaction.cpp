@@ -746,12 +746,13 @@ static inline void SoftFaceScratchFree( void* p )
 
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
 		const idRenderLightLocal* light, float penumbraSize, const float* modelToWorld,
-		idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters )
+		idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters, bool* outIsBox )
 {
 	*outElems = NULL;
 	*outNumElems = 0;
 	*outClusters = NULL;
 	*outNumClusters = 0;
+	if( outIsBox != NULL ) { *outIsBox = false; }
 
 	if( tri->indexes == NULL || tri->numIndexes < 3 || penumbraSize <= 0.0f )
 	{
@@ -766,12 +767,24 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 	// 12-triangle AABB proxy is equal-or-better and cuts the walk's record count ~100x for that caster.
 	// Round/detailed/L-shaped meshes have interior verts far from every face -> fail the test -> keep
 	// their triangles. Verts drive the whole pipeline below (transform, cluster, emit) unchanged.
-	extern idCVar r_softShadowProxyBox, r_softShadowProxyBoxGap;
+	extern idCVar r_softShadowProxyBox, r_softShadowProxyBoxGap, r_softShadowProxyModel, r_softShadowProxyInflate;
 	extern int fe_softProxyBoxed;
 	const int SW_PROXY_MIN_TRIS = 64;			// below this the 12-tri box saves too little to bother
 	idVec3 boxLocal[36];						// 12 tris x 3 local-space box verts (when proxied)
 	bool useBox = false;
-	if( r_softShadowProxyBox.GetBool() && numTris >= SW_PROXY_MIN_TRIS && tri->numVerts > 0 )
+	// CURATED single-model swap: this ONE specific named mesh is replaced by its AABB box, no geometric
+	// test - the mesh is identified offline (r_softShadowProxyProfile) as a genuine right-angle box, so
+	// its box IS its shadow. The auto path below (r_softShadowProxyBox) keeps its verts-hug-AABB gate.
+	bool curated = false;
+	{
+		const char* pm = r_softShadowProxyModel.GetString();
+		if( pm != NULL && pm[0] != '\0' && ent != NULL && ent->parms.hModel != NULL &&
+				idStr::Icmp( ent->parms.hModel->Name(), pm ) == 0 )
+		{
+			curated = true;
+		}
+	}
+	if( ( curated || ( r_softShadowProxyBox.GetBool() && numTris >= SW_PROXY_MIN_TRIS ) ) && tri->numVerts > 0 )
 	{
 		idVec3 lmn( 1e30f, 1e30f, 1e30f ), lmx( -1e30f, -1e30f, -1e30f );
 		for( int v = 0; v < tri->numVerts; v++ )
@@ -784,30 +797,62 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 		const float diag = ext.Length();
 		if( diag > 1e-3f )
 		{
-			float maxGap = 0.0f;				// worst vertex's distance INTO the box from its nearest face
-			for( int v = 0; v < tri->numVerts; v++ )
+			bool pass = curated;			// curated: named mesh, swap unconditionally
+			if( !pass )
 			{
-				const idVec3& p = verts[v].xyz;
-				const float g = Min( Min( Min( p.x - lmn.x, lmx.x - p.x ), Min( p.y - lmn.y, lmx.y - p.y ) ), Min( p.z - lmn.z, lmx.z - p.z ) );
-				maxGap = Max( maxGap, g );
+				float maxGap = 0.0f;			// worst vertex's distance INTO the box from its nearest face
+				for( int v = 0; v < tri->numVerts; v++ )
+				{
+					const idVec3& p = verts[v].xyz;
+					const float g = Min( Min( Min( p.x - lmn.x, lmx.x - p.x ), Min( p.y - lmn.y, lmx.y - p.y ) ), Min( p.z - lmn.z, lmx.z - p.z ) );
+					maxGap = Max( maxGap, g );
+				}
+				pass = ( maxGap < r_softShadowProxyBoxGap.GetFloat() * diag );
 			}
-			if( maxGap < r_softShadowProxyBoxGap.GetFloat() * diag )
+			if( pass )
 			{
 				useBox = true;
 				fe_softProxyBoxed++;
+				// curated size adjust: grow (>0) or shrink (<0) the box about its centre so the proxy
+				// fits the true occluder better than the raw AABB (r_softShadowProxyInflate, fraction of
+				// extent). Auto-boxed meshes keep their exact AABB; only the named curated mesh is tuned.
+				if( curated )
+				{
+					const float infl = r_softShadowProxyInflate.GetFloat();
+					if( infl != 0.0f )
+					{
+						const idVec3 c = ( lmn + lmx ) * 0.5f;
+						lmn = c + ( lmn - c ) * ( 1.0f + infl );
+						lmx = c + ( lmx - c ) * ( 1.0f + infl );
+					}
+				}
 				idVec3 corner[8];
 				for( int c = 0; c < 8; c++ )
 				{
 					corner[c].Set( ( c & 1 ) ? lmx.x : lmn.x, ( c & 2 ) ? lmx.y : lmn.y, ( c & 4 ) ? lmx.z : lmn.z );
 				}
-				static const int F[6][4] = { {0,2,6,4}, {1,3,7,5}, {0,1,5,4}, {2,3,7,6}, {0,1,3,2}, {4,5,7,6} };
-				int b = 0;
-				for( int f = 0; f < 6; f++ )
+				if( curated )
 				{
-					boxLocal[b++] = corner[F[f][0]]; boxLocal[b++] = corner[F[f][1]]; boxLocal[b++] = corner[F[f][2]];
-					boxLocal[b++] = corner[F[f][0]]; boxLocal[b++] = corner[F[f][2]]; boxLocal[b++] = corner[F[f][3]];
+					// ANALYTIC box: emit the 8 corners (bit convention: index bit0=x,bit1=y,bit2=z) packed as
+					// 3 "triangles" (9 vertex slots = 8 corners + a centre marker), so the term walk reads them
+					// as box params and evaluates SoftScan_FillBox ONCE instead of rasterising 12 triangles.
+					// The caller tags this caster (numTris < 0) so the bin/term dispatch to the analytic path.
+					for( int c = 0; c < 8; c++ ) { boxLocal[c] = corner[c]; }
+					boxLocal[8] = ( lmn + lmx ) * 0.5f;					// marker slot (pads to 3 tris); walk ignores it
+					numTris = 3;
+					if( outIsBox != NULL ) { *outIsBox = true; }
 				}
-				numTris = 12;
+				else
+				{
+					static const int F[6][4] = { {0,2,6,4}, {1,3,7,5}, {0,1,5,4}, {2,3,7,6}, {0,1,3,2}, {4,5,7,6} };
+					int b = 0;
+					for( int f = 0; f < 6; f++ )
+					{
+						boxLocal[b++] = corner[F[f][0]]; boxLocal[b++] = corner[F[f][1]]; boxLocal[b++] = corner[F[f][2]];
+						boxLocal[b++] = corner[F[f][0]]; boxLocal[b++] = corner[F[f][2]]; boxLocal[b++] = corner[F[f][3]];
+					}
+					numTris = 12;
+				}
 			}
 		}
 	}
@@ -1093,7 +1138,7 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 			idVec4* clusters = NULL;
 			int     nClusters = 0;
 			R_CollectPenumbraFaces( ent, tri, light, penumbraSize, ent->modelMatrix,
-									&faceElems, &nElems, &clusters, &nClusters );
+									&faceElems, &nElems, &clusters, &nClusters, NULL );
 			if( clusters != NULL )
 			{
 				Mem_Free( clusters );		// warm never uses the cluster block

@@ -219,6 +219,24 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 			continue;
 		}
 		float4 c1 = t_Edges[ g_range.w + cc * 2 + 1 ];			// ( firstTri, numTris, 0, 0 )
+		// ANALYTIC BOX caster (numTris < 0): its 3 tri-slots hold 8 box corners, not triangles. Append ONE
+		// tagged tile entry (high bit set on the caster index) and skip the tri stride - the term walk reads
+		// the corners and evaluates SoftScan_FillBox once per fragment, never rasterising a triangle.
+		if( c1.y < 0.0f )
+		{
+			if( tid == 0 )
+			{
+				uint bslot;
+				InterlockedAdd( gsCount, 1u, bslot );
+				if( bslot < ( uint )g_tune.x )
+				{
+					// tag = high bit + the box's FIRST tri-slot index, so any consumer reads its 8 corners
+					// at (triStreamBase + firstTri*3) with no caster-table lookup.
+					u_Tiles[ outSlot + 1 + ( int )bslot ] = 0x80000000u | ( uint )( ( int )c1.x );
+				}
+			}
+			continue;
+		}
 		const int triFirst = ( int )c1.x;
 		const int triEnd   = triFirst + ( int )c1.y;
 		for( int t = triFirst + ( int )tid; t < triEnd; t += 64 )

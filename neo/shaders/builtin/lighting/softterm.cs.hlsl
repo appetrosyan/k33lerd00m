@@ -753,7 +753,26 @@ void main( uint3 tid : SV_DispatchThreadID )
 			const bool swHasDyn = swDynFirstTri != 0x7FFFFFFF;
 			[loop] for( int ld2 = 0; swHasDyn && !swUmbE && ld2 < swServeListCount; ld2++ )
 			{
-				const int dt = ( int )t_SoftTiles[ swServeListBase + ld2 ];
+				const uint dtEnc = t_SoftTiles[ swServeListBase + ld2 ];
+				if( dtEnc & 0x80000000u )
+				{
+					// ANALYTIC BOX caster: high-bit-tagged FIRST tri-slot index. Read its 8 corners from the
+					// 3 tri-slots and evaluate SoftScan_FillBox ONCE - no triangle rasterisation.
+					const int bft = ( int )( dtEnc & 0x7FFFFFFFu );
+					const int bb  = g_range.x + bft * 3;
+					float3 bcorner[8];
+					bcorner[0] = t_SoftEdges[ bb + 0 ].xyz; bcorner[1] = t_SoftEdges[ bb + 1 ].xyz;
+					bcorner[2] = t_SoftEdges[ bb + 2 ].xyz; bcorner[3] = t_SoftEdges[ bb + 3 ].xyz;
+					bcorner[4] = t_SoftEdges[ bb + 4 ].xyz; bcorner[5] = t_SoftEdges[ bb + 5 ].xyz;
+					bcorner[6] = t_SoftEdges[ bb + 6 ].xyz; bcorner[7] = t_SoftEdges[ bb + 7 ].xyz;
+					swDFill++;
+					SoftScan_FillBox( swGrid, bcorner, swP, swFC, swRC, SW_NEAR_EPS );
+					int swCovB = 0;
+					[unroll] for( int fmb = 0; fmb < SW_SCAN_CHORDS; fmb++ ) { swCovB += SoftScan_PC( swGrid[fmb] & swDiskMask[fmb] ); }
+					if( swCovB * 100 >= swDiskBits * 99 ) { break; }
+					continue;
+				}
+				const int dt = ( int )dtEnc;
 				if( dt < swDynFirstTri )
 				{
 					continue;						// static tri: served from the recorded union above

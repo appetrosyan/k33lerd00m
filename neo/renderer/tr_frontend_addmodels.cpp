@@ -58,7 +58,7 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 // coverage, temporally stable; the light-silhouette path above undershoots off-axis (Interaction.cpp).
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
 							 float penumbraSize, const float* modelToWorld,
-							 idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters );
+							 idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters, bool* outIsBox = NULL );
 extern idCVar r_shadowPenumbraSize;	// soft shadow volumes: light source radius (RenderSystem_init.cpp)
 extern idCVar r_softShadowFaceCoverage;	// 1 = stream caster faces + front-face coverage instead of light silhouette
 
@@ -95,6 +95,131 @@ int fe_softStaticRecords = 0, fe_softDynRecords = 0;	// tri-stream float4 record
 int fe_softDynLightMoved = 0;						// of the dynamic records: those under a MOVED light
 int fe_softDynGeomMoved = 0;						// of the dynamic records: static light but moving/animated caster
 
+// PROXY PROFILER (r_softShadowProxyProfile): one-shot, per distinct caster MODEL. It exists to IDENTIFY a
+// specific mesh offline - which named erebus meshes are genuine right-angle boxes (corner gap ~0) versus
+// rounded/beveled ones (corner gap > 0) - so the operator can name the right one in r_softShadowProxyModel.
+// It never swaps anything; it only reports. Accumulates over one frame of collection, then prints + resets.
+struct softProxyProf_t
+{
+	idStr	name;
+	int		casts;			// number of (model,light) collections this frame
+	int		records;		// sum of tris across those casts (the walk-relevant mass)
+	int		tris;			// tri count of one instance
+	float	cornerRatio;	// worst-of-8 AABB-corner gap / diagonal: ~0 = right-angle box, larger = rounded corners
+	float	faceRatio;		// deepest vertex INTO the box / diagonal: ~0 = shell hugs the box, larger = interior detail
+};
+static idList<softProxyProf_t>	s_softProxyProf;
+static int						s_softProxyProfFrame = -1;
+
+static void R_SoftProxyProfileMetrics( const srfTriangles_t* tri, int& outTris, float& outCorner, float& outFace )
+{
+	outTris = tri->numIndexes / 3;
+	outCorner = 1.0f;
+	outFace = 0.0f;
+	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
+	if( verts == NULL || tri->numVerts <= 0 )
+	{
+		return;
+	}
+	idVec3 mn( 1e30f, 1e30f, 1e30f ), mx( -1e30f, -1e30f, -1e30f );
+	for( int v = 0; v < tri->numVerts; v++ )
+	{
+		const idVec3& p = verts[v].xyz;
+		mn.x = Min( mn.x, p.x ); mn.y = Min( mn.y, p.y ); mn.z = Min( mn.z, p.z );
+		mx.x = Max( mx.x, p.x ); mx.y = Max( mx.y, p.y ); mx.z = Max( mx.z, p.z );
+	}
+	const float diag = ( mx - mn ).Length();
+	if( diag < 1e-4f )
+	{
+		return;
+	}
+	float worstCorner = 0.0f;					// the AABB corner that is FARTHEST from any mesh vertex
+	for( int c = 0; c < 8; c++ )
+	{
+		const idVec3 corner( ( c & 1 ) ? mx.x : mn.x, ( c & 2 ) ? mx.y : mn.y, ( c & 4 ) ? mx.z : mn.z );
+		float best = 1e30f;
+		for( int v = 0; v < tri->numVerts; v++ )
+		{
+			const float d = ( verts[v].xyz - corner ).Length();
+			if( d < best ) { best = d; }
+		}
+		if( best > worstCorner ) { worstCorner = best; }
+	}
+	outCorner = worstCorner / diag;
+	float maxGap = 0.0f;
+	for( int v = 0; v < tri->numVerts; v++ )
+	{
+		const idVec3& p = verts[v].xyz;
+		const float g = Min( Min( Min( p.x - mn.x, mx.x - p.x ), Min( p.y - mn.y, mx.y - p.y ) ), Min( p.z - mn.z, mx.z - p.z ) );
+		maxGap = Max( maxGap, g );
+	}
+	outFace = maxGap / diag;
+}
+
+static void R_SoftProxyProfile( const idRenderEntityLocal* ent, const srfTriangles_t* tri )
+{
+	extern idCVar r_softShadowProxyProfile;
+	// lazy flush: once a full frame has elapsed since the enable, print the table and auto-reset the cvar.
+	if( s_softProxyProfFrame >= 0 && tr.frameCount != s_softProxyProfFrame )
+	{
+		extern int fe_softProxyBoxed;
+		extern idCVar r_softShadowProxyModel;
+		common->Printf( "[softproxy] per-model profile (%d distinct), sorted by records = tris x casts:\n", s_softProxyProf.Num() );
+		common->Printf( "[softproxy] curated model '%s' -> %d casters boxed this frame\n", r_softShadowProxyModel.GetString(), fe_softProxyBoxed );
+		common->Printf( "[softproxy]   records casts  tris  cornerGap  faceGap  model\n" );
+		const int LIMIT = 80;
+		for( int printed = 0; printed < LIMIT; printed++ )
+		{
+			int best = -1;
+			for( int i = 0; i < s_softProxyProf.Num(); i++ )
+			{
+				if( s_softProxyProf[i].casts >= 0 && ( best < 0 || s_softProxyProf[i].records > s_softProxyProf[best].records ) )
+				{
+					best = i;
+				}
+			}
+			if( best < 0 ) { break; }
+			const softProxyProf_t& e = s_softProxyProf[best];
+			common->Printf( "[softproxy] %9d %5d %5d   %7.4f  %7.4f  %s\n", e.records, e.casts, e.tris, e.cornerRatio, e.faceRatio, e.name.c_str() );
+			s_softProxyProf[best].casts = -1;		// mark printed
+		}
+		const bool quitAfter = ( r_softShadowProxyProfile.GetInteger() >= 2 );	// 2 = headless one-shot
+		s_softProxyProf.Clear();
+		s_softProxyProfFrame = -1;
+		r_softShadowProxyProfile.SetInteger( 0 );
+		// profile 2 = headless: quit after the table so a loadGame run terminates on its own. profile 1
+		// stays alive (interactive playtest can profile without being killed).
+		if( quitAfter )
+		{
+			cmdSystem->AppendCommandText( "quit\n" );
+		}
+		return;
+	}
+	if( !r_softShadowProxyProfile.GetBool() )
+	{
+		return;
+	}
+	if( s_softProxyProfFrame < 0 ) { s_softProxyProfFrame = tr.frameCount; }
+	const char* nm = ( ent != NULL && ent->parms.hModel != NULL ) ? ent->parms.hModel->Name() : "<null>";
+	int idx = -1;
+	for( int i = 0; i < s_softProxyProf.Num(); i++ )
+	{
+		if( s_softProxyProf[i].name.Icmp( nm ) == 0 ) { idx = i; break; }
+	}
+	int tris; float corner, face;
+	R_SoftProxyProfileMetrics( tri, tris, corner, face );
+	if( idx < 0 )
+	{
+		softProxyProf_t e;
+		e.name = nm; e.casts = 0; e.records = 0; e.tris = tris; e.cornerRatio = corner; e.faceRatio = face;
+		idx = s_softProxyProf.Append( e );
+	}
+	s_softProxyProf[idx].casts++;
+	s_softProxyProf[idx].records += tris;
+	s_softProxyProf[idx].cornerRatio = Max( s_softProxyProf[idx].cornerRatio, corner );
+	s_softProxyProf[idx].faceRatio = Max( s_softProxyProf[idx].faceRatio, face );
+}
+
 // A soft caster is CACHEABLE-STATIC iff its light is immobile AND its geometry is immobile (static world
 // surface or DM_STATIC entity) AND the entity was not updated this frame. Mirrors the stencil path's
 // static-interaction gate (IsDynamicModel()==DM_STATIC) + event-driven move invalidation (lastModifiedFrameNum).
@@ -109,6 +234,18 @@ static bool R_SoftCasterIsStatic( const idRenderEntityLocal* entityDef, const vi
 	if( m == NULL )
 	{
 		return false;
+	}
+	// CURATED ANALYTIC BOX (r_softShadowProxyModel): force this model onto the DYNAMIC path so its box
+	// caster is (re)emitted + tagged by the frontend flatten every frame, never routed through the warm
+	// static cache (which has a separate flatten that would not carry the numTris<0 box tag). Cheap - one
+	// analytic caster - and keeps the v1 box wiring confined to the single dynamic flatten site.
+	{
+		extern idCVar r_softShadowProxyModel;
+		const char* pm = r_softShadowProxyModel.GetString();
+		if( pm != NULL && pm[0] != '\0' && idStr::Icmp( m->Name(), pm ) == 0 )
+		{
+			return false;
+		}
 	}
 	// LINGER classification (r_softShadowContribLinger > 0): a light+entity pair unmodified for
 	// >= linger frames is cacheable regardless of movement history - the sticky lightHasMoved and
@@ -1882,11 +2019,12 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					// stored through the same drawSurf fields (count in FLOAT4 elements; see drawSurf_t).
 					idVec4* faceClusters = NULL;
 					int nClusters = 0;
+					bool swFaceIsBox = false;			// analytic box caster (curated): tagged numTris<0 at flatten
 					if( r_softShadowFaceCoverage.GetBool() )
 					{
 						idVec4* faceElems = NULL;
 						R_CollectPenumbraFaces( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
-												vEntity->modelMatrix, &faceElems, &nedges, &faceClusters, &nClusters );
+												vEntity->modelMatrix, &faceElems, &nedges, &faceClusters, &nClusters, &swFaceIsBox );
 						sedges = ( softShadowEdge_t* )faceElems;
 					}
 					else
@@ -1895,6 +2033,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 												vEntity->modelMatrix, &sedges, &nedges );
 					}
 					tr.pc.softShadowMicroSec += Sys_Microseconds() - swCollectStart;
+					R_SoftProxyProfile( entityDef, tri );
 					extern int fe_softEdgesCollected;
 					fe_softEdgesCollected += nedges;
 					if( nedges > 0 )
@@ -1907,6 +2046,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 						edgeSurf->numSoftClusters = nClusters;
 						edgeSurf->frontEndGeo = tri;		// caster solid, for the scene-capture ground-truth mesh
 						edgeSurf->space = vEntity;
+						edgeSurf->softIsBox = swFaceIsBox;	// analytic box: flatten tags numTris<0 for the walk's FillBox
 						edgeSurf->scissorRect = vLight->scissorRect;
 
 						edgeSurf->linkChain = &vLight->softShadowWedges;
@@ -2669,6 +2809,7 @@ void R_AddModels()
 				int  nStaticTris = 0;
 				bool swSeenDynCaster = false;
 				bool swCurCasterStatic = false;
+				bool swCurCasterBox = false;			// analytic box caster: its 3 tri-slots are 8 box corners
 				uint64_t swSurfFold = 0;
 				idVec3 gmn( 1e30f, 1e30f, 1e30f ), gmx( -1e30f, -1e30f, -1e30f );
 				for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
@@ -2682,7 +2823,8 @@ void R_AddModels()
 							const idVec3 c = ( gmn + gmx ) * 0.5f;
 							const float  rad = ( gmx - gmn ).Length() * 0.5f;
 							casFlat[nCas * 2 + 0] = idVec4( c.x, c.y, c.z, rad );
-							casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri, ( float )( nElems / 3 - openFirstTri ),
+							casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri,
+															swCurCasterBox ? -( float )( nElems / 3 - openFirstTri ) : ( float )( nElems / 3 - openFirstTri ),
 															( float )openFirstClu, ( float )( nClu - openFirstClu ) );
 							nCas++;
 							if( swCurCasterStatic && !swSeenDynCaster )
@@ -2698,6 +2840,7 @@ void R_AddModels()
 						gmx.Set( -1e30f, -1e30f, -1e30f );
 						curSpace = s->space;
 						swCurCasterStatic = R_SoftCasterIsStatic( s->space->entityDef, vLight );
+						swCurCasterBox = false;			// reset for the new caster; OR'd across its surfaces below
 						if( !swCurCasterStatic )
 						{
 							swSeenDynCaster = true;    // prefix ends: later statics (shouldn't happen post-sort) stay "dynamic" = exact walk
@@ -2713,6 +2856,7 @@ void R_AddModels()
 							swSurfFold = swSurfFold * 0x2545F4914F6CDD1Dull + h;
 						}
 					}
+					if( s->softIsBox ) { swCurCasterBox = true; }		// analytic box surf -> tag this caster
 					const std::vector<unsigned char>* swM = ( swSurfIdx < ( int )swMasks.size() ) ? swMasks[swSurfIdx] : NULL;
 					swSurfIdx++;
 					if( swM != NULL && s->numSoftClusters > 0 )
@@ -2776,7 +2920,8 @@ void R_AddModels()
 					const idVec3 c = ( gmn + gmx ) * 0.5f;
 					const float  rad = ( gmx - gmn ).Length() * 0.5f;
 					casFlat[nCas * 2 + 0] = idVec4( c.x, c.y, c.z, rad );
-					casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri, ( float )( nElems / 3 - openFirstTri ),
+					casFlat[nCas * 2 + 1] = idVec4( ( float )openFirstTri,
+													swCurCasterBox ? -( float )( nElems / 3 - openFirstTri ) : ( float )( nElems / 3 - openFirstTri ),
 													( float )openFirstClu, ( float )( nClu - openFirstClu ) );
 					nCas++;
 					if( swCurCasterStatic && !swSeenDynCaster )

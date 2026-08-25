@@ -106,6 +106,8 @@ struct drawSurf_t
 	const idVec4*			softClusters;		// FACE v3: this caster's cluster table (2 float4/cluster: sphere +
 												// ( firstTri, numTris ) surface-local), frame mem; NULL in wedge mode
 	int						numSoftClusters;	// FACE v3: CLUSTER count (2 float4 elements each)
+	bool					softIsBox;			// analytic BOX caster (curated proxy): its 3 tri-slots hold 8 box
+												// corners, not triangles; flatten tags numTris<0 so the walk runs FillBox
 	int						numIndexes;
 	vertCacheHandle_t		indexCache;			// triIndex_t
 	vertCacheHandle_t		ambientCache;		// idDrawVert

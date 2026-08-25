@@ -308,10 +308,16 @@ SW_FUNC softFrame_t SoftShadow_Frame( float3 swP, float3 swL )
 // is RUNTIME-toggle-able: each pass's main() writes this static from its cvar BEFORE the walk; 0 = exact
 // (default here, so any path that does not set it stays lossless). HLSL statics are per-invocation mutable.
 static float g_swMinDnR = 0.0f;
+// g_swMinDnAbs: an ABSOLUTE dn floor knob (default 0 = inert). A footprint-DRIVEN version of this was tried
+// for the grazing grain and REFUTED (SoftShadowGrainAA_test): the clamp family biases the projection instead
+// of averaging, so it plateaus ~0.10 off the supersampled truth and over-blurs past that. The lossless grain
+// fix is footprint SUPERSAMPLING of swP at the walk call sites; production never sets this (the test does, to
+// keep the refutation reproducible).
+static float g_swMinDnAbs = 0.0f;
 // central projection of a receiver-relative point onto the light plane (depth dn along nrm precomputed)
 SW_FUNC float2 SoftShadow_ProjectVert( float3 rel, float dn, softFrame_t f )
 {
-	float dnc = max( dn, f.distPL * g_swMinDnR );
+	float dnc = max( dn, max( f.distPL * g_swMinDnR, g_swMinDnAbs ) );
 	return float2( ( f.distPL / dnc ) * dot( rel, f.u ), ( f.distPL / dnc ) * dot( rel, f.v ) );
 }
 
@@ -968,6 +974,142 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 v
 	}
 }
 
+// ANALYTIC BOX coverage: fill a box caster's receiver-silhouette (a convex <=6-gon) into swGrid ONCE,
+// instead of walking its 12 triangles. The projection of a convex SOLID from the receiver equals the
+// projection of its SILHOUETTE, so this is bit-identical coverage to SoftScan_FillTri over the 12 box
+// tris - but one polygon, zero per-triangle records, no per-tri cull/FillTri overhead. `corner[8]` are the
+// 8 world-space box corners in the bit convention (index bit0=x, bit1=y, bit2=z; 0=min side). From the
+// silhouette on, the body is FillTri verbatim (slab clip -> project -> per-chord x-span OR) over N<=6 verts.
+SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 corner[8],
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	// 6 faces, each 4 corner indices wound outward-CCW, so cross(edge1,edge2) is the OUTWARD normal.
+	const int BF[6][4] = { {1,3,7,5}, {0,4,6,2}, {2,6,7,3}, {0,1,5,4}, {4,5,7,6}, {0,2,3,1} };
+	bool front[6];
+	for( int f = 0; f < 6; f++ )
+	{
+		float3 a = corner[BF[f][0]], b = corner[BF[f][1]], c = corner[BF[f][2]];
+		float3 fc = ( a + b + c + corner[BF[f][3]] ) * 0.25f;
+		float3 fn = cross( b - a, c - a );							// outward by winding
+		front[f] = dot( fn, swP - fc ) > 0.0f;						// face turns toward the receiver
+	}
+	// silhouette = front-face edges whose opposite face is back. Collect directed (a->c) in front-face
+	// winding order so the pieces chain into one CCW loop.
+	int dA[12], dB[12]; int dcount = 0;
+	for( int f2 = 0; f2 < 6; f2++ )
+	{
+		if( !front[f2] ) { continue; }
+		for( int e = 0; e < 4; e++ )
+		{
+			int a = BF[f2][e], c = BF[f2][( e + 1 ) & 3];
+			bool nbBack = false, found = false;						// the other face sharing edge {a,c}
+			for( int g = 0; g < 6; g++ )
+			{
+				if( g == f2 ) { continue; }
+				bool ha = false, hc = false;
+				for( int k = 0; k < 4; k++ ) { int idx = BF[g][k]; ha = ha || ( idx == a ); hc = hc || ( idx == c ); }
+				if( ha && hc ) { nbBack = !front[g]; found = true; }
+			}
+			if( found && nbBack && dcount < 12 ) { dA[dcount] = a; dB[dcount] = c; dcount++; }
+		}
+	}
+	if( dcount < 3 )
+	{
+		// receiver INSIDE or ON the box: the front/back silhouette is degenerate (a contact-umbra
+		// fragment at the box's base plane, or a receiver passing through the solid). Fall back to the
+		// exact 12-triangle union of the 6 faces - slab-clipped like any triangle, so it is correct both
+		// ways (box above P -> umbra fills; box below P -> all faces clip, stays lit). Rare: only the
+		// fragments coplanar-inside the footprint hit this, so the 12 FillTri calls cost nothing at large.
+		for( int fb = 0; fb < 6; fb++ )
+		{
+			float3 a0 = corner[BF[fb][0]], a1 = corner[BF[fb][1]], a2 = corner[BF[fb][2]], a3 = corner[BF[fb][3]];
+			SoftScan_FillTri( swGrid, a0, a1, a2, swP, swF, swR, swEps );
+			SoftScan_FillTri( swGrid, a0, a2, a3, swP, swF, swR, swEps );
+		}
+		return;
+	}
+	// chain the directed edges into an ordered vertex loop
+	float3 loopV[8]; int loopN = 0;
+	bool used[12];
+	for( int u = 0; u < 12; u++ ) { used[u] = false; }
+	used[0] = true; int startV = dA[0], cur = dB[0];
+	loopV[0] = corner[dA[0]]; loopN = 1;
+	for( int s = 0; s < dcount && loopN < 8; s++ )
+	{
+		loopV[loopN++] = corner[cur];
+		if( cur == startV ) { loopN--; break; }						// closed the loop (last vert dup of start)
+		int nx = -1;
+		for( int k2 = 0; k2 < dcount; k2++ ) { if( !used[k2] && dA[k2] == cur ) { nx = k2; break; } }
+		if( nx < 0 ) { break; }
+		used[nx] = true; cur = dB[nx];
+	}
+	if( loopN < 3 ) { return; }
+	// ---- from here: SoftScan_FillTri body, generalised to loopN verts ----
+	float3 rel[8]; float dn[8];
+	for( int i = 0; i < loopN; i++ ) { rel[i] = loopV[i] - swP; dn[i] = dot( rel[i], swF.nrm ); }
+	float3 nRel[10]; float nDn[10]; int nn = 0;							// near clip: dn >= swEps
+	for( int e2 = 0; e2 < loopN; e2++ )
+	{
+		int i = e2, k = ( e2 + 1 ) % loopN;
+		bool ai = dn[i] >= swEps, bi = dn[k] >= swEps;
+		if( ai && nn < 10 ) { nRel[nn] = rel[i]; nDn[nn] = dn[i]; nn++; }
+		if( ( ai != bi ) && nn < 10 ) { float t = ( swEps - dn[i] ) / ( dn[k] - dn[i] ); nRel[nn] = rel[i] + ( rel[k] - rel[i] ) * t; nDn[nn] = swEps; nn++; }
+	}
+	if( nn < 3 ) { return; }
+	float3 fRel[12]; float fDn[12]; int fn = 0;							// far clip: dn <= distPL
+	for( int e3 = 0; e3 < nn; e3++ )
+	{
+		int i = e3, k = ( e3 + 1 ) % nn;
+		bool ai = nDn[i] <= swF.distPL, bi = nDn[k] <= swF.distPL;
+		if( ai && fn < 12 ) { fRel[fn] = nRel[i]; fDn[fn] = nDn[i]; fn++; }
+		if( ( ai != bi ) && fn < 12 ) { float t = ( swF.distPL - nDn[i] ) / ( nDn[k] - nDn[i] ); fRel[fn] = nRel[i] + ( nRel[k] - nRel[i] ) * t; fDn[fn] = swF.distPL; fn++; }
+	}
+	if( fn < 3 ) { return; }
+	float invR = 1.0f / swR;
+	float2 q[12]; int qn = fn; float ymin = 1e30f, ymax = -1e30f, xmin = 1e30f, xmax = -1e30f;
+	for( int j = 0; j < fn; j++ ) { float2 p = SoftShadow_ProjectVert( fRel[j], fDn[j], swF ) * invR; q[j] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); xmin = min( xmin, p.x ); xmax = max( xmax, p.x ); }
+	{
+		float nx2 = ( xmin > 0.0f ) ? xmin : ( ( xmax < 0.0f ) ? xmax : 0.0f );
+		float ny2 = ( ymin > 0.0f ) ? ymin : ( ( ymax < 0.0f ) ? ymax : 0.0f );
+		if( nx2 * nx2 + ny2 * ny2 > 1.0f ) { return; }
+	}
+	const float halfC = SW_SCAN_CHORDS * 0.5f;
+	int mLo = max( ( int )ceil( ( ymin + 1.0f ) * halfC - 0.5f ), 0 );
+	int mHi = min( ( int )floor( ( ymax + 1.0f ) * halfC - 0.5f ), SW_SCAN_CHORDS - 1 );
+	if( mLo > mHi ) { return; }
+	{
+		SwGridWord bboxRun = SoftScan_Run( xmin, xmax );
+		bool newBits = false;
+		for( int mc = mLo; mc <= mHi; mc++ ) { if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; break; } }
+		if( !newBits ) { return; }
+	}
+	float eax[12], eay[12], eslope[12], elo[12], ehi[12];
+	for( int e4 = 0; e4 < 12; e4++ )
+	{
+		if( e4 >= qn ) { eax[e4] = 0; eay[e4] = 0; eslope[e4] = 0; elo[e4] = 1e30f; ehi[e4] = -1e30f; continue; }
+		float2 A = q[e4], B = q[( e4 + 1 ) % qn];
+		eax[e4] = A.x; eay[e4] = A.y; eslope[e4] = ( B.x - A.x ) / ( B.y - A.y );
+		elo[e4] = min( A.y, B.y ); ehi[e4] = max( A.y, B.y );
+	}
+	for( int m = mLo; m <= mHi; m++ )
+	{
+		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
+		float xlo = 1e30f, xhi = -1e30f; bool any = false;
+		for( int e5 = 0; e5 < 12; e5++ )
+		{
+			if( Y >= elo[e5] && Y < ehi[e5] )
+			{
+				float x = eax[e5] + eslope[e5] * ( Y - eay[e5] );
+				xlo = min( xlo, x ); xhi = max( xhi, x ); any = true;
+			}
+		}
+		if( any )
+		{
+			swGrid[m] |= SoftScan_Run( xlo, xhi );
+		}
+	}
+}
+
 // TOPOLOGY-ONLY fill: for callers that use the grid for SET membership (contrib-cache contribution
 // tests, the surf-grid build/serve) and reduce by popcount, not the exact-length coverage. Discards the
 // exact edges so the call site needs no throwaway arrays.
@@ -1492,6 +1634,26 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 		float3 v0, v1, v2;
 		float  cd = 0.0f;			// centroid depth along the receiver normal; used by the SW_FACE_PROFILE==2 probe
 		bool   swLoaded = false;	// set once a path has fetched v0/v1/v2 (a cull-before-load survivor)
+		// ANALYTIC BOX caster: high-bit-tagged tile entry carrying the box's first tri-slot. Under the Fubini
+		// scanline path read its 8 corners and SoftScan_FillBox once; the box feature is scanline-only, so the
+		// sampling permutation just skips the entry (never emitted there).
+		{
+			uint swEncB = t_SoftTiles[ swListBase + li ];
+			if( ( swEncB & 0x80000000u ) != 0u )
+			{
+#if SW_SCANLINE
+				const int bbB = swFirstElem + ( int )( swEncB & 0x7FFFFFFFu ) * 3;
+				float3 bcornerB[8];
+				for( int bk = 0; bk < 8; bk++ )
+				{
+					float4 bcv = t_SoftEdges[ bbB + bk ];
+					bcornerB[bk] = float3( bcv.x, bcv.y, bcv.z );
+				}
+				SoftScan_FillBox( swGrid, bcornerB, swP, swF, swR, swEps );
+#endif
+				continue;
+			}
+		}
 #if SW_CULL_BEFORE_LOAD && !SW_FACE_PROFILE
 		// CULL BEFORE LOAD (RUNTIME toggle SW_CBL_RT = r_softShadowCullBeforeLoad): cull from the tile-bin's
 		// stored (centroid, tight triRad) - a SEQUENTIAL read - and only scatter-load the 3 verts for
