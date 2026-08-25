@@ -143,6 +143,7 @@ extern idCVar r_useRTShadows;		// runtime RT shadows toggle (RenderSystem_init.c
 extern idCVar r_useStencilShadows;	// stencil shadow volumes toggle (tr_frontend_addmodels.cpp)
 extern idCVar r_useSoftShadowVolumes;	// soft shadow volumes / penumbra wedges (RenderSystem_init.cpp)
 extern idCVar r_shadowPenumbraSize;		// soft shadow volumes: light source radius (RenderSystem_init.cpp)
+extern float R_SoftPenumbraRadius( const idRenderLightLocal* lightDef );	// per-light emitter radius (task #105, tr_frontend_addmodels.cpp)
 extern idCVar r_shadowPenumbraMinWidth;	// soft shadow volumes: penumbra half-width floor (RenderSystem_init.cpp)
 extern idCVar r_softShadowTwoSided;		// soft shadow volumes: two-sided vs single-sided wedge raster (RenderSystem_init.cpp)
 extern idCVar r_softShadowShowMask;		// soft shadow volumes: blit the raw signed accumulator (RenderSystem_init.cpp)
@@ -1785,7 +1786,7 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 						currentSoftEdgeBuffer = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
 						currentSoftEdgeCount = din->vLight->softEdgeCount;
 
-						float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), ( float )currentSoftEdgeCount, 0.0f };
+						float swParm[4] = { R_SoftPenumbraRadius( din->vLight->lightDef ), r_shadowPenumbraMinWidth.GetFloat(), ( float )currentSoftEdgeCount, 0.0f };
 						SetVertexParm( RENDERPARM_JITTERTEXSCALE, swParm );	// vertex bank; the PS reads the fragment bank (sign-select is applied there)
 
 						if( din->vLight->parallel )
@@ -1983,7 +1984,7 @@ void idRenderBackend::DrawSingleInteraction( drawInteraction_t* din, bool useFas
 			extern idCVar r_softShadowFaceCoverage;
 			const bool swFaceMode = r_softShadowFaceCoverage.GetBool();
 			const float swCountSigned = swFaceMode ? -( float )din->vLight->softCasterCount : ( float )currentSoftEdgeCount;
-			float swParm[4] = { r_shadowPenumbraSize.GetFloat(), r_shadowPenumbraMinWidth.GetFloat(), swCountSigned, ( float )r_softShadowDebugShader.GetInteger() };
+			float swParm[4] = { R_SoftPenumbraRadius( din->vLight->lightDef ), r_shadowPenumbraMinWidth.GetFloat(), swCountSigned, ( float )r_softShadowDebugShader.GetInteger() };
 			SetFragmentParm( RENDERPARM_JITTERTEXSCALE, swParm );	// the pixel shader reads rpJitterTexScale from the FRAGMENT bank
 
 			// first edge element in the joint buffer (structStride 16 bytes) - the shader indexes from here
@@ -4988,7 +4989,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 						 joint, edgeOfs / 16u,		// tri stream base in float4 elements
 						 casOfs / 16u,				// caster table base in float4 elements
 						 vLight->softCasterCount,
-						 r_shadowPenumbraSize.GetFloat(),
+						 R_SoftPenumbraRadius( vLight->lightDef ),
 						 r.ox, r.oy, r.tilesX );
 			if( r.base >= 0 )
 			{
@@ -5048,7 +5049,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 				const uint casOfs = ( uint )( ( ch >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
 				nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
 				swSurf->BuildLight( target, vLight, joint, edgeOfs / 16u, casOfs / 16u,
-									r_shadowPenumbraSize.GetFloat() );
+									R_SoftPenumbraRadius( vLight->lightDef ) );
 			}
 			swSurf->EndBuilds( target );
 		}
@@ -5109,7 +5110,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 						joint, edgeOfs / 16u,		// tri stream base in float4 elements
 						casOfs / 16u,				// caster table base in float4 elements
 						vLight->softCasterCount,
-						r_shadowPenumbraSize.GetFloat(),
+						R_SoftPenumbraRadius( vLight->lightDef ),
 						tileBase, tileOx, tileOy, tileTilesX,
 						( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
 						( softTileBinPass != NULL ) ? softTileBinPass->GetTileCullBuffer() : NULL,
@@ -5398,7 +5399,7 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				lightParm[0] = vLight->globalLightOrigin.x;
 				lightParm[1] = vLight->globalLightOrigin.y;
 				lightParm[2] = vLight->globalLightOrigin.z;
-				lightParm[3] = r_shadowPenumbraSize.GetFloat();
+				lightParm[3] = R_SoftPenumbraRadius( vLight->lightDef );
 				SetVertexParm( RENDERPARM_JITTERTEXSCALE, lightParm );
 
 				// .x = penumbra half-width floor (caps coverage gradient near contact). .y = per-invocation
@@ -5701,7 +5702,7 @@ void idRenderBackend::DrawInteractions( const viewDef_t* _viewDef )
 				// counts (the property SoftContract.shell_capped_volume_* proved unknowable). The write
 				// mask means this pass can never disturb the core's low-bit counts; the reverse is why the
 				// core must draw FIRST (its DECR could borrow across the bit boundary).
-				const float swParm[4] = { r_shadowPenumbraSize.GetFloat(), -1.0f, 1.1f, 0.0f };
+				const float swParm[4] = { R_SoftPenumbraRadius( vLight->lightDef ), -1.0f, 1.1f, 0.0f };
 				SetVertexParm( RENDERPARM_JITTERTEXSCALE, swParm );
 				GL_State(
 					GLS_DEPTHMASK | GLS_COLORMASK | GLS_ALPHAMASK | GLS_DEPTHFUNC_LESS |

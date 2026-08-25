@@ -94,6 +94,9 @@ void idGameEdit::ParseSpawnArgsToRenderLight( const idDict* args, renderLight_t*
 		args->GetVector( "origin", "", renderLight->origin );
 	}
 
+	// analytic soft shadows: authored physical emitter radius (world units); 0 = derive in the renderer
+	renderLight->penumbraSize = args->GetFloat( "penumbraSize", "0" );
+
 	gotTarget = args->GetVector( "light_target", "", renderLight->target );
 	gotUp = args->GetVector( "light_up", "", renderLight->up );
 	gotRight = args->GetVector( "light_right", "", renderLight->right );

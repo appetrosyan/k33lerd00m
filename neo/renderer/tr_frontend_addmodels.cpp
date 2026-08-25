@@ -60,6 +60,43 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 							 float penumbraSize, const float* modelToWorld,
 							 idVec4** outElems, int* outNumElems, idVec4** outClusters, int* outNumClusters, bool* outIsBox = NULL );
 extern idCVar r_shadowPenumbraSize;	// soft shadow volumes: light source radius (RenderSystem_init.cpp)
+extern idCVar r_shadowPenumbraAuto, r_shadowPenumbraAutoScale;
+
+// Per-light soft-shadow emitter radius (task #105: lights sized by their PHYSICAL emitters, not one
+// global). Priority: authored "penumbraSize" entity key (the physical truth - a disk approximates any
+// fixture shape; the radius, not the shape, drives penumbra width), else a heuristic from the light's
+// own extents (fixtures scale weakly with their volumes), else the r_shadowPenumbraSize global. The
+// global also CAPS the derived value, so no light ever gets a larger emitter than the legacy default.
+// Smaller emitters shrink the penumbra band, the per-fragment cull cones and the tile lists together -
+// the attribution runs measured those as the dominant per-pixel work multipliers.
+float R_SoftPenumbraRadius( const idRenderLightLocal* lightDef )
+{
+	const float globalR = Max( r_shadowPenumbraSize.GetFloat(), 1e-2f );
+	if( lightDef == NULL )
+	{
+		return globalR;
+	}
+	const float authored = lightDef->parms.penumbraSize;
+	if( authored > 0.0f )
+	{
+		return Min( authored, 128.0f );
+	}
+	if( !r_shadowPenumbraAuto.GetBool() )
+	{
+		return globalR;
+	}
+	float ext;
+	if( lightDef->parms.pointLight )
+	{
+		ext = Min( lightDef->parms.lightRadius.x, Min( lightDef->parms.lightRadius.y, lightDef->parms.lightRadius.z ) );
+	}
+	else
+	{
+		ext = Min( lightDef->parms.right.Length(), lightDef->parms.up.Length() );	// projected: aperture scale
+	}
+	const float derived = ext * r_shadowPenumbraAutoScale.GetFloat();
+	return Max( Min( 1.0f, globalR ), Min( derived, globalR ) );
+}
 extern idCVar r_softShadowFaceCoverage;	// 1 = stream caster faces + front-face coverage instead of light silhouette
 
 idCVar r_skipStaticShadows( "r_skipStaticShadows", "0", CVAR_RENDERER | CVAR_BOOL, "skip static shadows" );
@@ -752,6 +789,35 @@ struct swStaticLightCache_t
 	std::unordered_map<uint64_t, swStaticCaster_t> casters;
 };
 static std::unordered_map<int, swStaticLightCache_t> s_swStaticCasterCache;
+
+// CONTRIBUTION SCORE (r_softShadowDepthOrder 2): angular size of the caster as seen from the
+// light = boundRadius / distance. A wider cone cuts a wider shadow frustum and saturates more
+// receivers' disks, so emitting casters in DESCENDING score order lets the walk's saturation
+// early-outs fire before the low-score tail is ever visited. The bound is a stride-sampled vert
+// min/max (cheap, deterministic); exactness is irrelevant - order is semantically free (the walk
+// is a commutative union), only the early-out landing point moves.
+static void R_SoftAccumSampleBounds( const idVec4* e, int n, idBounds& b )
+{
+	if( e == NULL || n <= 0 )
+	{
+		return;
+	}
+	const int stride = Max( 1, n / 8 );
+	for( int i = 0; i < n; i += stride )
+	{
+		b.AddPoint( idVec3( e[i].x, e[i].y, e[i].z ) );
+	}
+}
+static float R_SoftAngularScore( const idBounds& b, const idVec3& lightOrg )
+{
+	if( b.IsCleared() )
+	{
+		return 0.0f;	// empty stream: conservative-only junk, lands last
+	}
+	const idVec3 c = b.GetCenter();
+	const float r = ( b[1] - b[0] ).Length() * 0.5f;
+	return r / Max( ( c - lightOrg ).Length(), Max( r, 1e-3f ) );
+}
 // RB begin
 idCVar r_forceShadowMapsOnAlphaTestedSurfaces( "r_forceShadowMapsOnAlphaTestedSurfaces", "1", CVAR_RENDERER | CVAR_BOOL, "0 = same shadowing as with stencil shadows, 1 = ignore noshadows for alpha tested materials" );
 // RB end
@@ -2023,13 +2089,13 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					if( r_softShadowFaceCoverage.GetBool() )
 					{
 						idVec4* faceElems = NULL;
-						R_CollectPenumbraFaces( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
+						R_CollectPenumbraFaces( entityDef, tri, lightDef, R_SoftPenumbraRadius( lightDef ),
 												vEntity->modelMatrix, &faceElems, &nedges, &faceClusters, &nClusters, &swFaceIsBox );
 						sedges = ( softShadowEdge_t* )faceElems;
 					}
 					else
 					{
-						R_CollectPenumbraEdges( entityDef, tri, lightDef, r_shadowPenumbraSize.GetFloat(),
+						R_CollectPenumbraEdges( entityDef, tri, lightDef, R_SoftPenumbraRadius( lightDef ),
 												vEntity->modelMatrix, &sedges, &nedges );
 					}
 					tr.pc.softShadowMicroSec += Sys_Microseconds() - swCollectStart;
@@ -2415,13 +2481,15 @@ void R_AddModels()
 			vLight->softStaticTriCount = 0;
 			vLight->softSurfHash = 0;
 
-			// DEPTH-ORDER casters (r_softShadowDepthOrder, measurement): reorder softShadowWedges so casters
-			// NEAREST the light come first. The bin writes each tile list in stream order, so this makes the
-			// tile list ~depth-ordered -> the lit early-out (SW_LIT_EARLYOUT) tests big near-light blockers
-			// before bailing. Caster-runs (contiguous same-space surfs) stay intact; only run order changes.
-			// The walk's mask is a commutative UNION, so WITHOUT the early-out this reorder is bit-exact.
+			// CASTER-ORDER (r_softShadowDepthOrder): reorder softShadowWedges so the highest-impact casters
+			// come first. The bin writes each tile list in stream order, so this makes the tile list
+			// ~impact-ordered -> the walk's saturation/lit early-outs fire before the tail is visited.
+			// Mode 1 = nearest-light first (legacy depth key); mode 2 = contribution order (angular size
+			// from the light, descending). Caster-runs (contiguous same-space surfs) stay intact; only run
+			// order changes. The walk's mask is a commutative UNION, so on its own this reorder is bit-exact.
 			extern idCVar r_softShadowDepthOrder;
-			if( r_softShadowDepthOrder.GetBool() && vLight->softShadowWedges != NULL && vLight->lightDef != NULL )
+			const int swOrderMode = r_softShadowDepthOrder.GetInteger();
+			if( swOrderMode != 0 && vLight->softShadowWedges != NULL && vLight->lightDef != NULL )
 			{
 				const idVec3 Lorg = vLight->lightDef->globalLightOrigin;
 				struct SwRun { drawSurf_t* head; drawSurf_t* tail; float depth; };
@@ -2435,8 +2503,23 @@ void R_AddModels()
 						const idVec4* e = ( const idVec4* )s->softEdges;
 						dep = ( idVec3( e[0].x, e[0].y, e[0].z ) - Lorg ).LengthSqr();
 					}
-					SwRun run; run.head = s; run.tail = s; run.depth = dep;
-					while( s->nextOnLight != NULL && s->nextOnLight->space == sp ) { s = s->nextOnLight; run.tail = s; }
+					SwRun run; run.head = s; run.tail = s;
+					idBounds rb;
+					rb.Clear();
+					if( swOrderMode == 2 )
+					{
+						R_SoftAccumSampleBounds( ( const idVec4* )s->softEdges, s->numSoftEdges, rb );
+					}
+					while( s->nextOnLight != NULL && s->nextOnLight->space == sp )
+					{
+						s = s->nextOnLight; run.tail = s;
+						if( swOrderMode == 2 )
+						{
+							R_SoftAccumSampleBounds( ( const idVec4* )s->softEdges, s->numSoftEdges, rb );
+						}
+					}
+					// sort is ascending on .depth: mode 2 negates the score so biggest-first wins
+					run.depth = ( swOrderMode == 2 ) ? -R_SoftAngularScore( rb, Lorg ) : dep;
 					runs.push_back( run );
 					s = s->nextOnLight;
 				}
@@ -2573,10 +2656,38 @@ void R_AddModels()
 					std::vector<const swStaticCaster_t*> ordered;
 					ordered.reserve( sc.casters.size() );
 					for( auto& kv : sc.casters ) { ordered.push_back( &kv.second ); }
-					std::sort( ordered.begin(), ordered.end(), []( const swStaticCaster_t * a, const swStaticCaster_t * b )
+					if( swOrderMode == 2 )
 					{
-						return a->key < b->key;
-					} );
+						// contribution order, DESCENDING, key tie-break: score is a pure function of the
+						// cached stream + light origin, so same set => same order every frame - the
+						// determinism the contrib cache's global tri indices require, same as key order
+						const idVec3 sLorg = vLight->lightDef->globalLightOrigin;
+						std::vector<std::pair<float, const swStaticCaster_t*>> scored;
+						scored.reserve( ordered.size() );
+						for( const swStaticCaster_t* c : ordered )
+						{
+							idBounds b;
+							b.Clear();
+							R_SoftAccumSampleBounds( c->tris.data(), ( int )c->tris.size(), b );
+							scored.emplace_back( R_SoftAngularScore( b, sLorg ), c );
+						}
+						std::sort( scored.begin(), scored.end(), []( const std::pair<float, const swStaticCaster_t*>& a, const std::pair<float, const swStaticCaster_t*>& b )
+						{
+							if( a.first != b.first )
+							{
+								return a.first > b.first;
+							}
+							return a.second->key < b.second->key;
+						} );
+						for( size_t i = 0; i < scored.size(); i++ ) { ordered[i] = scored[i].second; }
+					}
+					else
+					{
+						std::sort( ordered.begin(), ordered.end(), []( const swStaticCaster_t * a, const swStaticCaster_t * b )
+						{
+							return a->key < b->key;
+						} );
+					}
 
 					std::unordered_map<idRenderEntityLocal*, viewEntity_t*> synthSpace;
 					drawSurf_t* staticHead = NULL;
@@ -2626,7 +2737,7 @@ void R_AddModels()
 			if( ( r_softShadowSurfCache.GetBool() || r_softShadowContribCache.GetInteger() != 0 )
 					&& vLight->softShadowWedges != NULL && vLight->lightDef != NULL )
 			{
-				struct SwSRun { drawSurf_t* head; drawSurf_t* tail; bool isStatic; uint64_t key; };
+				struct SwSRun { drawSurf_t* head; drawSurf_t* tail; bool isStatic; uint64_t key; float score; };
 				std::vector<SwSRun> runs;
 				for( drawSurf_t* s = vLight->softShadowWedges; s != NULL; )
 				{
@@ -2635,6 +2746,7 @@ void R_AddModels()
 					run.head = s;
 					run.tail = s;
 					run.isStatic = R_SoftCasterIsStatic( s->space->entityDef, vLight );
+					run.score = 0.0f;
 					uint64_t vq = 0;
 					if( s->softEdges != NULL && s->numSoftEdges > 0 )
 					{
@@ -2644,21 +2756,46 @@ void R_AddModels()
 							 ^ ( uint64_t )( int64_t )( e[0].z * 8.0f );
 					}
 					run.key = ( ( uint64_t )( uint32_t )( s->space->entityDef != NULL ? s->space->entityDef->index : -1 ) << 32 ) ^ ( vq & 0xFFFFFFFFull );
+					idBounds rb;
+					rb.Clear();
+					if( swOrderMode == 2 )
+					{
+						R_SoftAccumSampleBounds( ( const idVec4* )s->softEdges, s->numSoftEdges, rb );
+					}
 					while( s->nextOnLight != NULL && s->nextOnLight->space == sp )
 					{
 						s = s->nextOnLight;
 						run.tail = s;
+						if( swOrderMode == 2 )
+						{
+							R_SoftAccumSampleBounds( ( const idVec4* )s->softEdges, s->numSoftEdges, rb );
+						}
+					}
+					if( swOrderMode == 2 )
+					{
+						run.score = R_SoftAngularScore( rb, vLight->lightDef->globalLightOrigin );
 					}
 					runs.push_back( run );
 					s = s->nextOnLight;
 				}
-				std::stable_sort( runs.begin(), runs.end(), []( const SwSRun & a, const SwSRun & b )
+				std::stable_sort( runs.begin(), runs.end(), [swOrderMode]( const SwSRun & a, const SwSRun & b )
 				{
 					if( a.isStatic != b.isStatic )
 					{
 						return a.isStatic;    // static prefix first
 					}
-					return a.isStatic ? ( a.key < b.key ) : false;	// deterministic order inside the prefix only
+					if( !a.isStatic )
+					{
+						return false;	// dynamics keep their (possibly score-ordered) relative order
+					}
+					// static prefix: order must be DETERMINISTIC across frames (the caches store global
+					// tri indices into it). Mode 2 = contribution desc with key tie-break (pure function
+					// of stream + light origin, so as deterministic as the key order); else key order.
+					if( swOrderMode == 2 && a.score != b.score )
+					{
+						return a.score > b.score;
+					}
+					return a.key < b.key;
 				} );
 				for( size_t i = 0; i < runs.size(); i++ )
 				{
@@ -2753,7 +2890,7 @@ void R_AddModels()
 					extern idCVar r_softShadowUmbraAccumMargin;
 					// cull against an INFLATED disk: only drop a triangle when even the enlarged disk is fully
 					// blocked -> boundary slivers keep their shadow with margin (the gate's arbiter tolerance)
-					const float swRlight = Max( r_shadowPenumbraSize.GetFloat(), 1e-2f )
+					const float swRlight = R_SoftPenumbraRadius( vLight->lightDef )
 										   * Max( 1.0f, r_softShadowUmbraAccumMargin.GetFloat() );
 					uint64_t comboKey = 0x9E3779B97F4A7C15ull ^ ( uint64_t )( int64_t )( swRlight * 64.0f );
 					int nStable = 0;
@@ -2966,7 +3103,7 @@ void R_AddModels()
 						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( vLight->globalLightOrigin.x * 8.0f )
 							+ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.y * 8.0f ) << 20 )
 							+ ( ( uint64_t )( int64_t )( vLight->globalLightOrigin.z * 8.0f ) << 40 );
-						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( r_shadowPenumbraSize.GetFloat() * 64.0f );
+						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( R_SoftPenumbraRadius( vLight->lightDef ) * 64.0f );
 						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )r_softShadowSurfCacheTexel.GetInteger();
 						h = h * 0x9E3779B97F4A7C15ull + ( uint64_t )( int64_t )( r_softShadowSurfCacheSecondThr.GetFloat() * 4096.0f );
 						if( h == 0 )
@@ -3070,7 +3207,7 @@ void R_AddModels()
 					static idList<idVec4> swClsPacked;		// frontend is single-threaded per view; reused scratch
 					extern idCVar r_rtAccelDebug;
 					softClassifyGrid_t g;
-					if( R_SoftClassifyBuild( lo, r_shadowPenumbraSize.GetFloat(), dmn, dmx,
+					if( R_SoftClassifyBuild( lo, R_SoftPenumbraRadius( vLight->lightDef ), dmn, dmx,
 											 ( const idVec4* )triFlat, nElems / 3,
 											 Max( 1.0f, ( float )r_softShadowClassifyCell.GetInteger() ), swClsPacked, g ) )
 					{

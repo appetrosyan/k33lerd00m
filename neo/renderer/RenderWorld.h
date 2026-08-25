@@ -210,6 +210,12 @@ typedef struct renderLight_s
 	idVec3					lightCenter;		// offset the lighting direction for shading and
 	// shadows, relative to origin
 
+	// analytic soft shadows: PHYSICAL emitter radius in world units ("penumbraSize" entity key).
+	// 0 = not authored -> the renderer derives it (r_shadowPenumbraAuto heuristic, capped by the
+	// r_shadowPenumbraSize global). The emitter is modelled as a disk regardless of the fixture's
+	// true shape - the radius, not the shape, drives penumbra width and soft-shadow cost.
+	float					penumbraSize;
+
 	// frustum definition for projected lights, all reletive to origin
 	// FIXME: we should probably have real plane equations here, and offer
 	// a helper function for conversion from this format
