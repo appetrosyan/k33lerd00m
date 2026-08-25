@@ -20,6 +20,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 #include "renderer/RenderCommon.h"
 #include "renderer/RenderWorld_local.h"		// idRenderWorldLocal::lightDefs (warm-queue resolution)
+#include "framework/Common_local.h"			// commonLocal.GetRendererGPUMicroseconds (emergency-FPS gate)
 #include "SoftShadowSurfCache.h"
 
 // mirrors c_SurfBuild in softsurf_build.cs.hlsl
@@ -156,7 +157,10 @@ void SoftShadowSurfCache::EnsurePipeline()
 	cb.byteSize = sizeof( SoftSurfBuildCB );
 	cb.isConstantBuffer = true;
 	cb.isVolatile = true;
-	cb.maxVersions = 1024;
+	// 16384 (was 1024): the full-drain warm writes the CB once per build WINDOW (up to 16/light with
+	// the table-sized queue) plus the seed write - a 220-light burst frame versions past 1024 and
+	// Sys_Errors. The version ring is CPU-side staging; at ~200 B/version this is ~3 MB. (2026-08-26)
+	cb.maxVersions = 16384;
 	cb.debugName = "SoftShadowSurfCache/CB";
 	m_ConstantBuffer = m_Device->createBuffer( cb );
 }
@@ -186,7 +190,9 @@ bool SoftShadowSurfCache::EnsureResources()
 	const int poolCap = r_softShadowSurfCachePoolCap.GetInteger();
 	const int budget = r_softShadowSurfCacheBudget.GetInteger();
 	const int warmBudget = r_softShadowSurfCacheWarmBudget.GetInteger();
-	const int wantQueue = Max( budget + 1, warmBudget + 1 );	// per-light queue holds one light's claimed texels
+	// queue must hold EVERY texel a light can seed (task #87 full drain): sizing it to the warm budget
+	// silently truncated big lights at the seed - capacity = table cap + count word (4 MB at 1M slots)
+	const int wantQueue = Max( Max( budget + 1, warmBudget + 1 ), capP2 + 1 );
 	const float texel = ( float )r_softShadowSurfCacheTexel.GetInteger();
 	const float thr = r_softShadowSurfCacheSecondThr.GetFloat();
 	const float errTol = r_softShadowSurfCacheErrTol.GetFloat();
@@ -221,7 +227,7 @@ bool SoftShadowSurfCache::EnsureResources()
 		bd.initialState = nvrhi::ResourceStates::UnorderedAccess;
 		bd.keepInitialState = true;
 
-		bd.byteSize = ( ( uint64_t )m_TableCap * 8 + 8 ) * sizeof( uint32_t );	// +8: 4 path counters + 4 miss sub-reason counters
+		bd.byteSize = ( ( uint64_t )m_TableCap * 8 + 8 + 32 ) * sizeof( uint32_t );	// +8: 4 path counters + 4 miss sub-reason counters; +32: per-light {hit,miss} pairs keyed lightKey&15 (bench attribution)
 		bd.debugName = "SoftShadowSurfCache/Table";
 		m_Table = m_Device->createBuffer( bd );
 
@@ -278,12 +284,17 @@ void SoftShadowSurfCache::DoClearIfNeeded( nvrhi::ICommandList* commandList )
 	// the per-frame stats readback was reporting 0xFFFFFFFF (a bogus even 25/25/25/25 split) because this
 	// clear left them at the sentinel and the first ring copy captured it before EndBuilds' reset ran.
 	{
-		const uint32_t swZeroC[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+		const uint32_t swZeroC[8 + 32] = { 0 };		// 8 path/miss counters + 32 per-light {hit,miss} pairs
 		commandList->writeBuffer( m_Table, swZeroC, sizeof( swZeroC ), ( uint64_t )m_TableCap * 8 * sizeof( uint32_t ) );
 	}
 	commandList->clearBufferUInt( m_Pool, 0 );
 	commandList->clearBufferUInt( m_Queue, 0 );
 	m_NeedClear = false;
+	// a wholesale wipe reclaims every orphaned slot by definition - the bump counter's debt is spent.
+	// NOT resetting it here was harness-audit finding #3: the counter survived the wipe, so the FIRST
+	// BeginView after a warm burst crossed the >=64 threshold again and erased the entire just-warmed
+	// table, then re-warm dripped at 1 light/frame - the caps caught by the wipe benched ~0% hit.
+	m_GenBumps = 0;
 	m_StatsRingFilled = 0;		// ring slots are stale after a wipe; don't read them until re-filled
 	s_gcClears++;
 	m_ScanCursor = m_TableCap;
@@ -352,11 +363,25 @@ void SoftShadowSurfCache::BuildLight( nvrhi::ICommandList* commandList, const vi
 // accumulators for the one-shot warm-at-load summary line (reset in WarmMapBurst)
 static int s_warmRecvTotal = 0, s_warmCasterTotal = 0, s_warmStreamedLights = 0;
 
-bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idRenderLightLocal* light )
+bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idRenderLightLocal* light, bool fullDrain )
 {
 	if( light == NULL || m_Pipeline == nullptr || m_Table == nullptr )
 	{
 		return false;
+	}
+	// harness-audit guard: a direct WarmLight call while a wipe is PENDING would seed into a table
+	// about to be cleared (the gate's per-probe warm was exposed to exactly this). No-op otherwise.
+	DoClearIfNeeded( commandList );
+	// EMERGENCY build (r_softShadowSurfCacheEmergencyFPS): a frame slower than the threshold is
+	// unshippable regardless - full-drain the build so the cache CONVERGES instead of dripping.
+	{
+		extern idCVar r_softShadowSurfCacheEmergencyFPS;
+		const float swEmFps = r_softShadowSurfCacheEmergencyFPS.GetFloat();
+		if( !fullDrain && swEmFps > 0.0f
+				&& commonLocal.GetRendererGPUMicroseconds() > ( uint64 )( 1000000.0f / swEmFps ) )
+		{
+			fullDrain = true;
+		}
 	}
 	extern idCVar r_shadowPenumbraSize, r_softShadowSurfCacheErrTol;
 	extern bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumbraSize,
@@ -427,10 +452,11 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		}
 	}
 
-	// QUEUE-mode warm: the seed ENQUEUES this light's claimed texels; the build consumes only those
-	// (bounded by SW_WARM_BUDGET), NOT the whole 1M-slot table - a whole-table sweep x this light's
-	// casters is what hung the GPU (device removed). One dispatch warms up to SW_WARM_BUDGET texels;
-	// larger lights cache their first SW_WARM_BUDGET texels and the rest fall to the exact miss walk.
+	// QUEUE-mode warm: the seed ENQUEUES this light's claimed texels; the build consumes those in
+	// SW_WARM_BUDGET-bounded windows, NOT via a whole-table sweep - a whole-table sweep x this light's
+	// casters is what hung the GPU (device removed). fullDrain loops windows over the entire queue
+	// (task #87 - the old single window left big lights permanently part-warm = permanent misses);
+	// the non-emergency runtime keeps one window per frame.
 	extern idCVar r_softShadowSurfCacheWarmBudget;
 	const int SW_WARM_BUDGET = Min( r_softShadowSurfCacheWarmBudget.GetInteger(), m_QueueWords - 1 );
 	commandList->clearBufferUInt( m_Queue, 0 );		// reset the queue count for this light's seed
@@ -496,15 +522,32 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_Queue ),
 	};
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
-	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
+	// WINDOWED build (task #87): fullDrain loops bounded windows over the whole queue - each dispatch
+	// stays at the proven-safe SW_WARM_BUDGET bound, empty tail windows retire on the count check.
+	// Single-window (the old behavior) remains the cheap runtime default above the emergency line.
+	const int swWindows = fullDrain
+						  ? ( ( m_QueueWords - 1 + SW_WARM_BUDGET - 1 ) / SW_WARM_BUDGET )
+						  : 1;
 	nvrhi::ComputeState cs;
 	cs.pipeline = gridMode ? swGrid().pipeline : m_Pipeline;
 	cs.bindings = { set };
-	commandList->setComputeState( cs );
-	commandList->dispatch( ( SW_WARM_BUDGET + 63 ) / 64, 1, 1 );
+	// TIER-2 ECONOMICS (task #112): the BUILD windows repurpose g_seed.z as the min-ROI threshold
+	// (the seed dispatch above already consumed its own CB version with seed[2] = nRecv). Without
+	// this overwrite the build would read nRecv as the threshold and free nearly every texel.
+	{
+		extern idCVar r_softShadowSurfCacheMinROI;
+		cb.seed[2] = r_softShadowSurfCacheMinROI.GetInteger();
+	}
+	for( int wb = 0; wb < swWindows; wb++ )
+	{
+		cb.seed[1] = wb * SW_WARM_BUDGET;	// queue window base (build CS: qi = g_seed.y + i)
+		commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
+		commandList->setComputeState( cs );
+		commandList->dispatch( ( SW_WARM_BUDGET + 63 ) / 64, 1, 1 );
+	}
 
 	st.seedPending = false;
-	st.needSweep = false;		// warmed (up to SW_WARM_BUDGET texels) in this one dispatch
+	st.needSweep = false;		// warmed (fullDrain: every seeded texel; else the first WarmBudget window)
 	return true;
 }
 
@@ -608,6 +651,36 @@ bool SoftShadowSurfCache::GetMissReasons( uint32_t out[4] )
 		return false;
 	}
 	memcpy( out, p, 4 * sizeof( uint32_t ) );
+	m_Device->unmapBuffer( staging );
+	return true;
+}
+
+// blocking readback of the 16 per-light {hit,miss} ring pairs (base = tableCap*8 + 8, ring = lightKey&15).
+// Bench attribution: names WHICH lights own the miss bucket - an all-or-nothing light (never seeded, 0% hit)
+// reads as a ring with hits 0 / misses large. LAST rendered frame's sample.
+bool SoftShadowSurfCache::GetPerLightStats( uint32_t out[32] )
+{
+	if( m_Table == nullptr || m_TableCap <= 0 )
+	{
+		return false;
+	}
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = 32 * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowSurfCache/PerLightReadback";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_Table, ( uint64_t )( m_TableCap * 8 + 8 ) * sizeof( uint32_t ), 32 * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	void* p = m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( p == nullptr )
+	{
+		return false;
+	}
+	memcpy( out, p, 32 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
 	return true;
 }
@@ -827,7 +900,7 @@ void SoftShadowSurfCache::EndBuilds( nvrhi::ICommandList* commandList )
 	}
 	// reset the per-frame path counters (the 4 words after the table) so each frame's term
 	// dispatches accumulate a fresh hit/miss/walkalways/anchor-reject sample
-	const uint32_t swZero[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };	// 4 class counters + 4 miss sub-reason counters
+	const uint32_t swZero[8 + 32] = { 0 };	// 4 class counters + 4 miss sub-reason counters + 32 per-light {hit,miss} pairs
 	commandList->writeBuffer( m_Table, swZero, sizeof( swZero ), swCounterOff );
 
 	// prewarm sweep bookkeeping: a fresh seed (or an in-view light that missed the last sweep)
@@ -959,6 +1032,29 @@ void SoftShadowSurfCache::DrainWarmQueue( nvrhi::ICommandList* commandList, int 
 	// dispatched a (re)build.
 	extern idCVar r_softShadowSurfCacheWarmLightsPerFrame;
 	const int swMaxWarm = idMath::ClampInt( 1, 64, r_softShadowSurfCacheWarmLightsPerFrame.GetInteger() );
+	// EXPENSIVE-FIRST (task #87 / #83): under the per-frame budget, re-warm the heaviest queued lights
+	// first (same interaction-chain-length proxy as the load burst) - queue arrival order was blind to
+	// cost, so a cheap mover could starve a heavy room light's re-warm for many frames.
+	if( warm.size() > 1 )
+	{
+		std::sort( warm.begin(), warm.end(), [world]( int a, int b )
+		{
+			auto chainLen = [world]( int li ) -> int
+			{
+				if( li < 0 || li >= world->lightDefs.Num() || world->lightDefs[li] == NULL )
+				{
+					return -1;
+				}
+				int c = 0;
+				for( const idInteraction* inter = world->lightDefs[li]->firstInteraction; inter != NULL; inter = inter->lightNext )
+				{
+					c++;
+				}
+				return c;
+			};
+			return chainLen( a ) > chainLen( b );
+		} );
+	}
 	int builtCount = 0;
 	size_t qi = 0;
 	for( ; qi < warm.size() && builtCount < swMaxWarm; qi++ )
@@ -1011,8 +1107,18 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 		return;
 	}
 	{
+		// fresh world: the previous world's CPU-side state is ALL stale (harness-audit findings #3 +
+		// use-after-free): m_LightHash keys are old light indices (their re-warm queue entries resolve
+		// NULL forever and inflate "pending"; index collisions with the new world's lights bump
+		// generations spuriously), m_WarmEntries streams belong to freed lights, and queued indices
+		// dereference m_WarmWorld at drain time - clear everything under the lock, then adopt.
 		std::lock_guard<std::mutex> lock( m_WarmMutex );
 		m_WarmWorld = world;
+		m_WarmQueue.clear();
+		m_InvalidateQueue.clear();
+		m_LightHash.clear();
+		m_WarmEntries.clear();
+		m_GenBumps = 0;
 	}
 	// fresh map: force a clear so stale slots from the previous world cannot alias into a hit.
 	m_NeedClear = true;
@@ -1026,6 +1132,10 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 	s_warmRecvTotal = 0;
 	s_warmCasterTotal = 0;
 	s_warmStreamedLights = 0;
+	{
+		extern void R_SoftWarmDiagReset();
+		R_SoftWarmDiagReset();		// one-shot warm-miss attribution (task #87 "instrument the misses")
+	}
 	const int n = world->lightDefs.Num();
 	int warmed = 0;
 	// drive the LOADING BAR: this burst runs from ExecuteMapChange (behind the load screen), so report
@@ -1033,8 +1143,29 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 	// GUI (LoadPacifierProgressIncrement -> UpdateLevelLoadPacifier), which self-guards to a no-op when
 	// not inside a map change (the view-path fallback), so this is safe from either caller.
 	common->LoadPacifierProgressTotal( n );
-	for( int i = 0; i < n; i++ )
+	// EXPENSIVE-FIRST (task #87 / #83): warm the heaviest lights first so a truncated or interrupted
+	// burst spends its time where the runtime walk is dearest. Cost proxy = interaction-chain length
+	// (cheap: pointer walk, no per-surface tests); map-parse index order was blind to cost.
+	std::vector<std::pair<int, int>> warmOrder;	// ( -chainLen, lightIndex ): sort ascending = heaviest first
+	warmOrder.reserve( n );
+	for( int oi = 0; oi < n; oi++ )
 	{
+		const idRenderLightLocal* ol = world->lightDefs[oi];
+		if( ol == NULL )
+		{
+			continue;
+		}
+		int chainLen = 0;
+		for( const idInteraction* inter = ol->firstInteraction; inter != NULL; inter = inter->lightNext )
+		{
+			chainLen++;
+		}
+		warmOrder.emplace_back( -chainLen, oi );
+	}
+	std::sort( warmOrder.begin(), warmOrder.end() );
+	for( size_t wi = 0; wi < warmOrder.size(); wi++ )
+	{
+		const int i = warmOrder[wi].second;
 		common->LoadPacifierProgressIncrement( 1 );
 		const idRenderLightLocal* light = world->lightDefs[i];
 		if( light == NULL )
@@ -1042,7 +1173,7 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 			continue;
 		}
 		cl->open();
-		const bool built = WarmLight( cl, light );
+		const bool built = WarmLight( cl, light, true );	// load burst: FULL drain (partial warm = permanent miss)
 		cl->close();
 		device->executeCommandList( cl );
 		device->waitForIdle();		// one bounded light per submit -> watchdog-safe
@@ -1053,6 +1184,10 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 	}
 	common->Printf( "[softsurf] warm-at-load: %d of %d lights warmed | %d recv-tris, %d caster-tris over %d streamed lights\n",
 					warmed, n, s_warmRecvTotal, s_warmCasterTotal, s_warmStreamedLights );
+	{
+		extern void R_SoftWarmDiagPrint();
+		R_SoftWarmDiagPrint();		// one-shot: where the collector rejected everything (task #87)
+	}
 	extern idCVar r_softShadowSurfCacheDump;
 	if( r_softShadowSurfCacheDump.GetBool() )
 	{

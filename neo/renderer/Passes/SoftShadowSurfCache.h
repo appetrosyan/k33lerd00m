@@ -80,6 +80,7 @@ public:
 	// blocking readback of the 4 MISS sub-reason counters (0 stale-gen, 1 requested-unbuilt, 2 empty-slot,
 	// 3 probe-overflow) - splits WHERE the miss% comes from. Diagnostic (waitForIdle).
 	bool GetMissReasons( uint32_t out[4] );
+	bool GetPerLightStats( uint32_t out[32] );
 	// TRUSTWORTHY table census (blocking full scan): out = [built, requested-unbuilt, empty, other]. Unlike
 	// the per-frame path counters (whose GPU-atomic breakdown proved unreliable), this reads the actual slot
 	// states, so it honestly shows warm progress + table FILL (oversubscription = probe-overflow = no hits).
@@ -159,7 +160,11 @@ public:
 	// Build a light's static cache COMPLETELY and camera-independently from its interaction chain
 	// (seed + build-to-completion). Never called from the per-view render path, so camera motion
 	// cannot trigger a build. No-op if the light moved or has no static casters.
-	bool WarmLight( nvrhi::ICommandList* commandList, const idRenderLightLocal* light );
+	// fullDrain (task #87): loop bounded build windows over the WHOLE seeded queue instead of the
+	// first WarmBudget slice. The load burst always passes true (a partially-warm light is a
+	// permanent-miss light under the read-only runtime); the runtime drain passes true only below
+	// r_softShadowSurfCacheEmergencyFPS (a frame that slow is unshippable anyway - spend it building).
+	bool WarmLight( nvrhi::ICommandList* commandList, const idRenderLightLocal* light, bool fullDrain = false );
 	// Queue a light to (re)warm; deduped, drained by DrainWarmQueue. Cheap - safe to call from the
 	// engine's interaction/spawn hooks (GenerateAllInteractions, UpdateEntityDef, lightHasMoved).
 	// Captures the light's world so the drain can resolve indices fresh (no dangling pointers).

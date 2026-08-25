@@ -167,11 +167,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 		{
 			qc = qCap - 1u;	// the count word can over-increment past capacity; entries beyond it are invalid
 		}
-		if( i >= qc )
+		// WINDOWED full drain (task #87): g_seed.y is the queue window base (unused in queue mode
+		// before). The warm build loops bounded windows over the whole queue instead of truncating a
+		// big light at the first WarmBudget slice ("the rest fall to the exact miss walk" was a
+		// permanent-starvation mechanism once the runtime went read-only).
+		const uint qi = ( uint )g_seed.y + i;
+		if( qi >= qc )
 		{
 			return;
 		}
-		slot = u_SurfQueue[ 1u + i ];
+		slot = u_SurfQueue[ 1u + qi ];
 	}
 	if( slot >= ( uint )g_caps.x )
 	{
