@@ -1231,6 +1231,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 				{
 					const uint sBase = slot * 8u;
 					const uint w0 = u_SurfTable[ sBase ];
+					if( w0 == 0xFFFFFFFEu )				// TOMBSTONE (build freed a record here): the chain
+					{									// continues past it - do NOT treat as end-of-chain
+						slot = ( slot + 1u ) & capM;
+						continue;
+					}
 					if( w0 == keyLo && u_SurfTable[ sBase + 1 ] == keyHi )
 					{
 						const uint s2 = u_SurfTable[ sBase + 2 ];

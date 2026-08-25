@@ -721,6 +721,11 @@ bool SoftShadowSurfCache::GetTableCensus( uint32_t out[4] )
 			out[2]++;    // empty
 			continue;
 		}
+		if( w0 == 0xFFFFFFFEu )
+		{
+			out[3]++;    // TOMBSTONE (build-freed, chain-preserving): its stale state word must not read as requested/built
+			continue;
+		}
 		const uint32_t code = t[s * 8 + 2] & 3u;
 		if( code == 2u )
 		{

@@ -564,7 +564,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 		{
 			if( resCount > redCap )
 			{
-				u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// over the K cap (reduced) / max residual (fold): WALK-ALWAYS -> FREE the slot (empty key). Empty reads as miss = exact walk (same result), keeps table load low so BUILT records stay reachable.
+				u_SurfTable[ sBase ] = 0xFFFFFFFEu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// over the K cap (reduced) / max residual (fold): WALK-ALWAYS -> TOMBSTONE (0xFFFFFFFE), NOT the empty sentinel. Freeing with EMPTY punctured the linear-probe chain: every key displaced past this slot became unreachable and read as "empty-slot" at serve (audit finding #1, the dominant miss class). Tombstones keep the chain walkable (serve skips them, seed re-claims them).
 				return;
 			}
 			if( resCount > 0u )
@@ -574,7 +574,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				InterlockedAdd( u_SurfPool[ 0 ], resWords, ofs );
 				if( ofs + resWords + 1u > ( uint )g_caps.y )
 				{
-					u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// WALK-ALWAYS -> FREE the slot (empty key). Was code 3: measured 77% of the table = dead weight oversubscribing it -> collision-misses. Empty reads as miss = exact walk (same result), keeps load low so BUILT records stay reachable. //	// pool full: WALK-ALWAYS (exact); reservation leaks, cache clear reclaims
+					u_SurfTable[ sBase ] = 0xFFFFFFFEu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// pool full: WALK-ALWAYS -> TOMBSTONE (chain-preserving free, see the K-cap site above); reservation leaks, cache clear reclaims
 					return;
 				}
 				resOfs = 1u + ofs;					// entries start after the counter word
@@ -635,7 +635,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	const bool foldActive = ( foldCnt > 0u );
 	if( ( !reduced || foldActive ) && ( umbraStraddle || ( devFold > g_params.w ) ) )
 	{
-		u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// WALK-ALWAYS -> FREE the slot (empty key). Was code 3: measured 77% of the table = dead weight oversubscribing it -> collision-misses. Empty reads as miss = exact walk (same result), keeps load low so BUILT records stay reachable. //		// umbra-straddle / too-curved fold: WALK-ALWAYS (exact)
+		u_SurfTable[ sBase ] = 0xFFFFFFFEu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// umbra-straddle / too-curved fold: WALK-ALWAYS -> TOMBSTONE (chain-preserving free, see the K-cap site above)
 		return;
 	}
 	// TIER-2 ECONOMICS (task #112): foldCnt IS the walk work a serve removes (the residuals are
@@ -646,7 +646,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// build window); in scan mode the lane is unrelated, so scan builds are ungated. 0 = off.
 	if( g_seed.x == 0 && ( uint )g_seed.z > 0u && foldCnt < ( uint )g_seed.z )
 	{
-		u_SurfTable[ sBase ] = 0xFFFFFFFFu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;
+		u_SurfTable[ sBase ] = 0xFFFFFFFEu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// tier-2 MinROI: TOMBSTONE (chain-preserving free, see the K-cap site above)
 		return;
 	}
 	u_SurfTable[ sBase + 3 ] = resOfs;

@@ -189,23 +189,26 @@ void main( uint3 tid : SV_DispatchThreadID )
 					}
 					break;
 				}
-				if( w0 == 0xFFFFFFFFu )
+				if( w0 == 0xFFFFFFFFu || w0 == 0xFFFFFFFEu )	// empty OR tombstone (build-freed): both claimable
 				{
 					uint prev;
-					InterlockedCompareExchange( u_SurfTable[ sBase ], 0xFFFFFFFFu, keyLo, prev );
-					if( prev == 0xFFFFFFFFu )
+					InterlockedCompareExchange( u_SurfTable[ sBase ], w0, keyLo, prev );
+					if( prev == w0 )
 					{
 						u_SurfTable[ sBase + 1 ] = keyHi;
-						InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( h ) );	// cleared = +inf: Min just works
+						InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( h ) );	// cleared/freed = +inf: Min just works
 						u_SurfTable[ sBase + 2 ] = ( curGen << 2 ) | 1u;	// REQUESTED (gen-tagged)
 						uint qie; InterlockedAdd( u_SurfQueue[ 0 ], 1u, qie );	// enqueue for the warm build (queue mode)
 						if( qie + 1u < ( uint )g_params.z ) { u_SurfQueue[ 1u + qie ] = slot; }
+						break;		// claimed by us
 					}
-					else if( prev == keyLo && u_SurfTable[ sBase + 1 ] == keyHi )
+					if( prev == keyLo && u_SurfTable[ sBase + 1 ] == keyHi )
 					{
-						InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( h ) );	// lost the race to a sibling: still contribute
+						InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( h ) );	// lost the race to a SIBLING: still contribute
+						break;
 					}
-					break;			// claimed by us or a racer either way
+					// lost the race to a FOREIGN key (audit finding #5): our key is NOT planted here -
+					// keep probing (the old unconditional break silently dropped the texel forever).
 				}
 				slot = ( slot + 1u ) & capM;
 			}
