@@ -544,6 +544,17 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		return false;
 	}
 
+	// CASTERLESS lights (audit #7) seed receiver texels for a trivial F=0 serve - but the TERM-side
+	// serve gate still requires softStaticCasterCount > 0 (the deferred half of audit #7), so today
+	// their slots are pure table load: MEASURED 2026-08-26, 132 casterless lights oversubscribed the
+	// 4M table (seed claims 4.8M, census 100% full, probe-overflow became the whole miss bucket) and
+	// displaced the SERVING lights' texels. Skip warming them until the term-side gate lands. Placed
+	// BEFORE any m_LightHash mutation (a stored hash with no seed = stuck light, the known trap).
+	if( nCas <= 0 )
+	{
+		return false;
+	}
+
 	lightState_t& st = m_LightHash[ light->index ];
 	if( st.hash != 0 && st.hash != fp )
 	{
