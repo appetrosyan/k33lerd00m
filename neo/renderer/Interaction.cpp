@@ -1076,8 +1076,11 @@ The seed/build compute passes read only these two; the cluster block is skipped 
 Static gate is camera-independent: light immobile + DM_STATIC/world model. The per-frame
 lastModifiedFrameNum check from R_SoftCasterIsStatic is intentionally omitted - warming is a one-time
 build event, not a per-frame decision. Returns false (and empty output) if the light has moved or has
-no static casters. outFingerprint is a camera-invariant identity of the static set (sorted entity
-indices + counts + penumbra + cache cvars) used to skip redundant re-warms.
+nothing static at all - a light with RECEIVERS but zero static casters returns TRUE with
+outStaticCasters == 0 (audit #7: the seed still plants its receiver texels and the build writes them
+F=0 / zero residuals, so they serve ~free instead of probing+missing forever). outFingerprint is a
+camera-invariant identity of the static set (sorted entity indices + counts + penumbra + cache
+cvars) used to skip redundant re-warms.
 ====================
 */
 bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumbraSize,
@@ -1296,8 +1299,30 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 	outRecvTriCount = outRecvTris.Num() / 3;
 	if( outStaticTris == 0 || outStaticCasters == 0 )
 	{
-		s_swWarmDiag[SWD_RET_FALSE]++;
-		return false;
+		// CASTERLESS-BUT-RECEIVING light (audit #7): with the audit-#6 view alignment DM_STATIC
+		// props ride the DYNAMIC suffix, so a light can legitimately collect receivers and ZERO
+		// static casters. Returning false here left its receiver texels unplanted: every fragment
+		// probed and MISSED forever (probe tax + miss-classification noise). Return TRUE instead -
+		// the seed plants the receiver texels and the build writes them F=0 with zero residuals.
+		// SWD_RET_FALSE now counts only the genuinely-nothing case (no casters AND no receivers).
+		if( outRecvTriCount == 0 )
+		{
+			s_swWarmDiag[SWD_RET_FALSE]++;
+			return false;
+		}
+		// WarmLight sizes its two m_WarmStream writeBuffers straight off these lists: empty lists
+		// would never create the stream (EnsureWarmStream(0) is a no-op -> nullptr bail before the
+		// seed) and would issue zero-byte writeBuffers (a vkCmdUpdateBuffer spec violation). Append
+		// ONE inert pad record the build never reads (outStaticCasters/outStaticTris stay 0, so the
+		// build CS caster loop bound g_range.y is 0) and that the caster cull rejects
+		// unconditionally even if it ever were walked (negative-radius sphere: wholly "behind"
+		// every receiver plane, first cull test). Not counted in the warm summary.
+		outTris.Append( idVec4( 0.0f, 0.0f, 0.0f, 0.0f ) );
+		outTris.Append( idVec4( 0.0f, 0.0f, 0.0f, 0.0f ) );
+		outTris.Append( idVec4( 0.0f, 0.0f, 0.0f, 0.0f ) );
+		outCasters.Append( idVec4( light->globalLightOrigin.x, light->globalLightOrigin.y,
+								   light->globalLightOrigin.z, -1e30f ) );
+		outCasters.Append( idVec4( 0.0f, 0.0f, 0.0f, 0.0f ) );
 	}
 
 	// camera-invariant fingerprint = the SET IDENTITY only (sorted static entity indices + penumbra +
@@ -1305,6 +1330,8 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 	// can recompute it CHEAPLY (no face collection) to skip already-warm lights. Per-entity CONTENT
 	// changes (skin/model swap that keeps the same entity in the set) do not move this - they are caught
 	// by the invalidation hooks (UpdateEntityDef teardown -> InvalidateLight forces a rebuild).
+	// The casterless-but-receiving acceptance (audit #7) folds the EMPTY set here - the same value for
+	// every such light, which R_LightStaticChainSig mirrors so those lights cheap-skip once warmed.
 	staticEnts.SortWithTemplate();
 	extern idCVar r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;
 	uint64_t fp = 1469598103934665603ull;
@@ -1326,7 +1353,9 @@ R_LightStaticChainSig
 CHEAP recompute of R_BuildLightStaticSoftStream's fingerprint (the static entity-index SET), WITHOUT
 collecting any faces. WarmLight calls this first so a per-light scan skips already-warm lights for
 almost nothing (just a chain walk + a shadow-cast test per surface). Must fold IDENTICALLY to the
-assembler above or the skip is wrong. Returns 0 if the light moved or has no static shadow casters.
+assembler above or the skip is wrong. Returns 0 only if the light moved or has NOTHING static at all
+(no casters AND no receivers) - a receivers-only light returns the empty-set fingerprint, matching
+the assembler's audit-#7 casterless acceptance, so it is not stuck cheap-skipped as "nothing".
 ====================
 */
 uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraSize )
@@ -1336,6 +1365,7 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 		return 0;
 	}
 	idList<int> staticEnts;
+	bool hasRecv = false;		// any receiver-eligible surface in the light (audit #7 casterless acceptance)
 	for( const idInteraction* inter = light->firstInteraction; inter != NULL; inter = inter->lightNext )
 	{
 		if( inter->IsEmpty() || inter->entityDef == NULL )
@@ -1356,15 +1386,22 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 		{
 			continue;
 		}
+		// MUST match R_BuildLightStaticSoftStream's gate (incl. the bench-soup / ExcludeWorld
+		// exception, task #87 stream alignment) or the signature disagrees with the stream and
+		// every warm skips/rebuilds spuriously. ExcludeWorld demotes the world to RECEIVER-ONLY
+		// (audit #7) - it must still be scanned for receivers below, not skipped outright.
+		const bool swIsWorld = model->IsStaticWorldModel();
+		const bool swBenchSoup = idStr::Cmpn( model->Name(), "_softBenchCaster_", 17 ) == 0;
+		if( !swIsWorld && !swBenchSoup )
 		{
-			// MUST match R_BuildLightStaticSoftStream's gate (incl. the bench-soup / ExcludeWorld
-			// exception, task #87 stream alignment) or the signature disagrees with the stream and
-			// every warm skips/rebuilds spuriously.
+			continue;					// neither world nor bench soup: not part of the static stream
+		}
+		bool swCastsRole = true;
+		{
 			extern idCVar r_softShadowBenchExcludeWorld;
-			const bool swBenchSoup = idStr::Cmpn( model->Name(), "_softBenchCaster_", 17 ) == 0;
-			if( model->IsStaticWorldModel() ? r_softShadowBenchExcludeWorld.GetBool() : !swBenchSoup )
+			if( swIsWorld && r_softShadowBenchExcludeWorld.GetBool() )
 			{
-				continue;
+				swCastsRole = false;	// world under bench exclusion: receiver-only
 			}
 		}
 		if( ent->parms.noShadow )
@@ -1380,7 +1417,7 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 			continue;	// deferred (bench-soup) interactions have no computed shadow state yet - HasShadows()
 		}				// is meaningless there; the surface-level SurfaceCastsShadow gate below still applies
 		bool casts = false;
-		for( int c = 0; c < model->NumSurfaces() && !casts; c++ )
+		for( int c = 0; c < model->NumSurfaces() && !( casts && hasRecv ); c++ )
 		{
 			const modelSurface_t* surf = model->Surface( c );
 			const srfTriangles_t* tri = ( surf != NULL ) ? surf->geometry : NULL;
@@ -1390,7 +1427,17 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 			}
 			const idMaterial* shader = R_RemapShaderBySkin( surf->shader,
 										ent->parms.customSkin, ent->parms.customShader );
-			if( shader == NULL || !shader->SurfaceCastsShadow() )
+			if( shader == NULL )
+			{
+				continue;
+			}
+			// mirror the stream's two per-surface roles: CASTER (enters the entity set the
+			// fingerprint hashes) and RECEIVER (audit #7: alone it still makes the stream return
+			// true with the empty-set fingerprint - the seed plants its texels)
+			const bool wantCast = !casts && swCastsRole && shader->SurfaceCastsShadow();
+			const bool wantRecv = !hasRecv && ( shader->ReceivesLighting() || swBenchSoup )
+								  && tri->verts != NULL && tri->indexes != NULL && tri->numIndexes >= 3;
+			if( !wantCast && !wantRecv )
 			{
 				continue;
 			}
@@ -1398,16 +1445,17 @@ uint64_t R_LightStaticChainSig( const idRenderLightLocal* light, float penumbraS
 			{
 				continue;
 			}
-			casts = true;
+			casts |= wantCast;
+			hasRecv |= wantRecv;
 		}
 		if( casts )
 		{
 			staticEnts.Append( ent->index );
 		}
 	}
-	if( staticEnts.Num() == 0 )
+	if( staticEnts.Num() == 0 && !hasRecv )
 	{
-		return 0;
+		return 0;		// genuinely nothing: mirrors the stream's no-casters-AND-no-receivers false
 	}
 	staticEnts.SortWithTemplate();
 	extern idCVar r_softShadowSurfCacheTexel, r_softShadowSurfCacheSecondThr;

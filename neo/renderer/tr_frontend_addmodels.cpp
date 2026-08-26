@@ -284,6 +284,24 @@ static bool R_SoftCasterIsStatic( const idRenderEntityLocal* entityDef, const vi
 			return false;
 		}
 	}
+	// SURF-CACHE STREAM ALIGNMENT (audit #6): with the world-texel cache on, the VIEW's static
+	// prefix must equal the WARM collector's acceptance set EXACTLY (world model + bench soup,
+	// R_BuildLightStaticSoftStream) - a served fragment SKIPS the whole static prefix on the
+	// assumption the cache folded it, so a DM_STATIC prop classified static here but never warmed
+	// (SWD_I_NOTSTREAM) silently lost its shadow on every cache hit, and a light whose only
+	// casters were such props warmed nothing while the serve gate still engaged (100% misses).
+	// Route those props onto the DYNAMIC suffix instead: walked per fragment on hits, so their
+	// shadows stay exact (just uncached). Placed BEFORE the linger clause so linger cannot
+	// re-admit a model the warm set will never fold. Cache off: byte-identical to the historical
+	// classification below.
+	{
+		extern idCVar r_softShadowSurfCache;
+		if( r_softShadowSurfCache.GetBool() && !m->IsStaticWorldModel()
+				&& idStr::Cmpn( m->Name(), "_softBenchCaster_", 17 ) != 0 )
+		{
+			return false;
+		}
+	}
 	// BENCH REPLAY soup: classifies STATIC (DM_STATIC, never updated) - and since the task-#87
 	// stream alignment the WARM collectors ingest _softBenchCaster_* too (and honor
 	// r_softShadowBenchExcludeWorld), so the warm stream and the view's static prefix agree: a

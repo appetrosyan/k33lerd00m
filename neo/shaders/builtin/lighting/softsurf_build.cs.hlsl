@@ -412,11 +412,14 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// ---- two passes: 0 = classify + fold (count residuals, accumulate masks), 1 = emit residual indices
 	uint allMask[4] = { 0u, 0u, 0u, 0u };
 	uint resMask[4] = { 0u, 0u, 0u, 0u };
-	// analytic accumulators (over the whole caster set) for the sub-probe-safe gates below
-	float scCornSum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };	// Σ continuous solo coverage at each CORNER -> umbra gate
-	float scCtrSum = 0.0f;								// Σ continuous solo coverage at the CENTER  -> umbra gate
-	float devFold = 0.0f;								// Σ bilinear deviation over FOLDED occluders -> bilerp gate
-	float devAll  = 0.0f;								// Σ bilinear deviation over ALL occluders -> umbra interior margin
+	// analytic accumulators (FOLDED set ONLY) + center-probe union masks for the abandon gates below.
+	// ptsI[0] IS the texel center, so intMask[0] is the all-caster sampled union there; splitting the
+	// same probe's per-triangle mask by the fold decision gives the folded/residual center unions.
+	float scCornSumFold[4] = { 0.0f, 0.0f, 0.0f, 0.0f };	// Σ continuous solo coverage at each CORNER, FOLDED set -> umbra gate
+	float scCtrSumFold = 0.0f;								// Σ continuous solo coverage at the CENTER, FOLDED set -> umbra gate
+	float devFold = 0.0f;									// Σ bilinear deviation over FOLDED occluders -> umbra interior margin
+	uint  foldMaskCtr = 0u;									// FOLDED-set sampled union at the center probe (ptsI[0])
+	uint  resMaskCtr  = 0u;									// RESIDUAL-set sampled union at the center probe (ptsI[0])
 	const float swR2c = swR * swR;
 	uint resCount = 0u;
 	uint foldCnt = 0u;			// static occluders folded into F = the per-texel saving (walk-units), stored in word 4 hi
@@ -496,6 +499,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				// SAMPLED interior union masks (pass 0 only) - accumulate this triangle's occlusion at the
 				// 5 interior probes into the running union, for the umbra gate below.
 				uint intHit = 0u;
+				uint mCtr = 0u;		// this triangle's sampled mask at the CENTER probe (ptsI[0] = texel center)
 				if( pass == 0 )
 				{
 					for( int ii = 0; ii < 5; ii++ )
@@ -510,6 +514,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						const uint m = SurfBuild_SoloMask( ptsI[ii], v0, v1, v2, iBase[ii], iSu[ii], iSv[ii], scr );
 						intMask[ii] |= m;
 						intHit |= m;
+						if( ii == 0 ) { mCtr = m; }
 					}
 				}
 				if( anyHit == 0u && intHit == 0u && scCtr <= 1e-6f )
@@ -521,17 +526,19 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const bool  fold = reduced ? ( msolo <= redCut ) : ( dev <= thr );	// reduced: FOLD the small-solo tail (bilerp), walk the big occluders exactly
 				if( pass == 0 )
 				{
-					for( int cc = 0; cc < 4; cc++ ) { scCornSum[cc] += scC[cc]; allMask[cc] |= solo[cc]; }
-					scCtrSum += scCtr;
-					devAll += dev;						// every occluder's non-affinity (folded OR residual)
+					for( int cc = 0; cc < 4; cc++ ) { allMask[cc] |= solo[cc]; }
 					if( fold )
 					{
-						devFold += dev;								// Sum bilinear deviation over FOLDED (bilerp gate)
+						for( int cf = 0; cf < 4; cf++ ) { scCornSumFold[cf] += scC[cf]; }
+						scCtrSumFold += scCtr;
+						devFold += dev;								// Sum bilinear deviation over FOLDED (umbra interior margin)
+						foldMaskCtr |= mCtr;
 						foldCnt++;									// the saving: this occluder leaves the runtime walk
 					}
 					else
 					{
 						resCount++;
+						resMaskCtr |= mCtr;
 						for( int p5 = 0; p5 < 4; p5++ ) { resMask[p5] |= solo[p5]; }
 					}
 				}
@@ -599,17 +606,26 @@ void main( uint3 tid : SV_DispatchThreadID )
 		maxCornerCov = max( maxCornerCov, covAll );
 	}
 
-	// ANALYTIC sub-probe-safe gates - NO interior probe grid. The occlusion term is an area integral so its
-	// per-occluder solo coverage is smooth; sampling each occluder at the 4 corners + center catches
-	// corner-localized features a single center derivative missed:
-	//  - UMBRA STRADDLE gate: union coverage <= Sum of solo coverages. A LINEAR (folded) occluder's solo is
-	//    affine, so the max of the folded-set Sum is exactly at a corner; the max of Sum over the 4 corners +
-	//    center bounds the union. If it reaches 1 (umbra) while NOT every corner is saturated the texel
-	//    STRADDLES the umbra clamp where F = covAll - covRes is non-bilinear and bilerp erodes it ->
-	//    WALK-ALWAYS. The exact corner union coverage (maxCornerCov, free) catches a corner already in umbra;
-	//    fully-umbra texels (all corners saturated) keep F bilinear -> fold.
-	//  - BILERP gate: devFold = Sum over FOLDED occluders of |center - mean(corners)| bounds the 4-corner
-	//    bilerp error of F; over the error tolerance -> too curved to interpolate -> WALK-ALWAYS.
+	// ABANDON GATES, measured-error form (2026-08-26). The previous gates used Σ-over-occluder PROXIES:
+	// Σ solo coverage over ALL casters for umbra, and Σ per-occluder bilinear deviation over the FOLDED
+	// set for bilerp error. Both Σs grow with occluder COUNT while the true union clamps at 1, so at ~80
+	// surviving occluders they tripped on nearly every shadowed texel: measured on the heavy captures they
+	// freed ~3x more texels than they kept, preferentially the high-foldCnt (high-saving) ones. The gates
+	// now measure what they gate; the DEFECT GATE arbitrates the change - keeping a texel with a bad F is
+	// what it catches, freeing one is always safe, so any residual doubt goes to the walk:
+	//  - UMBRA STRADDLE gate: the reconstruction F = covAll - covRes is a non-bilinear clamp across the
+	//    umbra boundary, so umbra SOMEWHERE + a lit corner => WALK-ALWAYS. Umbra is detected in the TRUE
+	//    sampled union measure at the 9 probes (4 corners + center + 4 quadrant centers - same 1/N measure
+	//    as F, unchanged), plus an analytic belt-and-suspenders over the FOLDED set ONLY: the residuals
+	//    are walked exactly at P, so only the folded part's clamp non-linearity can erode F. Σ_folded >=
+	//    union_folded, and the folded occluders are the near-affine/small-solo tail, so the max of
+	//    Σ_folded over the 4 corners + center plus a 3x devFold interior-bulge margin bounds the folded
+	//    coverage between the probes; reaching 1 means the fold can clamp -> over-walk (Σ >= union so this
+	//    arm only ever over-walks, never under).
+	//  - BILERP gate: the ACTUAL center reconstruction error. F at the center is computed EXACTLY from the
+	//    center-probe union masks (same crack-close + 1/N measure as the corner F values) and compared
+	//    against the bilerp of the 4 corner Fs; over the error tolerance -> WALK-ALWAYS. This is the error
+	//    the r_softShadowSurfCacheErrTol doc always promised the build measured.
 	// SAMPLED interior union coverage at the 5 interior probes (same 1/N measure as F/reconstruction).
 	float maxIntCov = 0.0f;
 	for( int ik = 0; ik < 5; ik++ )
@@ -617,13 +633,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 		const float ci = ( float )SoftPopcount32( SurfBuild_CrackClose( intMask[ik], swNbr, swAll ) ) / ( float )SW_FACE_SAMPLES;
 		maxIntCov = max( maxIntCov, ci );
 	}
-	// analytic solo-coverage Sum max over the 4 corners + center, with a 3x devAll margin for the smooth
-	// interior bulge - a belt-and-suspenders catch for umbra hiding BETWEEN the sampled points (Sum >= union
-	// so it only ever over-walks). umbra somewhere in the texel + not everywhere (a lit corner) => STRADDLE
-	// => the reconstruction F = covAll - covRes is a non-bilinear clamp there => WALK-ALWAYS (exact).
-	float sMax = scCtrSum;
-	for( int cc2 = 0; cc2 < 4; cc2++ ) { sMax = max( sMax, scCornSum[cc2] ); }
-	const bool umbraSomewhere = ( maxCornerCov >= 0.999f || maxIntCov >= 0.999f || sMax + 3.0f * devAll >= 1.0f );
+	// measured center reconstruction error: F exact at the center (all-caster union minus residual union,
+	// both through the shipped crack-close) vs the bilerp of the 4 corner F values
+	const float covAllCtr = ( float )SoftPopcount32( SurfBuild_CrackClose( intMask[0], swNbr, swAll ) ) / ( float )SW_FACE_SAMPLES;
+	const float covResCtr = ( float )SoftPopcount32( SurfBuild_CrackClose( resMaskCtr, swNbr, swAll ) ) / ( float )SW_FACE_SAMPLES;
+	const float FexactCtr  = max( covAllCtr - covResCtr, 0.0f );
+	const float FbilerpCtr = 0.25f * ( F[0] + F[1] + F[2] + F[3] );
+	// FOLDED-set Σ max over the 4 corners + center with the 3x devFold interior-bulge margin (see above)
+	float sMaxFold = scCtrSumFold;
+	for( int cc2 = 0; cc2 < 4; cc2++ ) { sMaxFold = max( sMaxFold, scCornSumFold[cc2] ); }
+	const bool umbraSomewhere = ( maxCornerCov >= 0.999f || maxIntCov >= 0.999f || sMaxFold + 3.0f * devFold >= 1.0f );
 	const bool umbraStraddle  = ( umbraSomewhere && minCornerCov < 0.999f );
 	// The fold-abandon gates exist ONLY for the fold's bilinear-F erosion (umbra clamp / curvature). They apply
 	// when something is actually FOLDED. A PURE-RESIDUAL texel (foldCnt==0, e.g. cutoff 0 / coarse region) has
@@ -633,7 +652,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// (the additive fFold+occEx cancels covRes only when the residual is bilinear, but it is non-linear by
 	// construction -> light leaks, 545 defects); the covAll straddle gate is correctness-required WHEN folding.
 	const bool foldActive = ( foldCnt > 0u );
-	if( ( !reduced || foldActive ) && ( umbraStraddle || ( devFold > g_params.w ) ) )
+	if( ( !reduced || foldActive ) && ( umbraStraddle || ( abs( FexactCtr - FbilerpCtr ) > g_params.w ) ) )
 	{
 		u_SurfTable[ sBase ] = 0xFFFFFFFEu; u_SurfTable[ sBase + 7 ] = 0xFFFFFFFFu;	// umbra-straddle / too-curved fold: WALK-ALWAYS -> TOMBSTONE (chain-preserving free, see the K-cap site above)
 		return;

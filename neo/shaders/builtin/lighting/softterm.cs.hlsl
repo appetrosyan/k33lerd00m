@@ -1272,10 +1272,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// so the tilt/curve half of the guard's job is gone - a fragment up to ~1 texel above
 							// the min-anchor is the SAME tilted surface and the center-built grid is method-A valid.
 							// Only the genuine floor+step distinct-surface alias (two surfaces sharing the G-slab
-							// key) must still reject; widen the band to ~1 texel so tilt/curve stops walking.
+							// key) must still reject; the band IS the widened ~1 texel so tilt/curve stops walking.
 							// (measure-first 2026-08-23: 56% anchor-rej at 0.0625*g was almost all tilt; gate arbiter
 							// catches any floor+step alias that leaks through the wider band.)
-							const float swAnchBand = g * 0.0625f;
+							const float swAnchBand = g * 1.0f;
 #else
 							const float swAnchBand = g * 0.0625f;
 #endif

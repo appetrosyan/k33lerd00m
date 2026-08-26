@@ -48,6 +48,23 @@ void R_SoftCacheWarmDebugCounters( int& builds, int& clears )
 	s_gcClears = 0;
 }
 
+// IN-FLIGHT runtime drain (audit #7b): a non-fullDrain WarmLight seeds the WHOLE light but builds only
+// the first budget window; the remaining windows must keep draining on later frames or the light stays
+// part-warm forever - its queue tail is REQUESTED and the read-only term never re-requests, and a
+// same-generation re-seed enqueues NOTHING (softsurf_seed only enqueues empty/stale-gen claims), so
+// "just re-warm it" can never finish the tail (InvalidateLight on a big light hit exactly this).
+// The seed queue holds ONE light's seed at a time, so the in-flight drain is a single (light,
+// next-window) pair plus the parking warm's CB. File-scope static, not a member (growing the class
+// layout is the known init-fault landmine, see the grid statics below). Render-thread only.
+struct SwDrainState
+{
+	int				light = -1;		// lightDef index mid-drain; -1 = none
+	int				window = 0;		// next unbuilt build window of the parked seed queue
+	bool			grid = false;	// pipeline the parking warm ran on
+	SoftSurfBuildCB	cb;				// the parking warm's CB (caps[2] = its budget, seed[2] = MinROI)
+};
+static SwDrainState s_swDrain;
+
 SoftShadowSurfCache::SoftShadowSurfCache( nvrhi::IDevice* device )
 	: m_Device( device )
 {
@@ -289,6 +306,10 @@ void SoftShadowSurfCache::DoClearIfNeeded( nvrhi::ICommandList* commandList )
 	}
 	commandList->clearBufferUInt( m_Pool, 0 );
 	commandList->clearBufferUInt( m_Queue, 0 );
+	// the wipe just emptied the seed queue: a parked part-warm drain (audit #7b) has nothing left to
+	// consume, and every light re-warms from scratch below anyway.
+	s_swDrain.light = -1;
+	s_swDrain.window = 0;
 	m_NeedClear = false;
 	// a wholesale wipe reclaims every orphaned slot by definition - the bump counter's debt is spent.
 	// NOT resetting it here was harness-audit finding #3: the counter survived the wipe, so the FIRST
@@ -404,6 +425,66 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		}
 	}
 
+	// parked-drain helpers (audit #7b), shared by the CONTINUATION just below and the pre-seed FLUSH:
+	// build windows [w0,w1) of the parked seed queue against the stored CB - identical dispatches to
+	// the fresh path's windowed build (each stays at the parking warm's proven-safe budget bound).
+	auto swDrainTotalWindows = [this]() -> int
+	{
+		return ( m_QueueWords - 1 + s_swDrain.cb.caps[2] - 1 ) / s_swDrain.cb.caps[2];
+	};
+	auto swDrainDispatch = [&]( int w0, int w1 )
+	{
+		nvrhi::BindingSetDesc sd;
+		sd.bindings =
+		{
+			nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_WarmStream ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, m_WarmStream ),	// dummy t1 (include requirement)
+			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_Table ),
+			nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, s_swDrain.grid ? swGrid().buffer.Get() : m_Pool.Get() ),
+			nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_Queue ),
+		};
+		nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
+		nvrhi::ComputeState cs;
+		cs.pipeline = s_swDrain.grid ? swGrid().pipeline : m_Pipeline;
+		cs.bindings = { set };
+		for( int wb = w0; wb < w1; wb++ )
+		{
+			s_swDrain.cb.seed[1] = wb * s_swDrain.cb.caps[2];	// queue window base (build CS: qi = g_seed.y + i)
+			commandList->writeBuffer( m_ConstantBuffer, &s_swDrain.cb, sizeof( s_swDrain.cb ) );
+			commandList->setComputeState( cs );
+			commandList->dispatch( ( s_swDrain.cb.caps[2] + 63 ) / 64, 1, 1 );
+		}
+	};
+
+	// DRAIN CONTINUATION (audit #7b): a previous non-fullDrain warm of THIS light built only the first
+	// budget window and parked the rest; the seed queue and warm stream are untouched since (EndBuilds
+	// no longer clears the queue, and any other light's warm flushes the park before clobbering them),
+	// so just build the next window - no face re-collection, no re-seed. Converges: one window per
+	// frame via the warm queue until every seeded texel is built (empty tail windows retire on the
+	// queue-count check), fullDrain finishes in one call.
+	if( s_swDrain.light == light->index && sig != 0 )
+	{
+		auto sit = m_LightHash.find( light->index );
+		if( sit != m_LightHash.end() && sit->second.hash == sig && !sit->second.seedPending )
+		{
+			const int swTotal = swDrainTotalWindows();
+			const int wEnd = fullDrain ? swTotal : s_swDrain.window + 1;
+			swDrainDispatch( s_swDrain.window, wEnd );
+			s_swDrain.window = wEnd;
+			if( wEnd >= swTotal )
+			{
+				s_swDrain.light = -1;
+				sit->second.needSweep = false;	// drained: every seeded texel is built
+			}
+			else
+			{
+				EnqueueWarm( light );			// next frame continues the drain (one window/frame)
+			}
+			return true;
+		}
+	}
+
 	idList<idVec4> tris, casters, recvTris;
 	int nCas = 0, nTris = 0, nRecv = 0;
 	uint64_t fp = 0;
@@ -414,6 +495,10 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		se.hash = ( sig != 0 ) ? sig : 1;
 		se.seedPending = false;
 		se.needSweep = false;
+		if( s_swDrain.light == light->index )
+		{
+			s_swDrain.light = -1;	// its static set is gone: the parked queue tail is stale, drop it
+		}
 		return false;
 	}
 
@@ -424,6 +509,21 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		m_GenBumps++;
 	}
 	st.hash = fp;
+
+	// FLUSH a parked drain (audit #7b): the warm stream and seed queue written below are shared single
+	// buffers - seeding this light over them would strand the part-drained light's REQUESTED tail as a
+	// permanent miss. Finish it now: the same proven-safe per-window dispatches, and windows past the
+	// actually-enqueued count retire on the queue-count check (near-free).
+	if( s_swDrain.light >= 0 )
+	{
+		swDrainDispatch( s_swDrain.window, swDrainTotalWindows() );
+		auto dit = m_LightHash.find( s_swDrain.light );
+		if( dit != m_LightHash.end() && !dit->second.seedPending )
+		{
+			dit->second.needSweep = false;		// drained: every seeded texel is built
+		}
+		s_swDrain.light = -1;
+	}
 
 	// pack [tris][casters] into the reused warm-stream buffer (float4 elements)
 	const int triF4 = tris.Num();		// 3 per tri
@@ -524,10 +624,10 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, m_Layout );
 	// WINDOWED build (task #87): fullDrain loops bounded windows over the whole queue - each dispatch
 	// stays at the proven-safe SW_WARM_BUDGET bound, empty tail windows retire on the count check.
-	// Single-window (the old behavior) remains the cheap runtime default above the emergency line.
-	const int swWindows = fullDrain
-						  ? ( ( m_QueueWords - 1 + SW_WARM_BUDGET - 1 ) / SW_WARM_BUDGET )
-						  : 1;
+	// Single-window (the old behavior) remains the cheap runtime default above the emergency line;
+	// the unbuilt tail is PARKED below (audit #7b) so later frames keep draining it.
+	const int swTotalWindows = ( m_QueueWords - 1 + SW_WARM_BUDGET - 1 ) / SW_WARM_BUDGET;
+	const int swWindows = fullDrain ? swTotalWindows : 1;
 	nvrhi::ComputeState cs;
 	cs.pipeline = gridMode ? swGrid().pipeline : m_Pipeline;
 	cs.bindings = { set };
@@ -547,7 +647,24 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	}
 
 	st.seedPending = false;
-	st.needSweep = false;		// warmed (fullDrain: every seeded texel; else the first WarmBudget window)
+	if( swWindows < swTotalWindows )
+	{
+		// PART-WARM (audit #7b): windows remain unbuilt - park the drain (CB + pipeline choice) and
+		// keep needSweep pending so the warm queue continues it one window per frame until every
+		// seeded texel is built. The old unconditional clear here declared the light warm after ONE
+		// window, stranding the queue tail REQUESTED forever (re-warm could never recover it: a
+		// same-generation re-seed enqueues nothing).
+		s_swDrain.light = light->index;
+		s_swDrain.window = swWindows;
+		s_swDrain.grid = gridMode;
+		s_swDrain.cb = cb;
+		st.needSweep = true;
+		EnqueueWarm( light );
+	}
+	else
+	{
+		st.needSweep = false;	// warmed: every seeded texel built
+	}
 	return true;
 }
 
@@ -877,10 +994,11 @@ void SoftShadowSurfCache::EndBuilds( nvrhi::ICommandList* commandList )
 	{
 		return;
 	}
-	// reset the request queue: this frame's term dispatches claim a fresh budget's worth of texels.
-	// Claims that found the queue full reverted their slot to empty, so nothing is ever lost - the
-	// texel just re-claims on a later frame.
-	commandList->clearBufferUInt( m_Queue, 0 );
+	// NO per-frame queue clear (audit #9a): the runtime term is READ-ONLY - softterm's claim/enqueue
+	// path is dead (prev = 0u) and it does not even bind u_SurfQueue - and GetQueue() has no callers,
+	// so the only queue writers are this file's seed/build warms and the GC wipe, each of which does
+	// its own clear. The multi-MB clearBufferUInt here every frame was pure dead work; persisting the
+	// queue across frames is also what lets a parked part-warm drain (audit #7b) keep consuming it.
 	// HUD readback (non-blocking): snapshot THIS frame's counters into the ring, then map back the
 	// OLDEST ring entry - copied SW_STATS_RING-1 frames ago, so the GPU is long done and mapBuffer
 	// never stalls the pipe (unlike GetStats, which waitForIdle's). Feeds com_showFPS's cache line.
