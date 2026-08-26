@@ -936,6 +936,64 @@ static const uint SW_SCAN_MASK[16] =
 };
 #define SW_SCAN_DISKBITS 420
 #endif
+// ================= ADAPTIVE CHORD COUNT (task #85, r_softShadowAdaptiveChords) =================
+// Spend chords only where banding is visible. Banding is the SOLE artifact of too-few chords and it
+// appears ONLY in WIDE penumbrae (the N=8 EXTENT defects were on wide caps); narrow/hard penumbra and
+// umbra are banding-free at low chord counts. So per fragment we pick N chords from a COMPILE-MAX grid
+// by the fragment's penumbra width and consume only those.
+//
+// NESTED-SET VERDICT: the chords are NOT nested. Chord m's centre Y = -1+(m+.5)*(2/SW_SCAN_CHORDS) is the
+// 32-grid position; the 16-grid's centres (2/16 spacing) are DIFFERENT points, so "first-N-of-32" is not
+// the N-chord set and neither is any evenly-spaced-for-N subset. What IS valid: a STRATIFIED subset of the
+// 32 y-samples (stride s = 32/N, one residue class) is a coarser Fubini quadrature - same chord COUNT as
+// compiling at N, same banding characteristics, exact-along-each-chord preserved, just different y's. Both
+// numerator (covered bits) and denominator (disk bits) sum over the SAME active chords, so it stays an
+// unbiased area-ratio estimator. This is the "compile-max, consume-N" mechanism, done as a per-fragment
+// stride rather than a nested prefix.
+//
+// SAFETY: the shipped default is 16 chords (r_softShadowScanChords) and it is banding-free in playtest, so
+// stride 2 (=16 effective) is safe ANYWHERE; stride 4 (=8) only where the penumbra is narrow. The width
+// mapper routes wide penumbra -> stride 1 (=32, lossless) and hard/contact -> stride 4, so the N=8 defect
+// class (wide caps) never reaches stride 4.
+//
+// OFF-IDENTITY: SW_ADAPT_CHORDS 0 (default) compiles the SW_CHORD_SKIP macro to nothing and never
+// instantiates g_swChordStride, so every chord loop is byte-identical to today. Turned on it is a distinct
+// shader permutation (SoftShadowTermPass), so the shipped pipeline is untouched.
+#ifndef SW_ADAPT_CHORDS
+	#define SW_ADAPT_CHORDS 0
+#endif
+#if SW_ADAPT_CHORDS
+// CALIBRATION (disk half-angle swSinA = swR/distPL thresholds). Conservative defaults; GateGrain is the
+// arbiter - if banding appears, RAISE these (more fragments to higher N) and re-run the failing caps.
+// ponytail: baked constants, calibrated by edit+rebuild (the scan permutation already rebuilds on the
+// chord-count cvar); promote to a cvar only if runtime tuning proves necessary.
+#ifndef SW_ADAPT_HI
+	#define SW_ADAPT_HI 0.25f		// >= : widest penumbra -> N=32 (lossless)
+#endif
+#ifndef SW_ADAPT_LO
+	#define SW_ADAPT_LO 0.06f		// >= : moderate -> N=16 (shipped quality); below -> N=8 (narrow/hard)
+#endif
+// per-invocation active-chord stride (1/2/4 -> N=32/16/8). 1 = all chords, so any walker that does not set
+// it (serve/grid paths, the pixel shader) stays lossless even in the adaptive permutation.
+static uint g_swChordStride = 1u;
+// chord m is active iff m == (stride>>1) (mod stride): stride 1 -> all; 2 -> odds; 4 -> {2,6,10,...}.
+SW_FUNC bool SwChordActive( int m ) { return ( ( ( uint )m & ( g_swChordStride - 1u ) ) == ( g_swChordStride >> 1u ) ); }
+// active-chord disk-bit denominator, folded from the COMPILE-TIME mask (countbits of a constant per chord,
+// so this is 32 predicated adds - negligible next to the walk).
+SW_FUNC int SwActiveDiskBits() { int b = 0; SW_UNROLL for( int m = 0; m < SW_SCAN_CHORDS; m++ ) { if( SwChordActive( m ) ) { b += ( int )SoftScan_PC( SW_SCAN_MASK[m] ); } } return b; }
+// width -> stride. swSinA overestimates penumbra width when the blocker hugs the receiver (contact
+// hardening) -> conservative (never under-chords -> never adds banding vs fixed-32). Upgrade path: fold a
+// cheap nearest-blocker depth for the contact-hardening claw-back.
+SW_FUNC uint SwPickChordStride( float swSinA )
+{
+	if( swSinA >= SW_ADAPT_HI ) { return 1u; }
+	if( swSinA >= SW_ADAPT_LO ) { return 2u; }
+	return 4u;
+}
+#define SW_CHORD_SKIP( m ) if( !SwChordActive( m ) ) { continue; }
+#else
+#define SW_CHORD_SKIP( m )
+#endif
 // [aN,bN] in disk-normalised [-1,1] -> a contiguous run of set columns across SW_SCAN_BITS columns,
 // packed one bit per column into SwGridWord (64-bit: word .x = columns 0..31, .y = 32..63). Empty if b<a.
 SW_FUNC SwGridWord SoftScan_Run( float aN, float bN )
@@ -998,6 +1056,7 @@ SW_FUNC float SoftScan_ReduceCov( SwGridWord swGrid[SW_SCAN_CHORDS], float2 swEn
 	float swCov = 0.0f;
 	SW_UNROLL for( int cm = 0; cm < SW_SCAN_CHORDS; cm++ )
 	{
+		SW_CHORD_SKIP( cm )		// adaptive: inactive chords contribute 0 (matches the active-chord denominator)
 		const SwGridWord swG = swGrid[cm] & swDiskMask[cm];
 		float c = ( float )SoftScan_PC( swG );
 		if( SwGridNZ( swG ) )
@@ -1151,6 +1210,7 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 		SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
 		{
 			if( mc < mLo || mc > mHi || newBits ) { continue; }
+			SW_CHORD_SKIP( mc )		// adaptive: only active chords count toward coverage
 			skipIt++;
 			if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; }
 		}
@@ -1164,6 +1224,7 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 				SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
 				{
 					if( mc < mLo || mc > mHi || !SwGridNZ( swGrid[mc] ) ) { continue; }
+					SW_CHORD_SKIP( mc )		// adaptive: fold only touches active chords' envelopes
 					if( SwGridNZ( bboxRun & SwGridColBit( SwGridLoCol( swGrid[mc] ) ) ) ) { swEnv[mc].x = min( swEnv[mc].x, xmin ); }
 					if( SwGridNZ( bboxRun & SwGridColBit( SwGridHiCol( swGrid[mc] ) ) ) ) { swEnv[mc].y = max( swEnv[mc].y, xmax ); }
 				}
@@ -1190,6 +1251,7 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 	SW_UNROLL for( int m = 0; m < SW_SCAN_CHORDS; m++ )					// constant-trip + span predication (see the skip loop)
 	{
 		if( m < mLo || m > mHi ) { continue; }
+		SW_CHORD_SKIP( m )		// adaptive: sweep only the active chords (the per-fragment claw-back)
 		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
 		float xlo = 1e30f, xhi = -1e30f; bool any = false;
 		for( int e2 = 0; e2 < 5; e2++ )
@@ -1320,6 +1382,7 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 		SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
 		{
 			if( mc < mLo || mc > mHi || newBits ) { continue; }
+			SW_CHORD_SKIP( mc )		// adaptive: only active chords count toward coverage
 			if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; }
 		}
 		if( !newBits )
@@ -1331,6 +1394,7 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 				SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
 				{
 					if( mc < mLo || mc > mHi || !SwGridNZ( swGrid[mc] ) ) { continue; }
+					SW_CHORD_SKIP( mc )		// adaptive: fold only touches active chords' envelopes
 					if( SwGridNZ( bboxRun & SwGridColBit( SwGridLoCol( swGrid[mc] ) ) ) ) { swEnv[mc].x = min( swEnv[mc].x, xmin ); }
 					if( SwGridNZ( bboxRun & SwGridColBit( SwGridHiCol( swGrid[mc] ) ) ) ) { swEnv[mc].y = max( swEnv[mc].y, xmax ); }
 				}
@@ -1349,6 +1413,7 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 	SW_UNROLL for( int m = 0; m < SW_SCAN_CHORDS; m++ )					// constant-trip + span predication (see FillTri)
 	{
 		if( m < mLo || m > mHi ) { continue; }
+		SW_CHORD_SKIP( m )		// adaptive: sweep only the active chords (the per-fragment claw-back)
 		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
 		float xlo = 1e30f, xhi = -1e30f; bool any = false;
 		for( int e5 = 0; e5 < 12; e5++ )
@@ -1692,7 +1757,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 			{
 				// UMBRA EARLY-OUT + rounding, identical to the tile-list/cluster scanline walkers
 				int swCovE = 0;
-				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { SW_CHORD_SKIP( fm ) swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
 				if( swCovE * 100 >= swDiskBits * 99 ) { SW_BKT_FLUSH_COV( 1.0f ); return 1.0f; }
 			}
 #else
@@ -1888,7 +1953,15 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
 #if SW_SCANLINE
 	SwGridWord swGrid[SW_SCAN_CHORDS];			// Fubini scanline grid: SW_SCAN_CHORDS chords x 32 bits, OR-unioned
+#if SW_ADAPT_CHORDS
+	g_swChordStride = SwPickChordStride( saturate( swR / swDistPL ) );	// per-fragment N from penumbra width (task #85)
+	const int swDiskBits = SwActiveDiskBits();							// denominator over the ACTIVE chords
+#if defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
+	InterlockedAdd( u_WalkCnt[ 28 ], ( uint )SW_SCAN_CHORDS / g_swChordStride );	// mean-N accumulator (active chords); slot 7 = walked frags
+#endif
+#else
 	const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array, no init loop)
+#endif
 	float2 swEnv[SW_SCAN_CHORDS];		// fractional-endpoint envelope (task #90): exact union interval per chord
 	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
 #endif
@@ -2033,7 +2106,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			// >=99%-occluded fragment to exact umbra (return 1) - the <1% residual is discretisation noise and
 			// reads as black regardless, so the visible penumbra gradient is untouched.
 			int swCovE = 0;
-			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { SW_CHORD_SKIP( fm ) swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
 			if( swCovE * 100 >= swDiskBits * 99 ) { SW_BKT_FLUSH_COV( 1.0f ); return 1.0f; }
 		}
 #else
@@ -2174,7 +2247,7 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 		SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );
 		{	// umbra early-out: same >=99% coverage threshold + exact-umbra rounding as the sibling walks
 			int swCovE = 0;
-			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+			SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { SW_CHORD_SKIP( fm ) swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
 			if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 		}
 	}
@@ -2217,7 +2290,7 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 			SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );
 			{
 				int swCovE = 0;
-				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { SW_CHORD_SKIP( fm ) swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
 				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 			}
 		}
@@ -2270,7 +2343,7 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 				SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );
 				{
 					int swCovE = 0;
-					SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+					SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { SW_CHORD_SKIP( fm ) swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
 					if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
 				}
 			}
@@ -2684,7 +2757,15 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 	// listed fragments ran the scanline: two algorithms in one frame (and the contributor cache's
 	// scanline serve measured 15.7% term mismatches against the sampled spill reference).
 	SwGridWord swGrid[SW_SCAN_CHORDS];
+#if SW_ADAPT_CHORDS
+	g_swChordStride = SwPickChordStride( saturate( swR / swDistPL ) );	// per-fragment N from penumbra width (task #85)
+	const int swDiskBits = SwActiveDiskBits();							// denominator over the ACTIVE chords
+#if defined( SW_GPU_WALK_COUNTERS ) && SW_GPU_WALK_COUNTERS
+	InterlockedAdd( u_WalkCnt[ 28 ], ( uint )SW_SCAN_CHORDS / g_swChordStride );	// mean-N accumulator (active chords); slot 7 = walked frags
+#endif
+#else
 	const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array, no init loop)
+#endif
 	float2 swEnv[SW_SCAN_CHORDS];		// fractional-endpoint envelope (task #90): exact union interval per chord
 	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
 #endif
@@ -2747,7 +2828,7 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 			{
 				// UMBRA EARLY-OUT + rounding, identical to the tile-list scanline walker
 				int swCovE = 0;
-				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { SW_CHORD_SKIP( fm ) swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
 				if( swCovE * 100 >= swDiskBits * 99 ) { SW_BKT_FLUSH_COV( 1.0f ); return 1.0f; }
 			}
 #else
