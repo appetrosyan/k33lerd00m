@@ -64,6 +64,41 @@ static const int SW_TERM_MAX_TEX_DIM = 16384;
 static int swTermAtlasCols = 0;
 static int swTermAtlasRows = 0;
 
+// TERM-LIGHT IDENTITY accumulator (bench instrument): unique surf-permutation light indices seen
+// since the last Take, with whether the cache was ON for them at CB-fill time. Names the by-light
+// rings (ring = index & 15), whose collisions made miss attribution ambiguous at >6 lights.
+static int  s_swSurfTermLightIdx[64];
+static bool s_swSurfTermLightOn[64];
+static int  s_swSurfTermLightCount = 0;
+void R_SoftSurfTermLightSeen( int index, bool cacheOn )
+{
+	for( int i = 0; i < s_swSurfTermLightCount; i++ )
+	{
+		if( s_swSurfTermLightIdx[i] == index )
+		{
+			s_swSurfTermLightOn[i] = cacheOn;
+			return;
+		}
+	}
+	if( s_swSurfTermLightCount < 64 )
+	{
+		s_swSurfTermLightIdx[s_swSurfTermLightCount] = index;
+		s_swSurfTermLightOn[s_swSurfTermLightCount] = cacheOn;
+		s_swSurfTermLightCount++;
+	}
+}
+int R_SoftSurfTermLightsTake( int* outIdx, bool* outOn, int cap )
+{
+	const int n = ( s_swSurfTermLightCount < cap ) ? s_swSurfTermLightCount : cap;
+	for( int i = 0; i < n; i++ )
+	{
+		outIdx[i] = s_swSurfTermLightIdx[i];
+		outOn[i] = s_swSurfTermLightOn[i];
+	}
+	s_swSurfTermLightCount = 0;
+	return n;
+}
+
 // SURF-CACHE GRID permutation kept OFF the class layout (not members): growing SoftShadowTermPass shifts
 // its heap layout and can surface a latent init-time heap fault (the idImageManager-class landmine). They
 // must ALSO outlive normal static teardown: a file-scope nvrhi handle runs its destructor at PROGRAM EXIT,
@@ -683,6 +718,14 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		cb.surfA[1] = surfCache->GetQueueWords();
 		cb.surfA[2] = vLight->softStaticCasterCount;
 		cb.surfA[3] = ( vLight->lightDef != NULL ) ? ( vLight->lightDef->index & 0x1FFF ) : 0;
+		// TERM-LIGHT IDENTITY (bench instrument): record each surf-permutation light's index so the
+		// bench can NAME the by-light rings (ring = index & 15; collisions past 16 lights made ring
+		// attribution ambiguous exactly when it mattered). One-shot list, reset by the bench reader.
+		if( vLight->lightDef != NULL )
+		{
+			extern void R_SoftSurfTermLightSeen( int index, bool cacheOn );
+			R_SoftSurfTermLightSeen( vLight->lightDef->index, cb.surfA[0] != 0 );
+		}
 		// econ.z = this light's persistent static-stream segment TRI BASE (float4 elems), BIT-CAST into
 		// the float lane (asuint on the shader side) so any base stays exact - audit finding #4. The
 		// pool's 1-uint residual indices resolve against t_SurfStream at this base. A warmed light

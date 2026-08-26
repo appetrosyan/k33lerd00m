@@ -419,6 +419,7 @@ void SoftShadowSurfCache::BuildLight( nvrhi::ICommandList* commandList, const vi
 // cheap-skipped an already-warm light or found nothing to warm.
 // accumulators for the one-shot warm-at-load summary line (reset in WarmMapBurst)
 static int s_warmRecvTotal = 0, s_warmCasterTotal = 0, s_warmStreamedLights = 0;
+static int64_t s_warmClaimsTotal = 0;	// seed-claims instrument (see WarmMapBurst readback)
 
 bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idRenderLightLocal* light, bool fullDrain )
 {
@@ -1348,6 +1349,7 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 	s_warmRecvTotal = 0;
 	s_warmCasterTotal = 0;
 	s_warmStreamedLights = 0;
+	s_warmClaimsTotal = 0;
 	{
 		extern void R_SoftWarmDiagReset();
 		R_SoftWarmDiagReset();		// one-shot warm-miss attribution (task #87 "instrument the misses")
@@ -1396,10 +1398,33 @@ void SoftShadowSurfCache::WarmMapBurst( nvrhi::IDevice* device, idRenderWorldLoc
 		if( built )
 		{
 			warmed++;
+			// SEED-CLAIMS instrument (2026-08-26 0%-hit regression): m_Queue[0] right after this light's
+			// submit IS its successful-claim count (the seed bumps it on every table claim, past the
+			// queue's write cap too). The pipeline had counters for emission (SWD, CPU-side), post-build
+			// state (census) and serve outcomes (rings) but nothing for CLAIMS - the one number that
+			// splits "seed starved / rasterised garbage" from "claims erased later". Burst-only, one
+			// 4-byte readback per light behind the load screen.
+			nvrhi::BufferDesc qbd;
+			qbd.byteSize = sizeof( uint32_t );
+			qbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+			qbd.debugName = "SoftShadowSurfCache/ClaimCountReadback";
+			nvrhi::BufferHandle qstage = device->createBuffer( qbd );
+			nvrhi::CommandListHandle qcl = device->createCommandList();
+			qcl->open();
+			qcl->copyBuffer( qstage, 0, m_Queue, 0, sizeof( uint32_t ) );
+			qcl->close();
+			device->executeCommandList( qcl );
+			device->waitForIdle();
+			const uint32_t* qp = ( const uint32_t* )device->mapBuffer( qstage, nvrhi::CpuAccessMode::Read );
+			if( qp != NULL )
+			{
+				s_warmClaimsTotal += ( int64_t )qp[0];
+				device->unmapBuffer( qstage );
+			}
 		}
 	}
-	common->Printf( "[softsurf] warm-at-load: %d of %d lights warmed | %d recv-tris, %d caster-tris over %d streamed lights\n",
-					warmed, n, s_warmRecvTotal, s_warmCasterTotal, s_warmStreamedLights );
+	common->Printf( "[softsurf] warm-at-load: %d of %d lights warmed | %d recv-tris, %d caster-tris over %d streamed lights | %lld seed claims\n",
+					warmed, n, s_warmRecvTotal, s_warmCasterTotal, s_warmStreamedLights, ( long long )s_warmClaimsTotal );
 	{
 		extern void R_SoftWarmDiagPrint();
 		R_SoftWarmDiagPrint();		// one-shot: where the collector rejected everything (task #87)

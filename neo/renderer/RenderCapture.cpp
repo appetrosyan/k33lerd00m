@@ -3637,6 +3637,38 @@ int R_SoftShadowGate( const char* arg )
 							}
 							common->Printf( "[softgate] BENCH %-14s surf by-light ring:hit/miss(hit%%):%s\n",
 											cap.name.c_str(), swPlLine.c_str() );
+							// TERM-LIGHT IDENTITY: name the rings. index(ring, cache on/off at CB fill,
+							// warm?) - a ring whose misses dwarf its hits while its named light reads
+							// OFF/COLD is an unwarmed light hiding in a ring collision, not a keying gap.
+							{
+								extern int R_SoftSurfTermLightsTake( int* outIdx, bool* outOn, int cap );
+								int tlIdx[64]; bool tlOn[64];
+								const int tlN = R_SoftSurfTermLightsTake( tlIdx, tlOn, 64 );
+								idStr swTlLine;
+								for( int tl = 0; tl < tlN; tl++ )
+								{
+									swTlLine += va( " %d(r%d,%s,%s)", tlIdx[tl], tlIdx[tl] & 15,
+													tlOn[tl] ? "on" : "OFF",
+													backEnd.GetSoftShadowSurfCache()->IsWarmLight( tlIdx[tl] ) ? "warm" : "COLD" );
+								}
+								common->Printf( "[softgate] BENCH %-14s surf term lights idx(ring,cache,warm):%s\n",
+												cap.name.c_str(), swTlLine.c_str() );
+							}
+							// VIZ FRAME DUMP: with a surf viz mode active, dump the last bench frame -
+							// the term tint (viz 2 dims serves, viz 4 brightens hits / tints classes)
+							// shows WHICH SURFACES serve: the spatial truth the counters cannot give.
+							// (The repro path replays captured records without the cache, so its dumps
+							// are structurally blind to serving - this is the bench-side counterpart.)
+							extern idCVar r_softShadowSurfCacheViz;
+							if( r_softShadowSurfCacheViz.GetInteger() != 0 )
+							{
+								R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+												  globalImages->currentRenderHDRImage->GetTextureHandle(),
+												  nvrhi::ResourceStates::ShaderResource,
+												  va( "dumps/benchviz_%s.png", cap.name.c_str() ) );
+								common->Printf( "[softgate] BENCH %-14s viz frame dumped to dumps/benchviz_%s.png\n",
+												cap.name.c_str(), cap.name.c_str() );
+							}
 						}
 					}
 				}
