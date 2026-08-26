@@ -1327,6 +1327,167 @@ void R_CaptureBackendFinish()
 	ResetAccumulators();
 }
 
+// ============================================================ com_softShadowGateSmoke: the REAL-GAME SMOKE gate
+// The minimal-init defect gate (com_softShadowGate) never boots the game, so it is structurally blind to
+// load-path stalls and black-frame-but-no-crash failures (e.g. r_softShadowSurfCacheGrid 1: the map warms at
+// load but the game view never presents - viewLights stays 0, the frame is black). This stage rides the FULL
+// shipped load+present path: the caller launches `+devmap <map> +set com_softShadowGateSmoke N` (the proven
+// benchmark path - the map load is the engine's job, exactly as com_softShadowFrameProbe does it), and the
+// per-frame tick self-arms off the cvar, counts real game-view frames (INGAME && viewLights>0), and once N have
+// rendered reads back the lit HDR frame and asserts it is not black. A run that never reaches a game view (load
+// stall / hang) FAILs on the wall-clock budget - never a silent pass. Verdict line + process exit code mirror
+// the defect gate; then quit. The `softShadowGateSmoke <map>` command is interactive convenience (arm + devmap
+// from an already-booted console); the tested path is the pure cvar arm so nothing races engine init.
+static bool  s_smokeArmed       = false;
+static idStr s_smokeMap;
+static int   s_smokeFrames      = 0;	// target genuine game-view frames before the luminance verdict
+static int   s_smokeStartMs     = 0;
+static int   s_smokeLastTickMs  = 0;	// wall time of the previous tick, for the per-frame stall check
+static int   s_smokeGameViews    = 0;
+static int   s_smokeTotalFrames = 0;
+
+static void R_SoftShadowSmokeVerdict( bool pass, const char* reason, double meanLum, double litFrac, int wallMs )
+{
+	extern void Sys_SetExitCode( int code );
+	s_smokeArmed = false;
+	const int grid = cvarSystem->GetCVarInteger( "r_softShadowSurfCacheGrid" );
+	char verdict[256];
+	if( pass )
+	{
+		idStr::Copynz( verdict, "PASS", sizeof( verdict ) );
+	}
+	else
+	{
+		idStr::snPrintf( verdict, sizeof( verdict ), "FAIL(%s)", reason );
+	}
+	common->Printf( "[softsmoke] %s grid=%d: mean-lum %.4f, lit-frac %.2f%%, frames %d, wallms %d -> %s\n",
+					s_smokeMap.c_str(), grid, meanLum, litFrac * 100.0, s_smokeTotalFrames, wallMs, verdict );
+	Sys_SetExitCode( pass ? 0 : 1 );
+	// disarm (cvar 0 so the next frame's tick early-outs) then quit CLEANLY via the command buffer - NOT
+	// Sys_Quit() directly. The defect gate can Sys_Quit mid-call because it runs at minimal-init with no game
+	// thread; here the full SMP game thread is live and an abrupt synchronous Sys_Quit from inside Frame()
+	// tears it down under itself and crashes. The deferred `quit` shuts down at the frame boundary; the exit
+	// code set above survives to Posix_Exit. Mirrors com_autoCapture / com_softShadowFrameProbe.
+	cvarSystem->SetCVarInteger( "com_softShadowGateSmoke", 0 );
+	cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "quit\n" );
+}
+
+void R_SoftShadowGateSmokeTick( int viewLights )
+{
+	const int cvarN = cvarSystem->GetCVarInteger( "com_softShadowGateSmoke" );
+	if( cvarN <= 0 )
+	{
+		return;	// disabled
+	}
+	// first tick after the cvar is set: latch config, start the wall clock, arm the hard-wedge watchdog. Self
+	// arming off the cvar (not a command) means `+set com_softShadowGateSmoke N` alongside `+devmap <map>` works
+	// with zero ordering races against engine init - the failure mode of issuing devmap from a startup command.
+	if( !s_smokeArmed )
+	{
+		s_smokeArmed = true;
+		s_smokeFrames = cvarN;
+		s_smokeGameViews = 0;
+		s_smokeTotalFrames = 0;
+		s_smokeStartMs = Sys_Milliseconds();
+		s_smokeLastTickMs = s_smokeStartMs;
+		s_smokeMap = cvarSystem->GetCVarString( "com_softShadowGateSmokeMap" );
+		const int budget = cvarSystem->GetCVarInteger( "com_softShadowGateSmokeMaxSeconds" );
+		common->Printf( "[softsmoke] armed: map=%s frames=%d budget=%ds grid=%d\n",
+						s_smokeMap.c_str(), s_smokeFrames, budget, cvarSystem->GetCVarInteger( "r_softShadowSurfCacheGrid" ) );
+	}
+	s_smokeTotalFrames++;
+
+	const int now = Sys_Milliseconds();
+	const int wallMs = now - s_smokeStartMs;
+	const int frameMs = now - s_smokeLastTickMs;
+	s_smokeLastTickMs = now;
+	const int budgetMs = cvarSystem->GetCVarInteger( "com_softShadowGateSmokeMaxSeconds" ) * 1000;
+	const int frameStallMs = cvarSystem->GetCVarInteger( "com_softShadowGateSmokeFrameStallMs" );
+
+	// a real game view = the frontend actually drew lights this frame (viewLights>0, passed in from the
+	// COMPLETED frame's stats_frontend). This is exactly the signal the perf overlay shows as 0 during the
+	// black-frame load stall this gate exists to catch. NOTE: do NOT also require session INGAME - erebus1
+	// opens on a scripted cinematic whose session state is not INGAME, yet it IS a real lit 3D view; gating on
+	// INGAME would loop forever on the cinematic benchmark.
+	if( viewLights > 0 )
+	{
+		s_smokeGameViews++;
+	}
+
+	// enough settled game-view frames rendered -> luminance verdict on the lit HDR frame
+	if( s_smokeGameViews >= s_smokeFrames )
+	{
+		std::vector<uint8_t> px;
+		int w = 0, h = 0;
+		if( !ReadImageRGBA8( globalImages->currentRenderHDRImage, px, w, h ) || w <= 0 || h <= 0 )
+		{
+			R_SoftShadowSmokeVerdict( false, "hdr-readback-failed", -1.0, -1.0, wallMs );
+			return;
+		}
+		// dump the exact frame the verdict scores, for eyeball confirmation
+		R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+						  globalImages->currentRenderHDRImage->GetTextureHandle(),
+						  nvrhi::ResourceStates::ShaderResource, "dumps/softsmoke.png" );
+		double sum = 0.0;
+		long lit = 0;
+		const long n = ( long )w * h;
+		const double litThresh = 0.15;	// normalized luma a genuinely lit erebus1 pixel clears
+		for( long i = 0; i < n; i++ )
+		{
+			const uint8_t* p = &px[( size_t )i * 4];
+			const double luma = ( 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] ) / 255.0;
+			sum += luma;
+			if( luma > litThresh )
+			{
+				lit++;
+			}
+		}
+		const double meanLum = ( n > 0 ) ? sum / n : 0.0;
+		const double litFrac = ( n > 0 ) ? ( double )lit / n : 0.0;
+		// a correctly-lit erebus1 view has a nonzero mean AND a real fraction of bright pixels; a black
+		// load-stall frame is ~0 on both. Floors are 10x below the observed lit values, 10x above black.
+		const bool pass = ( meanLum > 0.01 ) && ( litFrac > 0.01 );
+		R_SoftShadowSmokeVerdict( pass, "blackout: lit HDR frame is black", meanLum, litFrac, wallMs );
+		return;
+	}
+
+	// STALL, per-frame: a single frame that took longer than the threshold before any real view = a froze-at-
+	// load hitch (the "stuck at Loading deferred images" case). Catches it in one frame instead of waiting out
+	// the whole budget. Skipped for frame 1 (it carries the whole pre-arm init gap).
+	if( frameStallMs > 0 && s_smokeTotalFrames > 1 && frameMs > frameStallMs )
+	{
+		R_SoftShadowSmokeVerdict( false, "stall: a frame exceeded the per-frame budget before any game view", -1.0, -1.0, wallMs );
+		return;
+	}
+
+	// STALL, total: budget blown before we ever accumulated the target game-view frames -> loud fail, never a
+	// silent pass (mirrors the defect gate's "0 lights probed = nothing tested = FAIL" anti-false-green rule).
+	// This catches the bug class where the game renders black frames forever (viewLights stays 0).
+	// ponytail: a TOTAL frame-loop wedge (init deadlock, no frames at all) won't reach here - the outer harness
+	// timeout is the backstop for that rarer class. Add an independent watchdog thread only if it recurs.
+	if( budgetMs > 0 && wallMs > budgetMs )
+	{
+		R_SoftShadowSmokeVerdict( false, "stall: no game view (viewLights>0) within budget", -1.0, -1.0, wallMs );
+		return;
+	}
+}
+
+void R_SoftShadowGateSmoke_f( const idCmdArgs& args )
+{
+	const char* map = ( args.Argc() > 1 ) ? args.Argv( 1 ) : "game/erebus1";
+	int n = ( args.Argc() > 2 ) ? atoi( args.Argv( 2 ) ) : cvarSystem->GetCVarInteger( "com_softShadowGateSmoke" );
+	if( n <= 0 )
+	{
+		n = 30;	// N>=1 is required: "0 frames rendered" must never count as a pass
+	}
+	// set the label + arm the tick via the cvar, then devmap. Interactive path only (console already up, so
+	// devmap does not race init); automated runs prefer `+devmap <map> +set com_softShadowGateSmoke N` directly.
+	cvarSystem->SetCVarString( "com_softShadowGateSmokeMap", map );
+	cvarSystem->SetCVarInteger( "com_softShadowGateSmoke", n );
+	cmdSystem->BufferCommandText( CMD_EXEC_APPEND, va( "devmap %s\n", map ) );
+	common->Printf( "[softsmoke] command: devmap %s, %d frames\n", map, n );
+}
+
 // ------------------------------------------------------------------------------------------- console command
 void R_CaptureSoftShadow_f( const idCmdArgs& args )
 {

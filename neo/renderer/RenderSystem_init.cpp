@@ -2077,6 +2077,7 @@ void R_InitCommands()
 	cmdSystem->AddCommand( "softShadowRecapture", R_SoftShadowRecapture_f, CMD_FL_RENDERER, "headless: restore each .cap's embedded save + camera, overwrite the .cap in place with the current writer (v7 live-light tail), then quit" );
 	cmdSystem->AddCommand( "softShadowReproShot", R_SoftShadowReproShot_f, CMD_FL_RENDERER, "internal: the synchronous freeze+A/B+diff shot for one already-positioned capture (used by softShadowRepro)" );
 	cmdSystem->AddCommand( "softShadowSpawnCasters", R_SoftShadowSpawnCasters_f, CMD_FL_RENDERER, "reproduce a capture's dynamic casters (the scripted rock/crate) that loadGame does not spawn" );
+	cmdSystem->AddCommand( "softShadowGateSmoke", R_SoftShadowGateSmoke_f, CMD_FL_RENDERER, "REAL-GAME smoke gate: devmap <map> [frames] through the full load+present path, assert the lit HDR frame is not black + a real game view rendered (viewLights>0), set exit code, quit" );
 	cmdSystem->AddCommand( "envshot", R_EnvShot_f, CMD_FL_RENDERER, "takes an environment shot" );
 	cmdSystem->AddCommand( "envToSky", R_TransformEnvToSkybox_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "transforms environment textures to sky box textures" );
 	cmdSystem->AddCommand( "skyToEnv", R_TransformSkyboxToEnv_f, CMD_FL_RENDERER | CMD_FL_CHEAT, "transforms sky box textures to environment textures" );
