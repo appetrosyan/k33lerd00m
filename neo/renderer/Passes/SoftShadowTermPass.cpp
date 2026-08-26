@@ -218,7 +218,7 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineCnt = m_Device->createComputePipeline( pc );
 
 			nvrhi::BufferDesc wc;
-			wc.byteSize = 28 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106)
+			wc.byteSize = 29 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106), 27 lit-early-out, 28 classifier-umbra skip
 			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
 			wc.canHaveUAVs = true;
 			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -977,20 +977,20 @@ bool SoftShadowTermPass::GetContribStats( uint32_t out[20] )
 	return true;
 }
 
-bool SoftShadowTermPass::GetWalkStats( uint32_t out[28] )
+bool SoftShadowTermPass::GetWalkStats( uint32_t out[29] )
 {
 	if( !m_WalkCntEnabled || m_WalkCntBuffer == nullptr )
 	{
 		return false;
 	}
 	nvrhi::BufferDesc sbd;
-	sbd.byteSize = 28 * sizeof( uint32_t );
+	sbd.byteSize = 29 * sizeof( uint32_t );
 	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
 	sbd.debugName = "SoftShadowTerm/WalkCountersReadback";
 	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
 	nvrhi::CommandListHandle cl = m_Device->createCommandList();
 	cl->open();
-	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 28 * sizeof( uint32_t ) );
+	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 29 * sizeof( uint32_t ) );
 	cl->close();
 	m_Device->executeCommandList( cl );
 	m_Device->waitForIdle();
@@ -999,7 +999,7 @@ bool SoftShadowTermPass::GetWalkStats( uint32_t out[28] )
 	{
 		return false;
 	}
-	memcpy( out, p, 28 * sizeof( uint32_t ) );
+	memcpy( out, p, 29 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
 	return true;
 }

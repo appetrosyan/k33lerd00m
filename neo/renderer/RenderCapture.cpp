@@ -3746,7 +3746,7 @@ int R_SoftShadowGate( const char* arg )
 			// below attributes the PLAIN walk (tile-list, spill/cluster, unbinned-full paths - all
 			// instrumented). Slots: [0/1] caster+cluster sphere tests/culls, [2/3] coarse v0, [4/5]
 			// tight cone, [6] survivors reaching FillTri, [7] fragments walked.
-			uint32_t walk[28] = {};
+			uint32_t walk[29] = {};
 			if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetWalkStats( walk ) && walk[7] > 0 )
 			{
 				// SCANLINE FillTri attribution (task #106, slots 20-26): where the chord-sweep walk spends
@@ -3766,6 +3766,13 @@ int R_SoftShadowGate( const char* arg )
 				{
 					common->Printf( "[softgate] BENCH %-14s lit-early-out: %u frags skipped (T > 0 path EXECUTED)\n",
 									cap.name.c_str(), walk[27] );
+				}
+				// CLASSIFIER-UMBRA skip (slot 28): fragments the world-cell UMBRA class short-circuited to
+				// term 0 before the walk. Fraction = of the classifiable population (umbra-skips + walked).
+				if( walk[28] > 0 )
+				{
+					common->Printf( "[softgate] BENCH %-14s classifier-umbra: %u frags skipped (term 0, %.1f%% of umbra-skip + walked)\n",
+									cap.name.c_str(), walk[28], 100.0 * walk[28] / ( double )( walk[28] + walk[7] ) );
 				}
 				const double f = ( double )walk[7];			// fragments that ran the walk (this frame)
 				// Cull cascade, all plain-walk paths (tile-list fills tight/mtTri; spill/cluster fills
