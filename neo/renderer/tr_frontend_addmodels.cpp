@@ -2125,12 +2125,14 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					// per hull (shared .w=-N encoding, FillHull) INSTEAD of this area's triangle stream, and
 					// ONCE per light (the hulls are the whole area, not per surface). Needs face-coverage: the
 					// .w=-N decode lives in that walk. Lossless: a brush is convex, hull == brush projection.
-					if( swAreaHulls != NULL && r_softShadowFaceCoverage.GetBool() )
+					// Gate the hull swap on the FULL precondition: area has hulls, face-coverage is on, AND this is
+					// a SOFT light (penumbra > 0). A hard light (penumbra <= 0) or a hull-less area falls THROUGH
+					// to the canonical triangle/silhouette path below - it must never be swallowed here casting
+					// nothing. (The old form entered on swAreaHulls alone, then bailed inside for hard lights.)
+					if( swAreaHulls != NULL && r_softShadowFaceCoverage.GetBool() && R_SoftPenumbraRadius( lightDef ) > 0.0f )
 					{
 						if( swHullLightsDone.FindIndex( vLight->lightDef->index ) == -1 )
 						{
-							const float swPen = R_SoftPenumbraRadius( lightDef );
-							if( swPen > 0.0f )
 							{
 								swHullLightsDone.Append( vLight->lightDef->index );
 								extern int fe_softEdgesCollected;
