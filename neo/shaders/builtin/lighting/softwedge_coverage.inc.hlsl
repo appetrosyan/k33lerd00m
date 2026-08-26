@@ -1813,6 +1813,107 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 	SoftScan_FillPoly( swGrid, swEnv, loopV, loopN, swP, swF, swR, swEps );
 }
 
+// ANALYTIC CONVEX-HULL coverage: a shadow-casting brush is a 3-D convex POLYHEDRON, so its occlusion is
+// its SILHOUETTE from the receiver, not a flat face. Under central projection from the receiver the
+// silhouette of a convex solid is the 2-D CONVEX HULL of the projected vertices; that hull's WORLD-space
+// loop (the hull verts in cyclic order) handed to SoftScan_FillPoly gives the exact coverage - FillPoly
+// does the real slab-clip + projection, so the projection here selects ONLY the silhouette subset and its
+// order (a clamped/approximate projection suffices for that). This SUBSUMES the committed primitives:
+//   - COPLANAR input is already its own silhouette -> FillPoly on the input loop VERBATIM (bit-exact).
+//   - a box's 8 corners -> the same silhouette SoftScan_FillBox derives from its faces (bit-exact via the
+//     shared FillPoly core - same real-valued chord spans, same column snapping).
+// `hv[0..hn)` are the hull's world vertices, hn <= SW_POLY_MAX_VERTS. No forked fill: FillPoly IS the core.
+SW_FUNC void SoftScan_FillHull( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS],
+		float3 hv[SW_POLY_MAX_VERTS], int hn, float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	if( hn < 3 )
+	{
+		SoftScan_FillPoly( swGrid, swEnv, hv, hn, swP, swF, swR, swEps );	// < 3 verts: no silhouette area (FillPoly returns 0)
+		return;
+	}
+	// COPLANAR short-circuit: a flat caster is already its own silhouette, so fill the input loop DIRECTLY
+	// through FillPoly - FillHull on coplanar input is bit-for-bit SoftScan_FillPoly (the committed coplanar
+	// gate cannot move). Reference plane normal from the first non-degenerate corner triple; coplanar iff
+	// every vertex's perpendicular distance is a negligible fraction of the hull's spread.
+	float3 hn0 = cross( hv[1] - hv[0], hv[2] - hv[0] );
+	SW_UNROLL for( int ni = 3; ni < SW_POLY_MAX_VERTS; ni++ )
+	{
+		if( ni < hn && dot( hn0, hn0 ) < 1e-12f ) { hn0 = cross( hv[1] - hv[0], hv[ni] - hv[0] ); }
+	}
+	float nlen = sqrt( dot( hn0, hn0 ) );
+	if( nlen > 1e-12f )
+	{
+		float3 nhat = hn0 * ( 1.0f / nlen );
+		float spread = 1e-6f;
+		bool  coplanar = true;
+		SW_UNROLL for( int si = 1; si < SW_POLY_MAX_VERTS; si++ )
+		{
+			if( si < hn ) { spread = max( spread, sqrt( dot( hv[si] - hv[0], hv[si] - hv[0] ) ) ); }
+		}
+		SW_UNROLL for( int ci = 1; ci < SW_POLY_MAX_VERTS; ci++ )
+		{
+			if( ci < hn && abs( dot( nhat, hv[ci] - hv[0] ) ) > 1e-4f * spread ) { coplanar = false; }
+		}
+		if( coplanar )
+		{
+			SoftScan_FillPoly( swGrid, swEnv, hv, hn, swP, swF, swR, swEps );
+			return;
+		}
+	}
+	// 3-D hull: project each vertex to the light plane for SILHOUETTE SELECTION ONLY. dn is clamped to a
+	// small positive floor so a grazing (dn ~ 0) vertex stays a large-but-finite extreme point - it is then
+	// correctly kept on the silhouette and FillPoly does the exact near-plane clip. The scale factor (and
+	// invR) are irrelevant to a convex hull, so they are dropped; only the selected subset + cyclic order
+	// feed the fill, whose coverage comes from the real slab-clip/projection in FillPoly.
+	float2 p2[SW_POLY_MAX_VERTS];
+	SW_UNROLL for( int pi = 0; pi < SW_POLY_MAX_VERTS; pi++ )
+	{
+		float3 rel = hv[min( pi, hn - 1 )] - swP;
+		float  dn  = max( dot( rel, swF.nrm ), swEps );
+		float  s   = swF.distPL / dn;
+		p2[pi] = float2( s * dot( rel, swF.u ), s * dot( rel, swF.v ) );
+	}
+	// 2-D convex hull by gift-wrapping (hn <= 8, so O(hn^2) is trivial). Start at the lowest point and walk,
+	// each step choosing the candidate with every other point on one side (cr < 0 => more clockwise);
+	// collinear ties keep the FARTHEST so interior collinear points drop. Fully collinear (degenerate
+	// projection) closes at 2 verts -> FillPoly returns 0. ponytail: the dynamic-indexed p2[]/loop selection
+	// may spill to scratch on the GPU, but the analytic-hull path is rare - correctness over the register
+	// diet here; promote to a face-indexed silhouette if profiling ever convicts it.
+	int start = 0;
+	SW_UNROLL for( int li = 1; li < SW_POLY_MAX_VERTS; li++ )
+	{
+		if( li < hn && ( p2[li].y < p2[start].y || ( p2[li].y == p2[start].y && p2[li].x < p2[start].x ) ) ) { start = li; }
+	}
+	float3 loopV[SW_POLY_MAX_VERTS]; int loopN = 0;
+	int cur = start;
+	SW_UNROLL for( int gw = 0; gw < SW_POLY_MAX_VERTS; gw++ )
+	{
+		if( gw >= hn ) { continue; }
+		loopV[loopN] = hv[cur]; loopN++;
+		int nxt = -1;
+		SW_UNROLL for( int cand = 0; cand < SW_POLY_MAX_VERTS; cand++ )
+		{
+			if( cand >= hn || cand == cur ) { continue; }
+			if( nxt < 0 ) { nxt = cand; continue; }
+			float2 A = p2[cur], B = p2[nxt], C = p2[cand];
+			float cr = ( B.x - A.x ) * ( C.y - A.y ) - ( B.y - A.y ) * ( C.x - A.x );
+			if( cr < 0.0f )
+			{
+				nxt = cand;											// cand is more clockwise: extend the hull toward it
+			}
+			else if( cr == 0.0f )
+			{
+				float2 dN = float2( B.x - A.x, B.y - A.y ), dC = float2( C.x - A.x, C.y - A.y );
+				if( dot( dC, dC ) > dot( dN, dN ) ) { nxt = cand; }	// collinear: keep the farther (drop interior)
+			}
+		}
+		if( nxt < 0 || nxt == start ) { break; }					// closed the loop (or degenerate)
+		cur = nxt;
+	}
+	// the silhouette IS a convex world loop -> the shared analytic-polygon fill (same core FillPoly/FillBox use)
+	SoftScan_FillPoly( swGrid, swEnv, loopV, loopN, swP, swF, swR, swEps );
+}
+
 // TOPOLOGY-ONLY fill: for callers that use the grid for SET membership (contrib-cache contribution
 // tests, the surf-grid build/serve) and reduce by popcount, not the exact-length coverage. Discards the
 // exact edges so the call site needs no throwaway arrays.
@@ -1839,6 +1940,13 @@ SW_FUNC void SoftScan_FillPoly( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 
 	float2 e[SW_SCAN_CHORDS];
 	for( int i = 0; i < SW_SCAN_CHORDS; i++ ) { e[i] = SwEnvZero(); }
 	SoftScan_FillPoly( swGrid, e, loopV, loopN, swP, swF, swR, swEps );
+}
+SW_FUNC void SoftScan_FillHull( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 hv[SW_POLY_MAX_VERTS], int hn,
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	float2 e[SW_SCAN_CHORDS];
+	for( int i = 0; i < SW_SCAN_CHORDS; i++ ) { e[i] = SwEnvZero(); }
+	SoftScan_FillHull( swGrid, e, hv, hn, swP, swF, swR, swEps );
 }
 #endif
 #endif // SW_SCANLINE
@@ -2383,12 +2491,14 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 				const float4 bslot0B = t_SoftEdges[ bbB + 0 ];
 				if( bslot0B.w < 0.0f )
 				{
-					// coplanar POLY caster (.w = -vertexCount): boundary loop -> FillPoly (the box's Phase-A
-					// umbra wMin has no poly form; skipping it only forgoes an early-out, never coverage).
+					// convex HULL caster (.w = -vertexCount): hull verts -> FillHull, which fills the silhouette
+					// through the shared FillPoly core (a coplanar/flat record reduces to FillPoly bit-exactly;
+					// a 3-D brush hull gets its true silhouette). The box's Phase-A umbra wMin has no hull form;
+					// skipping it only forgoes an early-out, never coverage.
 					const int pnB = min( ( int )( -bslot0B.w ), SW_POLY_MAX_VERTS );
 					float3 bloopB[SW_POLY_MAX_VERTS];
 					for( int pk = 0; pk < SW_POLY_MAX_VERTS; pk++ ) { float4 pcv = t_SoftEdges[ bbB + min( pk, pnB - 1 ) ]; bloopB[pk] = float3( pcv.x, pcv.y, pcv.z ); }
-					SoftScan_FillPoly( swGrid, swEnv, bloopB, pnB, swP, swF, swR, swEps );
+					SoftScan_FillHull( swGrid, swEnv, bloopB, pnB, swP, swF, swR, swEps );
 				}
 				else
 				{

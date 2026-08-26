@@ -917,8 +917,11 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 				if( dtEnc & 0x80000000u )
 				{
 					// ANALYTIC caster: high-bit-tagged FIRST tri-slot index. The first slot's .w discriminates
-					// BOX (.w = v0Rad > 0, read 8 corners -> FillBox) from a coplanar POLY (.w = -vertexCount,
-					// read that many boundary verts -> FillPoly). Both evaluate ONCE - no triangle rasterisation.
+					// BOX (.w = v0Rad > 0, read 8 corners -> FillBox) from a convex HULL (.w = -vertexCount,
+					// read that many hull verts -> FillHull). FillHull is the generalisation: it projects the
+					// hull, takes its 2-D silhouette and fills that through the shared FillPoly core, so a
+					// COPLANAR record (a flat caster) reduces to FillPoly bit-exactly while a 3-D brush hull
+					// gets its true silhouette. Both evaluate ONCE - no triangle rasterisation.
 					const int bft = ( int )( dtEnc & 0x7FFFFFFFu );
 					const int bb  = g_range.x + bft * 3;
 					const float4 bslot0 = t_SoftEdges[ bb + 0 ];
@@ -928,7 +931,7 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 						const int pn = min( ( int )( -bslot0.w ), SW_POLY_MAX_VERTS );
 						float3 bloop[SW_POLY_MAX_VERTS];
 						for( int pk = 0; pk < SW_POLY_MAX_VERTS; pk++ ) { bloop[pk] = t_SoftEdges[ bb + min( pk, pn - 1 ) ].xyz; }
-						SoftScan_FillPoly( swGrid, swEnv, bloop, pn, swP, swFC, swRC, SW_NEAR_EPS );
+						SoftScan_FillHull( swGrid, swEnv, bloop, pn, swP, swFC, swRC, SW_NEAR_EPS );
 					}
 					else
 					{
