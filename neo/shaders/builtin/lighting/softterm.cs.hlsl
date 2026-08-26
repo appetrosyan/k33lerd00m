@@ -494,6 +494,18 @@ void main( uint3 tid : SV_DispatchThreadID )
 				u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( 1.0f, SWVC_OTHER );	// classifier lit
 				return;
 			}
+			// CLASSIFIER UMBRA (SW_CLASS_UMBRA == 2): the cell is provably fully occluded (a single
+			// occluder's umbra wedge contains the whole cell ball), so the coverage integral saturates
+			// to 1 and the term is EXACTLY 0 - skip the walk. Same value the tile-umbra sentinel writes
+			// (SwHoistTerm(0,swHoist)), lossless by the identical all-or-nothing argument as lit.
+			if( cbyte == 2u )
+			{
+#if SW_GPU_WALK_COUNTERS
+				InterlockedAdd( u_WalkCnt[ 29 ], 1u );	// classifier UMBRA skip (frags never reaching the walk)
+#endif
+				u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
+				return;
+			}
 		}
 	}
 

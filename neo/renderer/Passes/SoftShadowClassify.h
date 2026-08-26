@@ -41,7 +41,11 @@ class idVec4;
 // cell classes (byte grid, packed into the float4 stream). Keep in sync with softterm.cs.hlsl.
 static const unsigned char SW_CLASS_LIT = 0;	// integral 0, skip the walk
 static const unsigned char SW_CLASS_PEN = 1;	// walk exactly (and the out-of-grid default)
-static const unsigned char SW_CLASS_UMBRA = 2;	// M2: integral 1, skip
+static const unsigned char SW_CLASS_UMBRA = 2;	// integral saturates to 1, skip (term 0). Conservative
+												// single-occluder wedge certificate (the tile-bin's proven
+												// SW_TILE_UMBRA math, ported per-cell): if ONE triangle's
+												// inner-penumbra wedge fully contains the cell ball, every
+												// disk-sample ray of every receiver in the cell hits it.
 
 struct softClassifyGrid_t
 {
@@ -49,7 +53,8 @@ struct softClassifyGrid_t
 	float	cellSize;
 	int		dims[3];		// cells per axis
 	int		valid;			// 0 = build failed / disabled -> full walk
-	int		nLit, nPen;		// diagnostic: cell-class counts
+	int		nLit, nPen;		// diagnostic: cell-class counts (nPen counts UMBRA cells too)
+	int		nUmbra;			// diagnostic: umbra-certified cells (subset of nPen; walk skipped, term 0)
 };
 
 // CPU-build the class grid for one light. worldTris = 3 float4/triangle (r0=v0.xyz+v0rad, r1=v1.xyz+

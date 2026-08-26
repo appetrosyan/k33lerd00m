@@ -3242,9 +3242,10 @@ void R_AddModels()
 						vLight->softClassifyDims[2] = g.dims[2];	vLight->softClassifyDims[3] = 1;
 						if( r_rtAccelDebug.GetBool() )
 						{
-							common->Printf( "SoftClassify: dims %dx%dx%d cell %.0f | lit %d pen %d (%.0f%% lit) | tris %d aabb (%.0f %.0f %.0f)-(%.0f %.0f %.0f)\n",
-											g.dims[0], g.dims[1], g.dims[2], g.cellSize, g.nLit, g.nPen,
-											100.0f * g.nLit / Max( 1, g.nLit + g.nPen ), nElems / 3,
+							common->Printf( "SoftClassify: dims %dx%dx%d cell %.0f | lit %d pen %d umbra %d (%.0f%% lit, %.0f%% umbra) | tris %d aabb (%.0f %.0f %.0f)-(%.0f %.0f %.0f)\n",
+											g.dims[0], g.dims[1], g.dims[2], g.cellSize, g.nLit, g.nPen - g.nUmbra, g.nUmbra,
+											100.0f * g.nLit / Max( 1, g.nLit + g.nPen ),
+											100.0f * g.nUmbra / Max( 1, g.nLit + g.nPen ), nElems / 3,
 											dmn[0], dmn[1], dmn[2], dmx[0], dmx[1], dmx[2] );
 						}
 					}

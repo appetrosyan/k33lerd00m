@@ -227,7 +227,7 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineCnt = m_Device->createComputePipeline( pc );
 
 			nvrhi::BufferDesc wc;
-			wc.byteSize = 30 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106), 27 lit-early-out, 28 adaptive-chord N sum (task #85)
+			wc.byteSize = 30 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106), 27 lit-early-out, 28 adaptive-chord N sum (task #85), 29 classifier-umbra skip
 			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
 			wc.canHaveUAVs = true;
 			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;

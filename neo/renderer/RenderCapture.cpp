@@ -3938,6 +3938,13 @@ int R_SoftShadowGate( const char* arg )
 					common->Printf( "[softgate] BENCH %-14s lit-early-out: %u frags skipped (T > 0 path EXECUTED)\n",
 									cap.name.c_str(), walk[27] );
 				}
+				// CLASSIFIER-UMBRA skip (slot 29): fragments the world-cell UMBRA class short-circuited to
+				// term 0 before the walk. Fraction = of the classifiable population (umbra-skips + walked).
+				if( walk[29] > 0 )
+				{
+					common->Printf( "[softgate] BENCH %-14s classifier-umbra: %u frags skipped (term 0, %.1f%% of umbra-skip + walked)\n",
+									cap.name.c_str(), walk[29], 100.0 * walk[29] / ( double )( walk[29] + walk[7] ) );
+				}
 				const double f = ( double )walk[7];			// fragments that ran the walk (this frame)
 				// Cull cascade, all plain-walk paths (tile-list fills tight/mtTri; spill/cluster fills
 				// caster+coarse+tight+mtTri; unbinned-full fills all). "FillTri survivors" replaces the
