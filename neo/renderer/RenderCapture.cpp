@@ -3754,6 +3754,20 @@ int R_SoftShadowGate( const char* arg )
 					}
 				}
 			}
+			// adaptive sub-sampling split from the LAST bench frame (r_softShadowSubSample):
+			// f = interpolated share of the walked class - the fraction of would-be walks the
+			// lattice interpolation absorbed (refined = criterion said no, exact walk ran).
+			{
+				extern bool R_SoftShadowSubSampleStats( uint32_t out[4] );
+				uint32_t swSub[4] = {};
+				if( cvarSystem->GetCVarInteger( "r_softShadowSubSample" ) > 0
+						&& R_SoftShadowSubSampleStats( swSub ) && ( swSub[0] | swSub[3] ) != 0 )
+				{
+					common->Printf( "[softgate] BENCH %-14s subsample: lattice %u interp %u refined %u (f=%.1f%%)\n",
+									cap.name.c_str(), swSub[3], swSub[1], swSub[2],
+									swSub[0] > 0 ? 100.0 * swSub[1] / ( double )swSub[0] : 0.0 );
+				}
+			}
 			// surface-fold cache path split from the LAST bench frame (r_softShadowSurfCache):
 			// hit% is THE cache-health number - a low rate explains a high TERM ms instantly
 			// (misses pay the full walk) instead of leaving it to conjecture.

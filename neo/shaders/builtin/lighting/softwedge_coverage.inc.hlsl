@@ -414,6 +414,224 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	#define SW_NEAR_EPS 1e-3f		// near-plane clip depth; small so near-plane crossings project far off the disk
 #endif
 
+// ---- ADAPTIVE SUB-SAMPLING wMin (SW_SUBSAMPLE, softterm.cs.hlsl only): C3 penumbra-width floor ----
+// During a Phase-A lattice walk every cone-cull site ALSO runs an EXPANDED cull (radius + the block's
+// world radius g_swWMinRad) and, for every occluder passing it, min-accumulates the occluder's
+// geometric penumbra width w = R * max(cd - trv, 0) / max(dpl - (cd - trv), eps) into g_swWMin.
+// Phase B interpolates a block only when every corner's wMin clears beta * blockWorldDiag - so a thin
+// or near-contact caster (small cd => tiny w) anywhere the BLOCK could see forces exact refinement,
+// even when it shadows no lattice corner. Conservative denominator dpl-(cd-trv) (not dpl-cd): it
+// under-estimates w, and it makes the same formula a sound lower bound when cd/trv describe a
+// BOUNDING SPHERE (cluster/caster records) instead of one triangle.
+// Occluders wholly at/below the receiver's tangent plane are skipped: a flat receiver's own coplanar
+// surface tris pass the cone cull with w ~ 0 and would otherwise pin wMin to 0 on every flat floor -
+// exactly the surfaces the sub-sampling targets - while casting nothing on the block (edge-on).
+// Guarded so the interaction-PS / C++ includes are untouched (macros expand empty).
+#ifdef SW_SUBSAMPLE_WMIN
+// BINARY CERTIFICATE form (measured: the first, exhaustive min-accumulating form cost ~40 ms/frame
+// on spill-heavy caps - unbounded cluster descents at every lattice corner). Only occluders whose
+// penumbra width could fall BELOW some C3 threshold this corner serves are relevant; g_swWMinCap is
+// the corner's certified ceiling over those thresholds (set by Phase A). An occluder with w >= cap
+// can never fail C3 -> skipped without touching state; one occluder with w < cap (and above the
+// receiver plane) POISONS the corner (g_swWMin = 0) and every later wMin site short-circuits.
+// Phase A stores min( g_swWMin, g_swWMinCap ): 0 = refine, else the certified width floor - so the
+// Phase-B comparison needs no slack assumption (the stored value IS the proven bound).
+static float  g_swWMin    = 1e30f;					// +inf = no relevant occluder; 0 = poisoned (refine)
+static float  g_swWMinRad = 0.0f;					// block world radius (expansion); <= 0 disables the sites
+static float  g_swWMinCap = 0.0f;					// relevance ceiling (beta * max served block diagonal)
+static float3 g_swWMinN   = float3( 0.0f, 0.0f, 1.0f );	// receiver shading normal at the lattice pixel
+static float3 g_swWMinP   = float3( 0.0f, 0.0f, 0.0f );	// receiver world position at the lattice pixel
+
+SW_FUNC void SwWMinAcc( float cdv, float trv, float dpl, float R, float3 wv0, float3 wv1, float3 wv2 )
+{
+	const float w = R * max( cdv - trv, 0.0f ) / max( dpl - ( cdv - trv ), 1e-3f );
+	if( w >= g_swWMinCap )
+	{
+		return;			// certified wider than any C3 threshold this corner serves: irrelevant
+	}
+	const float hTop = max( dot( g_swWMinN, wv0 - g_swWMinP ),
+							max( dot( g_swWMinN, wv1 - g_swWMinP ), dot( g_swWMinN, wv2 - g_swWMinP ) ) );
+	if( hTop <= 1e-3f )
+	{
+		return;			// at/below the receiver plane: occludes nothing on this block (self-surface tris)
+	}
+	g_swWMin = 0.0f;	// relevant narrow occluder: poison - C3 refines every block on this corner
+}
+
+// per-tri site with values in registers: expanded cone test, then accumulate
+SW_FUNC void SwWMinTriV( float cdv, float trv, float dpl, float R, float3 wv0, float3 wv1, float3 wv2, float3 wrcv, float3 wnrm )
+{
+	if( g_swWMinRad <= 0.0f || g_swWMin == 0.0f )
+	{
+		return;
+	}
+	const float we = trv + g_swWMinRad;
+	if( cdv + we < SW_NEAR_EPS || cdv - we > dpl )
+	{
+		return;
+	}
+	const float3 wpp = wrcv - cdv * wnrm;
+	const float  wcr = R * ( cdv + we ) / dpl;
+	if( dot( wpp, wpp ) > ( wcr + we ) * ( wcr + we ) )
+	{
+		return;
+	}
+	// RING-ONLY (the design's stated semantics): an occluder passing this corner's EXACT cone cull
+	// is walked at the corner - its shadow shows in the corner terms, so C2 owns it. Only occluders
+	// the corner cannot see (expanded-pass, exact-fail) can hide a shadow between corners and poison.
+	if( cdv + trv >= SW_NEAR_EPS && cdv - trv <= dpl )
+	{
+		const float wcrX = R * ( cdv + trv ) / dpl;
+		if( dot( wpp, wpp ) <= ( wcrX + trv ) * ( wcrX + trv ) )
+		{
+			return;
+		}
+	}
+	SwWMinAcc( cdv, trv, dpl, R, wv0, wv1, wv2 );
+}
+
+// per-tri site from the joint stream (3 float4 records at element b)
+SW_FUNC void SwWMinTriB( int b, float3 swP, float3 wnrm, float dpl, float R )
+{
+	if( g_swWMinRad <= 0.0f || g_swWMin == 0.0f )
+	{
+		return;
+	}
+	const float4 wr0 = t_SoftEdges[ b + 0 ];
+	const float4 wr1 = t_SoftEdges[ b + 1 ];
+	const float4 wr2 = t_SoftEdges[ b + 2 ];
+	const float3 wtc = ( wr0.xyz + wr1.xyz + wr2.xyz ) * ( 1.0f / 3.0f );
+	SwWMinTriV( dot( wtc - swP, wnrm ), wr1.w, dpl, R, wr0.xyz, wr1.xyz, wr2.xyz, wtc - swP, wnrm );
+}
+
+// sphere-gated tri span (cluster / caster records): expanded sphere test + RELEVANCE prune (the
+// sphere's conservative min-width >= cap means no contained tri can matter), then per-tri sites.
+// Sphere-in-sphere monotonicity makes both gates conservative for every contained triangle.
+SW_FUNC void SwWMinSpan( float4 sph, int triFirst, int triEnd, int triBase, float3 swP, float3 wnrm, float dpl, float R )
+{
+	if( g_swWMinRad <= 0.0f || g_swWMin == 0.0f )
+	{
+		return;
+	}
+	const float3 wcrc = sph.xyz - swP;
+	const float  wccd = dot( wcrc, wnrm );
+	const float  we = sph.w + g_swWMinRad;
+	if( wccd + we < SW_NEAR_EPS || wccd - we > dpl )
+	{
+		return;
+	}
+	const float3 wcpp = wcrc - wccd * wnrm;
+	const float  wccr = R * ( wccd + we ) / dpl;
+	if( dot( wcpp, wcpp ) > ( wccr + we ) * ( wccr + we ) )
+	{
+		return;
+	}
+	// relevance prune: min possible width over the sphere (numerator floor, denominator ceiling)
+	if( R * max( wccd - sph.w, 0.0f ) / max( dpl - ( wccd - sph.w ), 1e-3f ) >= g_swWMinCap )
+	{
+		return;
+	}
+	for( int wt = triFirst; wt < triEnd; wt++ )
+	{
+		SwWMinTriB( triBase + wt * 3, swP, wnrm, dpl, R );
+		if( g_swWMin == 0.0f )
+		{
+			return;			// poisoned: nothing left to learn at this corner
+		}
+	}
+}
+
+// cluster record (2 float4 at ABSOLUTE element se): sphere + (firstTri, numTris)
+SW_FUNC void SwWMinCluster( int se, int triBase, float3 swP, float3 wnrm, float dpl, float R )
+{
+	if( g_swWMinRad <= 0.0f || g_swWMin == 0.0f )
+	{
+		return;
+	}
+	const float4 wq0 = t_SoftEdges[ se + 0 ];
+	const float4 wq1 = t_SoftEdges[ se + 1 ];
+	SwWMinSpan( wq0, ( int )wq1.x, ( int )wq1.x + ( int )wq1.y, triBase, swP, wnrm, dpl, R );
+}
+
+// caster-table record (2 float4 at casterBase + sc*2): sphere + (firstTri, numTris)
+SW_FUNC void SwWMinCaster( int casterBase, int sc, int triBase, float3 swP, float3 wnrm, float dpl, float R )
+{
+	if( g_swWMinRad <= 0.0f || g_swWMin == 0.0f )
+	{
+		return;
+	}
+	const float4 wc0 = t_SoftEdges[ casterBase + sc * 2 + 0 ];
+	const float4 wc1 = t_SoftEdges[ casterBase + sc * 2 + 1 ];
+	SwWMinSpan( wc0, ( int )wc1.x, ( int )wc1.x + ( int )wc1.y, triBase, swP, wnrm, dpl, R );
+}
+
+// analytic-box caster (8 corners): bounding sphere + top-corner height, same expanded test
+SW_FUNC void SwWMinBox( float3 wbc[8], float3 swP, float3 wnrm, float dpl, float R )
+{
+	if( g_swWMinRad <= 0.0f || g_swWMin == 0.0f )
+	{
+		return;
+	}
+	float3 wc = wbc[0];
+	for( int wi = 1; wi < 8; wi++ )
+	{
+		wc += wbc[wi];
+	}
+	wc *= ( 1.0f / 8.0f );
+	float wrad2 = 0.0f;
+	float hTop = -1e30f;
+	for( int wj = 0; wj < 8; wj++ )
+	{
+		wrad2 = max( wrad2, dot( wbc[wj] - wc, wbc[wj] - wc ) );
+		hTop = max( hTop, dot( g_swWMinN, wbc[wj] - g_swWMinP ) );
+	}
+	const float wrad = sqrt( wrad2 );
+	const float3 wrcv = wc - swP;
+	const float  wcd = dot( wrcv, wnrm );
+	const float  we = wrad + g_swWMinRad;
+	if( wcd + we < SW_NEAR_EPS || wcd - we > dpl )
+	{
+		return;
+	}
+	const float3 wpp = wrcv - wcd * wnrm;
+	const float  wcr = R * ( wcd + we ) / dpl;
+	if( dot( wpp, wpp ) > ( wcr + we ) * ( wcr + we ) )
+	{
+		return;
+	}
+	// RING-ONLY, sphere form (boxes have no cull - FillBox always runs at the corner): a box whose
+	// bounding sphere passes the corner's exact-style cone test is evaluated there - C2 owns it.
+	if( wcd + wrad >= SW_NEAR_EPS && wcd - wrad <= dpl )
+	{
+		const float wcrX = R * ( wcd + wrad ) / dpl;
+		if( dot( wpp, wpp ) <= ( wcrX + wrad ) * ( wcrX + wrad ) )
+		{
+			return;
+		}
+	}
+	if( hTop <= 1e-3f )
+	{
+		return;
+	}
+	if( R * max( wcd - wrad, 0.0f ) / max( dpl - ( wcd - wrad ), 1e-3f ) >= g_swWMinCap )
+	{
+		return;			// certified wider than any C3 threshold this corner serves: irrelevant
+	}
+	g_swWMin = 0.0f;	// relevant narrow occluder: poison (binary certificate, see SwWMinAcc)
+}
+#define SW_WMIN_TRI_B( b, swP, nrm, dpl, R )			SwWMinTriB( b, swP, nrm, dpl, R )
+#define SW_WMIN_TRI_V( cd, trv, dpl, R, v0, v1, v2, rcv, nrm )	SwWMinTriV( cd, trv, dpl, R, v0, v1, v2, rcv, nrm )
+#define SW_WMIN_CLUSTER( se, triBase, swP, nrm, dpl, R )	SwWMinCluster( se, triBase, swP, nrm, dpl, R )
+#define SW_WMIN_CASTER( cb, sc, triBase, swP, nrm, dpl, R )	SwWMinCaster( cb, sc, triBase, swP, nrm, dpl, R )
+#define SW_WMIN_BOX( c, swP, nrm, dpl, R )				SwWMinBox( c, swP, nrm, dpl, R )
+#else
+#define SW_WMIN_TRI_B( b, swP, nrm, dpl, R )
+#define SW_WMIN_TRI_V( cd, trv, dpl, R, v0, v1, v2, rcv, nrm )
+#define SW_WMIN_CLUSTER( se, triBase, swP, nrm, dpl, R )
+#define SW_WMIN_CASTER( cb, sc, triBase, swP, nrm, dpl, R )
+#define SW_WMIN_BOX( c, swP, nrm, dpl, R )
+#endif	// SW_SUBSAMPLE_WMIN
+
 #ifdef __cplusplus
 	#define SW_EDGEBUF_PARAM , SoftEdgeBuffer t_SoftEdges
 	#define SW_TILEBUF_PARAM , SoftTileBuffer t_SoftTiles
@@ -1692,6 +1910,7 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 		float4 c0 = t_SoftEdges[ swCasterBase + sc * 2 + 0 ];		// ( centre.xyz, radius )
 		float4 c1 = t_SoftEdges[ swCasterBase + sc * 2 + 1 ];		// ( firstTri, numTris, 0, 0 )
 		float3 dCv = float3( c0.x, c0.y, c0.z ) - swP;
+		SW_WMIN_CASTER( swCasterBase, sc, swTriBase, swP, swF.nrm, swDistPL, swR );	// C3 wMin: expanded-cull site (Phase A only)
 		SW_ATTRIB_ADD( casterTest, 1 );
 		if( SoftShadow_CullCaster( dCv, c0.w, swF, swSinA, swCosA, swEps ) )
 		{
@@ -1997,10 +2216,12 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 					float4 bcv = t_SoftEdges[ bbB + bk ];
 					bcornerB[bk] = float3( bcv.x, bcv.y, bcv.z );
 				}
+				SW_WMIN_BOX( bcornerB, swP, swF.nrm, swDistPL, swR );	// C3 wMin: box caster site (Phase A only)
 				SoftScan_FillBox( swGrid, swEnv, bcornerB, swP, swF, swR, swEps );
 #endif
 				continue;
 			}
+			SW_WMIN_TRI_B( swFirstElem + ( int )swEncB * 3, swP, swF.nrm, swDistPL, swR );	// C3 wMin: expanded-cull site (Phase A only)
 		}
 #if SW_CULL_BEFORE_LOAD && !SW_FACE_PROFILE
 		// CULL BEFORE LOAD (RUNTIME toggle SW_CBL_RT = r_softShadowCullBeforeLoad): cull from the tile-bin's
@@ -2237,6 +2458,7 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 		float3 rc   = tcen - swP;
 		float  cd   = dot( rc, swF.nrm );
 		float  triRad = r1.w;
+		SW_WMIN_TRI_V( cd, triRad, swDistPL, swR, v0, v1, v2, rc, swF.nrm );	// C3 wMin: expanded-cull site (Phase A only)
 		SW_ATTRIB_ADD( tightTest, 1 );
 		if( cd + triRad < swEps ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
 		if( cd - triRad > swDistPL ) { SW_ATTRIB_ADD( tightCull, 1 ); continue; }
@@ -2260,6 +2482,7 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 			const int se = ( int )t_SoftTiles[ swListBase + ld ];
 			if( se < swDynFirstTri ) { continue; }			// static tri: in F or the residual pool, not here
 			const int bb = swTriBase + se * 3;
+			SW_WMIN_TRI_B( bb, swP, swF.nrm, swDistPL, swR );	// C3 wMin: expanded-cull site (Phase A only)
 			float4 r0 = t_SoftEdges[ bb + 0 ];
 			{
 				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
@@ -2302,6 +2525,7 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 			float4 c0 = t_SoftEdges[ swCasterBase + scc * 2 + 0 ];
 			float4 c1 = t_SoftEdges[ swCasterBase + scc * 2 + 1 ];
 			float3 dCv = float3( c0.x, c0.y, c0.z ) - swP;
+			SW_WMIN_CASTER( swCasterBase, scc, swTriBase, swP, swF.nrm, swDistPL, swR );	// C3 wMin: expanded-cull site (Phase A only)
 			SW_ATTRIB_ADD( casterTest, 1 );
 			if( SoftShadow_CullCaster( dCv, c0.w, swF, swSinA, swCosA, swEps ) )
 			{
@@ -2773,6 +2997,7 @@ SW_FUNC float SoftShadow_FaceCoverageClusterList( float3 swP, float3 swL, float 
 	for( int li = 0; li < swListCount; li++ )
 	{
 		const int se = ( int )t_SoftTiles[ swListBase + li ];		// ABSOLUTE cluster-record offset
+		SW_WMIN_CLUSTER( se, swFirstElem, swP, swF.nrm, swDistPL, swR );	// C3 wMin: expanded-cull site (Phase A only)
 		float4 q0 = t_SoftEdges[ se + 0 ];							// ( centre.xyz, radius )
 		// cluster-sphere cull = this walker's caster-level cascade stage: counted into the caster
 		// slots (0/1) so the SPILL path's cascade is visible - it read as silent zeros before

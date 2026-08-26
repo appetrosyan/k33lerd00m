@@ -223,6 +223,22 @@ void SwContribDiagSum( uint word, uint v )
 	}
 }
 #endif
+// ADAPTIVE SUB-SAMPLING (r_softShadowSubSample, SW_SUBSAMPLE permutation axis): two-phase dispatch.
+// Phase A (g_sub.x phase 1) evaluates the light rect's CORNER LATTICE at stride S with the exact
+// body, storing ( term, wMin ) per corner; Phase B (phase 2) runs the exact early-outs, then a
+// conservative detect-then-refine criterion - C1 receiver continuity, C2 corner-window term spread,
+// C3 penumbra-width floor - and bilinearly interpolates the 4 corner terms where all three hold,
+// falling through into the unchanged exact walk everywhere else. Cvar 0 = the pre-existing single
+// dispatch on the pre-existing pipelines (this axis compiled out).
+#ifndef SW_SUBSAMPLE
+	#define SW_SUBSAMPLE 0
+#endif
+#if SW_SUBSAMPLE
+	#define SW_SUBSAMPLE_WMIN 1		// enables the C3 wMin expanded-cull sites in the coverage include
+// side lattice: [0..3].x = wave-aggregated counters (walked-class, interpolated, refined, lattice
+// evals), then latW*latH entries of ( asuint(term), asuint(wMin) ) written by Phase A.
+RWStructuredBuffer<uint2>	u_SubLattice	: register( u3 );
+#endif
 #include "softwedge_coverage.inc.hlsl"
 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
@@ -280,6 +296,9 @@ cbuffer c_Term : register( b0 )
 								//   (normal .w encodes areaP1 = areaNum+1 above the 2-bit axis) in an
 								//   unreached area has NO interaction draw under this light - its term is
 								//   provably never read, so the walk is skipped (term 1.0).
+	float4	g_sub;				// ADAPTIVE SUB-SAMPLING (SW_SUBSAMPLE): x = phase | (viz << 2)
+								//   (0 = off/exact, 1 = lattice, 2 = full-rect refine), y = stride S,
+								//   z = C2 spread epsilon, w = C3 width-floor beta. Mirrors sub[4].
 };
 // *INDENT-ON*
 
@@ -340,6 +359,19 @@ float SwVizCostTerm( float v, float band )
 		   : band;
 }
 
+#if SW_SUBSAMPLE
+// wave-aggregated path counter into u_SubLattice[word].x (SwSurfStat pattern): one atomic per wave
+// per class. Words: 0 walked-class (reached the criterion), 1 interpolated, 2 refined, 3 lattice evals.
+void SwSubStat( uint word, bool pred )
+{
+	const uint c = WaveActiveCountBits( pred );
+	if( c != 0u && WaveIsFirstLane() )
+	{
+		InterlockedAdd( u_SubLattice[ word ].x, c );
+	}
+}
+#endif
+
 #if SW_SURF_CACHE
 // Wave-aggregated per-frame path counter (see SW_SURF_STAT): sum the active lanes in each class and
 // commit ONE atomic per wave per class, instead of one InterlockedAdd per fragment on a single global
@@ -378,14 +410,17 @@ void SwSurfMissReason( uint r )
 }
 #endif
 
-[numthreads( 8, 4, 1 )]
-void main( uint3 tid : SV_DispatchThreadID )
+// ---- REFACTOR (adaptive sub-sampling): the old main() body, split into PRELUDE + WALK so the
+// SW_SUBSAMPLE Phase-B dispatch can run the cheap early-outs bit-exactly, apply the interpolation
+// criterion, and fall through into the unchanged exact walk only for refined pixels. Every former
+// `u_Term[ ... ] = V; return;` site became `return V;` with its exact value expression preserved
+// (SwVizCostTerm / SwHoistTerm / SwTermQuant wrappers included); main() does the one atlas write.
+// SwTermFinal( px ) == the old main body, bit-identical by construction.
+
+// PRELUDE: coverage/falloff + N.L early-outs and the lit classifier. Returns true when the pixel is
+// fully handled (swTermOut holds the value to write); false -> run SwTermWalk with swPosOut/swHoistOut.
+bool SwTermPrelude( int2 px, out float4 swPosOut, out float swHoistOut, out float swTermOut )
 {
-	if( ( int )tid.x >= g_rect.z || ( int )tid.y >= g_rect.w )
-	{
-		return;
-	}
-	const int2 px = int2( g_rect.x + ( int )tid.x, g_rect.y + ( int )tid.y );
 	swCblRT = ( g_surfCost.y != 0 );	// cull-before-load runtime toggle (read by the tile-list walk)
 
 	// EXACT receiver position (same value the interaction PS computes from texcoord7 x model
@@ -395,6 +430,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// interaction), so writing 1.0 and skipping the integral is free.
 	const float4 swPos = t_WorldPos.Load( int3( px, 0 ) );
 	const float3 swP = swPos.xyz;
+	swPosOut = swPos;
+	swHoistOut = 1.0f;
+	swTermOut = 1.0f;
 
 	// COVERAGE EARLY-OUTS - the fix for the measured 1.8x loss of the first compute-decoupling
 	// cut (see r_softShadowCompute help): the fragment path pays only for pixels that survive
@@ -455,8 +493,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 #endif
 		if( swSkip )
 		{
-			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( 1.0f, SWVC_EARLYOUT );
-			return;
+			swTermOut = SwVizCostTerm( 1.0f, SWVC_EARLYOUT );
+			return true;
 		}
 	}
 
@@ -469,8 +507,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 		const int swAreaP1 = ( ( int )( t_WorldNormal.Load( int3( px, 0 ) ).w + 0.5 ) ) >> 2;
 		if( swAreaP1 > 0 && ( ( g_areaMask[ ( swAreaP1 - 1 ) >> 5 ] >> ( ( uint )( swAreaP1 - 1 ) & 31u ) ) & 1u ) == 0u )
 		{
-			u_Term[ uint2( px + g_tile.zw ) ] = 1.0f;
-			return;
+			swTermOut = 1.0f;
+			return true;
 		}
 	}
 
@@ -491,8 +529,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 			const uint  cbyte = ( cw[ ( ccell >> 2 ) & 3 ] >> ( ( uint )( ccell & 3 ) * 8u ) ) & 0xFFu;
 			if( cbyte == 0u )
 			{
-				u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( 1.0f, SWVC_OTHER );	// classifier lit
-				return;
+				swTermOut = SwVizCostTerm( 1.0f, SWVC_OTHER );	// classifier lit
+				return true;
 			}
 			// CLASSIFIER UMBRA (SW_CLASS_UMBRA == 2): the cell is provably fully occluded (a single
 			// occluder's umbra wedge contains the whole cell ball), so the coverage integral saturates
@@ -503,11 +541,21 @@ void main( uint3 tid : SV_DispatchThreadID )
 #if SW_GPU_WALK_COUNTERS
 				InterlockedAdd( u_WalkCnt[ 29 ], 1u );	// classifier UMBRA skip (frags never reaching the walk)
 #endif
-				u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
-				return;
+				swTermOut = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
+				return true;
 			}
 		}
 	}
+
+	swHoistOut = swHoist;
+	return false;
+}
+
+// WALK: everything after the prelude - contributor/surf cache paths + the exact tile/spill/full walk.
+// Bit-identical to the old main body from the walk-counter marker on; returns the term to write.
+float SwTermWalk( int2 px, float4 swPos, float swHoist )
+{
+	const float3 swP = swPos.xyz;
 
 #if SW_GPU_WALK_COUNTERS
 	InterlockedAdd( u_WalkCnt[ 7 ], 1u );	// this pixel survived the early-outs and runs the walk
@@ -573,8 +621,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const uint swPCnt = t_SoftTiles[ swPSlot ];
 				if( swPCnt == SW_TILE_UMBRA )
 				{
-					u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
-					return;
+					return SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
 				}
 				if( swPCnt <= ( uint )g_flags.w )
 				{
@@ -1039,11 +1086,9 @@ void main( uint3 tid : SV_DispatchThreadID )
 					InterlockedAdd( u_Contrib[ swTermServe < swTermPlain ? 16 : 17 ], 1u );
 					InterlockedAdd( u_Contrib[ ( swServeListCount < 0 ) ? 18 : 19 ], 1u );
 				}
-				u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( swTermPlain, swHoist ), SWVC_WALK );	// serve-verify: the plain walk ran
-				return;
+				return SwVizCostTerm( SwHoistTerm( swTermPlain, swHoist ), SWVC_WALK );	// serve-verify: the plain walk ran
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwTermQuant( SwHoistTerm( swTermServe, swHoist ) ), SWVC_HIT );	// contrib-cache serve
-			return;
+			return SwVizCostTerm( SwTermQuant( SwHoistTerm( swTermServe, swHoist ) ), SWVC_HIT );	// contrib-cache serve
 		}
 
 		if( recordSlot >= 0 )
@@ -1216,8 +1261,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			{
 				swCovR = swDiskBits;			// plain-walk umbra rounding, matched exactly
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 ), swHoist ) ), SWVC_WALK );	// record path walked its tile list
-			return;
+			return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 ), swHoist ) ), SWVC_WALK );	// record path walked its tile list
 		}
 		}	// keyLo != sentinel
 		}	// cell coords in range
@@ -1429,6 +1473,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 										swEnv[gr]  = SwEnvZero();		// grid-mode static envelope not cached yet (task #90 follow-up); reduction stays discrete here
 								}
 							}
+#ifdef SW_SUBSAMPLE_WMIN
+							// baked static bit-grid: per-occluder widths are unavailable, so this corner
+							// cannot vouch a C3 floor - force refinement around it (hits are cheap anyway)
+							g_swWMin = 0.0f;
+#endif
 #else
 							const uint resOfs = u_SurfTable[ sBase + 3 ];
 							const uint resCnt = w4 & 0xFFFFu;			// low 16: residual occluders still walked
@@ -1464,8 +1513,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 										if( hCnt == SW_TILE_UMBRA )
 										{
 											SW_SURF_STAT( 0u );
-											u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );	// whole tile provably umbra (as the miss path)
-											return;
+											return SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );	// whole tile provably umbra (as the miss path)
 										}
 										if( hCnt <= ( uint )g_flags.w )		// normal list (exclude spill/corrupt sentinels)
 										{
@@ -1559,8 +1607,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 								swTermC = 1.0f;		// COST-CLASS: hit -> full bright (non-hit classes tinted at the fall-through write)
 							}
 							SW_SURF_STAT( 0u );		// cached HIT
-							u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( swTermC, swHoist ), SWVC_HIT );	// surf-cache BUILT consume
-							return;
+							return SwVizCostTerm( SwHoistTerm( swTermC, swHoist ), SWVC_HIT );	// surf-cache BUILT consume
 						}
 						if( swPrimary )
 						{
@@ -1642,8 +1689,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						if( fCnt == SW_TILE_UMBRA )
 						{
 							SW_SURF_STAT( ( g_aa.z > 3.5f ) ? swStatIdx : 0u );	// mode 4 keeps the honest class split
-							u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );	// provable umbra: same as the real hit path
-							return;
+							return SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );	// provable umbra: same as the real hit path
 						}
 						if( fCnt <= ( uint )g_flags.w )		// normal list (exclude spill/corrupt sentinels)
 						{
@@ -1688,8 +1734,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					{
 						SW_SURF_STAT( 0u );	// mode 3: counted as HIT, the bench line must read 100%
 					}
-					u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 1.0f - saturate( occFh ), swHoist ), SWVC_OTHER );	// force-hit debug path
-					return;
+					return SwVizCostTerm( SwHoistTerm( 1.0f - saturate( occFh ), swHoist ), SWVC_OTHER );	// force-hit debug path
 				}
 				// spill/untiled tile: fall through to the exact walk (the real hit path does the same)
 			}
@@ -1837,8 +1882,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// 8/16/32 variant by the cvar), so the walk below stays the fast fp16 path at whatever count is built.
 	if( g_aa.x < 0.5f )
 	{
-		u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( 1.0, SWVC_OTHER );	// samples-disabled
-		return;
+		return SwVizCostTerm( 1.0, SWVC_OTHER );	// samples-disabled
 	}
 	const int swTx = px.x / SW_TILE_SIZE - g_tile.x;
 	const int swTy = px.y / SW_TILE_SIZE - g_tile.y;
@@ -1862,8 +1906,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 													// the sentinel threads and the lit/pen/umb split lies)
 #endif
 			// whole tile provably in umbra: the integral saturates to 1 for every receiver here
-			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
-			return;
+			return SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
 		}
 		if( swCnt == SW_TILE_SPILL )
 		{
@@ -1901,9 +1944,205 @@ void main( uint3 tid : SV_DispatchThreadID )
 		// COST-CLASS heatmap, non-hit fragments: miss 0.25, walk-always 0.5, anchor-reject 0.75
 		// (hit is full-bright, tinted on the hit path). Shows WHERE the overhead-payers cluster.
 		const float swClassLvl[4] = { 1.0f, 0.25f, 0.5f, 0.75f };
-		u_Term[ uint2( px + g_tile.zw ) ] = swClassLvl[ min( swVizClass, 3 ) ];
-		return;
+		return swClassLvl[ min( swVizClass, 3 ) ];
 	}
 #endif
-	u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0 - saturate( swOcc ), swHoist ) ), SWVC_WALK );	// plain/list/spill walk (fills==0 = empty tile list)
+	return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0 - saturate( swOcc ), swHoist ) ), SWVC_WALK );	// plain/list/spill walk (fills==0 = empty tile list)
+}
+
+// the old main body, whole: prelude, then the walk. Bit-identical value per pixel.
+float SwTermFinal( int2 px )
+{
+	float4 swPos;
+	float swHoist, swT;
+	if( SwTermPrelude( px, swPos, swHoist, swT ) )
+	{
+		return swT;
+	}
+	return SwTermWalk( px, swPos, swHoist );
+}
+
+[numthreads( 8, 4, 1 )]
+void main( uint3 tid : SV_DispatchThreadID )
+{
+#if SW_SUBSAMPLE
+	// g_sub: x = phase | (viz << 2), y = lattice stride S, z = C2 spread epsilon, w = C3 beta
+	const int sPh  = ( ( int )g_sub.x ) & 3;
+	const int sViz = ( ( int )g_sub.x ) >> 2;
+	const int sS   = max( ( int )g_sub.y, 2 );
+	if( sPh == 1 )
+	{
+		// ---- PHASE A: corner lattice at stride S. Each thread evaluates the EXACT body at its
+		// (clamped) corner pixel, writes the term to the atlas as usual AND ( term, wMin ) to the
+		// side lattice for Phase B's criterion. wMin accumulates inside the walk via the expanded
+		// cone-cull sites (SW_SUBSAMPLE_WMIN); early-out corners never walk and keep wMin = +inf
+		// by design (the design's stated contract for early-out pixels).
+		const int latW = ( g_rect.z + sS - 2 ) / sS + 1;	// ceil((w-1)/S)+1
+		const int latH = ( g_rect.w + sS - 2 ) / sS + 1;
+		if( ( int )tid.x >= latW || ( int )tid.y >= latH )
+		{
+			return;
+		}
+		const int lx = ( int )tid.x, ly = ( int )tid.y;
+		const int2 px = int2( g_rect.x + min( lx * sS, g_rect.z - 1 ), g_rect.y + min( ly * sS, g_rect.w - 1 ) );
+		// receiver frame + expansion radius for the wMin sites: the block world radius = max world
+		// distance to the +-S pixel neighbours, so the expanded cull covers every block this corner
+		// borders (S divides the tile size, so a pixel's own-tile corner always covers it).
+		const float4 aPos = t_WorldPos.Load( int3( px, 0 ) );
+		g_swWMinP = aPos.xyz;
+		g_swWMinN = t_WorldNormal.Load( int3( px, 0 ) ).xyz;
+		float aRad = 0.0f;
+		if( aPos.w != 0.0f )
+		{
+			[unroll] for( int nb = 0; nb < 4; nb++ )
+			{
+				const int2 nd = ( nb == 0 ) ? int2( sS, 0 ) : ( ( nb == 1 ) ? int2( -sS, 0 ) : ( ( nb == 2 ) ? int2( 0, sS ) : int2( 0, -sS ) ) );
+				const int2 np = int2( clamp( px.x + nd.x, g_rect.x, g_rect.x + g_rect.z - 1 ),
+									  clamp( px.y + nd.y, g_rect.y, g_rect.y + g_rect.w - 1 ) );
+				const float4 nP = t_WorldPos.Load( int3( np, 0 ) );
+				if( nP.w != 0.0f )
+				{
+					aRad = max( aRad, length( nP.xyz - aPos.xyz ) );
+				}
+			}
+		}
+		// beta (g_sub.w) <= 0 disables the whole wMin machinery (C3 then passes as 0 >= 0):
+		// both an isolation lever for the Phase-A expanded-walk cost and a "trust C1/C2 only" knob.
+		g_swWMinRad = ( g_sub.w > 0.0f ) ? aRad : 0.0f;
+		g_swWMin = 1e30f;
+		// relevance ceiling: beta x the largest block diagonal this corner can serve (adjacent block
+		// edges are +-S lattice steps, bounded by aRad; sqrt2 for the diagonal, x2 slack for the
+		// blocks whose P00 is a NEIGHBOUR corner). The lattice stores min(wMin, cap): the certified
+		// width floor Phase B compares against - 0 = poisoned (refine).
+		g_swWMinCap = g_sub.w * 1.41421356f * 2.0f * aRad;
+		const float aTerm = SwTermFinal( px );
+		u_Term[ uint2( px + g_tile.zw ) ] = aTerm;
+		u_SubLattice[ 4 + ly * latW + lx ] = uint2( asuint( aTerm ), asuint( min( g_swWMin, g_swWMinCap ) ) );
+		SwSubStat( 3u, true );		// counter: lattice evals
+		return;
+	}
+	if( sPh == 2 )
+	{
+		// ---- PHASE B: full rect. Lattice pixels were written by Phase A; the rest run the exact
+		// early-outs bit-exactly, then the conservative criterion; PASS = bilerp of the 4 corner
+		// terms, FAIL = fall through into the unchanged exact walk.
+		if( ( int )tid.x >= g_rect.z || ( int )tid.y >= g_rect.w )
+		{
+			return;
+		}
+		const int tx = ( int )tid.x, ty = ( int )tid.y;
+		const bool latX = ( tx % sS ) == 0 || tx == g_rect.z - 1;
+		const bool latY = ( ty % sS ) == 0 || ty == g_rect.w - 1;
+		if( latX && latY )
+		{
+			return;					// lattice pixel: Phase A already wrote it
+		}
+		const int2 px = int2( g_rect.x + tx, g_rect.y + ty );
+		g_swWMinRad = 0.0f;			// Phase B never accumulates wMin (the include sites no-op)
+		float4 swPos;
+		float swHoist, swT;
+		if( SwTermPrelude( px, swPos, swHoist, swT ) )
+		{
+			u_Term[ uint2( px + g_tile.zw ) ] = swT;	// early-out: bit-exact, no criterion
+			return;
+		}
+		// tile-umbra sentinel hoist: bit-exact - under the sentinel EVERY body path (surf hit, plain
+		// walk, contrib serve) writes exactly SwHoistTerm(0, swHoist), so answering it here only
+		// saves the criterion loads on umbra tiles.
+		{
+			const int uTx = px.x / SW_TILE_SIZE - g_tile.x;
+			const int uTy = px.y / SW_TILE_SIZE - g_tile.y;
+			if( g_range.z >= 0 && uTx >= 0 && uTy >= 0 )
+			{
+				if( t_SoftTiles[ g_range.z + ( uTy * g_range.w + uTx ) * ( g_flags.w + 1 ) ] == SW_TILE_UMBRA )
+				{
+					u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ) );
+					return;
+				}
+			}
+		}
+		// ---- criterion: INTERPOLATE iff C1 (receiver continuity) && C2 (corner-window term
+		// spread) && C3 (penumbra-width floor) over the surrounding corner lattice ----
+		const int latW = ( g_rect.z + sS - 2 ) / sS + 1;
+		const int latH = ( g_rect.w + sS - 2 ) / sS + 1;
+		const int lx0 = tx / sS, ly0 = ty / sS;
+		const int cx0 = lx0 * sS;
+		const int cy0 = ly0 * sS;
+		const int cx1 = min( cx0 + sS, g_rect.z - 1 );
+		const int cy1 = min( cy0 + sS, g_rect.w - 1 );
+		const uint2 e00 = u_SubLattice[ 4 + ly0 * latW + lx0 ];
+		const uint2 e10 = u_SubLattice[ 4 + ly0 * latW + ( lx0 + 1 ) ];
+		const uint2 e01 = u_SubLattice[ 4 + ( ly0 + 1 ) * latW + lx0 ];
+		const uint2 e11 = u_SubLattice[ 4 + ( ly0 + 1 ) * latW + ( lx0 + 1 ) ];
+		const int2 p00 = int2( g_rect.x + cx0, g_rect.y + cy0 );
+		const int2 p10 = int2( g_rect.x + cx1, g_rect.y + cy0 );
+		const int2 p01 = int2( g_rect.x + cx0, g_rect.y + cy1 );
+		const int2 p11 = int2( g_rect.x + cx1, g_rect.y + cy1 );
+		const float4 w00 = t_WorldPos.Load( int3( p00, 0 ) );
+		const float4 w10 = t_WorldPos.Load( int3( p10, 0 ) );
+		const float4 w01 = t_WorldPos.Load( int3( p01, 0 ) );
+		const float4 w11 = t_WorldPos.Load( int3( p11, 0 ) );
+		// all 4 corners rasterised, else refine
+		bool sPass = ( w00.w != 0.0f ) && ( w10.w != 0.0f ) && ( w01.w != 0.0f ) && ( w11.w != 0.0f );
+		const float sBlk = max( length( w10.xyz - w00.xyz ), length( w01.xyz - w00.xyz ) );
+		if( sPass )
+		{
+			// C1: the pixel and its 4 corners lie on one continuous, like-oriented receiver
+			const float3 sN = t_WorldNormal.Load( int3( px, 0 ) ).xyz;
+			const float3 sP = swPos.xyz;
+			const float sHTol = 0.25f * sBlk;
+			sPass = abs( dot( sN, w00.xyz - sP ) ) <= sHTol && dot( sN, t_WorldNormal.Load( int3( p00, 0 ) ).xyz ) >= 0.95f
+					&& abs( dot( sN, w10.xyz - sP ) ) <= sHTol && dot( sN, t_WorldNormal.Load( int3( p10, 0 ) ).xyz ) >= 0.95f
+					&& abs( dot( sN, w01.xyz - sP ) ) <= sHTol && dot( sN, t_WorldNormal.Load( int3( p01, 0 ) ).xyz ) >= 0.95f
+					&& abs( dot( sN, w11.xyz - sP ) ) <= sHTol && dot( sN, t_WorldNormal.Load( int3( p11, 0 ) ).xyz ) >= 0.95f;
+		}
+		if( sPass )
+		{
+			// C2: term max-min over the 4x4 corner window (own 4 + 12 surrounding, clamped)
+			float tMin = 1e30f, tMax = -1e30f;
+			[unroll] for( int wy = -1; wy <= 2; wy++ )
+			{
+				[unroll] for( int wx = -1; wx <= 2; wx++ )
+				{
+					const int cwx = clamp( lx0 + wx, 0, latW - 1 );
+					const int cwy = clamp( ly0 + wy, 0, latH - 1 );
+					const float tw = asfloat( u_SubLattice[ 4 + cwy * latW + cwx ].x );
+					tMin = min( tMin, tw );
+					tMax = max( tMax, tw );
+				}
+			}
+			sPass = ( tMax - tMin ) <= g_sub.z;
+		}
+		if( sPass )
+		{
+			// C3: every corner's min penumbra width clears beta x the block diagonal - thin casters
+			// and contact shadows (small cdv => tiny w) force refinement even when they shadow no
+			// lattice corner (the expanded Phase-A cull saw them).
+			const float sWMin = min( min( asfloat( e00.y ), asfloat( e10.y ) ), min( asfloat( e01.y ), asfloat( e11.y ) ) );
+			sPass = sWMin >= g_sub.w * sBlk * 1.41421356f;
+		}
+		SwSubStat( 0u, true );		// counter: walked-class pixels (reached the criterion)
+		SwSubStat( 1u, sPass );		// counter: interpolated
+		SwSubStat( 2u, !sPass );	// counter: refined
+		if( sPass )
+		{
+			// bilinear interpolation, weights from the ACTUAL clamped corner pixel coords
+			const float fx = ( cx1 > cx0 ) ? ( float )( tx - cx0 ) / ( float )( cx1 - cx0 ) : 0.0f;
+			const float fy = ( cy1 > cy0 ) ? ( float )( ty - cy0 ) / ( float )( cy1 - cy0 ) : 0.0f;
+			const float tL = lerp( asfloat( e00.x ), asfloat( e10.x ), fx );
+			const float tH = lerp( asfloat( e01.x ), asfloat( e11.x ), fx );
+			u_Term[ uint2( px + g_tile.zw ) ] = ( sViz != 0 ) ? 0.25f : lerp( tL, tH, fy );
+			return;
+		}
+		u_Term[ uint2( px + g_tile.zw ) ] = ( sViz != 0 ) ? 1.0f : SwTermWalk( px, swPos, swHoist );
+		return;
+	}
+	// phase 0: exact single dispatch (same behaviour as the non-subsample permutations)
+#endif	// SW_SUBSAMPLE
+	if( ( int )tid.x >= g_rect.z || ( int )tid.y >= g_rect.w )
+	{
+		return;
+	}
+	const int2 px = int2( g_rect.x + ( int )tid.x, g_rect.y + ( int )tid.y );
+	u_Term[ uint2( px + g_tile.zw ) ] = SwTermFinal( px );
 }
