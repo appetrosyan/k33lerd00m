@@ -674,6 +674,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	// Only when the surf permutation is already selected AND the grid buffer exists (built in grid mode).
 	extern idCVar r_softShadowSurfCacheGrid;
 	const bool surfGrid = surf && r_softShadowSurfCacheGrid.GetBool() && swTermGrid().pipeline != nullptr
+						  && surfCache != nullptr && surfCache->GetGridBuffer() != nullptr	// 2026-08-26: the grid ALLOC can fail (2GB worst-case sized buffer in a loaded-game VRAM context); serving the grid permutation against a null SRV while the build fell back to scalar = garbage terms = black world. The build checks the buffer; the serve must too.
 						  && surfCache != NULL && surfCache->GetGridBuffer() != NULL;
 	extern idCVar r_softShadowLitEarlyOut, r_softShadowRotGrid;
 	cb.surfParams[0] = 0.0f;

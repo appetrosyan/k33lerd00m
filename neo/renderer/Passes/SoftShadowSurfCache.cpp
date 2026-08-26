@@ -251,11 +251,14 @@ bool SoftShadowSurfCache::EnsureResources()
 	// reduced-set + grid-mode snapshots kept as function statics, not class members: growing SoftShadowSurfCache
 	// shifts its heap layout and surfaces an init-time fault in the render backend (see the .h note). Toggling
 	// grid mode changes what BUILD writes (bit-grid vs scalar fold), so it must DROP+rebuild the cache.
-	static int s_reduced = -1, s_reducedK = -1, s_gridMode = -1;
+	static int s_reduced = -1, s_reducedK = -1, s_gridMode = -1, s_gridChords = -1;
 	static float s_reducedCut = -1.0f;
+	extern idCVar r_softShadowScanChords;
+	const int gridChords = idMath::ClampInt( 4, 32, r_softShadowScanChords.GetInteger() );
 	if( m_Table == nullptr || capP2 != m_TableCap || poolCap != m_PoolCap || budget != m_Budget
 			|| wantQueue != m_QueueWords || texel != m_Texel || thr != m_Thr || errTol != m_ErrTol
-			|| reduced != s_reduced || reducedK != s_reducedK || reducedCut != s_reducedCut || grid != s_gridMode )
+			|| reduced != s_reduced || reducedK != s_reducedK || reducedCut != s_reducedCut || grid != s_gridMode
+			|| gridChords != s_gridChords )	// grid buffer is CHORD-EXACT sized: a chord change must drop + realloc (stride overflow otherwise)
 	{
 		m_TableCap = capP2;
 		m_PoolCap = poolCap;
@@ -268,6 +271,7 @@ bool SoftShadowSurfCache::EnsureResources()
 		s_reducedK = reducedK;
 		s_reducedCut = reducedCut;
 		s_gridMode = grid;
+		s_gridChords = gridChords;
 
 		nvrhi::BufferDesc bd;
 		bd.structStride = sizeof( uint32_t );
@@ -290,15 +294,24 @@ bool SoftShadowSurfCache::EnsureResources()
 		// GRID mode: parallel per-slot Fubini bit-grid, allocated only when r_softShadowSurfCacheGrid is
 		// set. The scalar path never touches it. Written by the grid build (u3), read by the surfgrid term
 		// (t7). No clear needed: the build writes the grid before marking the slot BUILT, and the term
-		// reads it only for BUILT slots. SIZED for the MAX config the shader can compile: SW_SCAN_CHORDS up
-		// to 32 x SwGridWord up to uint2 (2 words). The shader indexes at its COMPILED chord stride, so a
-		// larger allocation only leaves unused tail - never an overflow.
+		// reads it only for BUILT slots. CHORD-EXACT SIZING (2026-08-26): the old 32-chord worst case was
+		// 256 B/slot = 2 GB at an 8M table - the allocation FAILED silently in a loaded-game VRAM context
+		// (bench minimal-init hid it) and the serve ran the grid permutation against a null SRV -> black
+		// world. The shader indexes at its COMPILED chord stride = the ACTIVE r_softShadowScanChords
+		// permutation, which the recreate snapshot below now tracks (a chord change drops + reallocs).
 		if( grid && swGrid().pipeline != nullptr )
 		{
-			bd.byteSize = ( uint64_t )m_TableCap * 32 /*max chords*/ * 2 /*max words (uint2)*/ * sizeof( uint32_t );
+			extern idCVar r_softShadowScanChords;
+			const uint64_t swChords = ( uint64_t )idMath::ClampInt( 4, 32, r_softShadowScanChords.GetInteger() );
+			bd.byteSize = ( uint64_t )m_TableCap * swChords * 2 /*SwGridWord words (uint2)*/ * sizeof( uint32_t );
 			bd.debugName = "SoftShadowSurfCache/Grid";
 			swGrid().buffer = m_Device->createBuffer( bd );
 			swGrid().bufferCap = m_TableCap;
+			if( swGrid().buffer == nullptr )
+			{
+				common->Warning( "SoftShadowSurfCache: GRID buffer allocation FAILED (%llu MB) - grid serve disabled, scalar fold path takes over",
+								 ( unsigned long long )( bd.byteSize >> 20 ) );
+			}
 		}
 
 		// HUD counter readback ring (non-blocking): CPU-readable staging, one per in-flight frame
