@@ -95,6 +95,37 @@ nvrhi::IBuffer* SoftShadowSurfCache::GetGridBuffer() const
 	return swGrid().buffer;
 }
 
+// PERSISTENT static-caster stream (audit finding #4): each warmed light's [tris][casters] float4
+// stream APPENDED at a per-light base and kept for the cache's lifetime, so the residual pool can
+// store 1-uint tri indices into it (12x pool capacity vs the old self-contained 12-uint records)
+// with nothing to dangle - unlike the reused m_WarmStream or the per-frame view stream. Same
+// leaked-statics pattern (and reasons) as SwGridStatics above. Re-warming a light appends a FRESH
+// segment and the old one leaks until the next full clear - the same accepted leak model as the
+// pool's tombstoned reservations (DoClearIfNeeded reclaims both wholesale).
+struct SwStreamStatics
+{
+	nvrhi::BufferHandle				buffer;
+	int								capF4 = 0;		// capacity in float4 elements
+	int								cursorF4 = 0;	// append cursor (float4 elements)
+	std::unordered_map<int, int>	baseF4;			// lightDef->index -> segment base (float4 elements)
+};
+static SwStreamStatics& swStream()
+{
+	static SwStreamStatics* g = new SwStreamStatics();	// leaked on purpose - see SwGridStatics; never delete
+	return *g;
+}
+
+nvrhi::IBuffer* SoftShadowSurfCache::GetStaticStream() const
+{
+	return swStream().buffer;
+}
+
+int SoftShadowSurfCache::GetLightStreamBase( int lightIndex ) const
+{
+	auto it = swStream().baseF4.find( lightIndex );
+	return it != swStream().baseF4.end() ? it->second : -1;
+}
+
 void SoftShadowSurfCache::EnsurePipeline()
 {
 	if( m_PipelineTried )
@@ -310,6 +341,11 @@ void SoftShadowSurfCache::DoClearIfNeeded( nvrhi::ICommandList* commandList )
 	// consume, and every light re-warms from scratch below anyway.
 	s_swDrain.light = -1;
 	s_swDrain.window = 0;
+	// persistent static stream: reset the append cursor + segment map. Every leaked segment (re-warmed
+	// lights) is reclaimed here, exactly like the pool's leaked reservations; the buffer itself is kept
+	// (contents are garbage until lights re-warm, and nothing serves before a re-warm rebuilds records).
+	swStream().cursorF4 = 0;
+	swStream().baseF4.clear();
 	m_NeedClear = false;
 	// a wholesale wipe reclaims every orphaned slot by definition - the bump counter's debt is spent.
 	// NOT resetting it here was harness-audit finding #3: the counter survived the wipe, so the FIRST
@@ -434,12 +470,18 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	};
 	auto swDrainDispatch = [&]( int w0, int w1 )
 	{
+		if( swStream().buffer == nullptr )
+		{
+			return;		// no persistent stream = nothing was ever warmed = nothing parked to drain
+		}
 		nvrhi::BindingSetDesc sd;
 		sd.bindings =
 		{
 			nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
-			nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_WarmStream ),
-			nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, m_WarmStream ),	// dummy t1 (include requirement)
+			// PERSISTENT static stream (audit #4 merge): the parking warm's CB range bases are
+			// segment-relative into this buffer - the reused m_WarmStream is dead/bypassed.
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, swStream().buffer ),
+			nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, swStream().buffer ),	// dummy t1 (include requirement)
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_Table ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, s_swDrain.grid ? swGrid().buffer.Get() : m_Pool.Get() ),
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_Queue ),
@@ -510,8 +552,8 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	}
 	st.hash = fp;
 
-	// FLUSH a parked drain (audit #7b): the warm stream and seed queue written below are shared single
-	// buffers - seeding this light over them would strand the part-drained light's REQUESTED tail as a
+	// FLUSH a parked drain (audit #7b): the seed queue written below is a shared single buffer -
+	// seeding this light over it would strand the part-drained light's REQUESTED tail as a
 	// permanent miss. Finish it now: the same proven-safe per-window dispatches, and windows past the
 	// actually-enqueued count retire on the queue-count check (near-free).
 	if( s_swDrain.light >= 0 )
@@ -525,16 +567,49 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		s_swDrain.light = -1;
 	}
 
-	// pack [tris][casters] into the reused warm-stream buffer (float4 elements)
+	// pack [tris][casters] into the PERSISTENT static stream at this light's appended base (audit
+	// finding #4): the build walks it AND the residual pool's 1-uint tri indices resolve against it at
+	// serve, so the segment must outlive the warm (the old reused m_WarmStream could not). Grow on
+	// demand with a COPY (other lights' live segments must survive the realloc). A re-warmed light's
+	// old segment leaks until the next full clear - same leak model as the pool reservations.
 	const int triF4 = tris.Num();		// 3 per tri
 	const int casF4 = casters.Num();	// 2 per caster
-	EnsureWarmStream( triF4 + casF4 );
-	if( m_WarmStream == nullptr )
+	const int needF4 = triF4 + casF4;
+	if( needF4 <= 0 )
 	{
-		return false;
+		return false;		// nothing to stream (mirrors the old EnsureWarmStream(0) -> null early-out)
 	}
-	commandList->writeBuffer( m_WarmStream, tris.Ptr(), ( size_t )triF4 * sizeof( idVec4 ), 0 );
-	commandList->writeBuffer( m_WarmStream, casters.Ptr(), ( size_t )casF4 * sizeof( idVec4 ), ( size_t )triF4 * sizeof( idVec4 ) );
+	if( swStream().buffer == nullptr || swStream().cursorF4 + needF4 > swStream().capF4 )
+	{
+		int want = swStream().capF4 > 0 ? swStream().capF4 : 65536;
+		while( want < swStream().cursorF4 + needF4 )
+		{
+			want *= 2;
+		}
+		nvrhi::BufferDesc bd;
+		bd.byteSize = ( uint64_t )want * sizeof( idVec4 );
+		bd.structStride = sizeof( idVec4 );		// float4 stride (matches t_SoftEdges/t_SurfStream StructuredBuffer<float4>)
+		bd.canHaveUAVs = false;
+		bd.initialState = nvrhi::ResourceStates::ShaderResource;
+		bd.keepInitialState = true;
+		bd.debugName = "SoftShadowSurfCache/StaticStream";
+		nvrhi::BufferHandle grown = m_Device->createBuffer( bd );
+		if( grown == nullptr )
+		{
+			return false;
+		}
+		if( swStream().buffer != nullptr && swStream().cursorF4 > 0 )
+		{
+			commandList->copyBuffer( grown, 0, swStream().buffer, 0, ( uint64_t )swStream().cursorF4 * sizeof( idVec4 ) );
+		}
+		swStream().buffer = grown;
+		swStream().capF4 = want;
+	}
+	const int segBase = swStream().cursorF4;
+	swStream().cursorF4 += needF4;
+	swStream().baseF4[ light->index ] = segBase;
+	commandList->writeBuffer( swStream().buffer, tris.Ptr(), ( size_t )triF4 * sizeof( idVec4 ), ( uint64_t )segBase * sizeof( idVec4 ) );
+	commandList->writeBuffer( swStream().buffer, casters.Ptr(), ( size_t )casF4 * sizeof( idVec4 ), ( uint64_t )( segBase + triF4 ) * sizeof( idVec4 ) );
 
 	// RECEIVER stream for the seed (separate buffer): the seed rasterises RECEIVER tris to claim the
 	// texels the term reads; the build walks the CASTER stream above. Keying them to the same geometry
@@ -566,9 +641,9 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	cb.lightR[1] = light->globalLightOrigin.y;
 	cb.lightR[2] = light->globalLightOrigin.z;
 	cb.lightR[3] = penumbra;
-	cb.range[0] = 0;					// triBase (float4 elems)
+	cb.range[0] = segBase;				// triBase (float4 elems) = this light's persistent segment base
 	cb.range[1] = nCas;
-	cb.range[2] = triF4;				// casterBase (float4 elems) = right after the tris
+	cb.range[2] = segBase + triF4;		// casterBase (float4 elems) = right after the tris
 	cb.range[3] = light->index & 0x1FFF;
 	cb.caps[0] = m_TableCap;
 	cb.caps[1] = m_PoolCap;
@@ -615,8 +690,8 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 	sd.bindings =
 	{
 		nvrhi::BindingSetItem::ConstantBuffer( 0, m_ConstantBuffer ),
-		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, m_WarmStream ),
-		nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, m_WarmStream ),	// dummy t1 (include requirement)
+		nvrhi::BindingSetItem::StructuredBuffer_SRV( 0, swStream().buffer ),	// persistent stream (build walks this light's segment)
+		nvrhi::BindingSetItem::StructuredBuffer_SRV( 1, swStream().buffer ),	// dummy t1 (include requirement)
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 0, m_Table ),
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, gridMode ? swGrid().buffer.Get() : m_Pool.Get() ),	// u1 : pool (scalar) or grid (grid mode)
 		nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_Queue ),

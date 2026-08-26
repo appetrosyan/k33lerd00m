@@ -135,6 +135,14 @@ public:
 	{
 		return m_Pool;
 	}
+	// PERSISTENT static-caster stream (audit finding #4): every warmed light's [tris][casters] float4
+	// stream appended at a per-light base. The residual pool stores 1-uint tri indices into it; the
+	// term pass binds it (t8) and passes the light's segment tri base in the CB. Defined in the .cpp -
+	// it lives in a file-scope leaked static (not members) to avoid growing this class's heap layout
+	// (the known init-fault landmine, same as the grid buffer).
+	nvrhi::IBuffer* GetStaticStream() const;
+	// this light's segment tri base in float4 elements, or -1 if the light has no segment
+	int GetLightStreamBase( int lightIndex ) const;
 	// GRID mode (r_softShadowSurfCacheGrid): the parallel per-slot Fubini bit-grid buffer, or null when grid
 	// mode is off. Defined in the .cpp - it lives in a file-scope static (not a member) to avoid growing this
 	// class's heap layout (the known init-fault landmine; same reason the reduced-set snapshot uses statics).
@@ -210,8 +218,8 @@ private:
 	nvrhi::BufferHandle				m_Table;
 	nvrhi::BufferHandle				m_Pool;
 	nvrhi::BufferHandle				m_Queue;
-	nvrhi::BufferHandle				m_WarmStream;		// reused camera-independent warm caster stream (build walks)
-	int								m_WarmStreamF4 = 0;	// its capacity in float4 elements
+	nvrhi::BufferHandle				m_WarmStream;		// UNUSED (superseded by the persistent static stream, audit
+	int								m_WarmStreamF4 = 0;	// finding #4); kept so the class layout does not shift (landmine)
 	nvrhi::BufferHandle				m_WarmRecvStream;	// reused receiver-tri stream (seed rasterises, keys the reads)
 	int								m_WarmRecvStreamF4 = 0;
 	static const int				SW_STATS_RING = 4;	// staging depth so the readback is always past its frame

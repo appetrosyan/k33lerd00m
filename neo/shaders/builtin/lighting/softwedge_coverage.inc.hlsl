@@ -2108,7 +2108,8 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 // SURFACE-FOLD CACHE probe (r_softShadowSurfCache): the EXACT part of a cached fragment's term.
 // EXCLUDED in GRID mode: the grid hit path ORs a Fubini dynamic grid instead of walking the residual
 // pool, so t_SurfPool is unbound in grid mode (its register t6 is reused for the static grid buffer).
-// Walks the texel's RESIDUAL static occluders (triangle indices from the persistent pool t_SurfPool,
+// Walks the texel's RESIDUAL static occluders (1-uint stream indices from the persistent pool
+// t_SurfPool, resolved against the persistent static stream t_SurfStream at swStreamBase - both
 // declared by the term CS before this include) plus the frame's DYNAMIC casters (the caster-table
 // suffix after the static prefix) into ONE shared sample mask (union), then the shipped crack-close.
 // Per-fragment rotation, so the exact part keeps the shipped dither. The FOLDED static part arrives
@@ -2116,7 +2117,7 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 // SoftShadow_FaceCoverageList / SoftShadow_FaceCoverage in their SHIPPED config (in-loop dirs, fp16
 // MT) - duplication is house style here (the two sibling walks already duplicate; tests hold them).
 SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float swR, int swTriBase,
-		int swResBase, int swResCount, int swCasterBase, int swDynFirst, int swCasterCount,
+		int swResBase, int swResCount, int swStreamBase, int swCasterBase, int swDynFirst, int swCasterCount,
 		int swListBase, int swListCount, int swDynFirstTri, float swRotAng )
 {
 	swR = max( swR, 1e-2f );
@@ -2138,14 +2139,16 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 	const int swDiskBits = SW_SCAN_DISKBITS;	// compile-time (register diet: no per-thread mask array)
 	float2 swEnv[SW_SCAN_CHORDS];				// fractional-endpoint envelope (task #90)
 	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
-	// ---- residual static occluders: SELF-CONTAINED verts in the pool (12 uints/tri), per-fragment cone
-	// cull identical to the sampled body, then the shared Fubini fill. ----
+	// ---- residual static occluders: 1-uint STREAM INDICES in the pool (audit finding #4), resolved
+	// against the persistent static stream segment (swStreamBase, float4 elems) - bit-identical verts
+	// to what the build classified. Per-fragment cone cull identical to the sampled body, then the
+	// shared Fubini fill. ----
 	for( int li = 0; li < swResCount; li++ )
 	{
-		const int po = swResBase + li * 12;
-		float4 r0 = float4( asfloat( t_SurfPool[ po + 0 ] ), asfloat( t_SurfPool[ po + 1 ] ), asfloat( t_SurfPool[ po + 2 ] ), asfloat( t_SurfPool[ po + 3 ] ) );
-		float4 r1 = float4( asfloat( t_SurfPool[ po + 4 ] ), asfloat( t_SurfPool[ po + 5 ] ), asfloat( t_SurfPool[ po + 6 ] ), asfloat( t_SurfPool[ po + 7 ] ) );
-		float4 r2 = float4( asfloat( t_SurfPool[ po + 8 ] ), asfloat( t_SurfPool[ po + 9 ] ), asfloat( t_SurfPool[ po + 10 ] ), asfloat( t_SurfPool[ po + 11 ] ) );
+		const int po = swStreamBase + ( int )t_SurfPool[ swResBase + li ] * 3;
+		float4 r0 = t_SurfStream[ po + 0 ];
+		float4 r1 = t_SurfStream[ po + 1 ];
+		float4 r2 = t_SurfStream[ po + 2 ];
 		float3 v0 = float3( r0.x, r0.y, r0.z );
 		float3 v1 = float3( r1.x, r1.y, r1.z );
 		float3 v2 = float3( r2.x, r2.y, r2.z );
@@ -2352,14 +2355,15 @@ SW_FUNC float SoftShadow_FaceCoverageSurfResidual( float3 swP, float3 swL, float
 
 	uint swMask = 0u;
 	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
-	// ---- residual static occluders: SELF-CONTAINED verts in the pool (12 uints/tri), per-fragment cone
-	// cull + MT (List's body). No static-stream index: a warm texel is independent of the emitted prefix.
+	// ---- residual static occluders: 1-uint STREAM INDICES in the pool (audit finding #4), resolved
+	// against the persistent static stream segment (swStreamBase) - the index targets the PERSISTENT
+	// per-light segment, not the reused warm stream / per-frame view stream, so it cannot dangle.
 	for( int li = 0; li < swResCount; li++ )
 	{
-		const int po = swResBase + li * 12;
-		float4 r0 = float4( asfloat( t_SurfPool[ po + 0 ] ), asfloat( t_SurfPool[ po + 1 ] ), asfloat( t_SurfPool[ po + 2 ] ), asfloat( t_SurfPool[ po + 3 ] ) );
-		float4 r1 = float4( asfloat( t_SurfPool[ po + 4 ] ), asfloat( t_SurfPool[ po + 5 ] ), asfloat( t_SurfPool[ po + 6 ] ), asfloat( t_SurfPool[ po + 7 ] ) );
-		float4 r2 = float4( asfloat( t_SurfPool[ po + 8 ] ), asfloat( t_SurfPool[ po + 9 ] ), asfloat( t_SurfPool[ po + 10 ] ), asfloat( t_SurfPool[ po + 11 ] ) );
+		const int po = swStreamBase + ( int )t_SurfPool[ swResBase + li ] * 3;
+		float4 r0 = t_SurfStream[ po + 0 ];
+		float4 r1 = t_SurfStream[ po + 1 ];
+		float4 r2 = t_SurfStream[ po + 2 ];
 		float3 v0 = float3( r0.x, r0.y, r0.z );
 		float3 v1 = float3( r1.x, r1.y, r1.z );
 		float3 v2 = float3( r2.x, r2.y, r2.z );

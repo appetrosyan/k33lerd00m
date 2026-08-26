@@ -42,7 +42,9 @@ struct SoftTermCB
 	float	misc[4];		// x = r_softShadowMinDnRatio: projection dn-clamp (grazing grain fix);
 							// yzw = view origin (cache-economics tiers 1/3)
 	float	econ[4];		// cache economics (task #112): x = near-exact radius SQUARED, y = tier-1
-							// gate base margin, z/w reserved. Mirrors g_econ in softterm.cs.hlsl.
+							// gate base margin, z = persistent static-stream segment tri base (float4
+							// elems, uint BIT-CAST into the lane - audit finding #4), w reserved.
+							// Mirrors g_econ in softterm.cs.hlsl.
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -211,6 +213,11 @@ void SoftShadowTermPass::EnsurePipeline()
 			nvrhi::BindingLayoutDesc ls = ld;
 			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 2 ) );	// u2 : texel table
 			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 6 ) );	// t6 : residual pool
+			// t8 : persistent static stream (audit finding #4) - the pool's 1-uint residual indices
+			// resolve here. Declared only by the SCALAR surf shader; the grid shader (same layout)
+			// leaves it unreferenced, which Vulkan permits (the desync landmine is the OPPOSITE case:
+			// a shader-declared binding missing from the layout).
+			ls.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 8 ) );
 			// NOTE: no u3 request-queue - the read-only term never enqueues (the burst seeds), and a
 			// declared-but-stripped u3 desynced the reflected layout and crashed at r_softShadowSamples 32.
 			m_LayoutSurf = m_Device->createBindingLayout( ls );
@@ -676,6 +683,23 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		cb.surfA[1] = surfCache->GetQueueWords();
 		cb.surfA[2] = vLight->softStaticCasterCount;
 		cb.surfA[3] = ( vLight->lightDef != NULL ) ? ( vLight->lightDef->index & 0x1FFF ) : 0;
+		// econ.z = this light's persistent static-stream segment TRI BASE (float4 elems), BIT-CAST into
+		// the float lane (asuint on the shader side) so any base stays exact - audit finding #4. The
+		// pool's 1-uint residual indices resolve against t_SurfStream at this base. A warmed light
+		// always has a segment; if it somehow doesn't (scalar mode), disable the cache for this light
+		// rather than serve indices into garbage. Grid mode never reads the stream.
+		{
+			const int swSegBase = ( vLight->lightDef != NULL ) ? surfCache->GetLightStreamBase( vLight->lightDef->index ) : -1;
+			if( swSegBase >= 0 )
+			{
+				const uint32_t swSegBits = ( uint32_t )swSegBase;
+				memcpy( &cb.econ[2], &swSegBits, sizeof( swSegBits ) );
+			}
+			else if( !surfGrid )
+			{
+				cb.surfA[0] = 0;
+			}
+		}
 		// per-light generation: the term CS treats a slot whose stored generation != this as stale and
 		// reclaims it (a set change bumped the generation instead of wiping the whole table)
 		cb.aa[1] = ( vLight->lightDef != NULL ) ? ( float )surfCache->GetLightGeneration( vLight->lightDef->index ) : 0.0f;
@@ -764,6 +788,10 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		/* u3 request-queue binding removed: the read-only term never enqueues (the burst seeds it) */;
 		// t6 = residual pool (scalar) OR the static bit-grid (grid mode); same register, same layout.
 		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_SRV( 6, surfGrid ? surfCache->GetGridBuffer() : surfCache->GetPool() ) );
+		// t8 = persistent static stream (audit finding #4): residual indices resolve here. The layout
+		// demands a resource even in grid mode / before any warm - edgeBuffer stands in (never read then).
+		nvrhi::IBuffer* swStream = surfCache->GetStaticStream();
+		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_SRV( 8, ( swStream != nullptr ) ? swStream : edgeBuffer ) );
 	}
 	else if( contrib )
 	{
