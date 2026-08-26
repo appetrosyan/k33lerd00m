@@ -1633,78 +1633,20 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 	}
 }
 
-// ANALYTIC BOX coverage: fill a box caster's receiver-silhouette (a convex <=6-gon) into swGrid ONCE,
-// instead of walking its 12 triangles. The projection of a convex SOLID from the receiver equals the
-// projection of its SILHOUETTE, so this is bit-identical coverage to SoftScan_FillTri over the 12 box
-// tris - but one polygon, zero per-triangle records, no per-tri cull/FillTri overhead. `corner[8]` are the
-// 8 world-space box corners in the bit convention (index bit0=x, bit1=y, bit2=z; 0=min side). From the
-// silhouette on, the body is FillTri verbatim (slab clip -> project -> per-chord x-span OR) over N<=6 verts.
-SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS], float3 corner[8],
-		float3 swP, softFrame_t swF, float swR, float swEps )
+// ANALYTIC POLYGON coverage: fill a convex world-space loop `loopV[0..loopN)` into swGrid ONCE. This is
+// the FillTri body generalised to loopN verts (slab near/far clip -> project -> per-chord x-span OR),
+// factored out so BOTH the box silhouette (SoftScan_FillBox) and a flat coplanar caster's boundary loop
+// (r_softShadowCoplanarMerge) share ONE fill path - no forked primitive. loopN capped at SW_POLY_MAX_VERTS
+// (8): the clip arrays (nRel[10]=8+2, fRel[12]=10+2) size for at most 8 input verts + 2 new verts per
+// slab plane; the caster emitter keeps a caster's triangles rather than merge when its hull exceeds 8.
+#ifndef SW_POLY_MAX_VERTS
+	#define SW_POLY_MAX_VERTS 8
+#endif
+SW_FUNC void SoftScan_FillPoly( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS],
+		float3 loopV[SW_POLY_MAX_VERTS], int loopN, float3 swP, softFrame_t swF, float swR, float swEps )
 {
 	g_swVizFills++;		// per-FRAGMENT walk-cost counter (viz 9 heatmap)
-	// 6 faces, each 4 corner indices wound outward-CCW, so cross(edge1,edge2) is the OUTWARD normal.
-	const int BF[6][4] = { {1,3,7,5}, {0,4,6,2}, {2,6,7,3}, {0,1,5,4}, {4,5,7,6}, {0,2,3,1} };
-	bool front[6];
-	for( int f = 0; f < 6; f++ )
-	{
-		float3 a = corner[BF[f][0]], b = corner[BF[f][1]], c = corner[BF[f][2]];
-		float3 fc = ( a + b + c + corner[BF[f][3]] ) * 0.25f;
-		float3 fn = cross( b - a, c - a );							// outward by winding
-		front[f] = dot( fn, swP - fc ) > 0.0f;						// face turns toward the receiver
-	}
-	// silhouette = front-face edges whose opposite face is back. Collect directed (a->c) in front-face
-	// winding order so the pieces chain into one CCW loop.
-	int dA[12], dB[12]; int dcount = 0;
-	for( int f2 = 0; f2 < 6; f2++ )
-	{
-		if( !front[f2] ) { continue; }
-		for( int e = 0; e < 4; e++ )
-		{
-			int a = BF[f2][e], c = BF[f2][( e + 1 ) & 3];
-			bool nbBack = false, found = false;						// the other face sharing edge {a,c}
-			for( int g = 0; g < 6; g++ )
-			{
-				if( g == f2 ) { continue; }
-				bool ha = false, hc = false;
-				for( int k = 0; k < 4; k++ ) { int idx = BF[g][k]; ha = ha || ( idx == a ); hc = hc || ( idx == c ); }
-				if( ha && hc ) { nbBack = !front[g]; found = true; }
-			}
-			if( found && nbBack && dcount < 12 ) { dA[dcount] = a; dB[dcount] = c; dcount++; }
-		}
-	}
-	if( dcount < 3 )
-	{
-		// receiver INSIDE or ON the box: the front/back silhouette is degenerate (a contact-umbra
-		// fragment at the box's base plane, or a receiver passing through the solid). Fall back to the
-		// exact 12-triangle union of the 6 faces - slab-clipped like any triangle, so it is correct both
-		// ways (box above P -> umbra fills; box below P -> all faces clip, stays lit). Rare: only the
-		// fragments coplanar-inside the footprint hit this, so the 12 FillTri calls cost nothing at large.
-		for( int fb = 0; fb < 6; fb++ )
-		{
-			float3 a0 = corner[BF[fb][0]], a1 = corner[BF[fb][1]], a2 = corner[BF[fb][2]], a3 = corner[BF[fb][3]];
-			SoftScan_FillTri( swGrid, swEnv, a0, a1, a2, swP, swF, swR, swEps );
-			SoftScan_FillTri( swGrid, swEnv, a0, a2, a3, swP, swF, swR, swEps );
-		}
-		return;
-	}
-	// chain the directed edges into an ordered vertex loop
-	float3 loopV[8]; int loopN = 0;
-	bool used[12];
-	for( int u = 0; u < 12; u++ ) { used[u] = false; }
-	used[0] = true; int startV = dA[0], cur = dB[0];
-	loopV[0] = corner[dA[0]]; loopN = 1;
-	for( int s = 0; s < dcount && loopN < 8; s++ )
-	{
-		loopV[loopN++] = corner[cur];
-		if( cur == startV ) { loopN--; break; }						// closed the loop (last vert dup of start)
-		int nx = -1;
-		for( int k2 = 0; k2 < dcount; k2++ ) { if( !used[k2] && dA[k2] == cur ) { nx = k2; break; } }
-		if( nx < 0 ) { break; }
-		used[nx] = true; cur = dB[nx];
-	}
 	if( loopN < 3 ) { return; }
-	// ---- from here: SoftScan_FillTri body, generalised to loopN verts ----
 	float3 rel[8]; float dn[8];
 	for( int i = 0; i < loopN; i++ ) { rel[i] = loopV[i] - swP; dn[i] = dot( rel[i], swF.nrm ); }
 	float3 nRel[10]; float nDn[10]; int nn = 0;							// near clip: dn >= swEps
@@ -1790,9 +1732,85 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 		if( any )
 		{
 			swGrid[m] |= SoftScan_Run( xlo, xhi );
-			swEnv[m] = SwEnvAdd( swEnv[m], xlo, xhi );	// exact fractional endpoints (box silhouette chord)
+			swEnv[m] = SwEnvAdd( swEnv[m], xlo, xhi );	// exact fractional endpoints (convex-loop chord)
 		}
 	}
+}
+
+// ANALYTIC BOX coverage: fill a box caster's receiver-silhouette (a convex <=6-gon) into swGrid ONCE,
+// instead of walking its 12 triangles. The projection of a convex SOLID from the receiver equals the
+// projection of its SILHOUETTE, so this is bit-identical coverage to SoftScan_FillTri over the 12 box
+// tris - but one polygon, zero per-triangle records, no per-tri cull/FillTri overhead. `corner[8]` are the
+// 8 world-space box corners in the bit convention (index bit0=x, bit1=y, bit2=z; 0=min side). From the
+// silhouette on, the body is FillTri verbatim (slab clip -> project -> per-chord x-span OR) over N<=6 verts.
+SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS], float3 corner[8],
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	g_swVizFills++;		// per-FRAGMENT walk-cost counter (viz 9 heatmap)
+	// 6 faces, each 4 corner indices wound outward-CCW, so cross(edge1,edge2) is the OUTWARD normal.
+	const int BF[6][4] = { {1,3,7,5}, {0,4,6,2}, {2,6,7,3}, {0,1,5,4}, {4,5,7,6}, {0,2,3,1} };
+	bool front[6];
+	for( int f = 0; f < 6; f++ )
+	{
+		float3 a = corner[BF[f][0]], b = corner[BF[f][1]], c = corner[BF[f][2]];
+		float3 fc = ( a + b + c + corner[BF[f][3]] ) * 0.25f;
+		float3 fn = cross( b - a, c - a );							// outward by winding
+		front[f] = dot( fn, swP - fc ) > 0.0f;						// face turns toward the receiver
+	}
+	// silhouette = front-face edges whose opposite face is back. Collect directed (a->c) in front-face
+	// winding order so the pieces chain into one CCW loop.
+	int dA[12], dB[12]; int dcount = 0;
+	for( int f2 = 0; f2 < 6; f2++ )
+	{
+		if( !front[f2] ) { continue; }
+		for( int e = 0; e < 4; e++ )
+		{
+			int a = BF[f2][e], c = BF[f2][( e + 1 ) & 3];
+			bool nbBack = false, found = false;						// the other face sharing edge {a,c}
+			for( int g = 0; g < 6; g++ )
+			{
+				if( g == f2 ) { continue; }
+				bool ha = false, hc = false;
+				for( int k = 0; k < 4; k++ ) { int idx = BF[g][k]; ha = ha || ( idx == a ); hc = hc || ( idx == c ); }
+				if( ha && hc ) { nbBack = !front[g]; found = true; }
+			}
+			if( found && nbBack && dcount < 12 ) { dA[dcount] = a; dB[dcount] = c; dcount++; }
+		}
+	}
+	if( dcount < 3 )
+	{
+		// receiver INSIDE or ON the box: the front/back silhouette is degenerate (a contact-umbra
+		// fragment at the box's base plane, or a receiver passing through the solid). Fall back to the
+		// exact 12-triangle union of the 6 faces - slab-clipped like any triangle, so it is correct both
+		// ways (box above P -> umbra fills; box below P -> all faces clip, stays lit). Rare: only the
+		// fragments coplanar-inside the footprint hit this, so the 12 FillTri calls cost nothing at large.
+		for( int fb = 0; fb < 6; fb++ )
+		{
+			float3 a0 = corner[BF[fb][0]], a1 = corner[BF[fb][1]], a2 = corner[BF[fb][2]], a3 = corner[BF[fb][3]];
+			SoftScan_FillTri( swGrid, swEnv, a0, a1, a2, swP, swF, swR, swEps );
+			SoftScan_FillTri( swGrid, swEnv, a0, a2, a3, swP, swF, swR, swEps );
+		}
+		return;
+	}
+	// chain the directed edges into an ordered vertex loop
+	float3 loopV[8]; int loopN = 0;
+	bool used[12];
+	for( int u = 0; u < 12; u++ ) { used[u] = false; }
+	used[0] = true; int startV = dA[0], cur = dB[0];
+	loopV[0] = corner[dA[0]]; loopN = 1;
+	for( int s = 0; s < dcount && loopN < 8; s++ )
+	{
+		loopV[loopN++] = corner[cur];
+		if( cur == startV ) { loopN--; break; }						// closed the loop (last vert dup of start)
+		int nx = -1;
+		for( int k2 = 0; k2 < dcount; k2++ ) { if( !used[k2] && dA[k2] == cur ) { nx = k2; break; } }
+		if( nx < 0 ) { break; }
+		used[nx] = true; cur = dB[nx];
+	}
+	if( loopN < 3 ) { return; }
+	// the box silhouette IS a convex world loop: hand it to the shared analytic-polygon fill (the flat
+	// coplanar-caster path feeds the same primitive its own boundary loop).
+	SoftScan_FillPoly( swGrid, swEnv, loopV, loopN, swP, swF, swR, swEps );
 }
 
 // TOPOLOGY-ONLY fill: for callers that use the grid for SET membership (contrib-cache contribution
@@ -1814,6 +1832,13 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 c
 	float2 e[SW_SCAN_CHORDS];
 	for( int i = 0; i < SW_SCAN_CHORDS; i++ ) { e[i] = SwEnvZero(); }
 	SoftScan_FillBox( swGrid, e, corner, swP, swF, swR, swEps );
+}
+SW_FUNC void SoftScan_FillPoly( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 loopV[SW_POLY_MAX_VERTS], int loopN,
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	float2 e[SW_SCAN_CHORDS];
+	for( int i = 0; i < SW_SCAN_CHORDS; i++ ) { e[i] = SwEnvZero(); }
+	SoftScan_FillPoly( swGrid, e, loopV, loopN, swP, swF, swR, swEps );
 }
 #endif
 #endif // SW_SCANLINE
@@ -2355,14 +2380,28 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 			{
 #if SW_SCANLINE
 				const int bbB = swFirstElem + ( int )( swEncB & 0x7FFFFFFFu ) * 3;
-				float3 bcornerB[8];
-				for( int bk = 0; bk < 8; bk++ )
+				const float4 bslot0B = t_SoftEdges[ bbB + 0 ];
+				if( bslot0B.w < 0.0f )
 				{
-					float4 bcv = t_SoftEdges[ bbB + bk ];
-					bcornerB[bk] = float3( bcv.x, bcv.y, bcv.z );
+					// coplanar POLY caster (.w = -vertexCount): boundary loop -> FillPoly (the box's Phase-A
+					// umbra wMin has no poly form; skipping it only forgoes an early-out, never coverage).
+					const int pnB = min( ( int )( -bslot0B.w ), SW_POLY_MAX_VERTS );
+					float3 bloopB[SW_POLY_MAX_VERTS];
+					for( int pk = 0; pk < SW_POLY_MAX_VERTS; pk++ ) { float4 pcv = t_SoftEdges[ bbB + min( pk, pnB - 1 ) ]; bloopB[pk] = float3( pcv.x, pcv.y, pcv.z ); }
+					SoftScan_FillPoly( swGrid, swEnv, bloopB, pnB, swP, swF, swR, swEps );
 				}
-				SW_WMIN_BOX( bcornerB, swP, swF.nrm, swDistPL, swR );	// C3 wMin: box caster site (Phase A only)
-				SoftScan_FillBox( swGrid, swEnv, bcornerB, swP, swF, swR, swEps );
+				else
+				{
+					float3 bcornerB[8];
+					bcornerB[0] = float3( bslot0B.x, bslot0B.y, bslot0B.z );
+					for( int bk = 1; bk < 8; bk++ )
+					{
+						float4 bcv = t_SoftEdges[ bbB + bk ];
+						bcornerB[bk] = float3( bcv.x, bcv.y, bcv.z );
+					}
+					SW_WMIN_BOX( bcornerB, swP, swF.nrm, swDistPL, swR );	// C3 wMin: box caster site (Phase A only)
+					SoftScan_FillBox( swGrid, swEnv, bcornerB, swP, swF, swR, swEps );
+				}
 #endif
 				continue;
 			}

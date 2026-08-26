@@ -916,17 +916,29 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 				const uint dtEnc = t_SoftTiles[ swServeListBase + ld2 ];
 				if( dtEnc & 0x80000000u )
 				{
-					// ANALYTIC BOX caster: high-bit-tagged FIRST tri-slot index. Read its 8 corners from the
-					// 3 tri-slots and evaluate SoftScan_FillBox ONCE - no triangle rasterisation.
+					// ANALYTIC caster: high-bit-tagged FIRST tri-slot index. The first slot's .w discriminates
+					// BOX (.w = v0Rad > 0, read 8 corners -> FillBox) from a coplanar POLY (.w = -vertexCount,
+					// read that many boundary verts -> FillPoly). Both evaluate ONCE - no triangle rasterisation.
 					const int bft = ( int )( dtEnc & 0x7FFFFFFFu );
 					const int bb  = g_range.x + bft * 3;
+					const float4 bslot0 = t_SoftEdges[ bb + 0 ];
+					swDFill++;
+					if( bslot0.w < 0.0f )
+					{
+						const int pn = min( ( int )( -bslot0.w ), SW_POLY_MAX_VERTS );
+						float3 bloop[SW_POLY_MAX_VERTS];
+						for( int pk = 0; pk < SW_POLY_MAX_VERTS; pk++ ) { bloop[pk] = t_SoftEdges[ bb + min( pk, pn - 1 ) ].xyz; }
+						SoftScan_FillPoly( swGrid, swEnv, bloop, pn, swP, swFC, swRC, SW_NEAR_EPS );
+					}
+					else
+					{
 					float3 bcorner[8];
-					bcorner[0] = t_SoftEdges[ bb + 0 ].xyz; bcorner[1] = t_SoftEdges[ bb + 1 ].xyz;
+					bcorner[0] = bslot0.xyz;                bcorner[1] = t_SoftEdges[ bb + 1 ].xyz;
 					bcorner[2] = t_SoftEdges[ bb + 2 ].xyz; bcorner[3] = t_SoftEdges[ bb + 3 ].xyz;
 					bcorner[4] = t_SoftEdges[ bb + 4 ].xyz; bcorner[5] = t_SoftEdges[ bb + 5 ].xyz;
 					bcorner[6] = t_SoftEdges[ bb + 6 ].xyz; bcorner[7] = t_SoftEdges[ bb + 7 ].xyz;
-					swDFill++;
 					SoftScan_FillBox( swGrid, swEnv, bcorner, swP, swFC, swRC, SW_NEAR_EPS );
+					}
 					int swCovB = 0;
 					[unroll] for( int fmb = 0; fmb < SW_SCAN_CHORDS; fmb++ ) { swCovB += SoftScan_PC( swGrid[fmb] & SW_SCAN_MASK[fmb] ); }
 					if( swCovB * 100 >= swDiskBits * 99 ) { break; }

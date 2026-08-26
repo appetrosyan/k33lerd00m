@@ -770,8 +770,10 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 	extern idCVar r_softShadowProxyBox, r_softShadowProxyBoxGap, r_softShadowProxyModel, r_softShadowProxyInflate;
 	extern int fe_softProxyBoxed;
 	const int SW_PROXY_MIN_TRIS = 64;			// below this the 12-tri box saves too little to bother
-	idVec3 boxLocal[36];						// 12 tris x 3 local-space box verts (when proxied)
+	idVec3 boxLocal[36];						// 12 tris x 3 local-space box verts (when proxied); also holds the coplanar poly loop
 	bool useBox = false;
+	bool usePoly = false;						// r_softShadowCoplanarMerge: flat caster replaced by ONE analytic convex polygon
+	int  polyN = 0;								// its boundary-hull vertex count (3..SW_POLY_MAX_VERTS)
 	// CURATED single-model swap: this ONE specific named mesh is replaced by its AABB box, no geometric
 	// test - the mesh is identified offline (r_softShadowProxyProfile) as a genuine right-angle box, so
 	// its box IS its shadow. The auto path below (r_softShadowProxyBox) keeps its verts-hug-AABB gate.
@@ -857,6 +859,113 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 		}
 	}
 
+	// COPLANAR MERGE (r_softShadowCoplanarMerge): a caster whose verts ALL lie in one plane (flat panel,
+	// sign, grate) is a flat polygon; the projected occlusion of a flat convex face equals the projection
+	// of its BOUNDARY, so replacing its N triangles with ONE analytic convex polygon (its 2D convex hull in
+	// the plane) is bit-exact and walked once by SoftScan_FillPoly. Concave faces (hull area > triangle-area
+	// sum, e.g. an L-panel) would OVER-shadow, and hulls past the SW_POLY_MAX_VERTS cap can't be walked, so
+	// both keep their triangles - lossless is non-negotiable. Tagged like the box (numTris<0 analytic) and
+	// discriminated at the fill site by a negative vertex-count stamped into the first slot's .w (below).
+	// FOLLOW-UP (not built here): per-plane merge WITHIN a multi-plane mesh (a mixed poly+triangle stream) -
+	// this first cut merges only whole single-plane casters.
+	extern idCVar r_softShadowCoplanarMerge;
+	const int SW_MERGE_MIN_TRIS = 2;			// below 2 tris there is nothing to merge
+	const int SW_POLY_MAX_VERTS = 8;			// must match the shader cap in softwedge_coverage.inc.hlsl
+	if( !useBox && r_softShadowCoplanarMerge.GetBool() && tri->numVerts >= 3 && numTris >= SW_MERGE_MIN_TRIS )
+	{
+		// plane = normal of the largest-area triangle (most numerically stable), through its first vertex
+		idVec3 pn( 0, 0, 0 ), p0( 0, 0, 0 );
+		float bestA2 = 0.0f, triAreaSum = 0.0f;
+		for( int t = 0; t < numTris; t++ )
+		{
+			const idVec3& a = verts[tri->indexes[t * 3 + 0]].xyz;
+			const idVec3& b = verts[tri->indexes[t * 3 + 1]].xyz;
+			const idVec3& c = verts[tri->indexes[t * 3 + 2]].xyz;
+			const idVec3 nrm = ( b - a ).Cross( c - a );
+			const float a2 = nrm.LengthSqr();
+			triAreaSum += 0.5f * idMath::Sqrt( a2 );
+			if( a2 > bestA2 ) { bestA2 = a2; pn = nrm; p0 = a; }
+		}
+		idVec3 lmn( 1e30f, 1e30f, 1e30f ), lmx( -1e30f, -1e30f, -1e30f );
+		for( int v = 0; v < tri->numVerts; v++ )
+		{
+			const idVec3& p = verts[v].xyz;
+			lmn.x = Min( lmn.x, p.x ); lmn.y = Min( lmn.y, p.y ); lmn.z = Min( lmn.z, p.z );
+			lmx.x = Max( lmx.x, p.x ); lmx.y = Max( lmx.y, p.y ); lmx.z = Max( lmx.z, p.z );
+		}
+		const float diag = ( lmx - lmn ).Length();
+		if( bestA2 > 1e-12f && diag > 1e-3f )
+		{
+			pn *= idMath::InvSqrt( bestA2 );		// normalise
+			const float eps = 1e-4f * diag;			// coplanar = within float precision of the fit plane
+			bool flat = true;
+			for( int v = 0; v < tri->numVerts && flat; v++ )
+			{
+				if( idMath::Fabs( ( verts[v].xyz - p0 ) * pn ) > eps ) { flat = false; }
+			}
+			if( flat )
+			{
+				// in-plane orthonormal basis
+				idVec3 U = ( idMath::Fabs( pn.z ) < 0.9f ) ? idVec3( 0, 0, 1 ).Cross( pn ) : idVec3( 1, 0, 0 ).Cross( pn );
+				U.Normalize();
+				const idVec3 V = pn.Cross( U );
+				// gather the referenced verts' 2D projections (dedup identical), then monotone-chain hull
+				const int nv = tri->numVerts;
+				struct pt2_t { float u, v; int idx; };
+				pt2_t* pp = ( pt2_t* )SoftFaceAlloc( ( size_t )nv * sizeof( pt2_t ) );
+				int npp = 0;
+				for( int v = 0; v < nv; v++ )
+				{
+					const idVec3 d = verts[v].xyz - p0;
+					pp[npp].u = d * U; pp[npp].v = d * V; pp[npp].idx = v; npp++;
+				}
+				std::sort( pp, pp + npp, []( const pt2_t & a, const pt2_t & b )
+				{
+					return a.u < b.u || ( a.u == b.u && a.v < b.v );
+				} );
+				int* hull = ( int* )SoftFaceAlloc( ( size_t )( 2 * npp + 1 ) * sizeof( int ) );
+				auto crs = [&]( int o, int a, int b )
+				{
+					return ( pp[a].u - pp[o].u ) * ( pp[b].v - pp[o].v ) - ( pp[a].v - pp[o].v ) * ( pp[b].u - pp[o].u );
+				};
+				int k = 0;
+				for( int i = 0; i < npp; i++ )
+				{
+					while( k >= 2 && crs( hull[k - 2], hull[k - 1], i ) <= 0.0f ) { k--; }
+					hull[k++] = i;
+				}
+				for( int i = npp - 2, lo = k + 1; i >= 0; i-- )
+				{
+					while( k >= lo && crs( hull[k - 2], hull[k - 1], i ) <= 0.0f ) { k--; }
+					hull[k++] = i;
+				}
+				const int hullN = k - 1;			// last point duplicates the first
+				// hull polygon area (2D shoelace) - a CONVEX face's triangles tile it exactly, so hullArea
+				// == triAreaSum; a concave face has hullArea > triAreaSum and must keep its triangles.
+				float hullArea = 0.0f;
+				for( int i = 0; i < hullN; i++ )
+				{
+					const pt2_t& A = pp[hull[i]];
+					const pt2_t& B = pp[hull[( i + 1 ) % hullN]];
+					hullArea += A.u * B.v - B.u * A.v;
+				}
+				hullArea = 0.5f * idMath::Fabs( hullArea );
+				if( hullN >= 3 && hullN <= SW_POLY_MAX_VERTS && hullArea <= triAreaSum * 1.0001f + 1e-4f )
+				{
+					usePoly = true;
+					polyN = hullN;
+					for( int i = 0; i < hullN; i++ ) { boxLocal[i] = verts[pp[hull[i]].idx].xyz; }
+					numTris = ( hullN + 2 ) / 3;						// slot count = numTris*3 >= hullN
+					for( int s = hullN; s < numTris * 3; s++ ) { boxLocal[s] = boxLocal[hullN - 1]; }	// pad
+					fe_softProxyBoxed++;
+					if( outIsBox != NULL ) { *outIsBox = true; }		// reuse the analytic-caster tag/tile path
+				}
+				SoftFaceScratchFree( hull );
+				SoftFaceScratchFree( pp );
+			}
+		}
+	}
+
 	// pass 1: transform every triangle to world ONCE into a transient scratch (the emit below is in
 	// cluster order, so it cannot stream straight out of the index list). Box proxy: transform its 12
 	// local tris instead of the mesh's; the cluster/emit path below is identical either way.
@@ -864,7 +973,7 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 	idVec3* wc = ( idVec3* )SoftFaceAlloc( ( size_t )numTris * sizeof( idVec3 ) );
 	for( int t = 0; t < numTris; t++ )
 	{
-		if( useBox )
+		if( useBox || usePoly )
 		{
 			R_LocalPointToGlobal( modelToWorld, boxLocal[t * 3 + 0], wv[t * 3 + 0] );
 			R_LocalPointToGlobal( modelToWorld, boxLocal[t * 3 + 1], wv[t * 3 + 1] );
@@ -962,6 +1071,14 @@ void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_
 		clus[nClus * 2 + 0] = idVec4( ccen.x, ccen.y, ccen.z, crad * 1.00001f );
 		clus[nClus * 2 + 1] = idVec4( ( float )firstTriOut, ( float )count, 0.0f, 0.0f );
 		nClus++;
+	}
+
+	// COPLANAR-MERGE discriminator: stamp -(vertex count) into the first tri-slot's .w so the analytic
+	// fill site reads a POLY (loopN = -w) instead of a BOX (w = v0Rad > 0). numTris<=3 here => a single
+	// cluster leaf => no reorder, so recs[0] is boundary vert 0. The shader reads only .xyz for corners.
+	if( usePoly && n > 0 )
+	{
+		recs[0].w = -( float )polyN;
 	}
 
 	// warm/heap path: release the internal scratch (the two outputs are freed by the caller)
