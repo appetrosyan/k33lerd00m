@@ -45,6 +45,9 @@ struct SoftTermCB
 							// gate base margin, z = persistent static-stream segment tri base (float4
 							// elems, uint BIT-CAST into the lane - audit finding #4), w reserved.
 							// Mirrors g_econ in softterm.cs.hlsl.
+	float	sub[4];			// ADAPTIVE SUB-SAMPLING (SW_SUBSAMPLE): x = phase | (viz << 2), y = stride
+							// S, z = C2 spread epsilon, w = C3 width-floor beta. Zeros on every other
+							// pipeline. Mirrors g_sub in softterm.cs.hlsl - BOTH sides same commit.
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -110,6 +113,19 @@ struct SwTermGridStatics
 {
 	nvrhi::ShaderHandle				shader;
 	nvrhi::ComputePipelineHandle	pipeline;
+	// ADAPTIVE SUB-SAMPLING permutations (SW_SUBSAMPLE=1, r_softShadowSubSample): two pipelines -
+	// subs-scanline (plain Fubini) and subs-surf (surf-cache config, SW_SURF_GRID=0 like the surf
+	// block, so the heavy-cap bench config can measure it) - plus the shared lattice side buffer.
+	// Same leaked-statics rule as the grid permutation: NEVER grow the class.
+	nvrhi::DeviceHandle				device;			// for the stats readback free function
+	nvrhi::ShaderHandle				subsScanShader;
+	nvrhi::BindingLayoutHandle		subsScanLayout;
+	nvrhi::ComputePipelineHandle	subsScanPipeline;
+	nvrhi::ShaderHandle				subsSurfShader;
+	nvrhi::BindingLayoutHandle		subsSurfLayout;
+	nvrhi::ComputePipelineHandle	subsSurfPipeline;
+	nvrhi::BufferHandle				subsLattice;	// 4 counter uint2 + latW*latH (term,wMin) uint2
+	uint32_t						subsLatticeElems = 0;	// grow-only element count
 };
 static SwTermGridStatics& swTermGrid()
 {
@@ -154,6 +170,7 @@ void SoftShadowTermPass::EnsurePipeline()
 	macros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );		// and the contributor-cache axis
 	macros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		macros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+	macros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );				// new axis: explicit on every list (order matches shaders.cfg: last)
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, sfx.c_str(), macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
 	{
@@ -199,6 +216,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		cntMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		cntMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		cntMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
 		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
 		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
 		// blob path (LoadShader keys the .bin on shader.name only) - it forces a separate entry whose
@@ -242,6 +260,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		surfMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		surfMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		surfMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
 		m_ShaderSurf = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfcache" ) + sfx ).c_str(), surfMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderSurf != nullptr )
 		{
@@ -276,6 +295,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		gridMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		gridMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		gridMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		gridMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
 		swTermGrid().shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfgrid" ) + sfx ).c_str(), gridMacros, true, LAYOUT_DRAW_VERT ) );
 		if( swTermGrid().shader != nullptr && m_LayoutSurf != nullptr )
 		{
@@ -301,6 +321,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		scanMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		scanMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		scanMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		scanMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
 		m_ShaderScan = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "scanline" ) + sfx ).c_str(), scanMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderScan != nullptr )
 		{
@@ -308,6 +329,64 @@ void SoftShadowTermPass::EnsurePipeline()
 			pn.bindingLayouts = { m_Layout };		// identical bindings to the shipped path
 			pn.CS = m_ShaderScan;
 			m_PipelineScan = m_Device->createComputePipeline( pn );
+		}
+	}
+
+	// ADAPTIVE SUB-SAMPLING permutations (SW_SUBSAMPLE=1, r_softShadowSubSample): two-phase lattice +
+	// refine dispatch of the SAME shader. Two configs: subs-scanline wraps the plain Fubini path,
+	// subs-surf wraps the surf-cache config (SW_SURF_GRID=0, exactly as the surf block above - the
+	// heavy-cap bench runs the surf permutation, so sub-sampling must wrap it to be measurable).
+	// Handles live in the leaked statics (swTermGrid()) - NEVER grow the class (heap-layout landmine).
+	// Contrib-cache permutations are EXCLUDED this stage (mutually exclusive with surf).
+	swTermGrid().device = m_Device;
+	{
+		idList<shaderMacro_t> ssMacros;
+		ssMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );
+		ssMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+		ssMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
+		ssMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+		ssMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
+		ssMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		ssMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		ssMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "1" ) );
+		// distinct nameOutSuffix per FindShader dedup (dedups by name+stage+suffix, IGNORES macros)
+		swTermGrid().subsScanShader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "subsscan" ) + sfx ).c_str(), ssMacros, true, LAYOUT_DRAW_VERT ) );
+		if( swTermGrid().subsScanShader != nullptr )
+		{
+			nvrhi::BindingLayoutDesc lss = ld;
+			lss.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 3 ) );	// u3 : sub-sample lattice (u0 atlas / u1 counters / u2 tables stay free)
+			swTermGrid().subsScanLayout = m_Device->createBindingLayout( lss );
+			nvrhi::ComputePipelineDesc pss;
+			pss.bindingLayouts = { swTermGrid().subsScanLayout };
+			pss.CS = swTermGrid().subsScanShader;
+			swTermGrid().subsScanPipeline = m_Device->createComputePipeline( pss );
+		}
+	}
+	{
+		idList<shaderMacro_t> suMacros;
+		suMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );
+		suMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "1" ) );
+		suMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
+		suMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+		suMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
+		suMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		suMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		suMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "1" ) );
+		swTermGrid().subsSurfShader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "subssurf" ) + sfx ).c_str(), suMacros, true, LAYOUT_DRAW_VERT ) );
+		if( swTermGrid().subsSurfShader != nullptr )
+		{
+			// surf bindings (u2 table + t6 pool/grid + t8 stream, no u3 queue - see the surf block) + the
+			// lattice UAV at u3 (verified free: the surf layout's UAVs are u0 atlas + u2 table only)
+			nvrhi::BindingLayoutDesc lsu = ld;
+			lsu.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 2 ) );	// u2 : texel table
+			lsu.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 6 ) );	// t6 : residual pool
+			lsu.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_SRV( 8 ) );	// t8 : persistent static stream
+			lsu.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 3 ) );	// u3 : sub-sample lattice
+			swTermGrid().subsSurfLayout = m_Device->createBindingLayout( lsu );
+			nvrhi::ComputePipelineDesc psu;
+			psu.bindingLayouts = { swTermGrid().subsSurfLayout };
+			psu.CS = swTermGrid().subsSurfShader;
+			swTermGrid().subsSurfPipeline = m_Device->createComputePipeline( psu );
 		}
 	}
 
@@ -324,6 +403,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		conMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "1" ) );
 		conMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		conMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		conMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
 		m_ShaderContrib = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "contrib" ) + sfx ).c_str(), conMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderContrib != nullptr )
 		{
@@ -418,6 +498,8 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 			m_PipelineTried = false;
 			m_Pipeline = m_PipelineCnt = m_PipelineSurf = m_PipelineScan = m_PipelineContrib = swTermGrid().pipeline = nullptr;
 			m_Shader = m_ShaderCnt = m_ShaderSurf = m_ShaderScan = m_ShaderContrib = swTermGrid().shader = nullptr;
+			swTermGrid().subsScanPipeline = swTermGrid().subsSurfPipeline = nullptr;
+			swTermGrid().subsScanShader = swTermGrid().subsSurfShader = nullptr;
 		}
 	}
 	EnsurePipeline();
@@ -513,6 +595,18 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 	if( worldNormalTexture != nullptr )
 	{
 		commandList->setTextureState( worldNormalTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
+	}
+
+	// ADAPTIVE SUB-SAMPLING: zero the per-view path counters (u_SubLattice[0..3].x) so the bench
+	// reads one frame's lattice/interp/refined split; the lattice payload itself needs no clear
+	// (Phase A rewrites every entry this light's Phase B reads).
+	{
+		extern idCVar r_softShadowSubSample;
+		if( r_softShadowSubSample.GetInteger() > 0 && swTermGrid().subsLattice != nullptr )
+		{
+			const uint32_t swSubZero[8] = {};
+			commandList->writeBuffer( swTermGrid().subsLattice, swSubZero, sizeof( swSubZero ), 0 );
+		}
 	}
 
 	m_Valid = true;
@@ -672,6 +766,15 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	extern idCVar r_softShadowSurfCacheGrid;
 	const bool surfGrid = surf && r_softShadowSurfCacheGrid.GetBool() && swTermGrid().pipeline != nullptr
 						  && surfCache != NULL && surfCache->GetGridBuffer() != NULL;
+	// ADAPTIVE SUB-SAMPLING (r_softShadowSubSample, 0/2/4 = off/stride): two-phase dispatch on the
+	// SW_SUBSAMPLE permutation wrapping the ACTIVE config - subs-surf for surf lights, subs-scanline
+	// for plain scanline lights. Counting / contrib / surf-grid modes keep the exact single dispatch
+	// (no subs permutation is built for them; cvar 0 is exactly today's path by construction).
+	extern idCVar r_softShadowSubSample;
+	int swSubS = r_softShadowSubSample.GetInteger();
+	swSubS = ( swSubS >= 3 ) ? 4 : ( ( swSubS > 0 ) ? 2 : 0 );
+	const bool subs = swSubS > 0 && !m_WalkCntEnabled && !contrib && !surfGrid && ( surf || scan )
+					  && ( surf ? swTermGrid().subsSurfPipeline : swTermGrid().subsScanPipeline ) != nullptr;
 	extern idCVar r_softShadowLitEarlyOut, r_softShadowRotGrid;
 	cb.surfParams[0] = 0.0f;
 	cb.surfParams[1] = 0.0f;
@@ -707,6 +810,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		cb.econ[1] = r_softShadowSurfCacheGateMargin.GetFloat();
 		cb.econ[2] = cb.econ[3] = 0.0f;
 	}
+	cb.sub[0] = cb.sub[1] = cb.sub[2] = cb.sub[3] = 0.0f;	// sub-sampling off (phase 0) unless the subs dispatch below fills it
 	cb.surfA[0] = 0;
 	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
 	if( surf )
@@ -858,14 +962,62 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		}
 		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 2, m_ContribBuffer ) );
 	}
-	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd, cnt ? m_LayoutCnt : ( surf ? m_LayoutSurf : ( contrib ? m_LayoutContrib : m_Layout ) ) );
+	if( subs )
+	{
+		// lattice side buffer (u3): grow-only, sized for this light's corner lattice; reused per
+		// light (nvrhi's automatic UAV barriers serialize the per-light A -> B dispatch pairs).
+		const int latW = ( cb.rect[2] + swSubS - 2 ) / swSubS + 1;
+		const int latH = ( cb.rect[3] + swSubS - 2 ) / swSubS + 1;
+		const uint32_t swSubNeed = 4u + ( uint32_t )latW * ( uint32_t )latH;
+		if( swTermGrid().subsLattice == nullptr || swTermGrid().subsLatticeElems < swSubNeed )
+		{
+			nvrhi::BufferDesc sld;
+			sld.byteSize = ( uint64_t )swSubNeed * 8u;		// uint2 per element
+			sld.structStride = 8;
+			sld.canHaveUAVs = true;
+			sld.initialState = nvrhi::ResourceStates::UnorderedAccess;
+			sld.keepInitialState = true;
+			sld.debugName = "SoftShadowTerm/SubLattice";
+			swTermGrid().subsLattice = m_Device->createBuffer( sld );
+			swTermGrid().subsLatticeElems = swSubNeed;
+			commandList->clearBufferUInt( swTermGrid().subsLattice, 0 );	// counters start defined
+		}
+		sd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 3, swTermGrid().subsLattice ) );
+	}
+	nvrhi::BindingSetHandle set = m_Device->createBindingSet( sd,
+			subs ? ( surf ? swTermGrid().subsSurfLayout : swTermGrid().subsScanLayout )
+			: ( cnt ? m_LayoutCnt : ( surf ? m_LayoutSurf : ( contrib ? m_LayoutContrib : m_Layout ) ) ) );
 
-	commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 	nvrhi::ComputeState cs;
-	cs.pipeline = cnt ? m_PipelineCnt : ( surfGrid ? swTermGrid().pipeline : ( surf ? m_PipelineSurf : ( contrib ? m_PipelineContrib : ( scan ? m_PipelineScan : m_Pipeline ) ) ) );
 	cs.bindings = { set };
-	commandList->setComputeState( cs );
-	commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
+	if( subs )
+	{
+		// TWO-PHASE dispatch: corner lattice (phase 1) then full-rect refine (phase 2). The volatile
+		// CB is versioned per write; automatic UAV barriers on the lattice/atlas order A before B.
+		extern idCVar r_softShadowSubSampleSpread, r_softShadowSubSampleWidth, r_softShadowSubSampleViz;
+		const int sVizBits = ( r_softShadowSubSampleViz.GetInteger() != 0 ) ? 4 : 0;
+		cs.pipeline = surf ? swTermGrid().subsSurfPipeline : swTermGrid().subsScanPipeline;
+		const int latW = ( cb.rect[2] + swSubS - 2 ) / swSubS + 1;
+		const int latH = ( cb.rect[3] + swSubS - 2 ) / swSubS + 1;
+		cb.sub[0] = ( float )( 1 | sVizBits );
+		cb.sub[1] = ( float )swSubS;
+		cb.sub[2] = r_softShadowSubSampleSpread.GetFloat();
+		cb.sub[3] = r_softShadowSubSampleWidth.GetFloat();
+		commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
+		commandList->setComputeState( cs );
+		commandList->dispatch( ( latW + 7 ) / 8, ( latH + 3 ) / 4, 1 );
+		cb.sub[0] = ( float )( 2 | sVizBits );
+		commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
+		commandList->setComputeState( cs );
+		commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
+	}
+	else
+	{
+		cs.pipeline = cnt ? m_PipelineCnt : ( surfGrid ? swTermGrid().pipeline : ( surf ? m_PipelineSurf : ( contrib ? m_PipelineContrib : ( scan ? m_PipelineScan : m_Pipeline ) ) ) );
+		commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
+		commandList->setComputeState( cs );
+		commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
+	}
 
 	outOfsX = slotOfsX;
 	outOfsY = slotOfsY;
@@ -939,6 +1091,41 @@ bool SoftShadowTermPass::GetContribStats( uint32_t out[20] )
 	}
 	memcpy( out, p, 20 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
+	return true;
+}
+
+// ADAPTIVE SUB-SAMPLING stats readback (free function + leaked statics: the class must not grow).
+// Reads the 4 wave-aggregated counters at the head of the lattice buffer: [0] walked-class pixels,
+// [1] interpolated, [2] refined, [3] lattice evals. Cleared per view in BeginView, so the values are
+// the LAST rendered frame's split. Blocking readback (waitForIdle), bench-only - clone of GetWalkStats.
+bool R_SoftShadowSubSampleStats( uint32_t out[4] )
+{
+	nvrhi::IDevice* dev = swTermGrid().device;
+	if( dev == nullptr || swTermGrid().subsLattice == nullptr )
+	{
+		return false;
+	}
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = 4 * sizeof( uint32_t ) * 2;		// 4 uint2 counter elements
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowTerm/SubSampleStatsReadback";
+	nvrhi::BufferHandle staging = dev->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = dev->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, swTermGrid().subsLattice, 0, 4 * sizeof( uint32_t ) * 2 );
+	cl->close();
+	dev->executeCommandList( cl );
+	dev->waitForIdle();
+	uint32_t* p = ( uint32_t* )dev->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( p == nullptr )
+	{
+		return false;
+	}
+	for( int i = 0; i < 4; i++ )
+	{
+		out[i] = p[i * 2];		// .x of each uint2 counter element
+	}
+	dev->unmapBuffer( staging );
 	return true;
 }
 
