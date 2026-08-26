@@ -1288,11 +1288,27 @@ void main( uint3 tid : SV_DispatchThreadID )
 			// below) -> measures SETUP + probe-loop. Delta of the two isolates the 16-slot table-probe memory.
 			if( keyLo < 0xFFFFFFFEu && ( g_aa.z < 1.5f || g_aa.z > 3.5f ) )	// the two far world-corner cells alias the empty/tombstone sentinels: never cached; modes 2/3 skip the probe, mode 4 runs it (real hits serve)
 			{
+				// KW+-1 FALLBACK (2026-08-26, REAL viz-6 verdict after the cvar-clamp fix: 34% of cap0007's
+				// misses are found BUILT one height cell away - tilted receivers straddle the kw slab the
+				// seed's plane-center claim landed in). The kw key is only slab BUCKETING; the record's
+				// anchor plane is the validity truth, and the anchor-proximity guard arbitrates every
+				// candidate identically - serving a neighbouring slab's record is exactly as safe as
+				// serving its own. Candidates {kw, kw+1, kw-1}; only the PRIMARY candidate writes the
+				// miss classification (stat comparability); fallback candidates either serve or pass.
+				[loop] for( int swKwC = 0; swKwC < 3; swKwC++ )
+				{
+				const bool swPrimary = ( swKwC == 0 );
+				const int  swCwC = cw + ( ( swKwC == 0 ) ? 0 : ( ( swKwC == 1 ) ? 1 : -1 ) );
+				if( swCwC < 0 || swCwC > 65535 )
+				{
+					continue;
+				}
+				const uint keyHiC = ( uint )swCwC | ( axis << 16 ) | ( ( uint )g_surfA.w << 19 );
 				const uint capM = ( uint )g_surfA.x - 1u;	// capacity is a power of two (CPU-enforced)
-				const uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
+				const uint h = keyLo * 0x9E3779B1u ^ keyHiC * 0x85EBCA77u;
 				uint slot = h & capM;
 				// DOUBLE HASHING - second-hash odd step, MUST match softsurf_seed (see rationale there)
-				const uint hstep = ( ( keyLo * 0x85EBCA77u ^ keyHi * 0x9E3779B1u ) | 1u );
+				const uint hstep = ( ( keyLo * 0x85EBCA77u ^ keyHiC * 0x9E3779B1u ) | 1u );
 				[loop]										// keep the probe ROLLED: unrolling it exploded the
 				for( int pr = 0; pr < 128; pr++ )		// surf-permutation VGPR count (256 + spill), collapsing occupancy.
 														// 16 -> 64 -> 128 (2026-08-26): viz-8 measured millions of misses whose
@@ -1307,7 +1323,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						slot = ( slot + hstep ) & capM;
 						continue;
 					}
-					if( w0 == keyLo && u_SurfTable[ sBase + 1 ] == keyHi )
+					if( w0 == keyLo && u_SurfTable[ sBase + 1 ] == keyHiC )
 					{
 						const uint s2 = u_SurfTable[ sBase + 2 ];
 						const uint code = s2 & 3u;
@@ -1317,13 +1333,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// reclaim/re-request here - that was a per-fragment atomic storm on every un-warm
 							// texel (the dominant cache overhead). The camera-independent invalidation hook
 							// re-warms this light off the burst path; this frame just takes the exact walk.
-							swStatIdx = 1u;
-							swMissR = 0u;		// stale generation
+							if( swPrimary )
+							{
+								swStatIdx = 1u;
+								swMissR = 0u;		// stale generation
+							}
 							break;
 						}
 						if( code == 2u )	// BUILT: consume
 						{
-							if( g_aa.z > 0.5f && g_aa.z < 1.5f ) { swStatIdx = 2u; break; }	// DEBUG force-walk (g_aa.z==1 ONLY): probe ran, key found -> take the exact walk instead of the cached hit (probe-tax isolation); modes 3/4 must serve real hits
+							if( g_aa.z > 0.5f && g_aa.z < 1.5f ) { if( swPrimary ) { swStatIdx = 2u; } break; }	// DEBUG force-walk (g_aa.z==1 ONLY): probe ran, key found -> take the exact walk instead of the cached hit (probe-tax isolation); modes 3/4 must serve real hits
 							// ANCHOR-PROXIMITY GUARD: two surfaces inside the same G-height slab share
 							// this key (floor + step, tabletop + crate base) and the record was built
 							// at the LOWER plane (min-anchor). A fragment far from the built plane
@@ -1352,8 +1371,11 @@ void main( uint3 tid : SV_DispatchThreadID )
 #endif
 							if( abs( pw - aH ) > swAnchBand )
 							{
-								swStatIdx = 3u;	// ANCHOR-REJECT: wrong surface for this record
-								break;			// exact miss path
+								if( swPrimary )
+								{
+									swStatIdx = 3u;	// ANCHOR-REJECT: wrong surface for this record
+								}
+								break;			// exact miss path (a kw fallback candidate may still pass its own band)
 							}
 							const uint w4 = u_SurfTable[ sBase + 4 ];
 							const uint foldedCnt = w4 >> 16;			// high 16: static occluders gridded/folded = the per-texel saving (viz)
@@ -1509,13 +1531,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 							u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( swTermC, swHoist ), SWVC_HIT );	// surf-cache BUILT consume
 							return;
 						}
-						if( code == 3u )
+						if( swPrimary )
 						{
-							swStatIdx = 2u;			// WALK-ALWAYS (self-gate / overflow rejected the texel)
-						}
-						else
-						{
-							swMissR = 1u;			// code 1 REQUESTED: seeded but the build has not filled it yet
+							if( code == 3u )
+							{
+								swStatIdx = 2u;		// WALK-ALWAYS (self-gate / overflow rejected the texel)
+							}
+							else
+							{
+								swMissR = 1u;		// code 1 REQUESTED: seeded but the build has not filled it yet
+							}
 						}
 						// code 1 (REQUESTED, not yet built by the burst) -> miss. READ-ONLY: no anchor write.
 						break;						// requested / walk-always: exact miss path
@@ -1526,7 +1551,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						prev = 0u;	// READ-ONLY runtime: never CLAIM an empty texel (the per-fragment claim/enqueue atomics were the dominant low-hit-rate cost); prev=0 skips the claim body -> exact walk. Seeding happens once at load in softsurf_seed (the burst).
 						if( prev == 0xFFFFFFFFu )
 						{
-							u_SurfTable[ sBase + 1 ] = keyHi;
+							u_SurfTable[ sBase + 1 ] = keyHiC;
 							// anchor: build probes this height plane, EXACT surface height (MEASURED
 							// 2026-08-20: snapping to a G/16 quantum exploded the gate 48 -> 667,
 							// CONTINUITY 517 - contact shadows are hyper-sensitive to even G/32 of
@@ -1550,11 +1575,15 @@ void main( uint3 tid : SV_DispatchThreadID )
 								u_SurfTable[ sBase ] = 0xFFFFFFFFu;
 							}
 						}
-						swMissR = 2u;				// EMPTY slot: this texel was never seeded/claimed
+						if( swPrimary )
+						{
+							swMissR = 2u;			// EMPTY slot: this texel was never seeded/claimed
+						}
 						break;						// claimed (by us or a racer): exact miss path this frame
 					}
 					slot = ( slot + hstep ) & capM;	// occupied by another key: double-hash step
 				}
+				}	// kw candidate loop
 			}
 			// FORCE-HIT CEILING (r_softShadowSurfCacheForceWalk 3/4, task #87): UNREALISTIC benchmark
 			// modes for latency attribution. Mode 3: probe skipped, EVERY gated fragment served as if
