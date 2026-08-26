@@ -1122,12 +1122,19 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 			s_swWarmDiag[SWD_I_EMPTY]++;
 			continue;
 		}
-		if( inter->IsDeferred() )
+		// DM_STATIC props are RECEIVER-ONLY candidates (2026-08-26, see the role split below): a
+		// receiver needs neither computed shadow state (HasShadows is about CASTING) nor created
+		// interaction surfaces (the seed reads the model's tris directly, like the deferred soup) -
+		// both gates would silently exclude the prop-receiver class the term measurably probes.
+		const idRenderModel* swCm = inter->entityDef->parms.hModel;
+		const bool swRecvProp = ( swCm != NULL && !swCm->IsStaticWorldModel()
+								  && swCm->IsDynamicModel() == DM_STATIC );
+		if( inter->IsDeferred() && !swRecvProp )
 		{
 			s_swWarmDiag[SWD_I_DEFER]++;	// soup arrives via the direct sweep; deferred chains skip
 			continue;
 		}
-		if( !inter->HasShadows() )
+		if( !inter->IsDeferred() && !inter->HasShadows() && !swRecvProp )
 		{
 			s_swWarmDiag[SWD_I_HASSHAD]++;
 			continue;
@@ -1174,8 +1181,22 @@ bool R_BuildLightStaticSoftStream( const idRenderLightLocal* light, float penumb
 			extern idCVar r_softShadowBenchExcludeWorld;
 			if( !swIsWorld && !swBenchSoup )
 			{
-				s_swWarmDiag[SWD_I_NOTSTREAM]++;
-				continue;					// neither world nor bench soup: not part of the static stream
+				// DM_STATIC props: RECEIVER-ONLY (2026-08-26). Their fragments are probed by the term
+				// like any pixel, but their surfaces were never seeded - measured on cap0007 as the
+				// entire remaining miss class (2.4M frags/frame, absent at any kw/axis; ring12 capped
+				// at its world-brush screen share). Receiver-only is churn-free: props stay OUT of the
+				// caster fingerprint (no invalidation when they move - the historical NET-NEGATIVE was
+				// the caster-role broadening), their texels fold only the STATIC caster set, and a
+				// moved prop's stale anchors fail the anchor band into the exact walk (correct).
+				if( model->IsDynamicModel() == DM_STATIC )
+				{
+					swCastsRole = false;	// receiver-only: seed its texels, never fold it as a caster
+				}
+				else
+				{
+					s_swWarmDiag[SWD_I_NOTSTREAM]++;
+					continue;				// genuinely dynamic: not part of the static stream
+				}
 			}
 			if( swBenchSoup )
 			{
