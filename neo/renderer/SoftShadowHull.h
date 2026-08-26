@@ -66,4 +66,27 @@ static inline int SoftHull_EmitRecord( const float* verts, int n, float* outSlot
 // file-scope global keyed by area index; a second simultaneous idRenderWorldLocal would alias it.
 const areaShadowHull_t* R_GetAreaShadowHulls( int area, int* outNumHulls );
 
+// PER-BRUSH RESIDUALS (brush-recovery package B). dmap partitions each area's shadow brushes into
+// hull-emittable ones (the `shadowHulls` block above) and the residual, NON-emittable ones (>SW_HULL_MAX_VERTS
+// or otherwise not hull-walkable), which it emits as an ordinary per-area TRIANGLE stream in a parallel .proc
+// `shadowResiduals` block. The worldspawn soft-caster streams these residual triangles alongside the hulls, so
+// hulls(emittable) + residuals(non-emittable) = every brush ONCE (lossless), while the area's normal per-surface
+// stream stays skipped (no double-shadow). This is what the old all-or-nothing completeness rule was avoiding,
+// now handled explicitly. Presence-gated: an area with no residuals => no entry => nothing streamed.
+//
+// Engine-only (idList/idDrawVert): the standalone unit-test runner (ID_UNIT_TEST_STANDALONE) mirrors the
+// grammar with std::vector, so it must not see these engine types (SoftShadowResidual_test.cpp).
+#ifndef ID_UNIT_TEST_STANDALONE
+struct areaResidualTris_t
+{
+	idList<idDrawVert>	verts;		// MAP space (area world models are identity); only .xyz is read by the caster
+	idList<triIndex_t>	indexes;	// triangle list into verts (multiple of 3)
+};
+
+// Per-area residual-triangle table lookup (defined in RenderWorld_load.cpp, populated at InitFromMap from the
+// .proc `shadowResiduals` block or its .bproc mirror). Returns the area's residual tris, or NULL when the area
+// has none. Same one-active-render-world caveat as R_GetAreaShadowHulls: a file-scope global keyed by area.
+const areaResidualTris_t* R_GetAreaResidualTris( int area );
+#endif // ID_UNIT_TEST_STANDALONE
+
 #endif // __SOFTSHADOWHULL_H__

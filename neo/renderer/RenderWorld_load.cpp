@@ -56,6 +56,19 @@ const areaShadowHull_t* R_GetAreaShadowHulls( int area, int* outNumHulls )
 	return s_areaShadowHulls[area].Ptr();
 }
 
+// Brush-recovery soft shadows, package B: per-area residual TRIANGLES (the non-hull-emittable brushes), parsed
+// from the .proc `shadowResiduals` block. Parallel to s_areaShadowHulls; same one-active-render-world caveat.
+static idList< areaResidualTris_t > s_areaResidualTris;
+
+const areaResidualTris_t* R_GetAreaResidualTris( int area )
+{
+	if( area < 0 || area >= s_areaResidualTris.Num() || s_areaResidualTris[area].indexes.Num() == 0 )
+	{
+		return NULL;
+	}
+	return &s_areaResidualTris[area];
+}
+
 /*
 ================
 R_ParseShadowHulls
@@ -159,6 +172,128 @@ static void R_ReadBinaryShadowHulls( idFile* file )
 
 /*
 ================
+R_ParseShadowResiduals
+
+Additive, presence-gated .proc block (package B; grammar mirrors dmap's WriteShadowResiduals):
+  shadowResiduals { N  <a> { V I  ( x y z  s t  nx ny nz )...V  i0 i1 i2...I  } ... }
+Verts are 8 floats each (MAP space); indexes are a flat triangle list into that area's vert block. Missing
+block => s_areaResidualTris stays empty => nothing streamed (old .proc still loads). Only .xyz is read by the
+caster (R_CollectPenumbraFaces), but the full vert is parsed so the .proc grammar stays the normal one. When
+fileOut != NULL the parsed table is mirrored (xyz + indexes) into the .bproc so cached reloads keep it.
+================
+*/
+static void R_ParseShadowResiduals( idLexer* src, idFile* fileOut )
+{
+	s_areaResidualTris.Clear();
+
+	src->ExpectTokenString( "{" );
+	const int numAreas = src->ParseInt();
+	if( numAreas > 0 )
+	{
+		s_areaResidualTris.SetNum( numAreas );
+	}
+
+	for( int a = 0; a < numAreas; a++ )
+	{
+		const int areaIdx = src->ParseInt();
+		src->ExpectTokenString( "{" );
+		const int numVerts = src->ParseInt();
+		const int numIndexes = src->ParseInt();
+		const bool store = ( areaIdx >= 0 && areaIdx < s_areaResidualTris.Num() );
+		for( int v = 0; v < numVerts; v++ )
+		{
+			float f[8];
+			src->Parse1DMatrix( 8, f );
+			if( store )
+			{
+				idDrawVert dv;
+				dv.Clear();
+				dv.xyz.Set( f[0], f[1], f[2] );
+				dv.SetTexCoord( f[3], f[4] );
+				dv.SetNormal( f[5], f[6], f[7] );
+				s_areaResidualTris[areaIdx].verts.Append( dv );
+			}
+		}
+		for( int i = 0; i < numIndexes; i++ )
+		{
+			const int idx = src->ParseInt();
+			if( store )
+			{
+				s_areaResidualTris[areaIdx].indexes.Append( ( triIndex_t )idx );
+			}
+		}
+		src->ExpectTokenString( "}" );
+	}
+	src->ExpectTokenString( "}" );
+
+	if( fileOut != NULL )
+	{
+		fileOut->WriteString( "shadowResiduals" );
+		fileOut->WriteBig( s_areaResidualTris.Num() );
+		for( int a = 0; a < s_areaResidualTris.Num(); a++ )
+		{
+			const areaResidualTris_t& r = s_areaResidualTris[a];
+			fileOut->WriteBig( r.verts.Num() );
+			fileOut->WriteBig( r.indexes.Num() );
+			for( int v = 0; v < r.verts.Num(); v++ )
+			{
+				const idVec3& p = r.verts[v].xyz;		// only .xyz is consumed; st/normal reconstruct as 0 on read
+				fileOut->WriteBig( p.x );
+				fileOut->WriteBig( p.y );
+				fileOut->WriteBig( p.z );
+			}
+			for( int i = 0; i < r.indexes.Num(); i++ )
+			{
+				fileOut->WriteBig( ( int )r.indexes[i] );
+			}
+		}
+	}
+}
+
+/*
+================
+R_ReadBinaryShadowResiduals
+
+Read the .bproc mirror of the `shadowResiduals` block written by R_ParseShadowResiduals (xyz + indexes only;
+st/normal are not read by the caster, so they are not stored).
+================
+*/
+static void R_ReadBinaryShadowResiduals( idFile* file )
+{
+	s_areaResidualTris.Clear();
+	int numAreas = 0;
+	file->ReadBig( numAreas );
+	if( numAreas > 0 )
+	{
+		s_areaResidualTris.SetNum( numAreas );
+	}
+	for( int a = 0; a < numAreas; a++ )
+	{
+		int numVerts = 0, numIndexes = 0;
+		file->ReadBig( numVerts );
+		file->ReadBig( numIndexes );
+		for( int v = 0; v < numVerts; v++ )
+		{
+			float x, y, z;
+			file->ReadBig( x );
+			file->ReadBig( y );
+			file->ReadBig( z );
+			idDrawVert dv;
+			dv.Clear();
+			dv.xyz.Set( x, y, z );
+			s_areaResidualTris[a].verts.Append( dv );
+		}
+		for( int i = 0; i < numIndexes; i++ )
+		{
+			int idx = 0;
+			file->ReadBig( idx );
+			s_areaResidualTris[a].indexes.Append( ( triIndex_t )idx );
+		}
+	}
+}
+
+/*
+================
 idRenderWorldLocal::FreeWorld
 ================
 */
@@ -228,8 +363,9 @@ void idRenderWorldLocal::FreeWorld()
 	areaReferenceAllocator.Shutdown();
 	interactionAllocator.Shutdown();
 
-	// brush-recovery soft-shadow hulls belong to this map
+	// brush-recovery soft-shadow hulls + residual triangles belong to this map
 	s_areaShadowHulls.Clear();
+	s_areaResidualTris.Clear();
 
 	mapName = "<FREED>";
 }
@@ -963,6 +1099,11 @@ bool idRenderWorldLocal::InitFromMap( const char* name )
 					// brush-recovery soft-shadow hulls (mirror of the .proc `shadowHulls` block)
 					R_ReadBinaryShadowHulls( file );
 				}
+				else if( type == "shadowresiduals" )
+				{
+					// brush-recovery residual triangles (mirror of the .proc `shadowResiduals` block)
+					R_ReadBinaryShadowResiduals( file );
+				}
 				else
 				{
 					idLib::Error( "Binary proc file failed, unexpected type %s\n", type.c_str() );
@@ -1059,6 +1200,15 @@ bool idRenderWorldLocal::InitFromMap( const char* name )
 			if( token == "shadowHulls" )
 			{
 				R_ParseShadowHulls( src, outputFile );
+
+				numEntries++;
+				continue;
+			}
+
+			// brush-recovery residual triangles (the non-hull-emittable brushes), streamed alongside the hulls.
+			if( token == "shadowResiduals" )
+			{
+				R_ParseShadowResiduals( src, outputFile );
 
 				numEntries++;
 				continue;

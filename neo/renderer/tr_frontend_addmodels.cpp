@@ -1192,12 +1192,14 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 	extern idCVar r_softShadowBrushHulls;
 	const areaShadowHull_t* swAreaHulls = NULL;
 	int swNumAreaHulls = 0;
+	const areaResidualTris_t* swAreaResiduals = NULL;	// package B: the area's non-hull-emittable brushes, as triangles
+	int swAreaIdx = -1;									// entity scope: shared by the hull + residual emit below
 	if( r_softShadowBrushHulls.GetBool() && entityDef->parms.hModel != NULL && entityDef->parms.hModel->IsStaticWorldModel() )
 	{
-		int swAreaIdx = -1;
 		if( sscanf( entityDef->parms.hModel->Name(), "_area%d", &swAreaIdx ) == 1 && swAreaIdx >= 0 )
 		{
 			swAreaHulls = R_GetAreaShadowHulls( swAreaIdx, &swNumAreaHulls );
+			swAreaResiduals = R_GetAreaResidualTris( swAreaIdx );
 		}
 	}
 	// dedup: each area's hulls are the WHOLE area (not per-surface), so emit them once per contacted
@@ -2129,14 +2131,56 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					// a SOFT light (penumbra > 0). A hard light (penumbra <= 0) or a hull-less area falls THROUGH
 					// to the canonical triangle/silhouette path below - it must never be swallowed here casting
 					// nothing. (The old form entered on swAreaHulls alone, then bailed inside for hard lights.)
-					if( swAreaHulls != NULL && r_softShadowFaceCoverage.GetBool() && R_SoftPenumbraRadius( lightDef ) > 0.0f )
+					// PACKAGE B: enter also when the area has ONLY residuals (all brushes non-emittable); the hull
+						// loop no-ops (swNumAreaHulls 0) and the residual triangles still stream below.
+						if( ( swAreaHulls != NULL || swAreaResiduals != NULL ) && r_softShadowFaceCoverage.GetBool() && R_SoftPenumbraRadius( lightDef ) > 0.0f )
 					{
 						if( swHullLightsDone.FindIndex( vLight->lightDef->index ) == -1 )
 						{
 							{
 								swHullLightsDone.Append( vLight->lightDef->index );
 								extern int fe_softEdgesCollected;
-								for( int hIdx = 0; hIdx < swNumAreaHulls; hIdx++ )
+								// PACKAGE B residual triangles: stream the area's NON-hull-emittable brushes ONCE per light, exactly like the
+									// else-branch triangle path. A frame-alloc'd wrapper srfTriangles_t points at the loader-owned residual
+									// arrays (stable for the map); R_CollectPenumbraFaces reads only numVerts/verts/numIndexes/indexes/
+									// posedShadowVerts. Hulls(emittable)+residuals(non-emittable) = every brush ONCE (lossless).
+									if( swAreaResiduals != NULL )
+									{
+										srfTriangles_t* rtri = ( srfTriangles_t* )R_FrameAlloc( sizeof( *rtri ), FRAME_ALLOC_UNKNOWN );
+										memset( rtri, 0, sizeof( *rtri ) );
+										rtri->numVerts = swAreaResiduals->verts.Num();
+										rtri->verts = const_cast<idDrawVert*>( swAreaResiduals->verts.Ptr() );
+										rtri->numIndexes = swAreaResiduals->indexes.Num();
+										rtri->indexes = const_cast<triIndex_t*>( swAreaResiduals->indexes.Ptr() );
+										rtri->posedShadowVerts = NULL;
+										rtri->bounds.Clear();		// for the draw-sort depth-bounds key (main.cpp); verts are stable
+										for( int v = 0; v < rtri->numVerts; v++ ) { rtri->bounds.AddPoint( rtri->verts[v].xyz ); }
+										idVec4* rElems = NULL;
+										int rEdges = 0;
+										idVec4* rClusters = NULL;
+										int rClu = 0;
+										bool rIsBox = false;		// R_CollectPenumbraFaces may auto-reduce (proxy-box/coplanar); honor its tag like the else path
+										R_CollectPenumbraFaces( entityDef, rtri, lightDef, R_SoftPenumbraRadius( lightDef ),
+												vEntity->modelMatrix, &rElems, &rEdges, &rClusters, &rClu, &rIsBox );
+										if( rEdges > 0 )
+										{
+											drawSurf_t* resSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *resSurf ), FRAME_ALLOC_DRAW_SURFACE );
+											memset( resSurf, 0, sizeof( *resSurf ) );
+											resSurf->softEdges = ( softShadowEdge_t* )rElems;
+											resSurf->numSoftEdges = rEdges;
+											resSurf->softClusters = rClusters;
+											resSurf->numSoftClusters = rClu;
+											resSurf->frontEndGeo = rtri;		// the residual triangles ARE this caster's ground-truth mesh (capture)
+											resSurf->space = vEntity;
+											resSurf->softIsBox = rIsBox;		// false for ordinary residual tris; honored if auto-reduced
+											resSurf->scissorRect = vLight->scissorRect;
+											resSurf->linkChain = &vLight->softShadowWedges;
+											resSurf->nextOnLight = vEntity->drawSurfs;
+											vEntity->drawSurfs = resSurf;
+											fe_softEdgesCollected += rEdges;
+										}
+									}
+									for( int hIdx = 0; hIdx < swNumAreaHulls; hIdx++ )
 								{
 									const areaShadowHull_t& hull = swAreaHulls[hIdx];
 									// analytic record: .w=-N discriminator + N verts, padded to whole triangles.
