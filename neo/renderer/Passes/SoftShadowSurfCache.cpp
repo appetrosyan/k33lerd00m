@@ -674,6 +674,12 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 			nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_Queue ),
 		};
 		nvrhi::BindingSetHandle seedSet = m_Device->createBindingSet( ss, m_SeedLayout );
+		// SEED CB version: g_range.x is the SEED's tri base into the RECV stream, whose data is always
+		// at offset 0 - NOT the build's persistent-stream segment base. The finding-#4 merge left
+		// segBase in range[0] here, so every light past the first rasterised garbage float4s from
+		// [segBase..) and claimed near-nothing under garbage keys (2026-08-26 0%-hit regression: claims
+		// collapsed 2.5M -> 317k, all unmatchable). The build windows below restore range[0] = segBase.
+		cb.range[0] = 0;
 		commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 		nvrhi::ComputeState scs;
 		scs.pipeline = m_SeedPipeline;
@@ -713,6 +719,7 @@ bool SoftShadowSurfCache::WarmLight( nvrhi::ICommandList* commandList, const idR
 		extern idCVar r_softShadowSurfCacheMinROI;
 		cb.seed[2] = r_softShadowSurfCacheMinROI.GetInteger();
 	}
+	cb.range[0] = segBase;		// restore the BUILD's persistent-stream segment tri base (the seed CB version above zeroed it)
 	for( int wb = 0; wb < swWindows; wb++ )
 	{
 		cb.seed[1] = wb * SW_WARM_BUDGET;	// queue window base (build CS: qi = g_seed.y + i)
