@@ -25,7 +25,7 @@ version. See <http://www.gnu.org/licenses/>.
 
 // *INDENT-OFF*
 StructuredBuffer<float4>	t_SoftEdges	: register( t0 );	// tri stream (joint buffer)
-RWStructuredBuffer<uint>	u_SurfTable	: register( u0 );	// texel records, 8 uints each (layout: softterm.cs.hlsl)
+globallycoherent RWStructuredBuffer<uint>	u_SurfTable	: register( u0 );	// texel records, 8 uints each (layout: softterm.cs.hlsl). globallycoherent (2026-08-26): the sibling keyHi spin below reads a CROSS-GROUP plain store; without device coherence the winner's write can stay invisible for the whole spin and the loser re-inserts the same key deeper (the duplicate-stack race, measured as unexplained 64+ probe chains at 35% load and cross-run claims variance).
 RWStructuredBuffer<uint>	u_SurfQueue	: register( u1 );	// [0]=count, then claimed slot indices (warm build consumes)
 
 cbuffer c_SurfSeed : register( b0 )
@@ -219,6 +219,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						uint khs = u_SurfTable[ sBase + 1 ];
 						[loop] for( int sw = 0; sw < 32 && khs == 0xFFFFFFFFu; sw++ )
 						{
+							DeviceMemoryBarrier();		// order the re-read after the winner's keyHi store (with globallycoherent above, the spin actually observes it)
 							khs = u_SurfTable[ sBase + 1 ];
 						}
 						if( khs == keyHi )

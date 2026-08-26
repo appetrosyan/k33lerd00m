@@ -1288,27 +1288,46 @@ void main( uint3 tid : SV_DispatchThreadID )
 			// below) -> measures SETUP + probe-loop. Delta of the two isolates the 16-slot table-probe memory.
 			if( keyLo < 0xFFFFFFFEu && ( g_aa.z < 1.5f || g_aa.z > 3.5f ) )	// the two far world-corner cells alias the empty/tombstone sentinels: never cached; modes 2/3 skip the probe, mode 4 runs it (real hits serve)
 			{
-				// KW+-1 FALLBACK (2026-08-26, REAL viz-6 verdict after the cvar-clamp fix: 34% of cap0007's
-				// misses are found BUILT one height cell away - tilted receivers straddle the kw slab the
-				// seed's plane-center claim landed in). The kw key is only slab BUCKETING; the record's
-				// anchor plane is the validity truth, and the anchor-proximity guard arbitrates every
-				// candidate identically - serving a neighbouring slab's record is exactly as safe as
-				// serving its own. Candidates {kw, kw+1, kw-1}; only the PRIMARY candidate writes the
-				// miss classification (stat comparability); fallback candidates either serve or pass.
-				[loop] for( int swKwC = 0; swKwC < 3; swKwC++ )
+				// CANDIDATE-TOTAL PROBING (2026-08-26): the seed keys from TRIANGLE data (cross-product
+				// axis, plane height), the serve from FRAGMENT data (derivative axis, rasterized position)
+				// - forcing the two derivations to agree exactly leaked six ways (axis sign, kw knife-edge,
+				// kw slab, duplicates, chains, area). Instead the serve probes the COMPLETE candidate set
+				// the seed could have planted for this world position: 3 axes x {kw, kw+1, kw-1} - a
+				// provably exhaustive enumeration (axis has three values; the dominant-axis slope bound
+				// caps drift at one slab, re-proven 2026-08-26). The record's anchor plane arbitrates every
+				// candidate identically (the key is only bucketing), so serving any candidate's record is
+				// exactly as safe as the primary's. Measured en route: kw+-1 alone = 34% of cap0007's
+				// misses (35->48% hit); alt-axis floor 8.6%. After this, a miss MEANS the seed never
+				// rasterized the surface - a collector-coverage fact, not a keying failure. Only the
+				// PRIMARY candidate writes the miss classification (stat comparability).
+				[loop] for( int swCand = 0; swCand < 9; swCand++ )
 				{
-				const bool swPrimary = ( swKwC == 0 );
-				const int  swCwC = cw + ( ( swKwC == 0 ) ? 0 : ( ( swKwC == 1 ) ? 1 : -1 ) );
-				if( swCwC < 0 || swCwC > 65535 )
+				const bool swPrimary = ( swCand == 0 );
+				const int  swAx3 = swCand / 3;			// 0 = fragment's derived axis, 1/2 = the other two
+				const int  swKw3 = swCand % 3;			// 0:+0  1:+1  2:-1
+				const int  dC = ( swAx3 == 0 ) ? d : ( ( swAx3 == 1 ) ? ( ( d + 1 ) % 3 ) : ( ( d + 2 ) % 3 ) );
+				const float puC = ( dC == 0 ) ? swP.y : ( ( dC == 1 ) ? swP.z : swP.x );
+				const float pvC = ( dC == 0 ) ? swP.z : ( ( dC == 1 ) ? swP.x : swP.y );
+				const float pwC = ( dC == 0 ) ? swP.x : ( ( dC == 1 ) ? swP.y : swP.z );
+				const int  cuC = ( int )floor( puC / g ) + 32768;
+				const int  cvC = ( int )floor( pvC / g ) + 32768;
+				const int  swCwC = ( int )floor( ( pwC + 0.5f * g ) / g ) + 32768
+								   + ( ( swKw3 == 0 ) ? 0 : ( ( swKw3 == 1 ) ? 1 : -1 ) );
+				if( cuC < 0 || cuC > 65535 || cvC < 0 || cvC > 65535 || swCwC < 0 || swCwC > 65535 )
 				{
 					continue;
 				}
-				const uint keyHiC = ( uint )swCwC | ( axis << 16 ) | ( ( uint )g_surfA.w << 19 );
+				const uint keyLoC = ( uint )cuC | ( ( uint )cvC << 16 );
+				if( keyLoC >= 0xFFFFFFFEu )
+				{
+					continue;			// empty/tombstone sentinel alias: never cached
+				}
+				const uint keyHiC = ( uint )swCwC | ( ( uint )dC << 16 ) | ( ( uint )g_surfA.w << 19 );
 				const uint capM = ( uint )g_surfA.x - 1u;	// capacity is a power of two (CPU-enforced)
-				const uint h = keyLo * 0x9E3779B1u ^ keyHiC * 0x85EBCA77u;
+				const uint h = keyLoC * 0x9E3779B1u ^ keyHiC * 0x85EBCA77u;
 				uint slot = h & capM;
 				// DOUBLE HASHING - second-hash odd step, MUST match softsurf_seed (see rationale there)
-				const uint hstep = ( ( keyLo * 0x85EBCA77u ^ keyHiC * 0x9E3779B1u ) | 1u );
+				const uint hstep = ( ( keyLoC * 0x85EBCA77u ^ keyHiC * 0x9E3779B1u ) | 1u );
 				[loop]										// keep the probe ROLLED: unrolling it exploded the
 				for( int pr = 0; pr < 128; pr++ )		// surf-permutation VGPR count (256 + spill), collapsing occupancy.
 														// 16 -> 64 -> 128 (2026-08-26): viz-8 measured millions of misses whose
@@ -1323,7 +1342,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						slot = ( slot + hstep ) & capM;
 						continue;
 					}
-					if( w0 == keyLo && u_SurfTable[ sBase + 1 ] == keyHiC )
+					if( w0 == keyLoC && u_SurfTable[ sBase + 1 ] == keyHiC )
 					{
 						const uint s2 = u_SurfTable[ sBase + 2 ];
 						const uint code = s2 & 3u;
@@ -1369,7 +1388,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 #else
 							const float swAnchBand = g * 0.0625f;
 #endif
-							if( abs( pw - aH ) > swAnchBand )
+							if( abs( pwC - aH ) > swAnchBand )
 							{
 								if( swPrimary )
 								{
@@ -1403,8 +1422,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 							const uint resCnt = w4 & 0xFFFFu;			// low 16: residual occluders still walked
 							const uint f01 = u_SurfTable[ sBase + 5 ];
 							const uint f23 = u_SurfTable[ sBase + 6 ];
-							const float fu = pu / g - floor( pu / g );
-							const float fv = pv / g - floor( pv / g );
+							const float fu = puC / g - floor( puC / g );
+							const float fv = pvC / g - floor( pvC / g );
 							const float fLo = lerp( f16tof32( f01 & 0xFFFFu ), f16tof32( f01 >> 16 ), fu );
 							const float fHi = lerp( f16tof32( f23 & 0xFFFFu ), f16tof32( f23 >> 16 ), fu );
 							const float fFold = lerp( fLo, fHi, fv );
@@ -1558,7 +1577,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 							// off-surface anchor, same class as the PCSS bias floor). Accumulated via
 							// flip-encoded InterlockedMin (cleared slot = +inf), so the anchor is the
 							// MIN height over the contributing fragments - claim-race-independent.
-							InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( pw ) );
+							InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( pwC ) );
 							uint qi;
 							qi = 0u;	// read-only term: no request queue (dead claim path, kept for reference)
 							if( qi + 1u < ( uint )g_surfA.y )
@@ -1687,7 +1706,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const uint h5 = kLo5 * 0x9E3779B1u ^ kHi5 * 0x85EBCA77u;
 					uint s5 = h5 & capM5;
 					const uint st5 = ( ( kLo5 * 0x85EBCA77u ^ kHi5 * 0x9E3779B1u ) | 1u );	// double-hash step (matches seed/serve)
-					[loop] for( int p5 = 0; p5 < 16; p5++ )
+					[loop] for( int p5 = 0; p5 < 128; p5++ )	// depth MUST match the serve's 128 or the class % is a floor (audit 2026-08-26)
 					{
 						const uint b5 = s5 * 8u;
 						if( u_SurfTable[ b5 ] == kLo5 && u_SurfTable[ b5 + 1u ] == kHi5 )
@@ -1718,7 +1737,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const uint h6 = keyLo * 0x9E3779B1u ^ kHi6 * 0x85EBCA77u;
 					uint s6 = h6 & capM6;
 					const uint st6 = ( ( keyLo * 0x85EBCA77u ^ kHi6 * 0x9E3779B1u ) | 1u );	// double-hash step (matches seed/serve)
-					[loop] for( int p6 = 0; p6 < 16; p6++ )
+					[loop] for( int p6 = 0; p6 < 128; p6++ )	// depth MUST match the serve's 128 (audit 2026-08-26)
 					{
 						const uint b6 = s6 * 8u;
 						if( u_SurfTable[ b6 ] == keyLo && u_SurfTable[ b6 + 1u ] == kHi6 )
@@ -1751,7 +1770,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const uint h7 = kLo7 * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
 					uint s7 = h7 & capM7;
 					const uint st7 = ( ( kLo7 * 0x85EBCA77u ^ keyHi * 0x9E3779B1u ) | 1u );	// double-hash step (matches seed/serve)
-					[loop] for( int p7 = 0; p7 < 16; p7++ )
+					[loop] for( int p7 = 0; p7 < 128; p7++ )	// depth MUST match the serve's 128 (audit 2026-08-26)
 					{
 						const uint b7 = s7 * 8u;
 						if( u_SurfTable[ b7 ] == kLo7 && u_SurfTable[ b7 + 1u ] == keyHi )
@@ -1775,7 +1794,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const uint capM8 = ( uint )g_surfA.x - 1u;
 				const uint st8 = ( ( keyLo * 0x85EBCA77u ^ keyHi * 0x9E3779B1u ) | 1u );
 				uint s8 = ( keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u ) & capM8;
-				[loop] for( int p8 = 0; p8 < 64; p8++ )
+				[loop] for( int p8 = 0; p8 < 256; p8++ )	// deeper than the serve's 128 by design: "present past the serve horizon" must be distinguishable from absent (audit: 64 was vacuous)
 				{
 					const uint b8 = s8 * 8u;
 					const uint w8 = u_SurfTable[ b8 ];
