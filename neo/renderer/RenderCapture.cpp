@@ -3677,6 +3677,12 @@ int R_SoftShadowGate( const char* arg )
 												  va( "dumps/benchviz_%s.png", cap.name.c_str() ) );
 								common->Printf( "[softgate] BENCH %-14s viz frame dumped to dumps/benchviz_%s.png\n",
 												cap.name.c_str(), cap.name.c_str() );
+								if( r_softShadowSurfCacheViz.GetInteger() == 9 )
+								{
+									// legend for the walk-cost heatmap (mirrors SwVizCostTerm in softterm.cs.hlsl)
+									common->Printf( "[softgate] BENCH %-14s viz9 legend: 0=never-written 0.04=early-out 0.08=umbra-tile 0.12=cache-hit 0.16=other-zero-fill/empty-walk, log2 cost 0.25..1.0, max 4096 fills\n",
+													cap.name.c_str() );
+								}
 							}
 						}
 					}
