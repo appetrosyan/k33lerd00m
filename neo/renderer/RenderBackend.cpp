@@ -69,13 +69,21 @@ void R_SoftCacheInvalidateLight( const idRenderLightLocal* light )
 void R_SoftCacheWarmMapNow( idRenderWorld* world )
 {
 	extern idCVar r_softShadowSurfCache;
+	extern idCVar r_softShadowSurfCacheLoadBurst;
 	SoftShadowSurfCache* sc = backEnd.GetSoftShadowSurfCache();
 	if( sc == NULL || world == NULL || !r_softShadowSurfCache.GetBool() )
 	{
 		return;
 	}
+	// THE load-path burst (called from Common_load's ExecuteMapChange): WarmMapBurst does all ~144
+	// map lights in ONE synchronous submit+waitForIdle sequence, which is a single ~26s frame that
+	// never presents - the real-game load "freezes at Loading deferred images" until killed (smoke
+	// stage FAIL(stall), 2026-08-26; the minimal-init gate is blind to it). LoadBurst 0 skips the
+	// synchronous burst and lets DrainWarmQueue warm incrementally over gameplay frames instead
+	// (brief warm-up, no frozen load). The TakeLoadWarm flag is only consumed when we actually burst,
+	// so with the burst off the runtime drain still warms every light.
 	idRenderWorldLocal* rwl = static_cast<idRenderWorldLocal*>( world );
-	if( sc->TakeLoadWarm( rwl ) )
+	if( r_softShadowSurfCacheLoadBurst.GetBool() && sc->TakeLoadWarm( rwl ) )
 	{
 		sc->WarmMapBurst( deviceManager->GetDevice(), rwl );
 	}
@@ -4912,13 +4920,17 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 	// must be NO immediate list open: flush + close the frame list, burst, reopen (mirrors the async
 	// split below). Fires once per world; runtime spawns still drip through DrainWarmQueue.
 	extern idCVar r_softShadowSurfCache;
+	extern idCVar r_softShadowSurfCacheLoadBurst;	// BISECT/knob: 1 = synchronous load-time warm burst (mid-frame close/execute/reopen of the main list); 0 = skip it, cache warms lazily via DrainWarmQueue. Isolates the real-game load stall.
 	if( softShadowSurfCache != NULL && viewDef->renderWorld != NULL
 			&& softShadowSurfCache->TakeLoadWarm( viewDef->renderWorld ) )
 	{
-		commandList->close();
-		dev->executeCommandList( commandList );
-		softShadowSurfCache->WarmMapBurst( dev, viewDef->renderWorld );
-		commandList->open();
+		if( r_softShadowSurfCacheLoadBurst.GetBool() )
+		{
+			commandList->close();
+			dev->executeCommandList( commandList );
+			softShadowSurfCache->WarmMapBurst( dev, viewDef->renderWorld );
+			commandList->open();
+		}
 	}
 
 	nvrhi::ICommandList* target = commandList;
