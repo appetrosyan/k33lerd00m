@@ -160,7 +160,13 @@ void main( uint3 tid : SV_DispatchThreadID )
 			}
 			const uint hh = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
 			uint slot = hh & capM;
-			for( int pr = 0; pr < 16; pr++ )
+			// DOUBLE HASHING (2026-08-26): the +1 linear step formed contiguous occupied runs exactly
+			// where claim density is highest (adjacent texels share hash neighborhoods), dropping seed
+			// inserts and exhausting serve probes at only ~43% load (measured 2.3M probe-overflows).
+			// A second-hash ODD step visits all slots of the power-of-two table and gives colliding
+			// keys distinct probe sequences. MUST match the serve/instrument probes in softterm.
+			const uint hstep = ( ( keyLo * 0x85EBCA77u ^ keyHi * 0x9E3779B1u ) | 1u );
+			for( int pr = 0; pr < 128; pr++ )	// 16 -> 64 -> 128 with the serve (2026-08-26): insert and probe horizons must match
 			{
 				const uint sBase = slot * 8u;
 				const uint w0 = u_SurfTable[ sBase ];
@@ -202,15 +208,29 @@ void main( uint3 tid : SV_DispatchThreadID )
 						if( qie + 1u < ( uint )g_params.z ) { u_SurfQueue[ 1u + qie ] = slot; }
 						break;		// claimed by us
 					}
-					if( prev == keyLo && u_SurfTable[ sBase + 1 ] == keyHi )
+					if( prev == keyLo )
 					{
-						InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( h ) );	// lost the race to a SIBLING: still contribute
-						break;
+						// prev matches our keyLo: either a SIBLING (same full key) or a keyLo collision.
+						// The winner stores keyHi AFTER the ICE, so a same-wave sibling can read the
+						// stale sentinel here and misread SIBLING as FOREIGN - with the keep-probing
+						// fix below that re-inserted the SAME key deeper, forming duplicate stacks
+						// (measured 2026-08-26: chains past depth 64 at 35% load, anchors split across
+						// duplicates). Bounded re-read closes the visibility window.
+						uint khs = u_SurfTable[ sBase + 1 ];
+						[loop] for( int sw = 0; sw < 32 && khs == 0xFFFFFFFFu; sw++ )
+						{
+							khs = u_SurfTable[ sBase + 1 ];
+						}
+						if( khs == keyHi )
+						{
+							InterlockedMin( u_SurfTable[ sBase + 7 ], SwSurfFlipF( h ) );	// sibling: contribute our min-anchor
+							break;
+						}
 					}
 					// lost the race to a FOREIGN key (audit finding #5): our key is NOT planted here -
 					// keep probing (the old unconditional break silently dropped the texel forever).
 				}
-				slot = ( slot + 1u ) & capM;
+				slot = ( slot + hstep ) & capM;
 			}
 		}
 	}

@@ -1235,14 +1235,20 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const uint capM = ( uint )g_surfA.x - 1u;	// capacity is a power of two (CPU-enforced)
 				const uint h = keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
 				uint slot = h & capM;
-				[loop]										// keep the 16-slot probe ROLLED: unrolling it exploded the
-				for( int pr = 0; pr < 16; pr++ )		// surf-permutation VGPR count (256 + spill), collapsing occupancy
+				// DOUBLE HASHING - second-hash odd step, MUST match softsurf_seed (see rationale there)
+				const uint hstep = ( ( keyLo * 0x85EBCA77u ^ keyHi * 0x9E3779B1u ) | 1u );
+				[loop]										// keep the probe ROLLED: unrolling it exploded the
+				for( int pr = 0; pr < 128; pr++ )		// surf-permutation VGPR count (256 + spill), collapsing occupancy.
+														// 16 -> 64 -> 128 (2026-08-26): viz-8 measured millions of misses whose
+														// keys sit past the probe horizon; each doubling converted them to hits
+														// (cap0007 20->35% at 64) and the probe itself is measured ~free. The
+														// depth pathology at ~35% load is unexplained - root-cause pending.
 				{
 					const uint sBase = slot * 8u;
 					const uint w0 = u_SurfTable[ sBase ];
 					if( w0 == 0xFFFFFFFEu )				// TOMBSTONE (build freed a record here): the chain
 					{									// continues past it - do NOT treat as end-of-chain
-						slot = ( slot + 1u ) & capM;
+						slot = ( slot + hstep ) & capM;
 						continue;
 					}
 					if( w0 == keyLo && u_SurfTable[ sBase + 1 ] == keyHi )
@@ -1491,7 +1497,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						swMissR = 2u;				// EMPTY slot: this texel was never seeded/claimed
 						break;						// claimed (by us or a racer): exact miss path this frame
 					}
-					slot = ( slot + 1u ) & capM;	// occupied by another key: linear probe
+					slot = ( slot + hstep ) & capM;	// occupied by another key: double-hash step
 				}
 			}
 			// FORCE-HIT CEILING (r_softShadowSurfCacheForceWalk 3/4, task #87): UNREALISTIC benchmark
@@ -1595,6 +1601,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const uint kHi5 = ( uint )cw5 | ( ( uint )da << 16 ) | ( ( uint )g_surfA.w << 19 );
 					const uint h5 = kLo5 * 0x9E3779B1u ^ kHi5 * 0x85EBCA77u;
 					uint s5 = h5 & capM5;
+					const uint st5 = ( ( kLo5 * 0x85EBCA77u ^ kHi5 * 0x9E3779B1u ) | 1u );	// double-hash step (matches seed/serve)
 					[loop] for( int p5 = 0; p5 < 16; p5++ )
 					{
 						const uint b5 = s5 * 8u;
@@ -1603,7 +1610,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 							if( ( u_SurfTable[ b5 + 2u ] & 3u ) == 2u ) { swMissR = 3u; }	// BUILT under the other axis
 							break;
 						}
-						s5 = ( s5 + 1u ) & capM5;
+						s5 = ( s5 + st5 ) & capM5;
 					}
 					if( swMissR == 3u ) { break; }
 				}
@@ -1625,6 +1632,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					const uint kHi6 = ( uint )cw6 | ( axis << 16 ) | ( ( uint )g_surfA.w << 19 );
 					const uint h6 = keyLo * 0x9E3779B1u ^ kHi6 * 0x85EBCA77u;
 					uint s6 = h6 & capM6;
+					const uint st6 = ( ( keyLo * 0x85EBCA77u ^ kHi6 * 0x9E3779B1u ) | 1u );	// double-hash step (matches seed/serve)
 					[loop] for( int p6 = 0; p6 < 16; p6++ )
 					{
 						const uint b6 = s6 * 8u;
@@ -1633,7 +1641,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 							if( ( u_SurfTable[ b6 + 2u ] & 3u ) == 2u ) { swMissR = 3u; }	// BUILT one cell up/down
 							break;
 						}
-						s6 = ( s6 + 1u ) & capM6;
+						s6 = ( s6 + st6 ) & capM6;
 					}
 					if( swMissR == 3u ) { break; }
 				}
@@ -1657,6 +1665,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					if( kLo7 == 0xFFFFFFFFu ) { continue; }
 					const uint h7 = kLo7 * 0x9E3779B1u ^ keyHi * 0x85EBCA77u;
 					uint s7 = h7 & capM7;
+					const uint st7 = ( ( kLo7 * 0x85EBCA77u ^ keyHi * 0x9E3779B1u ) | 1u );	// double-hash step (matches seed/serve)
 					[loop] for( int p7 = 0; p7 < 16; p7++ )
 					{
 						const uint b7 = s7 * 8u;
@@ -1665,9 +1674,36 @@ void main( uint3 tid : SV_DispatchThreadID )
 							if( ( u_SurfTable[ b7 + 2u ] & 3u ) == 2u ) { swMissR = 3u; }	// BUILT neighbor: edge of a seeded region
 							break;
 						}
-						s7 = ( s7 + 1u ) & capM7;
+						s7 = ( s7 + st7 ) & capM7;
 					}
 					if( swMissR == 3u ) { break; }
+				}
+			}
+			// DEEP-PROBE INSTRUMENT (viz 8, 2026-08-26): a probe-overflow miss re-probed along the SAME
+			// double-hash sequence to depth 64. Found BUILT deeper -> sub-reason 3 stays (key present,
+			// probe depth is the binding constraint); not found -> reclassified to 2 (key ABSENT: the
+			// seed never planted it - an insert-side loss, not congestion). Splits the 2.3M cap0007
+			// overflow bucket decisively. Instrument mode, never default.
+			if( ( int )g_surfParams.y == 8 && swStatIdx == 1u && swMissR == 3u )
+			{
+				swMissR = 2u;
+				const uint capM8 = ( uint )g_surfA.x - 1u;
+				const uint st8 = ( ( keyLo * 0x85EBCA77u ^ keyHi * 0x9E3779B1u ) | 1u );
+				uint s8 = ( keyLo * 0x9E3779B1u ^ keyHi * 0x85EBCA77u ) & capM8;
+				[loop] for( int p8 = 0; p8 < 64; p8++ )
+				{
+					const uint b8 = s8 * 8u;
+					const uint w8 = u_SurfTable[ b8 ];
+					if( w8 == 0xFFFFFFFFu )
+					{
+						break;			// true end-of-chain: key absent
+					}
+					if( w8 == keyLo && u_SurfTable[ b8 + 1u ] == keyHi )
+					{
+						swMissR = 3u;	// present past the 16-probe horizon
+						break;
+					}
+					s8 = ( s8 + st8 ) & capM8;
 				}
 			}
 			SW_SURF_STAT( swStatIdx );			// fall-through: miss / walk-always / anchor-reject
