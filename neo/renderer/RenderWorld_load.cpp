@@ -31,7 +31,131 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "RenderCommon.h"
+#include "SoftShadowHull.h"
 
+// Brush-recovery soft shadows: per-area convex hull table, parsed from the .proc `shadowHulls` block (or
+// the .bproc mirror) at InitFromMap. Outer index = BSP area; inner = that area's hulls. File-scope global
+// (see R_GetAreaShadowHulls in SoftShadowHull.h) - one active render world. The worldspawn soft-caster
+// reads it via R_GetAreaShadowHulls when r_softShadowBrushHulls is set. Absent block => empty => tris.
+static idList< idList<areaShadowHull_t> > s_areaShadowHulls;
+
+const areaShadowHull_t* R_GetAreaShadowHulls( int area, int* outNumHulls )
+{
+	if( area < 0 || area >= s_areaShadowHulls.Num() || s_areaShadowHulls[area].Num() == 0 )
+	{
+		if( outNumHulls != NULL )
+		{
+			*outNumHulls = 0;
+		}
+		return NULL;
+	}
+	if( outNumHulls != NULL )
+	{
+		*outNumHulls = s_areaShadowHulls[area].Num();
+	}
+	return s_areaShadowHulls[area].Ptr();
+}
+
+/*
+================
+R_ParseShadowHulls
+
+Additive, presence-gated .proc block (grammar in brush-recovery-implementation-plan.md Phase 0):
+  shadowHulls { N  areaIdx { M  { K ( x y z )... } ... } ... }
+Missing block => s_areaShadowHulls stays empty => triangle fallback (old .proc still loads). Oversized
+hulls (K outside [3, SW_HULL_MAX_VERTS]) are dropped, never stored (the shader can only walk <=8 verts).
+When fileOut != NULL the parsed table is mirrored into the .bproc so cached reloads keep the hulls.
+================
+*/
+static void R_ParseShadowHulls( idLexer* src, idFile* fileOut )
+{
+	s_areaShadowHulls.Clear();
+
+	src->ExpectTokenString( "{" );
+	const int numAreas = src->ParseInt();
+	if( numAreas > 0 )
+	{
+		s_areaShadowHulls.SetNum( numAreas );
+	}
+
+	for( int a = 0; a < numAreas; a++ )
+	{
+		const int areaIdx = src->ParseInt();
+		src->ExpectTokenString( "{" );
+		const int numHulls = src->ParseInt();
+		for( int h = 0; h < numHulls; h++ )
+		{
+			src->ExpectTokenString( "{" );
+			const int numVerts = src->ParseInt();
+			areaShadowHull_t hull;
+			hull.numVerts = numVerts;
+			for( int v = 0; v < numVerts; v++ )
+			{
+				float xyz[3];
+				src->Parse1DMatrix( 3, xyz );
+				if( v < SW_HULL_MAX_VERTS )
+				{
+					hull.verts[v * 3 + 0] = xyz[0];
+					hull.verts[v * 3 + 1] = xyz[1];
+					hull.verts[v * 3 + 2] = xyz[2];
+				}
+			}
+			src->ExpectTokenString( "}" );
+			// keep only walkable hulls; drop degenerate/oversized to the triangle path
+			if( numVerts >= 3 && numVerts <= SW_HULL_MAX_VERTS && areaIdx >= 0 && areaIdx < s_areaShadowHulls.Num() )
+			{
+				s_areaShadowHulls[areaIdx].Append( hull );
+			}
+		}
+		src->ExpectTokenString( "}" );
+	}
+	src->ExpectTokenString( "}" );
+
+	if( fileOut != NULL )
+	{
+		fileOut->WriteString( "shadowHulls" );
+		fileOut->WriteBig( s_areaShadowHulls.Num() );
+		for( int a = 0; a < s_areaShadowHulls.Num(); a++ )
+		{
+			fileOut->WriteBig( s_areaShadowHulls[a].Num() );
+			for( int h = 0; h < s_areaShadowHulls[a].Num(); h++ )
+			{
+				fileOut->WriteBig( s_areaShadowHulls[a][h].numVerts );
+				fileOut->WriteBigArray( s_areaShadowHulls[a][h].verts, SW_HULL_MAX_VERTS * 3 );
+			}
+		}
+	}
+}
+
+/*
+================
+R_ReadBinaryShadowHulls
+
+Read the .bproc mirror of the `shadowHulls` block written by R_ParseShadowHulls.
+================
+*/
+static void R_ReadBinaryShadowHulls( idFile* file )
+{
+	s_areaShadowHulls.Clear();
+	int numAreas = 0;
+	file->ReadBig( numAreas );
+	if( numAreas > 0 )
+	{
+		s_areaShadowHulls.SetNum( numAreas );
+	}
+	for( int a = 0; a < numAreas; a++ )
+	{
+		int numHulls = 0;
+		file->ReadBig( numHulls );
+		for( int h = 0; h < numHulls; h++ )
+		{
+			areaShadowHull_t hull;
+			file->ReadBig( hull.numVerts );
+			file->ReadBigArray( hull.verts, SW_HULL_MAX_VERTS * 3 );
+			s_areaShadowHulls[a].Append( hull );
+		}
+	}
+}
 
 /*
 ================
@@ -103,6 +227,9 @@ void idRenderWorldLocal::FreeWorld()
 
 	areaReferenceAllocator.Shutdown();
 	interactionAllocator.Shutdown();
+
+	// brush-recovery soft-shadow hulls belong to this map
+	s_areaShadowHulls.Clear();
 
 	mapName = "<FREED>";
 }
@@ -831,6 +958,11 @@ bool idRenderWorldLocal::InitFromMap( const char* name )
 				{
 					ReadBinaryNodes( file );
 				}
+				else if( type == "shadowhulls" )
+				{
+					// brush-recovery soft-shadow hulls (mirror of the .proc `shadowHulls` block)
+					R_ReadBinaryShadowHulls( file );
+				}
 				else
 				{
 					idLib::Error( "Binary proc file failed, unexpected type %s\n", type.c_str() );
@@ -917,6 +1049,16 @@ bool idRenderWorldLocal::InitFromMap( const char* name )
 			if( token == "nodes" )
 			{
 				ParseNodes( src, outputFile );
+
+				numEntries++;
+				continue;
+			}
+
+			// brush-recovery soft shadows: additive, presence-gated hull block (Phase 0). Absent on
+			// unrelated/old maps => no hulls => triangle fallback. Mirrored into the .bproc via outputFile.
+			if( token == "shadowHulls" )
+			{
+				R_ParseShadowHulls( src, outputFile );
 
 				numEntries++;
 				continue;

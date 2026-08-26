@@ -42,6 +42,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "RenderCapture.h"
 #include "Model_local.h"
 #include "Passes/SoftShadowClassify.h"
+#include "SoftShadowHull.h"		// brush-recovery: per-area hull table + record encoding
 
 extern idCVar r_useRTShadows;	// RT shadows need occluders whose shadow is off-view (RenderSystem_init.cpp)
 extern idCVar r_useSoftShadowVolumes;	// soft shadow volumes reuse the stencil shadow-volume geometry (RenderSystem_init.cpp)
@@ -1184,6 +1185,25 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 	const bool addInteractions = modelIsVisible && ( !viewDef->isXraySubview || entityDef->parms.xrayIndex == 2 );
 	const int entityIndex = entityDef->index;
 
+	// BRUSH-RECOVERY soft shadows (r_softShadowBrushHulls): each portal area's world model is entity
+	// "_area%i" (AddWorldModelEntities). When that area carries dmap'd convex hulls, the worldspawn
+	// soft-caster below emits one analytic hull record per hull INSTEAD of the area's triangle stream.
+	// Resolve the area's hulls once here (name-derived area index; area world models are identity space).
+	extern idCVar r_softShadowBrushHulls;
+	const areaShadowHull_t* swAreaHulls = NULL;
+	int swNumAreaHulls = 0;
+	if( r_softShadowBrushHulls.GetBool() && entityDef->parms.hModel != NULL && entityDef->parms.hModel->IsStaticWorldModel() )
+	{
+		int swAreaIdx = -1;
+		if( sscanf( entityDef->parms.hModel->Name(), "_area%d", &swAreaIdx ) == 1 && swAreaIdx >= 0 )
+		{
+			swAreaHulls = R_GetAreaShadowHulls( swAreaIdx, &swNumAreaHulls );
+		}
+	}
+	// dedup: each area's hulls are the WHOLE area (not per-surface), so emit them once per contacted
+	// light. Records the light indices already served this entity (small - a few lights touch an area).
+	idList<int> swHullLightsDone;
+
 	//---------------------------
 	// Find which of the visible lights contact this entity
 	//
@@ -2101,6 +2121,65 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				const bool swSkipStatic = r_softShadowSkipStatic.GetBool() && R_SoftCasterIsStatic( entityDef, vLight );
 				if( !swExcludeWorld && !swSkipStatic && r_useSoftShadowVolumes.GetBool() && ( tri->silEdges != NULL || r_softShadowFaceCoverage.GetBool() ) )
 				{
+					// BRUSH-RECOVERY: this area carries dmap'd convex hulls -> emit one analytic hull record
+					// per hull (shared .w=-N encoding, FillHull) INSTEAD of this area's triangle stream, and
+					// ONCE per light (the hulls are the whole area, not per surface). Needs face-coverage: the
+					// .w=-N decode lives in that walk. Lossless: a brush is convex, hull == brush projection.
+					if( swAreaHulls != NULL && r_softShadowFaceCoverage.GetBool() )
+					{
+						if( swHullLightsDone.FindIndex( vLight->lightDef->index ) == -1 )
+						{
+							const float swPen = R_SoftPenumbraRadius( lightDef );
+							if( swPen > 0.0f )
+							{
+								swHullLightsDone.Append( vLight->lightDef->index );
+								extern int fe_softEdgesCollected;
+								for( int hIdx = 0; hIdx < swNumAreaHulls; hIdx++ )
+								{
+									const areaShadowHull_t& hull = swAreaHulls[hIdx];
+									// analytic record: .w=-N discriminator + N verts, padded to whole triangles.
+									// Hulls are stored in map space; area world models are identity, so map == world.
+									float slots[ 12 * 4 ];		// <=9 slots (N<=8 -> 3 tris); headroom
+									const int numSlots = SoftHull_EmitRecord( hull.verts, hull.numVerts, slots );
+									if( numSlots <= 0 )
+									{
+										continue;
+									}
+									const int numTris = numSlots / 3;
+									idVec4* recs = ( idVec4* )R_FrameAlloc( numSlots * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
+									idBounds hb;
+									hb.Clear();
+									for( int s = 0; s < numSlots; s++ )
+									{
+										recs[s].Set( slots[s * 4 + 0], slots[s * 4 + 1], slots[s * 4 + 2], slots[s * 4 + 3] );
+										hb.AddPoint( recs[s].ToVec3() );
+									}
+									// one cluster, mirroring the box/poly path: (center,radius),(firstTri=0,numTris,0,0)
+									idVec4* clu = ( idVec4* )R_FrameAlloc( 2 * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
+									const idVec3 cc = ( hb[0] + hb[1] ) * 0.5f;
+									clu[0].Set( cc.x, cc.y, cc.z, ( hb[1] - hb[0] ).Length() * 0.5f * 1.00001f );
+									clu[1].Set( 0.0f, ( float )numTris, 0.0f, 0.0f );
+
+									drawSurf_t* hullSurf = ( drawSurf_t* )R_FrameAlloc( sizeof( *hullSurf ), FRAME_ALLOC_DRAW_SURFACE );
+									memset( hullSurf, 0, sizeof( *hullSurf ) );
+									hullSurf->softEdges = ( softShadowEdge_t* )recs;
+									hullSurf->numSoftEdges = numSlots;
+									hullSurf->softClusters = clu;
+									hullSurf->numSoftClusters = 1;
+									hullSurf->frontEndGeo = tri;
+									hullSurf->space = vEntity;
+									hullSurf->softIsBox = true;		// analytic caster: flatten stamps a negative count -> high-bit tile tag -> .w=-N decode
+									hullSurf->scissorRect = vLight->scissorRect;
+									hullSurf->linkChain = &vLight->softShadowWedges;
+									hullSurf->nextOnLight = vEntity->drawSurfs;
+									vEntity->drawSurfs = hullSurf;
+									fe_softEdgesCollected += numSlots;
+								}
+							}
+						}
+					}
+					else
+					{
 					const int swCollectStart = Sys_Microseconds();
 					softShadowEdge_t* sedges = NULL;
 					int nedges = 0;
@@ -2143,6 +2222,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 						edgeSurf->nextOnLight = vEntity->drawSurfs;
 						vEntity->drawSurfs = edgeSurf;
 					}
+					}	// end else (triangle / silhouette path; hull path is the if above)
 				}
 
 				// PCSS LOCATOR ATLAS: the soft-wedge PCSS locator (r_shadowMapPCSS) samples the shadow ATLAS to
