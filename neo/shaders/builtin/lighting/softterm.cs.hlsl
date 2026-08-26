@@ -299,6 +299,16 @@ float SwHoistTerm( float swTerm, float swHoist )
 	return ( swHoist < 1.0f ) ? ( 1.0f - swHoist * ( 1.0f - swTerm ) ) : swTerm;
 }
 
+// WALK-COST HEATMAP (r_softShadowSurfCacheViz 9): override every term write with this fragment's
+// fill-kernel entry count mapped to brightness (256 fills = white). Early-outs and cache hits paint
+// near-black, the walk's cost paints the exact surfaces/objects that own it - spatial cost
+// attribution the aggregate counters cannot give. Wraps EVERY u_Term write site; diagnostic only
+// (the image is wrong by construction); the bench viz dump captures the PNG.
+float SwVizCostTerm( float v )
+{
+	return ( ( int )g_surfParams.y == 9 ) ? saturate( ( float )g_swVizFills * ( 1.0f / 256.0f ) ) : v;
+}
+
 #if SW_SURF_CACHE
 // Wave-aggregated per-frame path counter (see SW_SURF_STAT): sum the active lanes in each class and
 // commit ONE atomic per wave per class, instead of one InterlockedAdd per fragment on a single global
@@ -414,7 +424,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 #endif
 		if( swSkip )
 		{
-			u_Term[ uint2( px + g_tile.zw ) ] = 1.0f;
+			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( 1.0f );
 			return;
 		}
 	}
@@ -436,7 +446,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			const uint  cbyte = ( cw[ ( ccell >> 2 ) & 3 ] >> ( ( uint )( ccell & 3 ) * 8u ) ) & 0xFFu;
 			if( cbyte == 0u )
 			{
-				u_Term[ uint2( px + g_tile.zw ) ] = 1.0f;
+				u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( 1.0f );
 				return;
 			}
 		}
@@ -506,7 +516,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 				const uint swPCnt = t_SoftTiles[ swPSlot ];
 				if( swPCnt == SW_TILE_UMBRA )
 				{
-					u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );
+					u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ) );
 					return;
 				}
 				if( swPCnt <= ( uint )g_flags.w )
@@ -972,10 +982,10 @@ void main( uint3 tid : SV_DispatchThreadID )
 					InterlockedAdd( u_Contrib[ swTermServe < swTermPlain ? 16 : 17 ], 1u );
 					InterlockedAdd( u_Contrib[ ( swServeListCount < 0 ) ? 18 : 19 ], 1u );
 				}
-				u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( swTermPlain, swHoist );
+				u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( swTermPlain, swHoist ) );
 				return;
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( SwHoistTerm( swTermServe, swHoist ) );
+			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwTermQuant( SwHoistTerm( swTermServe, swHoist ) ) );
 			return;
 		}
 
@@ -1149,7 +1159,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			{
 				swCovR = swDiskBits;			// plain-walk umbra rounding, matched exactly
 			}
-			u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( SwHoistTerm( 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 ), swHoist ) );
+			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0 - saturate( swDiskBits > 0 ? ( float )swCovR / ( float )swDiskBits : 0.0 ), swHoist ) ) );
 			return;
 		}
 		}	// keyLo != sentinel
@@ -1355,7 +1365,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 										if( hCnt == SW_TILE_UMBRA )
 										{
 											SW_SURF_STAT( 0u );
-											u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );	// whole tile provably umbra (as the miss path)
+											u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ) );	// whole tile provably umbra (as the miss path)
 											return;
 										}
 										if( hCnt <= ( uint )g_flags.w )		// normal list (exclude spill/corrupt sentinels)
@@ -1450,7 +1460,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 								swTermC = 1.0f;		// COST-CLASS: hit -> full bright (non-hit classes tinted at the fall-through write)
 							}
 							SW_SURF_STAT( 0u );		// cached HIT
-							u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( swTermC, swHoist );
+							u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( swTermC, swHoist ) );
 							return;
 						}
 						if( code == 3u )
@@ -1526,7 +1536,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 						if( fCnt == SW_TILE_UMBRA )
 						{
 							SW_SURF_STAT( ( g_aa.z > 3.5f ) ? swStatIdx : 0u );	// mode 4 keeps the honest class split
-							u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );	// provable umbra: same as the real hit path
+							u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ) );	// provable umbra: same as the real hit path
 							return;
 						}
 						if( fCnt <= ( uint )g_flags.w )		// normal list (exclude spill/corrupt sentinels)
@@ -1572,7 +1582,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 					{
 						SW_SURF_STAT( 0u );	// mode 3: counted as HIT, the bench line must read 100%
 					}
-					u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 1.0f - saturate( occFh ), swHoist );
+					u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 1.0f - saturate( occFh ), swHoist ) );
 					return;
 				}
 				// spill/untiled tile: fall through to the exact walk (the real hit path does the same)
@@ -1721,7 +1731,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 	// 8/16/32 variant by the cvar), so the walk below stays the fast fp16 path at whatever count is built.
 	if( g_aa.x < 0.5f )
 	{
-		u_Term[ uint2( px + g_tile.zw ) ] = 1.0;
+		u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( 1.0 );
 		return;
 	}
 	const int swTx = px.x / SW_TILE_SIZE - g_tile.x;
@@ -1746,7 +1756,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 													// the sentinel threads and the lit/pen/umb split lies)
 #endif
 			// whole tile provably in umbra: the integral saturates to 1 for every receiver here
-			u_Term[ uint2( px + g_tile.zw ) ] = SwHoistTerm( 0.0f, swHoist );
+			u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ) );
 			return;
 		}
 		if( swCnt == SW_TILE_SPILL )
@@ -1789,5 +1799,5 @@ void main( uint3 tid : SV_DispatchThreadID )
 		return;
 	}
 #endif
-	u_Term[ uint2( px + g_tile.zw ) ] = SwTermQuant( SwHoistTerm( 1.0 - saturate( swOcc ), swHoist ) );
+	u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0 - saturate( swOcc ), swHoist ) ) );
 }

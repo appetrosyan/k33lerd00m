@@ -3662,8 +3662,17 @@ int R_SoftShadowGate( const char* arg )
 							extern idCVar r_softShadowSurfCacheViz;
 							if( r_softShadowSurfCacheViz.GetInteger() != 0 )
 							{
+								// Dump the TERM ATLAS, not the lit HDR frame: the lit frame multiplies
+								// the viz term by the (near-zero on dark caps) lighting and the heatmap
+								// vanishes. The atlas is the raw per-light term, scissor-shelf packed -
+								// every light's slot lands in the one image, which is what we want.
+								// R16F single-channel -> the PNG carries the heatmap in the RED channel.
+								nvrhi::ITexture* vizTex = ( backEnd.GetSoftShadowTermPass() != NULL
+															&& backEnd.GetSoftShadowTermPass()->GetTermTexture() != nullptr )
+														  ? backEnd.GetSoftShadowTermPass()->GetTermTexture()
+														  : ( nvrhi::ITexture* )globalImages->currentRenderHDRImage->GetTextureHandle();
 								R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
-												  globalImages->currentRenderHDRImage->GetTextureHandle(),
+												  vizTex,
 												  nvrhi::ResourceStates::ShaderResource,
 												  va( "dumps/benchviz_%s.png", cap.name.c_str() ) );
 								common->Printf( "[softgate] BENCH %-14s viz frame dumped to dumps/benchviz_%s.png\n",

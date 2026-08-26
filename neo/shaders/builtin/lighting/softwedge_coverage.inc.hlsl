@@ -15,6 +15,12 @@ the Free Software Foundation, either version 3 of the License, or
 
 #include "softscan_word.inc.hlsl"		// SW_SCAN_BITS + SwGridWord typedef (the SoftScan_* helpers build on it)
 
+// PER-FRAGMENT walk-cost counter (r_softShadowSurfCacheViz 9 heatmap): counts fill-kernel entries this
+// thread executed; the term CS maps it to brightness so the bench viz dump shows WHICH SURFACES/OBJECTS
+// own the walk cost spatially. Free when unread: consumers that never branch on it let DCE erase the
+// increments (the interaction PS includes this file but has no viz-9 consumer).
+static uint g_swVizFills = 0;
+
 // Analytic soft shadows by LIGHT-DISK COVERAGE. From the receiver, the caster's silhouette loop projects
 // onto the area light's disk; the occluded fraction is area( disk INTERSECT projected-silhouette ) / area.
 // That is a signed sum of per-edge circle-triangle areas around the loop: it is winding-correct, so it is
@@ -1040,6 +1046,7 @@ SW_FUNC bool SoftScan_TriDisk( float2 a, float2 b, float2 c )
 SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS], float3 v0, float3 v1, float3 v2,
 		float3 swP, softFrame_t swF, float swR, float swEps )
 {
+	g_swVizFills++;		// per-FRAGMENT walk-cost counter (viz 9 heatmap; DCE'd when the consumer branch is absent)
 	SW_ATTRIB_ADD( scanFill, 1 );										// attribution (task #106): FillTri entered
 	float3 rel[3]; float dn[3];
 	rel[0] = v0 - swP; rel[1] = v1 - swP; rel[2] = v2 - swP;
@@ -1210,6 +1217,7 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS], float3 corner[8],
 		float3 swP, softFrame_t swF, float swR, float swEps )
 {
+	g_swVizFills++;		// per-FRAGMENT walk-cost counter (viz 9 heatmap)
 	// 6 faces, each 4 corner indices wound outward-CCW, so cross(edge1,edge2) is the OUTWARD normal.
 	const int BF[6][4] = { {1,3,7,5}, {0,4,6,2}, {2,6,7,3}, {0,1,5,4}, {4,5,7,6}, {0,2,3,1} };
 	bool front[6];
