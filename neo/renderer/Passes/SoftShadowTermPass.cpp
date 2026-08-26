@@ -147,7 +147,14 @@ void SoftShadowTermPass::EnsurePipeline()
 	const int cv = r_softShadowScanChords.GetInteger();
 	m_BuiltChords = ( cv == 4 || cv == 8 || cv == 32 ) ? cv : 16;
 	const char* chordsStr = ( m_BuiltChords == 4 ) ? "4" : ( ( m_BuiltChords == 8 ) ? "8" : ( ( m_BuiltChords == 32 ) ? "32" : "16" ) );
-	const idStr sfx = idStr( "s" ) + samplesStr + "c" + chordsStr;
+	// ADAPTIVE CHORD COUNT permutation axis (r_softShadowAdaptiveChords, SW_ADAPT_CHORDS). Only the
+	// SCANLINE-carrying permutations that run the plain scalar walk (scan + the counting instrument) adapt;
+	// every other permutation compiles the axis at 0 (byte-identical). adaptStr flows into the suffix so a
+	// toggle mints distinct blob entries, and m_BuiltAdapt triggers the rebuild in BeginView.
+	extern idCVar r_softShadowAdaptiveChords;
+	m_BuiltAdapt = r_softShadowAdaptiveChords.GetBool() ? 1 : 0;
+	const char* adaptStr = m_BuiltAdapt ? "1" : "0";
+	const idStr sfx = idStr( "s" ) + samplesStr + "c" + chordsStr + "a" + adaptStr;
 
 	idList<shaderMacro_t> macros;
 	macros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );	// shipped permutation (must be explicit now the cfg declares {0,1})
@@ -157,6 +164,7 @@ void SoftShadowTermPass::EnsurePipeline()
 	macros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );		// and the contributor-cache axis
 	macros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		macros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+	macros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );		// shipped path is not scanline; never adapts
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, sfx.c_str(), macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
 	{
@@ -202,6 +210,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		cntMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		cntMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		cntMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		cntMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", adaptStr ) );	// counting instrument measures adaptive mean-N (slot 28)
 		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
 		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
 		// blob path (LoadShader keys the .bin on shader.name only) - it forces a separate entry whose
@@ -218,7 +227,7 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineCnt = m_Device->createComputePipeline( pc );
 
 			nvrhi::BufferDesc wc;
-			wc.byteSize = 28 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106)
+			wc.byteSize = 30 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106), 27 lit-early-out, 28 adaptive-chord N sum (task #85)
 			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
 			wc.canHaveUAVs = true;
 			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -245,6 +254,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		surfMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		surfMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		surfMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		surfMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );	// surf-cache path out of scope for the first cut
 		m_ShaderSurf = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfcache" ) + sfx ).c_str(), surfMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderSurf != nullptr )
 		{
@@ -279,6 +289,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		gridMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		gridMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		gridMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		gridMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );	// grid-serve path out of scope for the first cut
 		swTermGrid().shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfgrid" ) + sfx ).c_str(), gridMacros, true, LAYOUT_DRAW_VERT ) );
 		if( swTermGrid().shader != nullptr && m_LayoutSurf != nullptr )
 		{
@@ -304,6 +315,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		scanMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
 		scanMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		scanMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		scanMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", adaptStr ) );	// THE adaptive path (plain scalar walk, cache off)
 		m_ShaderScan = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "scanline" ) + sfx ).c_str(), scanMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderScan != nullptr )
 		{
@@ -327,6 +339,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		conMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "1" ) );
 		conMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
 		conMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		conMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );		// contrib-cache path out of scope for the first cut
 		m_ShaderContrib = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "contrib" ) + sfx ).c_str(), conMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderContrib != nullptr )
 		{
@@ -412,11 +425,13 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 	{
 		extern idCVar r_softShadowSamples;
 		extern idCVar r_softShadowScanChords;
+		extern idCVar r_softShadowAdaptiveChords;
 		const int sv = r_softShadowSamples.GetInteger();
 		const int want = ( sv == 8 || sv == 32 ) ? sv : 16;
 		const int cvc = r_softShadowScanChords.GetInteger();
 		const int wantC = ( cvc == 4 || cvc == 8 || cvc == 32 ) ? cvc : 16;
-		if( ( m_BuiltSamples != 0 && m_BuiltSamples != want ) || ( m_BuiltChords != 0 && m_BuiltChords != wantC ) )
+		const int wantA = r_softShadowAdaptiveChords.GetBool() ? 1 : 0;
+		if( ( m_BuiltSamples != 0 && m_BuiltSamples != want ) || ( m_BuiltChords != 0 && m_BuiltChords != wantC ) || ( m_BuiltAdapt >= 0 && m_BuiltAdapt != wantA ) )
 		{
 			m_PipelineTried = false;
 			m_Pipeline = m_PipelineCnt = m_PipelineSurf = m_PipelineScan = m_PipelineContrib = swTermGrid().pipeline = nullptr;
@@ -977,20 +992,20 @@ bool SoftShadowTermPass::GetContribStats( uint32_t out[20] )
 	return true;
 }
 
-bool SoftShadowTermPass::GetWalkStats( uint32_t out[28] )
+bool SoftShadowTermPass::GetWalkStats( uint32_t out[30] )
 {
 	if( !m_WalkCntEnabled || m_WalkCntBuffer == nullptr )
 	{
 		return false;
 	}
 	nvrhi::BufferDesc sbd;
-	sbd.byteSize = 28 * sizeof( uint32_t );
+	sbd.byteSize = 30 * sizeof( uint32_t );
 	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
 	sbd.debugName = "SoftShadowTerm/WalkCountersReadback";
 	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
 	nvrhi::CommandListHandle cl = m_Device->createCommandList();
 	cl->open();
-	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 28 * sizeof( uint32_t ) );
+	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 30 * sizeof( uint32_t ) );
 	cl->close();
 	m_Device->executeCommandList( cl );
 	m_Device->waitForIdle();
@@ -999,7 +1014,7 @@ bool SoftShadowTermPass::GetWalkStats( uint32_t out[28] )
 	{
 		return false;
 	}
-	memcpy( out, p, 28 * sizeof( uint32_t ) );
+	memcpy( out, p, 30 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
 	return true;
 }

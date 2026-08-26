@@ -3746,7 +3746,7 @@ int R_SoftShadowGate( const char* arg )
 			// below attributes the PLAIN walk (tile-list, spill/cluster, unbinned-full paths - all
 			// instrumented). Slots: [0/1] caster+cluster sphere tests/culls, [2/3] coarse v0, [4/5]
 			// tight cone, [6] survivors reaching FillTri, [7] fragments walked.
-			uint32_t walk[28] = {};
+			uint32_t walk[30] = {};
 			if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetWalkStats( walk ) && walk[7] > 0 )
 			{
 				// SCANLINE FillTri attribution (task #106, slots 20-26): where the chord-sweep walk spends
@@ -3758,6 +3758,16 @@ int R_SoftShadowGate( const char* arg )
 					const double f = ( double )walk[7];
 					common->Printf( "[softgate] BENCH %-14s walk-scan/frag: fills %.1f -> rejects %.1f | skips %.1f (test-iters %.1f, fold-iters %.1f) | sweep-tris %.1f, sweep-rows %.1f\n",
 									cap.name.c_str(), walk[20] / f, walk[21] / f, walk[22] / f, walk[23] / f, walk[24] / f, walk[25] / f, walk[26] / f );
+				}
+				// ADAPTIVE CHORD COUNT (task #85, slot 28 = sum of N over walked frags): the mean chord
+				// count the per-fragment width->N mapping actually used. 32 = every fragment stayed lossless
+				// (nothing adapted / cvar off); lower = the claw-back (cost ~ proportional to mean N vs the
+				// fixed 32). Only meaningful under r_softShadowAdaptiveChords 1 + r_softShadowScanChords 32.
+				if( walk[28] > 0 )
+				{
+					common->Printf( "[softgate] BENCH %-14s adaptive chords: mean N %.1f (of %u frags; claw-back %.0f%% vs fixed-32)\n",
+									cap.name.c_str(), walk[28] / ( double )walk[7], walk[7],
+									100.0 * ( 1.0 - ( walk[28] / ( double )walk[7] ) / 32.0 ) );
 				}
 				// LIT-EARLY-OUT execution proof (slot 27): fragments the intensity cut skipped at T > 0.
 				// Nonzero = the r_softShadowLitEarlyOut path actually ran under this config (a 0-defect
