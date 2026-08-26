@@ -986,6 +986,10 @@ area (a wall between two rooms lands in both), giving one hull per (brush n area
 ====================
 */
 
+// TriListForSide lives in usurface.cpp (not declared in dmap.h); we reuse it to
+// triangulate residual (non-hull-emittable) brushes in place.
+mapTri_t* TriListForSide( const side_t* s, const idWinding* w );
+
 // must match SW_POLY_MAX_VERTS in Interaction.cpp / softwedge_coverage.inc.hlsl:
 // FillHull walks at most this many verts; larger brushes fall back to triangles.
 static const int SHADOW_HULL_MAX_VERTS = 8;
@@ -1099,6 +1103,17 @@ static void BrushHullVerts( const uBrush_t* b, idList<idVec3>& verts )
 	}
 }
 
+// true if this brush should cast an analytic hull (fits the register-safe caps).
+// Non-emittable brushes fall to the residual triangle path instead of poisoning
+// the whole area, so hulls[emittable] + residualTris[rest] = every brush once.
+static bool BrushIsHullEmittable( const uBrush_t* b, int span )
+{
+	idList<idVec3> verts;
+	BrushHullVerts( b, verts );
+	return ( span <= SHADOW_HULL_MAX_AREAS
+			 && verts.Num() >= 4 && verts.Num() <= SHADOW_HULL_MAX_VERTS );
+}
+
 /*
 ====================
 WriteShadowHulls
@@ -1113,11 +1128,16 @@ Additive, presence-gated `shadowHulls` block for the worldspawn. Grammar:
     ...
   }
 
+PER-BRUSH (no completeness gate): every hull-emittable brush becomes a hull here;
+the non-emittable ones this area holds are returned in `residualAreas` for
+WriteShadowResiduals to triangulate. hulls + residuals = the brush set, once each.
+
 Old .proc files simply lack the block (triangle fallback); the loader tolerates
 its absence.
 ====================
 */
-static void WriteShadowHulls( const uEntity_t* world, idList< idList<uBrush_t*> >& areaBrushes, idFile* procFile )
+static void WriteShadowHulls( const uEntity_t* world, idList< idList<uBrush_t*> >& areaBrushes,
+							  idList< idList<uBrush_t*> >& residualAreas, idFile* procFile )
 {
 	const int numAreas = areaBrushes.Num();
 
@@ -1140,33 +1160,28 @@ static void WriteShadowHulls( const uEntity_t* world, idList< idList<uBrush_t*> 
 		}
 	}
 
+	residualAreas.SetNum( numAreas );
+
 	procFile->WriteFloatString( "shadowHulls { /* numAreas = */ %i\n\n", numAreas );
 
 	idList<idVec3> verts;
 	for( int a = 0 ; a < numAreas ; a++ )
 	{
-		// COMPLETENESS RULE: the renderer swaps an area's triangles for its hulls
-		// all-or-nothing, so a mix of hull and dropped casters would lose the
-		// dropped ones' shadows. If ANY shadow-casting brush here fails a cap,
-		// emit zero hulls for the whole area -> the renderer keeps the full
-		// triangle stream and nothing is lost.
+		// PER-BRUSH partition: emittable brushes -> hulls (this block),
+		// the rest -> residual triangles (WriteShadowResiduals). Nothing dropped.
 		idList<uBrush_t*> emit;
-		bool complete = true;
+		residualAreas[a].Clear();
 		for( int i = 0 ; i < areaBrushes[a].Num() ; i++ )
 		{
 			uBrush_t* b = areaBrushes[a][i];
-			BrushHullVerts( b, verts );
-			if( spanCount[ spanBrush.FindIndex( b ) ] > SHADOW_HULL_MAX_AREAS
-					|| verts.Num() < 4 || verts.Num() > SHADOW_HULL_MAX_VERTS )
+			if( BrushIsHullEmittable( b, spanCount[ spanBrush.FindIndex( b ) ] ) )
 			{
-				complete = false;	// a capped/dropped caster -> whole area falls back to triangles
-				break;
+				emit.Append( b );
 			}
-			emit.Append( b );
-		}
-		if( !complete )
-		{
-			emit.Clear();
+			else
+			{
+				residualAreas[a].Append( b );
+			}
 		}
 
 		procFile->WriteFloatString( "/* area */ %i { /* numHulls = */ %i\n", a, emit.Num() );
@@ -1187,6 +1202,81 @@ static void WriteShadowHulls( const uEntity_t* world, idList< idList<uBrush_t*> 
 		}
 
 		procFile->WriteFloatString( "}\n\n" );
+	}
+
+	procFile->WriteFloatString( "}\n\n" );
+}
+
+/*
+====================
+WriteShadowResiduals
+
+Presence-gated `shadowResiduals` block: the triangles of every non-hull-emittable
+shadow brush, per area, so the renderer casts them alongside the hulls (never
+skipping an area's casters). Grammar (mirrors the surface triangle stream, with
+the same "numVerts"/"numIndexes" annotation comments WriteUTriangles emits):
+
+  shadowResiduals { numAreas
+  (area) a { numVerts=V numIndexes=I
+      ( x y z  s t  nx ny nz ) ...   verts, V of them, offset by originOffset
+      i0 i1 i2 ...                    indexes, I of them
+  }
+  }
+
+An area with no residuals emits its header with 0 verts / 0 indexes. If NO area
+has residuals the whole block is omitted (loader tolerates its absence).
+====================
+*/
+static void WriteShadowResiduals( const uEntity_t* world, idList< idList<uBrush_t*> >& residualAreas, idFile* procFile )
+{
+	const int numAreas = residualAreas.Num();
+
+	int total = 0;
+	for( int a = 0 ; a < numAreas ; a++ )
+	{
+		total += residualAreas[a].Num();
+	}
+	if( total == 0 )
+	{
+		return;	// presence-gated: no residuals -> no block
+	}
+
+	procFile->WriteFloatString( "shadowResiduals { /* numAreas = */ %i\n\n", numAreas );
+
+	for( int a = 0 ; a < numAreas ; a++ )
+	{
+		// triangulate every residual brush in place and merge into one list,
+		// reusing the exact per-side path the surface stream uses.
+		mapTri_t* areaTris = NULL;
+		for( int i = 0 ; i < residualAreas[a].Num() ; i++ )
+		{
+			uBrush_t* b = residualAreas[a][i];
+			for( int s = 0 ; s < b->numsides ; s++ )
+			{
+				if( !b->sides[s].winding )
+				{
+					continue;
+				}
+				mapTri_t* tris = TriListForSide( &b->sides[s], b->sides[s].winding );
+				areaTris = MergeTriLists( areaTris, tris );
+			}
+		}
+
+		if( !areaTris )
+		{
+			procFile->WriteFloatString( "/* area */ %i { /* numVerts = */ 0 /* numIndexes = */ 0\n}\n\n", a );
+			continue;
+		}
+
+		srfTriangles_t* uTri = ShareMapTriVerts( areaTris );
+		FreeTriList( areaTris );
+		CleanupUTriangles( uTri );
+
+		procFile->WriteFloatString( "/* area */ %i { ", a );
+		WriteUTriangles( procFile, uTri, world->mapEntity->originOffset );
+		procFile->WriteFloatString( "}\n\n" );
+
+		R_FreeStaticTriSurf( uTri );
 	}
 
 	procFile->WriteFloatString( "}\n\n" );
@@ -1258,10 +1348,13 @@ void WriteOutputFile()
 		WriteOutputEntity( i, procFile, objFile );
 	}
 
-	// additive, presence-gated worldspawn shadow hulls
+	// additive, presence-gated worldspawn shadow hulls, then the residual
+	// triangles of the non-emittable brushes (block written AFTER the hulls).
 	if( haveWorld )
 	{
-		WriteShadowHulls( world, shadowHullBrushes, procFile );
+		idList< idList<uBrush_t*> > shadowResidualBrushes;
+		WriteShadowHulls( world, shadowHullBrushes, shadowResidualBrushes, procFile );
+		WriteShadowResiduals( world, shadowResidualBrushes, procFile );
 	}
 
 	if( objFile )
