@@ -274,6 +274,12 @@ cbuffer c_Term : register( b0 )
 								//   z = THIS light's persistent static-stream segment TRI BASE (float4 elems
 								//   into t_SurfStream), BIT-CAST uint (asuint - exact at any size, unlike a
 								//   float-rounded lane) - audit finding #4; w reserved.
+	uint4	g_areaMask;			// PORTAL-AREA CULL (r_softShadowAreaCull): 128-bit mask, bit areaNum set iff
+								//   the light's portal flood reached that area. ALL-ONES = cull inert (cvar
+								//   off / unqualified light: conservative, never skips). A world fragment
+								//   (normal .w encodes areaP1 = areaNum+1 above the 2-bit axis) in an
+								//   unreached area has NO interaction draw under this light - its term is
+								//   provably never read, so the walk is skipped (term 1.0).
 };
 // *INDENT-ON*
 
@@ -413,6 +419,20 @@ void main( uint3 tid : SV_DispatchThreadID )
 		}
 #endif
 		if( swSkip )
+		{
+			u_Term[ uint2( px + g_tile.zw ) ] = 1.0f;
+			return;
+		}
+	}
+
+	// PORTAL-AREA DEAD-WORK CULL (r_softShadowAreaCull): g_areaMask is all-ones unless the cvar armed it,
+	// so the guard keeps the normal Load off the shipped path. areaP1 = 0 (non-world receiver, or the
+	// never-rasterised clear) never skips; a world fragment in an area the light's flood never reached has
+	// no interaction draw under this light - its term is provably never read, write 1.0 and stop.
+	if( ( g_areaMask.x & g_areaMask.y & g_areaMask.z & g_areaMask.w ) != 0xFFFFFFFFu )
+	{
+		const int swAreaP1 = ( ( int )( t_WorldNormal.Load( int3( px, 0 ) ).w + 0.5 ) ) >> 2;
+		if( swAreaP1 > 0 && ( ( g_areaMask[ ( swAreaP1 - 1 ) >> 5 ] >> ( ( uint )( swAreaP1 - 1 ) & 31u ) ) & 1u ) == 0u )
 		{
 			u_Term[ uint2( px + g_tile.zw ) ] = 1.0f;
 			return;
@@ -1207,7 +1227,8 @@ void main( uint3 tid : SV_DispatchThreadID )
 		// shading normal disagreed on every normal-mapped surface whose bump flips the dominant axis, so the
 		// warm read missed (measured hit ~4% -> the empty-slot majority). softpos now writes the flat
 		// geometric dominant axis (ddx/ddy of world pos, same tie-break) into .w, so seed and read keys align.
-		const int   d  = ( int )( t_WorldNormal.Load( int3( px, 0 ) ).w + 0.5 );
+		// .w now also carries the portal-area tag above the axis (enc = axis + 4*areaP1): mask to 2 bits
+		const int   d  = ( ( int )( t_WorldNormal.Load( int3( px, 0 ) ).w + 0.5 ) ) & 3;
 		const uint  axis = ( uint )d;
 		// tangent-plane axes per dominant axis: d=0 -> (u,v)=(y,z), d=1 -> (z,x), d=2 -> (x,y)
 		// (explicit selects, no dynamic vector subscripts; MUST match softsurf_build.cs.hlsl)
