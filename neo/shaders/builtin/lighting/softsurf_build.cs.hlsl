@@ -537,17 +537,16 @@ void main( uint3 tid : SV_DispatchThreadID )
 				}
 				else if( !fold )
 				{
-					// SELF-CONTAINED residual: store the triangle's 3 verts (r0/r1/r2, 12 uints) instead of
-					// its stream index, so the cached-hit walk reads them straight from the pool and never
-					// touches the static tri stream. This decouples a warm texel from the emitted static
-					// prefix - the cache survives view-cull churn / a reordered stream without rebuilding.
-					const uint po = resOfs + emitted * 12u;
-					u_SurfPool[ po +  0u ] = asuint( r0.x );	u_SurfPool[ po +  1u ] = asuint( r0.y );
-					u_SurfPool[ po +  2u ] = asuint( r0.z );	u_SurfPool[ po +  3u ] = asuint( r0.w );
-					u_SurfPool[ po +  4u ] = asuint( r1.x );	u_SurfPool[ po +  5u ] = asuint( r1.y );
-					u_SurfPool[ po +  6u ] = asuint( r1.z );	u_SurfPool[ po +  7u ] = asuint( r1.w );
-					u_SurfPool[ po +  8u ] = asuint( r2.x );	u_SurfPool[ po +  9u ] = asuint( r2.y );
-					u_SurfPool[ po + 10u ] = asuint( r2.z );	u_SurfPool[ po + 11u ] = asuint( r2.w );
+					// STREAM-INDEX residual (audit finding #4): ONE uint - the tri's index in THIS light's
+					// PERSISTENT static stream segment (g_range.x-relative; exactly the `t` this walk read
+					// through t_SoftEdges, which the warm path now points at the persistent segment). The
+					// serve resolves it against the same persistent buffer (t_SurfStream + the segment base
+					// in the term CB), so the fetched verts are bit-identical to the floats classified here.
+					// A bare index is safe BECAUSE the segment persists across lights and frames (appended
+					// per light at warm, never reused within a cache lifetime) - unlike the old reused
+					// m_WarmStream / per-frame view stream, it cannot dangle. 12x the pool capacity of the
+					// old self-contained 12-uint records (~8-9k -> ~100k texels at the default 4M pool).
+					u_SurfPool[ resOfs + emitted ] = ( uint )t;
 					emitted++;
 					if( emitted >= resCount )
 					{
@@ -570,7 +569,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			if( resCount > 0u )
 			{
 				uint ofs;
-				const uint resWords = resCount * 12u;		// 12 uints per residual triangle (self-contained verts)
+				const uint resWords = resCount;				// 1 uint per residual triangle (persistent-stream index)
 				InterlockedAdd( u_SurfPool[ 0 ], resWords, ofs );
 				if( ofs + resWords + 1u > ( uint )g_caps.y )
 				{

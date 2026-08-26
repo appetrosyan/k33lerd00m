@@ -52,10 +52,11 @@ RWStructuredBuffer<uint>	u_WalkCnt	: register( u1 );
 #if SW_SURF_CACHE
 // SURFACE-FOLD CACHE probe (r_softShadowSurfCache, separate pipeline - the shipped shader never
 // declares these). Table: open-addressing hash of texel records, 8 uints each: [0] keyLo (0xFFFFFFFF
-// = empty), [1] keyHi, [2] state (1 requested / 2 built / 3 walk-always), [3] residual pool offset,
-// [4] residual count, [5][6] the 4 corner F values as packed fp16, [7] anchor (claiming fragment's
-// height along the texel's normal axis, asuint). Queue: [0] = count, then claimed slot indices for
-// the build CS. Pool: [0] = alloc counter, then residual triangle indices (static-prefix stream).
+// = empty), [1] keyHi, [2] state (1 requested / 2 built / 3 walk-always), [3] residual pool offset
+// (1-uint entries), [4] residual count, [5][6] the 4 corner F values as packed fp16, [7] anchor
+// (claiming fragment's height along the texel's normal axis, asuint). Queue: [0] = count, then
+// claimed slot indices for the build CS. Pool: [0] = alloc counter, then 1-uint residual triangle
+// indices into the light's PERSISTENT static stream segment (t_SurfStream; audit finding #4).
 RWStructuredBuffer<uint>	u_SurfTable	: register( u2 );
 // u_SurfQueue removed: the READ-ONLY runtime term never claims/enqueues (the burst seeds via
 // softsurf_seed), so it binds NO request queue. This also keeps the reflected binding layout stable
@@ -67,6 +68,11 @@ RWStructuredBuffer<uint>	u_SurfTable	: register( u2 );
 StructuredBuffer<SwGridWord>	t_SurfGrid	: register( t6 );	// per-chord grid word (uint or uint2, see SW_SCAN_BITS)
 #else
 StructuredBuffer<uint>		t_SurfPool	: register( t6 );	// read before the include: the residual walk consumes it
+// PERSISTENT per-light static caster stream (audit finding #4): every warmed light's [tris][casters]
+// float4 stream, appended at a per-light base by SoftShadowSurfCache::WarmLight. The pool's 1-uint
+// residual indices resolve here (segment tri base = asuint(g_econ.z), passed to the residual walk).
+// Scalar surf permutation only - grid mode has no residual pool and reuses t6 for the grid.
+StructuredBuffer<float4>	t_SurfStream	: register( t8 );
 #endif
 
 // order-preserving float->uint encoding for the texel anchor (word 7): anchors accumulate via
@@ -264,7 +270,10 @@ cbuffer c_Term : register( b0 )
 								//   (r_softShadowNearRadius; 0 = off) - fragments closer than this to the
 								//   view NEVER use the cache (full accuracy + zero popping where visible);
 								//   y = tier-1 serve/walk gate base margin (r_softShadowSurfCacheGateMargin;
-								//   0 = off = always serve on hit, today's behavior); z/w reserved.
+								//   0 = off = always serve on hit, today's behavior);
+								//   z = THIS light's persistent static-stream segment TRI BASE (float4 elems
+								//   into t_SurfStream), BIT-CAST uint (asuint - exact at any size, unlike a
+								//   float-rounded lane) - audit finding #4; w reserved.
 };
 // *INDENT-ON*
 
@@ -1410,7 +1419,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 							}
 							const float occEx = SoftShadow_FaceCoverageSurfResidual(
 													swP, g_lightR.xyz, max( g_lightR.w, 1e-2 ), g_range.x,
-													( int )resOfs, ( int )resCnt,
+													( int )resOfs, ( int )resCnt, ( int )asuint( g_econ.z ),
 													g_flags.y, g_surfA.z, g_range.y,
 													swHitListBase, swHitListCount, swHitDynTri, swRotAng );
 							float swTermC = 1.0 - saturate( fFold + occEx );
@@ -1544,7 +1553,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 #else
 					const float occFh = SoftShadow_FaceCoverageSurfResidual(
 											swP, g_lightR.xyz, max( g_lightR.w, 1e-2 ), g_range.x,
-											0, 0,
+											0, 0, 0,
 											g_flags.y, g_surfA.z, g_range.y,
 											fhBase, fhCount, fhDyn, swRotAng );
 #endif
