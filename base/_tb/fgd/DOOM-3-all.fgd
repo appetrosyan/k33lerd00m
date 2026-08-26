@@ -7259,6 +7259,13 @@ PDA's contain vidoes, audio, e-mail, and security clearances.
 	model(string) : "model to use."
 	broken(string) : "model to use when the light is broken (defaults to model name with '_broken' appended to name)"
 	proxymodel(string) : "A proxy model in OBJ file format automatically set by RBDoom so it can be displayed in TrenchBroom"
+	soft_tube_a(string) : "Soft-shadow tube emitter: name of endpoint entity A (an info_soft_tube). Set both A and B to model this light as a fluorescent-tube segment source."
+	soft_tube_b(string) : "Soft-shadow tube emitter: name of endpoint entity B (an info_soft_tube)."
+]
+
+@PointClass color(0 255 128) size(-4 -4 -4, 4 4 4) = info_soft_tube : "Soft-shadow tube emitter endpoint. Place two, name them, and reference both from a light's soft_tube_a / soft_tube_b keys to author a segment (fluorescent-tube) area light. Drag each endpoint freely in 3D."
+[
+	name(string) : "Unique name; reference this from the light's soft_tube_a or soft_tube_b."
 ]
 
 @PointClass color(255 127 0) size(-16 -16 0, 16 16 64) model({ "path": "sprites/camera.png", "scale": 0.03125 }) = lm_ending_camera : "No description"

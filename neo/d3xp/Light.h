@@ -177,12 +177,21 @@ private:
 	int				fadeEnd;
 	bool			soundWasPlaying;
 
+	// soft-shadow tube emitter (authored in the map editor as two linked point entities):
+	idStr			softTubeEndA;				// name of endpoint entity A
+	idStr			softTubeEndB;				// name of endpoint entity B
+	idVec3			softTubeA;					// resolved world position of A
+	idVec3			softTubeB;					// resolved world position of B
+	bool			softTubeAuthored;			// both endpoints named
+	bool			softTubeResolved;			// endpoints looked up (one-shot, post-spawn)
+
 	// RB: pointing to static model because this light entity was split into 2 entities by convertMapToValve220
 	idEntityPtr<idStaticEntity> modelTarget;
 
 private:
 	void			PresentLightDefChange();
 	void			PresentModelDefChange();
+	void			ResolveSoftTube();			// look up the two endpoint entities' world positions
 
 	void			Event_SetShader( const char* shadername );
 	void			Event_GetLightParm( int parmnum );

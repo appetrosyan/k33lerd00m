@@ -391,6 +391,8 @@ void idLight::Restore( idRestoreGame* savefile )
 idLight::Spawn
 ================
 */
+idCVar g_showSoftTube( "g_showSoftTube", "0", CVAR_GAME | CVAR_BOOL, "draw authored soft-shadow tube emitter endpoints as a debug line" );
+
 void idLight::Spawn()
 {
 	bool start_off;
@@ -432,6 +434,20 @@ void idLight::Spawn()
 	// also put the light texture on the model, so light flares
 	// can get the current intensity of the light
 	renderEntity.referenceShader = renderLight.shader;
+
+	// soft-shadow tube emitter: two linked point entities in the map editor name the segment
+	// endpoints. Their entities may spawn after this light, so resolve lazily on the first Think
+	// (all map entities present by then). Gated on spawnargs => default lighting path untouched.
+	{
+		bool gotA = spawnArgs.GetString( "soft_tube_a", "", softTubeEndA );
+		bool gotB = spawnArgs.GetString( "soft_tube_b", "", softTubeEndB );
+		softTubeAuthored = gotA && gotB && softTubeEndA.Length() > 0 && softTubeEndB.Length() > 0;
+		softTubeResolved = false;
+		if( softTubeAuthored )
+		{
+			BecomeActive( TH_THINK );
+		}
+	}
 
 	lightDefHandle = -1;		// no static version yet
 
@@ -1000,6 +1016,32 @@ void idLight::Present()
 
 /*
 ================
+idLight::ResolveSoftTube
+
+Look up the two authored endpoint entities and cache their world positions. One-shot: runs on
+the first Think, by which point every map entity has spawned.
+================
+*/
+void idLight::ResolveSoftTube()
+{
+	softTubeResolved = true;			// one-shot even on failure, so we stop retrying every frame
+
+	idEntity* a = gameLocal.FindEntity( softTubeEndA );
+	idEntity* b = gameLocal.FindEntity( softTubeEndB );
+	if( a == NULL || b == NULL )
+	{
+		gameLocal.Warning( "light '%s': soft_tube endpoint(s) not found (a='%s' b='%s')",
+						   name.c_str(), softTubeEndA.c_str(), softTubeEndB.c_str() );
+		softTubeAuthored = false;
+		return;
+	}
+
+	softTubeA = a->GetPhysics()->GetOrigin();
+	softTubeB = b->GetPhysics()->GetOrigin();
+}
+
+/*
+================
 idLight::Think
 ================
 */
@@ -1022,6 +1064,18 @@ void idLight::Think()
 				BecomeInactive( TH_THINK );
 			}
 			SetColor( color );
+		}
+	}
+
+	if( softTubeAuthored )
+	{
+		if( !softTubeResolved )
+		{
+			ResolveSoftTube();
+		}
+		if( softTubeResolved && g_showSoftTube.GetBool() )
+		{
+			gameRenderWorld->DebugLine( colorGreen, softTubeA, softTubeB );
 		}
 	}
 
