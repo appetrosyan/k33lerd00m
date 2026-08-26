@@ -1002,6 +1002,151 @@ SW_FUNC int SoftPopcount32( uint x )
 	return ( int )( ( x * 0x01010101u ) >> 24 );
 }
 
+// ================= SEGMENT (FLUORESCENT TUBE / LINE) AREA-LIGHT COVERAGE =================
+// A tube fixture modelled as its emitting LINE SEGMENT S(t) = A + t*(B-A), t in [0,1] (the two ends of
+// the bar). The source is 1-D, so the shadow term is EXACT with no sampling: the visibility v(t) of a
+// fragment P from S(t) is binary, and
+//     coverage(P) = integral_0^1 (1 - v(t)) dt = |{ t : ray P->S(t) is blocked }| / 1
+// (t already spans [0,1], so the segment length cancels). This is the disk-Fubini integrand evaluated
+// at a SINGLE chord - the projected segment IS that chord (docs/softshadow/cylinder-light-evaluation.md
+// section "Tube-as-segment", claim (S), the EXACT one). One convex occluder => exactly one blocked
+// interval (closed form, no per-triangle sweep). Multiple / non-convex occluders => a 1-D interval union
+// along [A,B] (walk the occluders' intervals, union them) - still exact, and far cheaper than the 2-D
+// disk union. This is NOT the doc-convicted lossy "two-endpoint hard-shadow memberships + blend" form
+// (claim (T)): that over-darkens the umbra (endpoint intersection is a superset of the true segment
+// umbra) and breaks monotonicity on non-convex casters, so it is gated out by the project's
+// "lossless = physically accurate" rule. Here every interval endpoint is the EXACT root of a linear
+// grazing equation, so the union is exact for convex AND non-convex casters.
+//
+// FACTORING: three shared primitives, used identically by the shader and the CPU test
+// (neo/tests/SoftShadowSegment_test.cpp) so there is ONE source of truth:
+//   - SoftSeg_SegHitTri  : the binary occlusion predicate (Moller-Trumbore, occluder strictly between
+//                          P and the light point). The TRUTH oracle samples S(t) and calls THIS; the
+//                          analytic path classifies sub-intervals with THIS - they cannot diverge on
+//                          the occlusion test, only on sampling-vs-exact-endpoints.
+//   - SoftSeg_TriInterval: the exact blocked t-interval [t0,t1] of ONE triangle (empty iff t1 < t0).
+//   - SoftSeg_UnionLength : total covered length of a set of intervals (sort + sweep). The caller loops
+//                          its own triangle source (stream on the GPU, array in the test), pushes each
+//                          TriInterval, and calls this - mirroring how the disk path loops the stream
+//                          and calls SoftScan_FillTri. Live-term wiring (per-light A,B endpoints in a CB
+//                          lane + a segment-sampling oracle) is the documented NEXT step, not this pass.
+
+#ifndef SW_SEG_MAX_IV
+	#define SW_SEG_MAX_IV 64		// interval-union scratch capacity (one interval per candidate occluder tri)
+#endif
+#ifndef SW_SEG_EPS
+	#define SW_SEG_EPS 1e-6f		// param / determinant epsilon
+#endif
+
+// Binary occlusion: does the ray from P toward the light point (P + dir, dir = S(t) - P) pass through
+// triangle (v0,v1,v2) STRICTLY between the receiver and the light (hit param lam in (0,1))? lam == 1 is
+// the light point itself, lam == 0 is P; an occluder at lam >= 1 sits at/behind the light and blocks
+// nothing, one at lam <= 0 is behind the receiver. Double-sided (facing is irrelevant to occlusion).
+SW_FUNC bool SoftSeg_SegHitTri( float3 P, float3 dir, float3 v0, float3 v1, float3 v2 )
+{
+	float3 e1 = v1 - v0;
+	float3 e2 = v2 - v0;
+	float3 pv = cross( dir, e2 );
+	float det = dot( e1, pv );
+	if( abs( det ) < 1e-12f ) { return false; }			// ray parallel to the triangle plane
+	float inv = 1.0f / det;
+	float3 tv = P - v0;
+	float u = dot( tv, pv ) * inv;
+	if( u < 0.0f || u > 1.0f ) { return false; }
+	float3 qv = cross( tv, e1 );
+	float v = dot( dir, qv ) * inv;
+	if( v < 0.0f || u + v > 1.0f ) { return false; }
+	float lam = dot( e2, qv ) * inv;					// hit at P + lam*dir; light point is lam == 1
+	return ( lam > SW_SEG_EPS ) && ( lam < 1.0f );
+}
+
+// The EXACT blocked-t interval of ONE triangle on the segment source. Returns (t0,t1); EMPTY iff t1 < t0.
+// The blocked set of a single (convex) triangle is exactly one interval, bounded by the t values where
+// the ray P->S(t) transitions across the triangle's boundary. Those transitions can ONLY occur where the
+// ray grazes one of the three EDGE lines (S(t) coplanar with P and that edge: dot( cross(Ei-P,Ej-P),
+// S(t)-P ) == 0, linear in t) or where S(t) crosses the triangle's own PLANE (the depth root lam == 1:
+// dot( n, S(t)-v0 ) == 0). Collect those roots plus the segment ends {0,1}, sort, and CLASSIFY each
+// sub-interval by its midpoint with the shared occlusion predicate - so the endpoints are the exact
+// roots and membership is exact. Merging keeps it one contiguous interval; the multi-occluder union is
+// handled one level up in SoftSeg_UnionLength.
+SW_FUNC float2 SoftSeg_TriInterval( float3 v0, float3 v1, float3 v2, float3 P, float3 A, float3 B )
+{
+	float3 d = B - A;								// S(t) = A + t*d
+	float cand[6];
+	int nc = 0;
+	cand[nc++] = 0.0f;
+	cand[nc++] = 1.0f;
+	// three edge-grazing roots: for edge (Ei,Ej), N = cross(Ei-P, Ej-P); the ray grazes the edge line
+	// when dot( N, S(t)-P ) == 0 => t = -dot(N, A-P) / dot(N, d).
+	{
+		float3 N = cross( v0 - P, v1 - P );
+		float den = dot( N, d );
+		if( abs( den ) > 1e-20f ) { float t = -dot( N, A - P ) / den; if( t > 0.0f && t < 1.0f ) { cand[nc++] = t; } }
+	}
+	{
+		float3 N = cross( v1 - P, v2 - P );
+		float den = dot( N, d );
+		if( abs( den ) > 1e-20f ) { float t = -dot( N, A - P ) / den; if( t > 0.0f && t < 1.0f ) { cand[nc++] = t; } }
+	}
+	{
+		float3 N = cross( v2 - P, v0 - P );
+		float den = dot( N, d );
+		if( abs( den ) > 1e-20f ) { float t = -dot( N, A - P ) / den; if( t > 0.0f && t < 1.0f ) { cand[nc++] = t; } }
+	}
+	// triangle-plane crossing (depth root lam == 1): S(t) on the triangle's plane.
+	{
+		float3 n = cross( v1 - v0, v2 - v0 );
+		float den = dot( n, d );
+		if( abs( den ) > 1e-20f ) { float t = -dot( n, A - v0 ) / den; if( t > 0.0f && t < 1.0f ) { cand[nc++] = t; } }
+	}
+	for( int i = 1; i < nc; i++ )					// insertion sort the (<=6) candidate boundaries
+	{
+		float key = cand[i];
+		int j = i - 1;
+		while( j >= 0 && cand[j] > key ) { cand[j + 1] = cand[j]; j--; }
+		cand[j + 1] = key;
+	}
+	float lo = 1.0f, hi = 0.0f;						// empty accumulator (hi < lo)
+	for( int k = 0; k + 1 < nc; k++ )
+	{
+		float ta = cand[k], tb = cand[k + 1];
+		if( tb - ta < SW_SEG_EPS ) { continue; }	// zero-width / duplicate roots
+		float tm = 0.5f * ( ta + tb );
+		float3 S = A + d * tm;
+		if( SoftSeg_SegHitTri( P, S - P, v0, v1, v2 ) )
+		{
+			if( hi < lo ) { lo = ta; hi = tb; }		// first blocked sub-interval
+			else { lo = min( lo, ta ); hi = max( hi, tb ); }	// contiguous extension (one interval per tri)
+		}
+	}
+	return float2( lo, hi );
+}
+
+// Total covered length of n intervals in [0,1] (their UNION, overlaps counted once). Insertion-sort by
+// low endpoint, then a single sweep-merge. Empty intervals (hi <= lo) are skipped. n <= SW_SEG_MAX_IV.
+SW_FUNC float SoftSeg_UnionLength( float2 iv[SW_SEG_MAX_IV], int n )
+{
+	for( int i = 1; i < n; i++ )						// insertion sort by .x (low endpoint)
+	{
+		float2 key = iv[i];
+		int j = i - 1;
+		while( j >= 0 && iv[j].x > key.x ) { iv[j + 1] = iv[j]; j--; }
+		iv[j + 1] = key;
+	}
+	float total = 0.0f, curLo = 0.0f, curHi = 0.0f;
+	bool have = false;
+	for( int k = 0; k < n; k++ )
+	{
+		float lo = iv[k].x, hi = iv[k].y;
+		if( hi <= lo ) { continue; }					// empty interval
+		if( !have ) { curLo = lo; curHi = hi; have = true; }
+		else if( lo <= curHi ) { curHi = max( curHi, hi ); }	// overlaps/touches the open run: extend
+		else { total += curHi - curLo; curLo = lo; curHi = hi; }	// disjoint: flush and start a new run
+	}
+	if( have ) { total += curHi - curLo; }
+	return total;
+}
+
 // ============================ FUBINI SCANLINE COVERAGE (SW_SCANLINE) ============================
 // Exact-union coverage by the Fubini identity: area( disk ∩ ⋃ tri ) = ∫ length( 1D interval-union along a
 // horizontal chord ) dy. Discretised as SW_SCAN_CHORDS chords x 32 bits: each occluder triangle fills a

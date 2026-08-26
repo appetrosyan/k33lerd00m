@@ -482,3 +482,56 @@ One script over an existing fixture decides it before a line of engine code is
 written — and it reuses the same interval-union primitive the shipping Fubini
 scanline already computes, so the "ground truth" is the engine's own math at
 chords→∞.
+
+# 8. Implementation status: the EXACT segment primitive (S) is built + tested
+
+The exact model (claim (S), NOT the lossy (T)) now exists as a pure primitive
+with an offline test, ahead of any live-term wiring:
+
+- **Primitive** — `softwedge_coverage.inc.hlsl`, section "SEGMENT (FLUORESCENT
+  TUBE / LINE) AREA-LIGHT COVERAGE". Three dual-compiled (HLSL + C++) `SW_FUNC`s
+  that are the single source of truth for both a future shader and the test:
+  - `SoftSeg_SegHitTri` — the binary occlusion predicate (Möller–Trumbore, hit
+    param `lam ∈ (0,1)`, i.e. the occluder strictly between receiver and the
+    light point). Both the analytic path and the ground-truth sampler call this,
+    so they can differ only in exact-endpoints-vs-sampling, never in the
+    occlusion test.
+  - `SoftSeg_TriInterval` — the EXACT blocked t-interval `[t0,t1]⊂[0,1]` of one
+    triangle. Boundaries are the roots of linear grazing equations: three
+    edge-grazings (`dot( cross(Ei−P,Ej−P), S(t)−P ) = 0`) plus the triangle-plane
+    crossing (`dot( n, S(t)−v0 ) = 0`, the `lam=1` depth root); sub-intervals are
+    classified by their midpoint via `SoftSeg_SegHitTri`. One convex occluder ⇒
+    one interval (closed form, no sweep).
+  - `SoftSeg_UnionLength` — sort + sweep union of the per-triangle intervals;
+    coverage = union length (`t` spans `[0,1]`, so the length IS the term). This
+    is the general multi-occluder / non-convex case, exact.
+- **Test** — `neo/tests/SoftShadowSegment_test.cpp` (auto-built into
+  `rbdoom3bfg_tests` via the `tests/*.cpp` glob). Ground truth is an INDEPENDENT
+  segment sampler (65 536 points, each an occlusion test), NOT the disk oracle.
+  Cases: fully lit (0), full umbra (1), single-occluder penumbra (one interval),
+  two-occluder disjoint and overlapping unions, and the doc's monotonicity-break
+  case (both segment endpoints blocked, middle lit — where (T) would over-darken
+  to ~1 but the exact union is 0.2). Achieved tolerances: analytic vs sampled
+  truth `< 1e-4` on every case (bounded by the truth quantum ≈ boundaries/N);
+  canonical hand values matched `< 2e-3`.
+
+## Next step — live-engine integration (deferred; NOT this pass)
+
+1. **Per-light endpoints in a CB lane.** A tube light needs `A,B` (or
+   `origin + axis·halfLength`) instead of the scalar `g_lightR` the disk uses —
+   one extra `float4` per light in `SoftShadowTermPass.cpp`, plumbed into
+   `softterm.cs.hlsl`. The term CS then loops the caster triangle stream (as the
+   disk path does) calling `SoftSeg_TriInterval`/`SoftSeg_UnionLength` instead of
+   the chord grid. Per `no-special-case-perf-paths`, build it as the degenerate
+   single-chord / `L→∞` limit of the stadium variant, not a third fork.
+2. **A SEGMENT oracle — and do NOT baseline it against the disk RT oracle.** The
+   existing RT reference pins "RT area-light radius == analytic light-DISK
+   radius"; that RT oracle is not necessarily running a realistic light geometry
+   for a tube, so it is **not** a valid ground truth here (its disk source is the
+   wrong shape, and the fixture's light geometry may itself be unphysical). The
+   correct oracle is an independent SEGMENT sampler — exactly the one this test
+   already implements (16+ Hammersley/uniform points along `A→B`, float64) — and,
+   separately, the RT area-light shape would have to become a segment/capsule
+   primitive before the corpus (11 caps / 76 lights) can be re-baselined. Until
+   that oracle exists and the light geometry is confirmed physical, the CPU test
+   here is the authoritative correctness check for the primitive.
