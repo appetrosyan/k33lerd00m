@@ -970,6 +970,230 @@ static void WriteOutputEntity( int entityNum, idFile* procFile, idFile* objFile 
 
 /*
 ====================
+Shadow-hull producer (brush-recovery soft shadows)
+
+A Doom brush is convex by construction, so its face-winding vertices ARE its
+convex hull - no computation, lossless. For each shadow-casting worldspawn
+brush we emit that hull, once per BSP render area the brush borders, into an
+additive `shadowHulls` block. The renderer (r_softShadowBrushHulls) casts one
+analytic hull per record instead of the area's triangles.
+
+Area keying: an opaque (solid) leaf never gets a render area (FindAreas_r skips
+opaque leaves), so we read the areas a solid brush borders from the leaf's
+portals to adjacent non-opaque leaves - exactly dmap's own adjacency
+(FloodAreas_r). The full original brush hull is emitted for every bordering
+area (a wall between two rooms lands in both), giving one hull per (brush n area).
+====================
+*/
+
+// must match SW_POLY_MAX_VERTS in Interaction.cpp / softwedge_coverage.inc.hlsl:
+// FillHull walks at most this many verts; larger brushes fall back to triangles.
+static const int SHADOW_HULL_MAX_VERTS = 8;
+// fragmentation cap: a brush spanning more areas than this is dropped to the
+// triangle path rather than replicating its hull into a runaway record count.
+static const int SHADOW_HULL_MAX_AREAS = 16;
+static const float SHADOW_HULL_VERT_EPSILON = 0.1f;	// == CLIP_EPSILON
+
+// true if this brush should cast an analytic hull shadow: solid, not an
+// areaportal, and at least one face is a shadow-casting material (skips pure
+// noshadows brushes). Matches the per-side test in TriListForSide (usurface.cpp).
+static bool BrushCastsHullShadow( const uBrush_t* b )
+{
+	if( !b->opaque )
+	{
+		return false;
+	}
+	if( b->contents & CONTENTS_AREAPORTAL )
+	{
+		return false;
+	}
+	for( int i = 0 ; i < b->numsides ; i++ )
+	{
+		const idMaterial* m = b->sides[i].material;
+		if( m && m->SurfaceCastsShadow() )
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// walk the tree; for each solid leaf holding brush fragments, find the render
+// areas it borders (via portals) and register each fragment's ORIGINAL brush
+// under those areas. Original brushes live in e->primitives and survive the
+// node pruning that WriteOutputNodes does later, so this must run first.
+static void CollectShadowHullBrushes_r( node_t* node, idList< idList<uBrush_t*> >& areaBrushes )
+{
+	if( node->planenum != PLANENUM_LEAF )
+	{
+		CollectShadowHullBrushes_r( node->children[0], areaBrushes );
+		CollectShadowHullBrushes_r( node->children[1], areaBrushes );
+		return;
+	}
+
+	if( !node->opaque || !node->brushlist )
+	{
+		return;
+	}
+
+	// gather the render areas adjacent to this solid leaf
+	idList<int> areas;
+	int s = 0;
+	for( uPortal_t* p = node->portals ; p ; p = p->next[s] )
+	{
+		s = ( p->nodes[1] == node );
+		node_t* other = p->nodes[!s];
+		if( other->opaque || other->area < 0 )
+		{
+			continue;
+		}
+		areas.AddUnique( other->area );
+	}
+	if( areas.Num() == 0 )
+	{
+		return;
+	}
+
+	for( uBrush_t* b = node->brushlist ; b ; b = b->next )
+	{
+		uBrush_t* orig = b->original ? b->original : b;
+		if( !BrushCastsHullShadow( orig ) )
+		{
+			continue;
+		}
+		for( int i = 0 ; i < areas.Num() ; i++ )
+		{
+			areaBrushes[ areas[i] ].AddUnique( orig );
+		}
+	}
+}
+
+// dedup the brush's face-winding points into its convex-hull vertex set.
+static void BrushHullVerts( const uBrush_t* b, idList<idVec3>& verts )
+{
+	verts.Clear();
+	for( int i = 0 ; i < b->numsides ; i++ )
+	{
+		const idWinding* w = b->sides[i].winding;
+		if( !w )
+		{
+			continue;
+		}
+		for( int k = 0 ; k < w->GetNumPoints() ; k++ )
+		{
+			const idVec3 p = ( *w )[k].ToVec3();
+			bool found = false;
+			for( int j = 0 ; j < verts.Num() ; j++ )
+			{
+				if( ( verts[j] - p ).LengthSqr() < SHADOW_HULL_VERT_EPSILON * SHADOW_HULL_VERT_EPSILON )
+				{
+					found = true;
+					break;
+				}
+			}
+			if( !found )
+			{
+				verts.Append( p );
+			}
+		}
+	}
+}
+
+/*
+====================
+WriteShadowHulls
+
+Additive, presence-gated `shadowHulls` block for the worldspawn. Grammar:
+
+  shadowHulls { <numAreas>
+    <areaIndex> { <numHulls>
+      { <numVerts> ( x y z ) ( x y z ) ... }
+      ...
+    }
+    ...
+  }
+
+Old .proc files simply lack the block (triangle fallback); the loader tolerates
+its absence.
+====================
+*/
+static void WriteShadowHulls( const uEntity_t* world, idList< idList<uBrush_t*> >& areaBrushes, idFile* procFile )
+{
+	const int numAreas = areaBrushes.Num();
+
+	// fragmentation cap: count how many areas each brush spans; drop the ones
+	// that span too many so a single brush can't explode the record count.
+	// ponytail: O(brushes^2) span count, fine for an offline compile.
+	idList<uBrush_t*> spanBrush;
+	idList<int>       spanCount;
+	for( int a = 0 ; a < numAreas ; a++ )
+	{
+		for( int i = 0 ; i < areaBrushes[a].Num() ; i++ )
+		{
+			int idx = spanBrush.FindIndex( areaBrushes[a][i] );
+			if( idx < 0 )
+			{
+				idx = spanBrush.Append( areaBrushes[a][i] );
+				spanCount.Append( 0 );
+			}
+			spanCount[idx]++;
+		}
+	}
+
+	procFile->WriteFloatString( "shadowHulls { /* numAreas = */ %i\n\n", numAreas );
+
+	idList<idVec3> verts;
+	for( int a = 0 ; a < numAreas ; a++ )
+	{
+		// COMPLETENESS RULE: the renderer swaps an area's triangles for its hulls
+		// all-or-nothing, so a mix of hull and dropped casters would lose the
+		// dropped ones' shadows. If ANY shadow-casting brush here fails a cap,
+		// emit zero hulls for the whole area -> the renderer keeps the full
+		// triangle stream and nothing is lost.
+		idList<uBrush_t*> emit;
+		bool complete = true;
+		for( int i = 0 ; i < areaBrushes[a].Num() ; i++ )
+		{
+			uBrush_t* b = areaBrushes[a][i];
+			BrushHullVerts( b, verts );
+			if( spanCount[ spanBrush.FindIndex( b ) ] > SHADOW_HULL_MAX_AREAS
+					|| verts.Num() < 4 || verts.Num() > SHADOW_HULL_MAX_VERTS )
+			{
+				complete = false;	// a capped/dropped caster -> whole area falls back to triangles
+				break;
+			}
+			emit.Append( b );
+		}
+		if( !complete )
+		{
+			emit.Clear();
+		}
+
+		procFile->WriteFloatString( "/* area */ %i { /* numHulls = */ %i\n", a, emit.Num() );
+
+		for( int i = 0 ; i < emit.Num() ; i++ )
+		{
+			BrushHullVerts( emit[i], verts );
+			procFile->WriteFloatString( "\t{ /* numVerts = */ %i ", verts.Num() );
+			for( int k = 0 ; k < verts.Num() ; k++ )
+			{
+				float v[3];
+				v[0] = verts[k].x - world->mapEntity->originOffset.x;
+				v[1] = verts[k].y - world->mapEntity->originOffset.y;
+				v[2] = verts[k].z - world->mapEntity->originOffset.z;
+				Write1DMatrix( procFile, 3, v );
+			}
+			procFile->WriteFloatString( "}\n" );
+		}
+
+		procFile->WriteFloatString( "}\n\n" );
+	}
+
+	procFile->WriteFloatString( "}\n\n" );
+}
+
+/*
+====================
 WriteOutputFile
 ====================
 */
@@ -1007,6 +1231,20 @@ void WriteOutputFile()
 
 	procFile->WriteFloatString( "%s\n\n", PROC_FILE_ID );
 
+	// Collect worldspawn shadow-caster hulls BEFORE writing entities: the tree,
+	// its leaf brushlists and portals are all still intact here, but
+	// WriteOutputEntity -> WriteOutputNodes prunes and frees them for entity 0.
+	// We only keep pointers to original brushes (in e->primitives), which the
+	// pruning never touches, so the block itself can be written afterwards.
+	idList< idList<uBrush_t*> > shadowHullBrushes;
+	uEntity_t* world = &dmapGlobals.uEntities[0];
+	const bool haveWorld = ( dmapGlobals.numEntities > 0 && world->primitives && world->tree );
+	if( haveWorld )
+	{
+		shadowHullBrushes.SetNum( world->numAreas );
+		CollectShadowHullBrushes_r( world->tree->headnode, shadowHullBrushes );
+	}
+
 	// write the entity models and information, writing entities first
 	for( i = dmapGlobals.numEntities - 1 ; i >= 0 ; i-- )
 	{
@@ -1018,6 +1256,12 @@ void WriteOutputFile()
 		}
 
 		WriteOutputEntity( i, procFile, objFile );
+	}
+
+	// additive, presence-gated worldspawn shadow hulls
+	if( haveWorld )
+	{
+		WriteShadowHulls( world, shadowHullBrushes, procFile );
 	}
 
 	if( objFile )

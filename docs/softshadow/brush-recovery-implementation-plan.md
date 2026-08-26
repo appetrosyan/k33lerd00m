@@ -55,6 +55,40 @@ So `.w=-N` means "N-vertex convex hull → FillHull"; box (`.w>0`) stays for bac
 soft-shadow header) defining the record layout constants + the in-memory `areaShadowHull_t`
 struct, plus the `.proc` block grammar documented here. Everything below `#include`s it.
 
+### `shadowHulls` block — AS IMPLEMENTED by package A (authoritative for the loader)
+Written by `WriteShadowHulls` in `dmap/output.cpp`, appended once after the worldspawn's
+`model`/`interAreaPortals`/`nodes` blocks (a top-level block, additive, presence-gated —
+old `.proc` simply lacks it → triangle fallback). `/* … */` comments are decorative and MUST
+be skipped by the parser (same convention as every other `.proc` block). Numbers are written
+with dmap's `WriteFloat` (integers print with no decimal point). Exact grammar:
+```
+shadowHulls { /* numAreas = */ <N>
+
+/* area */ <areaIndex> { /* numHulls = */ <M>
+	{ /* numVerts = */ <K> ( x y z ) ( x y z ) ... }
+	...          // M hull lines, K in [4 .. SW_POLY_MAX_VERTS(8)]
+}                // one such area block per area, areaIndex = 0 .. N-1
+
+}
+```
+- `N` = worldspawn `numAreas` (matches the `interAreaPortals`/`nodes` area numbering). An area
+  with no qualifying hulls still emits its header line with `numHulls = 0`.
+- Vertices are **world space**, worldspawn `originOffset` subtracted (= 0 for worldspawn); the
+  full brush corner set (dedup of its face windings), i.e. hull == brush, lossless.
+- **Caps enforced by the producer** (so the loader never sees a bad hull): a hull is emitted
+  only if `4 <= K <= SW_POLY_MAX_VERTS`; a brush spanning more than 16 areas is dropped
+  entirely. Dropped brushes fall to the triangle path.
+- **COMPLETENESS RULE — the loader/B may rely on this.** Because B's per-area swap is
+  *all-or-nothing* (an area with any hull uses hulls and drops its triangle stream), the
+  producer emits hulls for an area **only if EVERY shadow-casting brush touching that area is
+  hull-emittable**. If any brush in an area is dropped/capped, that whole area emits
+  `numHulls = 0`, so B keeps the full triangle stream there and nothing is lost. Consequence:
+  an area's hull list is either complete (all its shadow casters) or empty — a non-empty
+  `shadowHulls` area is a guarantee that those hulls are the area's *entire* caster set. This
+  trades coverage on mixed areas for guaranteed losslessness (non-negotiable for this feature).
+- **Shadow-caster filter** (matches dmap's own `TriListForSide`): brush is `opaque`, not
+  `CONTENTS_AREAPORTAL`, and has ≥1 side whose material `SurfaceCastsShadow()`.
+
 ---
 
 ## A — dmap producer  (parallel)
