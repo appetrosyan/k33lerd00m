@@ -216,6 +216,12 @@ void  R_SoftShadowRecapture_f( const idCmdArgs& args );
 void  R_SoftShadowReproShot_f( const idCmdArgs& args );
 void  R_SoftShadowReproTick();
 void  R_SoftShadowSpawnCasters_f( const idCmdArgs& args );	// reproduce a capture's dynamic casters (the rock)
+// REAL-GAME SMOKE gate: `softShadowGateSmoke <map> [frames]` devmaps the map through the FULL shipped
+// load+present path, then R_SoftShadowGateSmokeTick (frame loop) counts genuine game-view frames and asserts
+// the lit HDR frame is not black. Catches load-path stalls / black-frame-no-crash that the minimal-init
+// com_softShadowGate is structurally blind to. Sets the process exit code (nonzero=FAIL), then quits.
+void  R_SoftShadowGateSmoke_f( const idCmdArgs& args );
+void  R_SoftShadowGateSmokeTick( int viewLights );	// viewLights = completed frame's stats_frontend.c_viewLights
 // Pin every shadow-relevant cvar to the explicit soft-shadow test baseline (RT off, soft on, atlas+PCSS, etc.),
 // so the self-test NEVER inherits an archived D3BFGConfig value (e.g. r_useRTShadows 1 silently disabling the
 // soft-wedge path). verbose = log each value + WARN on any archived override.

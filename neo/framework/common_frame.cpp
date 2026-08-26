@@ -683,6 +683,17 @@ void idCommonLocal::Frame()
 			}
 		}
 
+		// REAL-GAME smoke gate (softShadowGateSmoke): mirror com_autoCapture's post-swap vantage - the GPU is
+		// idle here and the HDR scene buffer holds the completed previous frame, coherent with tr.pc.c_viewLights.
+		// Runs EVERY frame (loading + ingame), so a load-path stall trips the per-frame wall budget without
+		// waiting on the hard-wedge watchdog. No-op unless the softShadowGateSmoke command armed it.
+		{
+			// pass the COMPLETED frame's viewLights from stats_frontend: SwapCommandBuffers copied tr.pc into it
+			// just before zeroing tr.pc, so reading tr.pc here would always see 0 (the reset).
+			extern void R_SoftShadowGateSmokeTick( int viewLights );
+			R_SoftShadowGateSmokeTick( stats_frontend.c_viewLights );
+		}
+
 		// RB: slow down engine in background so it does not eat up so many resources along other 3D tools
 		if( !com_activeApp.GetBool() && !IsServer() /* and not VR */ )
 		{
