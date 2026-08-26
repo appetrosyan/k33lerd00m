@@ -2056,7 +2056,7 @@ void main( uint3 tid : SV_DispatchThreadID )
 			{
 				if( t_SoftTiles[ g_range.z + ( uTy * g_range.w + uTx ) * ( g_flags.w + 1 ) ] == SW_TILE_UMBRA )
 				{
-					u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ) );
+					u_Term[ uint2( px + g_tile.zw ) ] = SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
 					return;
 				}
 			}
