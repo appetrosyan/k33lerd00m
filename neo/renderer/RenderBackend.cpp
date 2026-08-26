@@ -3329,6 +3329,26 @@ void idRenderBackend::FillSoftShadowPosBuffer( const drawSurf_t* const* drawSurf
 			idRenderMatrix modelMatrix;
 			idRenderMatrix::Transpose( *( idRenderMatrix* )drawSurf->space->modelMatrix, modelMatrix );
 			SetVertexParms( RENDERPARM_MODELMATRIX_X, modelMatrix[0], 4 );
+
+			// PORTAL-AREA TAG for the term's dead-work cull (r_softShadowAreaCull): world geometry is
+			// one entityDef per portal area, model named "_area%i" (RenderWorld_load). softpos.ps packs
+			// areaNum+1 alongside the texel-key axis into its normal .w (enc = axis + 4*areaP1; max
+			// 4*128+2 = 514, fp16-exact); 0 = non-world receiver (never culled). Delivered via
+			// rpSpecularMatrixS.x - present in renderParmSet3 (BINDING_LAYOUT_GBUFFER) and provably
+			// unread by softpos.vs/.ps (they read bump/MVP/model rows/PSX only). Set per space on both
+			// the static and skinned binds (the PS is shared).
+			int swAreaP1 = 0;
+			const idRenderEntityLocal* swAreaEnt = drawSurf->space->entityDef;
+			if( swAreaEnt != NULL && swAreaEnt->parms.hModel != NULL && swAreaEnt->parms.hModel->IsStaticWorldModel() )
+			{
+				const char* swAreaName = swAreaEnt->parms.hModel->Name();
+				if( idStr::Cmpn( swAreaName, "_area", 5 ) == 0 )
+				{
+					swAreaP1 = idMath::ClampInt( 0, 128, atoi( swAreaName + 5 ) + 1 );
+				}
+			}
+			const idVec4 swAreaParm( ( float )swAreaP1, 0.0f, 0.0f, 0.0f );
+			SetVertexParm( RENDERPARM_SPECULARMATRIX_S, swAreaParm.ToFloatPtr() );
 		}
 
 		// per-surface BUMP for the world shading normal (2nd MRT -> softterm N.L early-out). The bump

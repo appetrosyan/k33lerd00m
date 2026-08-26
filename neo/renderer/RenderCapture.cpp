@@ -3644,15 +3644,35 @@ int R_SoftShadowGate( const char* arg )
 								extern int R_SoftSurfTermLightsTake( int* outIdx, bool* outOn, int cap );
 								int tlIdx[64]; bool tlOn[64];
 								const int tlN = R_SoftSurfTermLightsTake( tlIdx, tlOn, 64 );
+								// PORTAL-AREA audit (r_softShadowAreaCull confirmation): each light's
+								// reached-area list from its lightDef->references chain - the exact set
+								// the term CB's area mask is built from. n=0 = empty reference list
+								// (mask stays all-ones, cull inert for that light).
+								idRenderWorldLocal* swTlWorld = ( idRenderWorldLocal* )tr.primaryWorld;
 								idStr swTlLine;
 								for( int tl = 0; tl < tlN; tl++ )
 								{
-									swTlLine += va( " %d(r%d,%s,%s)", tlIdx[tl], tlIdx[tl] & 15,
+									idStr swTlAreas;
+									int swTlAreaN = 0;
+									if( swTlWorld != NULL && tlIdx[tl] >= 0 && tlIdx[tl] < swTlWorld->lightDefs.Num()
+											&& swTlWorld->lightDefs[tlIdx[tl]] != NULL )
+									{
+										for( const areaReference_t* ref = swTlWorld->lightDefs[tlIdx[tl]]->references;
+												ref != NULL; ref = ref->ownerNext )
+										{
+											swTlAreas += va( "%s%d", swTlAreaN ? "," : "", ref->area ? ref->area->areaNum : -1 );
+											swTlAreaN++;
+										}
+									}
+									swTlLine += va( " %d(r%d,%s,%s,areas:%d=[%s])", tlIdx[tl], tlIdx[tl] & 15,
 													tlOn[tl] ? "on" : "OFF",
-													backEnd.GetSoftShadowSurfCache()->IsWarmLight( tlIdx[tl] ) ? "warm" : "COLD" );
+													backEnd.GetSoftShadowSurfCache()->IsWarmLight( tlIdx[tl] ) ? "warm" : "COLD",
+													swTlAreaN, swTlAreas.c_str() );
 								}
-								common->Printf( "[softgate] BENCH %-14s surf term lights idx(ring,cache,warm):%s\n",
-												cap.name.c_str(), swTlLine.c_str() );
+								common->Printf( "[softgate] BENCH %-14s surf term lights idx(ring,cache,warm,areas):%s | viewArea %d of %d\n",
+												cap.name.c_str(), swTlLine.c_str(),
+												tr.viewDef ? tr.viewDef->areaNum : -999,
+												swTlWorld ? swTlWorld->NumAreas() : -1 );
 							}
 							// VIZ FRAME DUMP: with a surf viz mode active, dump the last bench frame -
 							// the term tint (viz 2 dims serves, viz 4 brightens hits / tints classes)

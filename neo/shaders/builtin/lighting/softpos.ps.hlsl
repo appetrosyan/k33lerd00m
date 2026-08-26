@@ -85,5 +85,8 @@ void main( PS_IN fragment, out PS_OUT result )
 	const float3 gn = cross( ddx( worldPosition ), ddy( worldPosition ) );
 	const float3 ga = abs( gn );
 	const float  gaxis = ( ga.x >= ga.y && ga.x >= ga.z ) ? 0.0 : ( ( ga.y >= ga.z ) ? 1.0 : 2.0 );
-	result.normal = float4( worldNormal, gaxis );
+	// PORTAL-AREA TAG (r_softShadowAreaCull): rpSpecularMatrixS.x carries areaNum+1 for world geometry
+	// (0 = non-world), set per space by FillSoftShadowPosBuffer. Pack it above the 2-bit axis:
+	// enc = axis + 4*areaP1, max 4*128+2 = 514 < 2048 - exact in fp16. Consumers decode axis = enc & 3.
+	result.normal = float4( worldNormal, gaxis + 4.0 * pc.rpSpecularMatrixS.x );
 }

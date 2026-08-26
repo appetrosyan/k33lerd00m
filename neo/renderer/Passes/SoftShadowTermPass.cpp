@@ -45,6 +45,9 @@ struct SoftTermCB
 							// gate base margin, z = persistent static-stream segment tri base (float4
 							// elems, uint BIT-CAST into the lane - audit finding #4), w reserved.
 							// Mirrors g_econ in softterm.cs.hlsl.
+	unsigned int areaMask[4];	// PORTAL-AREA CULL (r_softShadowAreaCull): 128-bit mask, bit areaNum set
+							// iff the light's flood reached the area; ALL-ONES = cull inert (cvar off /
+							// unqualified light - conservative). Mirrors g_areaMask in softterm.cs.hlsl.
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -706,6 +709,37 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		cb.econ[0] = swNearR * swNearR;
 		cb.econ[1] = r_softShadowSurfCacheGateMargin.GetFloat();
 		cb.econ[2] = cb.econ[3] = 0.0f;
+	}
+	// PORTAL-AREA DEAD-WORK CULL mask (r_softShadowAreaCull): bit areaNum set iff the light's portal
+	// flood reached that area (lightDef->references chain). A world fragment in an unreached area has no
+	// interaction draw under this light, so its term is provably never read - the CS skips the walk.
+	// All-ones = cull inert: cvar off, NULL lightDef, empty reference list, or any areaNum >= 128
+	// (conservative - never skip on doubt). Fog/blend lights never reach AddLight.
+	cb.areaMask[0] = cb.areaMask[1] = cb.areaMask[2] = cb.areaMask[3] = 0xFFFFFFFFu;
+	{
+		extern idCVar r_softShadowAreaCull;
+		if( r_softShadowAreaCull.GetInteger() > 0 && vLight->lightDef != NULL && vLight->lightDef->references != NULL )
+		{
+			unsigned int swAreaM[4] = { 0u, 0u, 0u, 0u };
+			bool swAreaOk = true;
+			for( const areaReference_t* ref = vLight->lightDef->references; ref != NULL; ref = ref->ownerNext )
+			{
+				const int a = ( ref->area != NULL ) ? ref->area->areaNum : -1;
+				if( a < 0 || a >= 128 )
+				{
+					swAreaOk = false;
+					break;
+				}
+				swAreaM[a >> 5] |= 1u << ( a & 31 );
+			}
+			if( swAreaOk )
+			{
+				cb.areaMask[0] = swAreaM[0];
+				cb.areaMask[1] = swAreaM[1];
+				cb.areaMask[2] = swAreaM[2];
+				cb.areaMask[3] = swAreaM[3];
+			}
+		}
 	}
 	cb.surfA[0] = 0;
 	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
