@@ -524,6 +524,15 @@ SW_FUNC softFrame_t SoftShadow_Frame( float3 swP, float3 swL )
 	#define SW_MINDNR_DEFAULT 0.0f	// exact projection unless a TU opts into the dn-clamp before including
 #endif
 static float g_swMinDnR = SW_MINDNR_DEFAULT;
+// WEDGE-ONLY projection floor. MEASURED (wedge gate, corpus, 2026-08-28): flooring the WEDGE projection
+// denominator kills the umbra-hole class outright (LIT_IN_UMBRA 405 -> 0, TOTAL 3902 -> 1145) - the holes
+// were clip endpoints at dn=eps projecting at ~75000x and detonating the shoelace where a contact edge
+// straddles eps. This floor must NOT reach FillTri/the scanline: a blanket PS clamp made near-coplanar
+// self-surface triangles project finitely and SELF-SHADOW whole receivers (measured: the gate's fully-lit
+// mask emptied, every light "drew 0 px"). 0.02 measured slightly worse than 0.04 (1254 vs 1145).
+#ifndef SW_WEDGE_MINDNR
+	#define SW_WEDGE_MINDNR 0.04f
+#endif
 // g_swMinDnAbs: an ABSOLUTE dn floor knob (default 0 = inert). A footprint-DRIVEN version of this was tried
 // for the grazing grain and REFUTED (SoftShadowGrainAA_test): the clamp family biases the projection instead
 // of averaging, so it plateaus ~0.10 off the supersampled truth and over-blurs past that. The lossless grain
@@ -534,6 +543,14 @@ static float g_swMinDnAbs = 0.0f;
 SW_FUNC float2 SoftShadow_ProjectVert( float3 rel, float dn, softFrame_t f )
 {
 	float dnc = max( dn, max( f.distPL * g_swMinDnR, g_swMinDnAbs ) );
+	return float2( ( f.distPL / dnc ) * dot( rel, f.u ), ( f.distPL / dnc ) * dot( rel, f.v ) );
+}
+// WEDGE-scoped projection: same central projection with the denominator additionally floored by
+// SW_WEDGE_MINDNR (see its comment above - kills the wedge's contact-band shoelace detonation while
+// FillTri/the scanline keep the runtime-controlled exact projection).
+SW_FUNC float2 SoftShadow_ProjectVertWedge( float3 rel, float dn, softFrame_t f )
+{
+	float dnc = max( dn, max( f.distPL * max( g_swMinDnR, SW_WEDGE_MINDNR ), g_swMinDnAbs ) );
 	return float2( ( f.distPL / dnc ) * dot( rel, f.u ), ( f.distPL / dnc ) * dot( rel, f.v ) );
 }
 
@@ -1110,8 +1127,8 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 		float3 pb  = a + cl.t1 * ( b - a );
 		float  dna = dnA + cl.t0 * d;
 		float  dnb = dnA + cl.t1 * d;
-		float2 q0 = SoftShadow_ProjectVert( pa, dna, swF );
-		float2 q1 = SoftShadow_ProjectVert( pb, dnb, swF );
+		float2 q0 = SoftShadow_ProjectVertWedge( pa, dna, swF );
+		float2 q1 = SoftShadow_ProjectVertWedge( pb, dnb, swF );
 
 		if( swFirstValid ) { float swBrA2 = SoftDisk_CircleTriArea( swPrev, q0, swR2 ); swArea += swBrA2; swCross += SoftDisk_Crossing( swPrev, q0 );
 			if( abs( swBrA2 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material intra-chain bridge

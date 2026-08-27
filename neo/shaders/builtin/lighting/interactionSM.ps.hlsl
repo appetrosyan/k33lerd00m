@@ -80,14 +80,9 @@ Texture2D t_SoftTerm : register( t14 VK_DESCRIPTOR_SET( 0 ) );
 // at the 1/16 quantum (playtest ants/terraces). Defined IN-SHADER, NOT via a shaders.cfg -D, so the
 // blob permutation key is unchanged (the renderprog requests this permutation without SW_SCANLINE).
 #define SW_SCANLINE 1
-// PS-path projection dn-clamp default, aligned with r_softShadowMinDnRatio's shipped softterm value.
-// MEASURED (wedge gate, corpus, 2026-08-28): clamping the PS wedge kills the umbra-hole class outright
-// (LIT_IN_UMBRA 405 -> 0, TOTAL 3902 -> 1145) - the holes were clip endpoints at dn=eps projecting at
-// ~75000x and detonating the shoelace in the band where a contact edge straddles eps; the clamp bounds
-// that to ~25x. 0.02 measured slightly worse (1254). Known deviation: the PS has no CB slot for the
-// cvar, so this is compile-time and also moves the in-shader Fubini overflow path off exact-0 - kept
-// deliberately so PS and compute agree on one projection.
-#define SW_MINDNR_DEFAULT 0.04
+// The wedge's projection floor lives in the include as SW_WEDGE_MINDNR (wedge-scoped: it must NOT
+// reach FillTri - a blanket PS clamp made self-surface triangles project finitely and SELF-SHADOW
+// whole receivers, emptying the gate's fully-lit mask). The in-shader Fubini path stays exact-0.
 // SW_RADIAL: route eligible (convex + contains-O) casters through the exact radial-max UNION with an umbra
 // early-out, instead of the wedge's lossy scalar MAX-combine. A/B knob for the gate + RoE bench (chunk 4);
 // flip to 0 for the pure-wedge baseline. In-shader like SW_SCANLINE so the perm key is unchanged.

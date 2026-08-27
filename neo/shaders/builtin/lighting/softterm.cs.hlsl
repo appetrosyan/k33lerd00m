@@ -561,10 +561,6 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 {
 	const float3 swP = swPos.xyz;
 
-	// dn-clamp BEFORE any coverage math (census included): the census must classify casters under the
-	// SHIPPED projection - it previously ran at the static default 0 and measured the wrong geometry.
-	g_swMinDnR = g_misc.x;			// projection dn-clamp (r_softShadowMinDnRatio): grazing-grain fix; 0 = exact
-
 #if SW_GPU_WALK_COUNTERS
 	InterlockedAdd( u_WalkCnt[ 7 ], 1u );	// this pixel survived the early-outs and runs the walk
 	// HYBRID-WHITELIST CENSUS (counting permutation only - shipped codegen untouched): scan the whitelist
@@ -623,6 +619,7 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 
 	const float3 swL = g_lightR.xyz;
 	const float  swR = max( g_lightR.w, 1e-2 );
+	g_swMinDnR = g_misc.x;			// projection dn-clamp (r_softShadowMinDnRatio): grazing-grain fix; 0 = exact
 
 
 
