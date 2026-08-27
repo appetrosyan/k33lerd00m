@@ -1213,6 +1213,14 @@ void idCommonLocal::Frame()
 											( unsigned long long )backEnd.GetSoftShadowTermPass()->m_ContribActiveLights );
 						}
 					}
+					// WEDGE-SELECTOR eligibility census (r_softShadowWedgeCensus): report the LAST fully-collected
+					// frame here, at probe-end, so the numbers reflect the settled cap viewpoint (softShadowGoto
+					// has long since teleported) rather than the frame-2 map-spawn view.
+					if( cvarSystem->GetCVarInteger( "r_softShadowWedgeCensus" ) > 0 )
+					{
+						extern void R_SoftWedgeCensusReport();
+						R_SoftWedgeCensusReport();
+					}
 					com_softShadowFrameProbe.SetInteger( 0 );
 					s_probeFrame = 0;
 					s_probeMs.Clear();

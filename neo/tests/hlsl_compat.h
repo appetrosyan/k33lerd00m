@@ -39,6 +39,14 @@ inline float2 operator+( float2 a, float2 b ) { return float2( a.x + b.x, a.y + 
 inline float2 operator-( float2 a, float2 b ) { return float2( a.x - b.x, a.y - b.y ); }
 inline float2 operator*( float2 a, float  s ) { return float2( a.x * s, a.y * s ); }
 inline float2 operator*( float  s, float2 a ) { return float2( a.x * s, a.y * s ); }
+// compound assignment (HLSL float3/float2 have these): needed by inc code that accumulates (bounding-sphere
+// centroids, etc.). Return void - callers use them as statements, never chained.
+inline void operator+=( float3& a, float3 b ) { a.x += b.x; a.y += b.y; a.z += b.z; }
+inline void operator-=( float3& a, float3 b ) { a.x -= b.x; a.y -= b.y; a.z -= b.z; }
+inline void operator*=( float3& a, float  s ) { a.x *= s; a.y *= s; a.z *= s; }
+inline void operator/=( float3& a, float  s ) { a.x /= s; a.y /= s; a.z /= s; }
+inline void operator+=( float2& a, float2 b ) { a.x += b.x; a.y += b.y; }
+inline void operator*=( float2& a, float  s ) { a.x *= s; a.y *= s; }
 
 inline float  dot( float3 a, float3 b ) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 inline float  dot( float2 a, float2 b ) { return a.x * b.x + a.y * b.y; }
