@@ -80,6 +80,18 @@ Texture2D t_SoftTerm : register( t14 VK_DESCRIPTOR_SET( 0 ) );
 // at the 1/16 quantum (playtest ants/terraces). Defined IN-SHADER, NOT via a shaders.cfg -D, so the
 // blob permutation key is unchanged (the renderprog requests this permutation without SW_SCANLINE).
 #define SW_SCANLINE 1
+// PS-path projection dn-clamp default, aligned with r_softShadowMinDnRatio's shipped softterm value.
+// MEASURED (wedge gate, corpus, 2026-08-28): clamping the PS wedge kills the umbra-hole class outright
+// (LIT_IN_UMBRA 405 -> 0, TOTAL 3902 -> 1145) - the holes were clip endpoints at dn=eps projecting at
+// ~75000x and detonating the shoelace in the band where a contact edge straddles eps; the clamp bounds
+// that to ~25x. 0.02 measured slightly worse (1254). Known deviation: the PS has no CB slot for the
+// cvar, so this is compile-time and also moves the in-shader Fubini overflow path off exact-0 - kept
+// deliberately so PS and compute agree on one projection.
+#define SW_MINDNR_DEFAULT 0.04
+// SW_RADIAL: route eligible (convex + contains-O) casters through the exact radial-max UNION with an umbra
+// early-out, instead of the wedge's lossy scalar MAX-combine. A/B knob for the gate + RoE bench (chunk 4);
+// flip to 0 for the pure-wedge baseline. In-shader like SW_SCANLINE so the perm key is unchanged.
+#define SW_RADIAL 0
 #include "softwedge_coverage.inc.hlsl"
 #endif
 
@@ -1026,6 +1038,54 @@ void main( PS_IN fragment, out PS_OUT result )
 	else if( swDbg == 2 ) { result.color = float4( frac( swP / 64.0 ), 1.0 ); }			// receiver world pos (smooth gradient => swP valid)
 	else if( swDbg == 6 ) { result.color = float4( saturate( SoftShadow_Coverage( swCovP, swL, swR, swFirstElem, swCasterBase, swN, pc.rpJitterTexOffset.y, swFace, swRotAng ) ), 0.0, 0.0, 1.0 ); }	// occlusion: red = occluded (shadow), black = lit
 	else if( swDbg == 9 ) { result.color = float4( frac( float( swFirstElem ) / 256.0 ), frac( float( swN ) / 64.0 ), 0.0, 1.0 ); }	// R = first-element param, G = edge count param
+	else if( swDbg == 16 )
+	{
+		// WEDGE-WHITELIST verdict (Phase A recall instrument): R = 1 where the whitelist says the wedge is
+		// NOT safe (the scanline must serve), 0 where the wedge may serve; G = union gap, B = nContrib/8.
+		// The gate correlates this image against the RT-oracle defect map: every wedge defect pixel must be
+		// R=1 (recall), and the R=0 fraction is the offload selectivity. Wedge streams only (face = blue).
+		if( swFace )
+		{
+			result.color = float4( 0.0, 0.0, 1.0, 1.0 );
+		}
+		else
+		{
+			float swWlGap = 0.0;
+			int   swWlNC  = 0;
+			int   swWlClip = 0;
+			SoftShadow_WedgeOcclusionEx( swCovP, swL, swR, swFirstElem, swN, pc.rpJitterTexOffset.y, swWlGap, swWlNC, swWlClip );
+			const bool swSinOK   = ( swR / max( length( swL - swCovP ), 1e-3 ) ) < SW_WL_SINA_MAX;
+			const bool swUnionOK = ( swWlNC <= 1 ) || ( swWlGap <= SW_WL_GAP_TOL );
+			// A = SILHOUETTE-DIVERGENCE (the candidate third predicate term): the stream's silhouettes are
+			// picked from the LIGHT apex; the wedge uses them from the RECEIVER apex. They agree when P, the
+			// caster centre C and L are collinear (C between) and drift apart with the angle kappa between
+			// (L-C) and (C-P) - an R-independent error source matching the residual ANT/STEP slivers. A holds
+			// the WORST (max kappa -> min cos) over cull-passed casters, encoded (1-minCos)/2 in [0,1], so one
+			// gate run yields the full recall-vs-fire-rate curve via CPU histograms at defect vs all pixels.
+			softFrame_t swWlF = SoftShadow_Frame( swCovP, swL );
+			const float swWlSin = saturate( swR / swWlF.distPL );
+			const float swWlCos = sqrt( 1.0 - swWlSin * swWlSin );
+			float swWlMinCos = 1.0;
+			for( int swWlSe = 0; swWlSe < swN; swWlSe++ )
+			{
+				float4 swWlE0 = t_SoftEdges[ swFirstElem + swWlSe * 2 + 0 ];
+				float4 swWlE1 = t_SoftEdges[ swFirstElem + swWlSe * 2 + 1 ];
+				if( swWlE0.w < 0.0 )
+				{
+					if( !SoftShadow_CullCaster( swWlE0.xyz - swCovP, swWlE1.x, swWlF, swWlSin, swWlCos, SW_NEAR_EPS ) )
+					{
+						const float3 swWlToL = swL - swWlE0.xyz;
+						const float3 swWlToP = swWlE0.xyz - swCovP;
+						const float  swWlD = dot( swWlToL, swWlToP ) / max( length( swWlToL ) * length( swWlToP ), 1e-4 );
+						swWlMinCos = min( swWlMinCos, swWlD );
+					}
+					swWlSe += int( swWlE1.y );		// jump the caster's edge span (headers only)
+				}
+			}
+			// R packs verdict + clip flags: bit0 = unsafe (sinA/union terms), bits1-3 = the walk's clip/bridge flags.
+			result.color = float4( ( ( swSinOK && swUnionOK ) ? 0.0 : 1.0 ) + 2.0 * float( swWlClip & 7 ), swWlGap, float( swWlNC ) / 8.0, ( 1.0 - swWlMinCos ) * 0.5 );
+		}
+	}
 		else if( swDbg == 8 ) { result.color = float4( shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
 		else if( swDbg == 10 ) { result.color = ( swLocFr < 0.0 ) ? float4( 0.0, 0.0, 0.4, 1.0 ) : float4( swLocFr, 1.0 - swLocFr, 0.0, 1.0 ); }	// LOCATOR: green = lit (frac 0), red = umbra (frac 1), blue = pcss off / outside face
 		else if( swDbg == 11 ) { result.color = float4( swLocRecv, swLocRecv, swLocRecv, 1.0 ); }	// receiver depth [0,1] (smooth gradient => projection sane)

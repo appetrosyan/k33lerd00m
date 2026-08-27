@@ -258,6 +258,284 @@ static void R_SoftProxyProfile( const idRenderEntityLocal* ent, const srfTriangl
 	s_softProxyProf[idx].faceRatio = Max( s_softProxyProf[idx].faceRatio, face );
 }
 
+// =========================================================================================================
+// WEDGE SELECTOR (r_softShadowWedgeSelector): route each soft caster to the CHEAPEST method that is EXACT in
+// its region; Fubini is only the residual where nothing cheaper is exact. Per-caster method is a tag (enum),
+// so the concave interval-union fill (step 1.5) drops into the same dispatch without reworking it.
+enum swMethod_t
+{
+	SW_M_FUBINI = 0,			// residual: NOT eligible (deep+large-light, or non-manifold soup) - permanent Fubini
+	SW_M_FILLHULL_CONVEX,		// eligible + coplanar + CONVEX + <=8 hull verts: exact O(verts) FillHull into the shared grid
+	SW_M_CONCAVE_INTERVAL		// eligible but concave / >8v / non-coplanar convex: RESERVED per-row interval-union
+								//   fill (step 1.5); falls back to Fubini today (NOT a permanent classification)
+};
+
+// eligibility (manifold silhouette walk requires silEdges; exact-region = coplanar sheet at any light size,
+// or a small enough light that the deep-caster parallax vanishes). Shared by the selector AND the census.
+static bool R_SoftWedgeEligible( const srfTriangles_t* tri, const idRenderLightLocal* lightDef,
+		const viewLight_t* vLight, const float* modelToWorld, bool& outManifold, bool& outPlanar, bool& outSmall )
+{
+	extern float R_SoftPenumbraRadius( const idRenderLightLocal* lightDef );
+	extern idCVar r_softShadowWedgeSinA;
+	outManifold = tri->silEdges != NULL && tri->numSilEdges > 0;
+	outPlanar = false;
+	outSmall = false;
+	if( !outManifold )
+	{
+		return false;
+	}
+	const idVec3 ext = tri->bounds[1] - tri->bounds[0];
+	int mn = 0;
+	if( ext[1] < ext[mn] ) { mn = 1; }
+	if( ext[2] < ext[mn] ) { mn = 2; }
+	outPlanar = ext[mn] < 0.25f * ext.Length();
+	idVec3 lc = ( tri->bounds[0] + tri->bounds[1] ) * 0.5f, wc;
+	R_LocalPointToGlobal( modelToWorld, lc, wc );
+	const float dist = ( vLight->globalLightOrigin - wc ).Length();
+	const float sinA = ( dist > 1e-3f ) ? R_SoftPenumbraRadius( lightDef ) / dist : 1.0f;
+	outSmall = sinA <= r_softShadowWedgeSinA.GetFloat();
+	return outPlanar || outSmall;
+}
+
+static inline float R_SoftHull_Cross2( const idVec2& o, const idVec2& a, const idVec2& b )
+{
+	return ( a.x - o.x ) * ( b.y - o.y ) - ( a.y - o.y ) * ( b.x - o.x );
+}
+
+// COPLANAR convex hull of a caster's world verts. Returns the hull vertex count (3..SW_HULL_MAX_VERTS), with
+// outHull filled (world xyz, CCW), when the caster is a SOLID CONVEX flat polygon - its filled area equals
+// its convex-hull area (so FillHull/FillPoly is bit-exact for it at any light size). Returns 0 for any
+// concavity, hole, double-sided sheet, non-coplanarity, >8 hull verts, or oversized mesh (-> Fubini/reserved).
+// This is the losslessness certificate: FillHull only ever runs on a caster proven to fill its convex hull.
+static int R_SoftWedgeConvexHull( const srfTriangles_t* tri, const float* modelToWorld, idVec3* outHull,
+		int& outHullVerts, bool& outConvex )
+{
+	outHullVerts = 0;
+	outConvex = false;
+	const int nv = tri->numVerts;
+	if( nv < 3 || nv > 8192 )				// oversized: cost-bound skip; <3: no polygon
+	{
+		return 0;
+	}
+	const idDrawVert* verts = tri->posedShadowVerts != NULL ? tri->posedShadowVerts : tri->verts;
+	static idVec3 wv[8192];					// static scratch (frontend single-threaded): avoids a large stack frame
+	idVec3 c( 0.0f, 0.0f, 0.0f );
+	idVec3 bmin, bmax;
+	for( int i = 0; i < nv; i++ )
+	{
+		R_LocalPointToGlobal( modelToWorld, verts[i].xyz, wv[i] );
+		c += wv[i];
+		if( i == 0 ) { bmin = bmax = wv[0]; }
+		else
+		{
+			bmin.x = Min( bmin.x, wv[i].x ); bmin.y = Min( bmin.y, wv[i].y ); bmin.z = Min( bmin.z, wv[i].z );
+			bmax.x = Max( bmax.x, wv[i].x ); bmax.y = Max( bmax.y, wv[i].y ); bmax.z = Max( bmax.z, wv[i].z );
+		}
+	}
+	c /= ( float )nv;
+	// Newell-summed face normal + one-sided filled area (sum of world tri areas)
+	const triIndex_t* idx = tri->indexes;
+	const int ntris = tri->numIndexes / 3;
+	idVec3 nrm( 0.0f, 0.0f, 0.0f );
+	double triAreaSum = 0.0;
+	for( int t = 0; t < ntris; t++ )
+	{
+		const idVec3& a = wv[idx[t * 3 + 0]];
+		const idVec3& b = wv[idx[t * 3 + 1]];
+		const idVec3& d = wv[idx[t * 3 + 2]];
+		idVec3 cr = ( b - a ).Cross( d - a );
+		nrm += cr;
+		triAreaSum += 0.5 * ( double )cr.Length();
+	}
+	const float nl = nrm.Length();
+	if( nl < 1e-6f )						// zero-area / fully degenerate
+	{
+		return 0;
+	}
+	nrm /= nl;
+	const float diag = ( bmax - bmin ).Length();
+	float maxOff = 0.0f;
+	for( int i = 0; i < nv; i++ )
+	{
+		maxOff = Max( maxOff, idMath::Fabs( ( wv[i] - c ) * nrm ) );
+	}
+	if( maxOff > 0.01f * Max( diag, 1.0f ) )	// not a flat sheet (thin slab / 3-D body): defer to Fubini/box path
+	{
+		return 0;
+	}
+	// in-plane 2-D basis + projection
+	idVec3 u = ( idMath::Fabs( nrm.z ) > 0.9f ) ? idVec3( 1.0f, 0.0f, 0.0f ) : idVec3( 0.0f, 0.0f, 1.0f );
+	u = u - nrm * ( u * nrm );
+	u.Normalize();
+	const idVec3 vv = nrm.Cross( u );
+	static idVec2 p2[8192];
+	static int order[8192];
+	for( int i = 0; i < nv; i++ )
+	{
+		p2[i].x = ( wv[i] - c ) * u;
+		p2[i].y = ( wv[i] - c ) * vv;
+		order[i] = i;
+	}
+	std::sort( order, order + nv, [&]( int a, int b )
+	{
+		return p2[a].x < p2[b].x || ( p2[a].x == p2[b].x && p2[a].y < p2[b].y );
+	} );
+	// Andrew's monotone chain -> CCW hull (indices)
+	static int hull[16384];
+	int hn = 0;
+	for( int k = 0; k < nv; k++ )
+	{
+		const int i = order[k];
+		while( hn >= 2 && R_SoftHull_Cross2( p2[hull[hn - 2]], p2[hull[hn - 1]], p2[i] ) <= 0.0f ) { hn--; }
+		hull[hn++] = i;
+	}
+	const int lower = hn + 1;
+	for( int k = nv - 2; k >= 0; k-- )
+	{
+		const int i = order[k];
+		while( hn >= lower && R_SoftHull_Cross2( p2[hull[hn - 2]], p2[hull[hn - 1]], p2[i] ) <= 0.0f ) { hn--; }
+		hull[hn++] = i;
+	}
+	hn--;									// last vertex == first
+	if( hn < 3 )
+	{
+		return 0;							// degenerate projection: not a polygon (non-coplanar handled above)
+	}
+	outHullVerts = hn;						// hull vertex count regardless of the shader's 8-vert fill cap
+	// convexity CERTIFICATE: filled area (tri sum) must equal the hull area, else concave / holed / two-sided
+	double hullArea = 0.0;
+	for( int i = 0; i < hn; i++ )
+	{
+		const idVec2& A = p2[hull[i]];
+		const idVec2& B = p2[hull[( i + 1 ) % hn]];
+		hullArea += ( double )A.x * B.y - ( double )B.x * A.y;
+	}
+	hullArea = 0.5 * ( hullArea < 0.0 ? -hullArea : hullArea );
+	outConvex = hullArea >= 1e-4 && ( hullArea - triAreaSum <= 0.01 * hullArea ) && ( triAreaSum - hullArea <= 0.01 * hullArea );
+	if( !outConvex || hn > SW_HULL_MAX_VERTS )
+	{
+		return 0;							// concave (fill needs interval-union), or convex but past the FillPoly cap
+	}
+	for( int i = 0; i < hn; i++ )
+	{
+		outHull[i] = wv[hull[i]];
+	}
+	return hn;
+}
+
+// Per-caster exact method + (for FillHull) the hull verts. outN = hull vert count when FILLHULL_CONVEX.
+// outHullVerts/outConvex carry the FULL classification (convex regardless of the 8-vert cap) for the census.
+static swMethod_t R_SoftWedgeMethod( const srfTriangles_t* tri, const idRenderLightLocal* lightDef,
+		const viewLight_t* vLight, const float* modelToWorld, idVec3* outHull, int& outN, int& outHullVerts, bool& outConvex )
+{
+	outN = 0;
+	outHullVerts = 0;
+	outConvex = false;
+	bool man, pl, sm;
+	if( !R_SoftWedgeEligible( tri, lightDef, vLight, modelToWorld, man, pl, sm ) )
+	{
+		return SW_M_FUBINI;					// residual (non-manifold, or deep+large-light)
+	}
+	const int n = R_SoftWedgeConvexHull( tri, modelToWorld, outHull, outHullVerts, outConvex );
+	if( n >= 3 )
+	{
+		outN = n;
+		return SW_M_FILLHULL_CONVEX;
+	}
+	return SW_M_CONCAVE_INTERVAL;			// eligible but concave/>8v/non-coplanar: reserved -> Fubini today
+}
+
+// selector active? gated on the STEP-1 verification config: SW_SCANLINE grid (FillHull lives there) on, tile
+// binner off (step 2 wires the binner). FillHull records ride the existing softIsBox analytic path.
+static bool R_SoftWedgeSelectorActive()
+{
+	extern idCVar r_softShadowWedgeSelector, r_softShadowTileBin, r_softShadowScanline;
+	return r_softShadowWedgeSelector.GetBool() && !r_softShadowTileBin.GetBool() && r_softShadowScanline.GetBool();
+}
+
+// ---- one-shot eligibility + method census (r_softShadowWedgeCensus), reported at frame-probe end ----
+struct softWedgeCensus_t
+{
+	long casters, tris;					// all soft casters
+	long convCasters, convTris, convHullVerts;	// FILLHULL-CONVEX NOW: convex + coplanar + <=8 hull verts (the O(verts) win)
+	long cbigCasters, cbigTris;			// CONVEX-but->8v: passes the convexity certificate but exceeds the 8-vert fill cap
+	long cbigHist[4];					// hull-vert histogram of the >8v-convex sub-bucket: [<=12, <=16, <=24, >24]
+	long cpcCasters, cpcTris;			// COPLANAR-CONCAVE: fails convex cert but IS coplanar -> FillPolyConcave (step 1.5)
+	long cpcSilHist[5];					// its outline size = tri->numSilEdges: [<=8, <=12, <=16, <=24, >24] (sizes SW_POLY_MAX_VERTS)
+	long ncvCasters, ncvTris;			// NON-COPLANAR concave (3-D parallax): stays Fubini for now
+	long resCasters, resTris;			// SW_M_FUBINI residual: non-eligible - permanently irreducible
+};
+static softWedgeCensus_t	s_wc;
+static softWedgeCensus_t	s_wcLast;
+static int					s_wcFrame = -1;
+long g_swWedgeRoutedTris = 0, g_swWedgeRoutedHullVerts = 0;	// exact ROUTED collapse (selector on), cumulative
+
+static void R_SoftWedgeCensusAccum( const srfTriangles_t* tri, const idRenderLightLocal* lightDef,
+		const viewLight_t* vLight, const float* modelToWorld )
+{
+	const long tris = tri->numIndexes / 3;
+	s_wc.casters++;
+	s_wc.tris += tris;
+	idVec3 hull[SW_HULL_MAX_VERTS];
+	int hn = 0, hvAll = 0;
+	bool cvx = false;
+	switch( R_SoftWedgeMethod( tri, lightDef, vLight, modelToWorld, hull, hn, hvAll, cvx ) )
+	{
+		case SW_M_FILLHULL_CONVEX:
+			s_wc.convCasters++; s_wc.convTris += tris; s_wc.convHullVerts += hn; break;
+		case SW_M_CONCAVE_INTERVAL:
+			// split the "concave-manifold" bucket: CONVEX-but->8v (raise the shader cap) vs TRULY-CONCAVE (interval fill)
+			if( cvx )
+			{
+				s_wc.cbigCasters++; s_wc.cbigTris += tris;
+				const int b = ( hvAll <= 12 ) ? 0 : ( hvAll <= 16 ) ? 1 : ( hvAll <= 24 ) ? 2 : 3;
+				s_wc.cbigHist[b]++;
+			}
+			else if( hvAll > 0 )		// hull was computed => COPLANAR but concave -> FillPolyConcave candidate
+			{
+				s_wc.cpcCasters++; s_wc.cpcTris += tris;
+				const int se = tri->numSilEdges;	// coplanar caster: silEdges == boundary outline size
+				const int b = ( se <= 8 ) ? 0 : ( se <= 12 ) ? 1 : ( se <= 16 ) ? 2 : ( se <= 24 ) ? 3 : 4;
+				s_wc.cpcSilHist[b]++;
+			}
+			else						// non-coplanar concave (3-D): needs true silhouette, stays Fubini
+			{
+				s_wc.ncvCasters++; s_wc.ncvTris += tris;
+			}
+			break;
+		default:
+			s_wc.resCasters++; s_wc.resTris += tris; break;
+	}
+}
+
+void R_SoftWedgeCensusReport()
+{
+	extern idCVar r_softShadowWedgeSinA;
+	const softWedgeCensus_t& w = s_wcLast.casters > 0 ? s_wcLast : s_wc;
+	if( w.casters <= 0 )
+	{
+		common->Printf( "[wedgecensus] no soft casters collected (soft path inert at this view?)\n" );
+		return;
+	}
+	const double t = Max( 1L, w.tris );
+	common->Printf( "[wedgecensus] sinA<=%.3f | %ld soft casters (%ld tris cost). By exact method:\n", r_softShadowWedgeSinA.GetFloat(), w.casters, w.tris );
+	common->Printf( "[wedgecensus]   FILLHULL-CONVEX (now):    %ld casters, %ld tris = %.0f%% of cost -> %ld hull verts (%.1fx tri->vert collapse)\n",
+					w.convCasters, w.convTris, 100.0 * w.convTris / t, w.convHullVerts, w.convHullVerts > 0 ? ( double )w.convTris / ( double )w.convHullVerts : 0.0 );
+	common->Printf( "[wedgecensus]   CONVEX->8v (raise cap):    %ld casters, %ld tris = %.0f%% of cost | hull-vert hist [<=12:%ld <=16:%ld <=24:%ld >24:%ld]\n",
+					w.cbigCasters, w.cbigTris, 100.0 * w.cbigTris / t, w.cbigHist[0], w.cbigHist[1], w.cbigHist[2], w.cbigHist[3] );
+	common->Printf( "[wedgecensus]   COPLANAR-CONCAVE (FillPolyConcave): %ld casters, %ld tris = %.0f%% of cost | outline(silEdge) hist [<=8:%ld <=12:%ld <=16:%ld <=24:%ld >24:%ld]\n",
+					w.cpcCasters, w.cpcTris, 100.0 * w.cpcTris / t, w.cpcSilHist[0], w.cpcSilHist[1], w.cpcSilHist[2], w.cpcSilHist[3], w.cpcSilHist[4] );
+	common->Printf( "[wedgecensus]   NON-COPLANAR concave (Fubini):  %ld casters, %ld tris = %.0f%% of cost (3-D parallax outline)\n",
+					w.ncvCasters, w.ncvTris, 100.0 * w.ncvTris / t );
+	common->Printf( "[wedgecensus]   RESIDUAL-FUBINI (permanent): %ld casters, %ld tris = %.0f%% of cost (non-manifold / deep+large-light)\n",
+					w.resCasters, w.resTris, 100.0 * w.resTris / t );
+	if( g_swWedgeRoutedTris > 0 )
+	{
+		common->Printf( "[wedgecensus]   ROUTED (selector on): %ld tris -> %ld hull verts = %.1fx O(tris)->O(verts) collapse\n",
+						g_swWedgeRoutedTris, g_swWedgeRoutedHullVerts, g_swWedgeRoutedHullVerts > 0 ? ( double )g_swWedgeRoutedTris / ( double )g_swWedgeRoutedHullVerts : 0.0 );
+	}
+}
+
 // A soft caster is CACHEABLE-STATIC iff its light is immobile AND its geometry is immobile (static world
 // surface or DM_STATIC entity) AND the entity was not updated this frame. Mirrors the stencil path's
 // static-interaction gate (IsDynamicModel()==DM_STATIC) + event-driven move invalidation (lastModifiedFrameNum).
@@ -2123,6 +2401,21 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 				const bool swSkipStatic = r_softShadowSkipStatic.GetBool() && R_SoftCasterIsStatic( entityDef, vLight );
 				if( !swExcludeWorld && !swSkipStatic && r_useSoftShadowVolumes.GetBool() && ( tri->silEdges != NULL || r_softShadowFaceCoverage.GetBool() ) )
 				{
+					// WEDGE-SELECTOR method census (one-shot): accumulate this soft caster; report the last
+					// fully-collected frame at probe-end (settled cap view). Read-only.
+					{
+						extern idCVar r_softShadowWedgeCensus;
+						if( r_softShadowWedgeCensus.GetInteger() > 0 )
+						{
+							if( s_wcFrame != tr.frameCount )
+							{
+								if( s_wcFrame >= 0 && s_wc.casters > 0 ) { s_wcLast = s_wc; }
+								s_wcFrame = tr.frameCount;
+								memset( &s_wc, 0, sizeof( s_wc ) );
+							}
+							R_SoftWedgeCensusAccum( tri, lightDef, vLight, vEntity->modelMatrix );
+						}
+					}
 					// BRUSH-RECOVERY: this area carries dmap'd convex hulls -> emit one analytic hull record
 					// per hull (shared .w=-N encoding, FillHull) INSTEAD of this area's triangle stream, and
 					// ONCE per light (the hulls are the whole area, not per surface). Needs face-coverage: the
@@ -2229,18 +2522,62 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					const int swCollectStart = Sys_Microseconds();
 					softShadowEdge_t* sedges = NULL;
 					int nedges = 0;
+					// HYBRID WHITELIST: the wedge-form silhouette collected ALONGSIDE the face triangles, so both
+					// representations of this caster coexist and the term CS can serve clean casters via the wedge
+					softShadowEdge_t* wSedges = NULL;
+					int wNedges = 0;
 					// FRONT-FACE coverage streams the caster's triangles (accurate + stable); the default streams
 					// the light silhouette (undershoots off-axis). Face mode uses the v2 float4-triple layout,
 					// stored through the same drawSurf fields (count in FLOAT4 elements; see drawSurf_t).
 					idVec4* faceClusters = NULL;
 					int nClusters = 0;
 					bool swFaceIsBox = false;			// analytic box caster (curated): tagged numTris<0 at flatten
-					if( r_softShadowFaceCoverage.GetBool() )
+					// WEDGE SELECTOR: a coplanar-convex eligible caster becomes ONE analytic HULL record (.w=-N)
+					// instead of its triangle stream - the walk fills its exact silhouette via SoftScan_FillHull
+					// into the shared scanline grid (O(verts), lossless: the hull certificate proved it fills its
+					// convex hull, and grid-OR unions casters exactly). Reuses the softIsBox analytic record path.
+					bool swHull = false;
+					if( R_SoftWedgeSelectorActive() )
+					{
+						idVec3 hullV[SW_HULL_MAX_VERTS];
+						int hn = 0, hvAll = 0;
+						bool cvx = false;
+						if( R_SoftWedgeMethod( tri, lightDef, vLight, vEntity->modelMatrix, hullV, hn, hvAll, cvx ) == SW_M_FILLHULL_CONVEX )
+						{
+							float hverts[SW_HULL_MAX_VERTS * 3];
+							for( int i = 0; i < hn; i++ ) { hverts[i * 3 + 0] = hullV[i].x; hverts[i * 3 + 1] = hullV[i].y; hverts[i * 3 + 2] = hullV[i].z; }
+							float slots[SW_HULL_MAX_VERTS * 4 + 8];			// <=3 tris -> 9 slots
+							const int numSlots = SoftHull_EmitRecord( hverts, hn, slots );
+							if( numSlots > 0 )
+							{
+								idVec4* recs = ( idVec4* )R_FrameAlloc( numSlots * sizeof( idVec4 ), FRAME_ALLOC_UNKNOWN );
+								for( int i = 0; i < numSlots; i++ ) { recs[i].Set( slots[i * 4 + 0], slots[i * 4 + 1], slots[i * 4 + 2], slots[i * 4 + 3] ); }
+								sedges = ( softShadowEdge_t* )recs;
+								nedges = numSlots;
+								swFaceIsBox = true;			// analytic record: flatten tags numTris<0; walk reads slot0.w=-N -> FillHull
+								swHull = true;
+								extern long g_swWedgeRoutedTris, g_swWedgeRoutedHullVerts;
+								g_swWedgeRoutedTris += tri->numIndexes / 3;
+								g_swWedgeRoutedHullVerts += hn;
+							}
+						}
+					}
+					if( swHull )
+					{
+						// hull record already assembled above
+					}
+					else if( r_softShadowFaceCoverage.GetBool() )
 					{
 						idVec4* faceElems = NULL;
 						R_CollectPenumbraFaces( entityDef, tri, lightDef, R_SoftPenumbraRadius( lightDef ),
 												vEntity->modelMatrix, &faceElems, &nedges, &faceClusters, &nClusters, &swFaceIsBox );
 						sedges = ( softShadowEdge_t* )faceElems;
+						extern idCVar r_softShadowWedgeWhitelist;
+						if( r_softShadowWedgeWhitelist.GetBool() )
+						{
+							R_CollectPenumbraEdges( entityDef, tri, lightDef, R_SoftPenumbraRadius( lightDef ),
+													vEntity->modelMatrix, &wSedges, &wNedges );
+						}
 					}
 					else
 					{
@@ -2262,6 +2599,8 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 						edgeSurf->frontEndGeo = tri;		// caster solid, for the scene-capture ground-truth mesh
 						edgeSurf->space = vEntity;
 						edgeSurf->softIsBox = swFaceIsBox;	// analytic box: flatten tags numTris<0 for the walk's FillBox
+						edgeSurf->softWedgeEdges = wSedges;	// hybrid whitelist: wedge form riding beside the face stream
+						edgeSurf->numSoftWedgeEdges = wNedges;
 						edgeSurf->scissorRect = vLight->scissorRect;
 
 						edgeSurf->linkChain = &vLight->softShadowWedges;
@@ -3342,6 +3681,74 @@ void R_AddModels()
 				vLight->softCasterCache = vertexCache.AllocJoint( casFlat, casterElems + nClu * 2, sizeof( idVec4 ) );
 				vLight->softCasterCount = nCas;
 
+				// HYBRID WHITELIST wedge block: a SECOND pass over the same chain with the SAME caster-grouping
+				// condition, so wedge caster k IS caster-table entry k (the correspondence the term CS's
+				// per-caster dispatch needs). Layout = the legacy inline-header wedge stream (header pair +
+				// edge pairs); the header sphere is COPIED from casFlat so cull decisions agree between the
+				// two walks. Casters with no wedge form (hull/box/none collected) emit an edgeCount-0 header:
+				// alignment holds and the term CS treats them as scanline-only.
+				{
+					extern idCVar r_softShadowWedgeWhitelist;
+					if( r_softShadowWedgeWhitelist.GetBool() && nCas > 0 )
+					{
+						int wRecords = nCas;						// one header pair per caster
+						for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
+						{
+							wRecords += s->numSoftWedgeEdges;
+						}
+						if( edgesUsed + wRecords <= SOFT_EDGE_FRAME_BUDGET )
+						{
+							edgesUsed += wRecords;
+							softShadowEdge_t* wFlat = ( softShadowEdge_t* )R_FrameAlloc( wRecords * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
+							int wN = 0;
+							int wCas = 0;
+							int wHeaderIdx = -1;
+							const void* wCurSpace = NULL;
+							for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
+							{
+								const bool wIsWorld = s->space->entityDef != NULL && s->space->entityDef->parms.hModel != NULL
+													  && s->space->entityDef->parms.hModel->IsStaticWorldModel();
+								if( wIsWorld || s->space != wCurSpace )	// EXACT mirror of the caster-table grouping
+								{
+									if( wHeaderIdx >= 0 )
+									{
+										wFlat[wHeaderIdx].e1.y = ( float )( wN - wHeaderIdx - 1 );	// backfill edgeCount
+									}
+									wHeaderIdx = wN++;
+									// header sphere = the caster table's (bit-identical cull between the walks)
+									const idVec4& wc0 = casFlat[wCas * 2 + 0];
+									wFlat[wHeaderIdx].e0 = idVec4( wc0.x, wc0.y, wc0.z, -1.0f );
+									wFlat[wHeaderIdx].e1 = idVec4( wc0.w, 0.0f, 0.0f, ( float )wCas );
+									wCas++;
+									wCurSpace = s->space;
+								}
+								for( int i = 0; i < s->numSoftWedgeEdges; i++ )
+								{
+									wFlat[wN++] = s->softWedgeEdges[i];
+								}
+							}
+							if( wHeaderIdx >= 0 )
+							{
+								wFlat[wHeaderIdx].e1.y = ( float )( wN - wHeaderIdx - 1 );
+							}
+							if( wCas == nCas )		// alignment is the whole contract: on mismatch drop the block
+							{
+								vLight->softWedgeCache = vertexCache.AllocJoint( wFlat, wN, sizeof( softShadowEdge_t ) );
+								vLight->softWedgeCount = wN;
+							}
+							else
+							{
+								edgesUsed -= wRecords;
+								common->Printf( "[wedgewl] light caster mismatch (wedge %d vs table %d) - block dropped\n", wCas, nCas );
+							}
+						}
+						else
+						{
+							tr.pc.c_softShadowDroppedEdges += wRecords;	// budget: drop ONLY the wedge block (scanline unaffected)
+						}
+					}
+				}
+
 				// WORLD-CELL LIT CLASSIFIER (r_softShadowClassify, M1): build a dense lit/penumbra class grid
 				// over the light's world bounds from the just-assembled world tri stream (triFlat = 3 float4/
 				// tri), pack it into the joint buffer (read via t_SoftEdges in the term CS), and record the
@@ -3409,6 +3816,11 @@ void R_AddModels()
 			const void* curSpace = NULL;
 			int   headerIdx = -1;			// record index of the current entity's header (reserved, backfilled on close)
 			idVec3 gmn( 1e30f, 1e30f, 1e30f ), gmx( -1e30f, -1e30f, -1e30f );	// entity bounding box (for the sphere)
+			// WEDGE TILE-BIN caster table (2 float4/caster): ( centre.xyz, radius ), ( headerRecIdx, -edgeCount, 0, 0 ).
+			// numTris = -edgeCount < 0 tags it ANALYTIC so softtile_bin appends ONE tile entry per surviving caster
+			// (its sphere-cone cull, reused verbatim); the wedge PS then walks only the tile's casters' edge spans.
+			std::vector<idVec4> swCasterTbl;
+			swCasterTbl.reserve( ( size_t )numCasters * 2 );
 			for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
 			{
 				const bool isWorld = s->space->entityDef != NULL && s->space->entityDef->parms.hModel != NULL
@@ -3421,6 +3833,8 @@ void R_AddModels()
 						const float  rad = ( gmx - gmn ).Length() * 0.5f;
 						flat[headerIdx].e0 = idVec4( c.x, c.y, c.z, -1.0f );		// e0 = ( centre, -1 marker )
 						flat[headerIdx].e1 = idVec4( rad, ( float )( n - headerIdx - 1 ), 0.0f, casterId );	// e1 = ( radius, edgeCount, 0, casterId )
+						swCasterTbl.push_back( idVec4( c.x, c.y, c.z, rad ) );
+						swCasterTbl.push_back( idVec4( ( float )headerIdx, -( float )( n - headerIdx - 1 ), 0.0f, 0.0f ) );	// c1.x=headerRec, c1.y=-edgeCount (analytic tag)
 						casterId += 1.0f;
 					}
 					headerIdx = n++;		// reserve this entity's header slot
@@ -3451,12 +3865,21 @@ void R_AddModels()
 				const float  rad = ( gmx - gmn ).Length() * 0.5f;
 				flat[headerIdx].e0 = idVec4( c.x, c.y, c.z, -1.0f );
 				flat[headerIdx].e1 = idVec4( rad, ( float )( n - headerIdx - 1 ), 0.0f, casterId );	// e1.y = edgeCount (shader jump-skip)
+					swCasterTbl.push_back( idVec4( c.x, c.y, c.z, rad ) );
+					swCasterTbl.push_back( idVec4( ( float )headerIdx, -( float )( n - headerIdx - 1 ), 0.0f, 0.0f ) );
 				casterId += 1.0f;
 			}
 			// AllocJoint (not AllocVertex): the joint buffer is the SRV-capable StructuredBuffer the
 			// interaction pixel shader can read; the vertex buffer is not bound as an SRV.
 			vLight->softEdgeCache = vertexCache.AllocJoint( flat, records, sizeof( softShadowEdge_t ) );
 			vLight->softEdgeCount = records;
+			// WEDGE TILE-BIN: publish the per-caster sphere table so the backend can run softtile_bin over the
+			// wedge's casters (analytic-tagged) and the PS walks only each tile's casters. 0 casters => no table.
+			if( !swCasterTbl.empty() )
+			{
+				vLight->softCasterCache = vertexCache.AllocJoint( swCasterTbl.data(), ( int )swCasterTbl.size(), sizeof( idVec4 ) );
+				vLight->softCasterCount = numCasters;
+			}
 
 			if( R_SoftShadowCaptureArmed() )
 			{

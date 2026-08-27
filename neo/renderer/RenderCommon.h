@@ -108,6 +108,10 @@ struct drawSurf_t
 	int						numSoftClusters;	// FACE v3: CLUSTER count (2 float4 elements each)
 	bool					softIsBox;			// analytic BOX caster (curated proxy): its 3 tri-slots hold 8 box
 												// corners, not triangles; flatten tags numTris<0 so the walk runs FillBox
+	const softShadowEdge_t*	softWedgeEdges;		// HYBRID WHITELIST (r_softShadowWedgeWhitelist): this surface's
+												// LIGHT-SILHOUETTE edge records collected ALONGSIDE the face stream,
+												// so the term CS can serve clean casters via the cheap wedge integral.
+	int						numSoftWedgeEdges;	// record count in softWedgeEdges (0 = none collected)
 	int						numIndexes;
 	vertCacheHandle_t		indexCache;			// triIndex_t
 	vertCacheHandle_t		ambientCache;		// idDrawVert
@@ -411,6 +415,10 @@ struct viewLight_t
 	int						softEdgeCount;				// analytic soft shadows: number of edges in softEdgeCache
 	vertCacheHandle_t		softCasterCache;			// FACE stream v2: per-caster table, 2 float4 each - ( centre.xyz, radius ) ( firstTri, numTris, 0, 0 )
 	int						softCasterCount;			// FACE stream v2: casters in the table
+	vertCacheHandle_t		softWedgeCache;				// HYBRID WHITELIST: wedge-form silhouette block (inline header pair +
+														// edge pairs per caster), caster order == the caster table's, so
+														// wedge caster k IS caster-table entry k. 0 = not emitted this frame.
+	int						softWedgeCount;				// records in softWedgeCache
 	vertCacheHandle_t		softClassifyCache;			// world-cell lit/penumbra classifier grid (packed 16 class bytes/float4), rides the joint buffer
 	float					softClassifyAabbCell[4];	// grid origin xyz + cellSize
 	int						softClassifyDims[4];		// cells per axis xyz + valid (0 = no classifier -> full walk)

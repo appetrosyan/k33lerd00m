@@ -299,6 +299,10 @@ cbuffer c_Term : register( b0 )
 	float4	g_sub;				// ADAPTIVE SUB-SAMPLING (SW_SUBSAMPLE): x = phase | (viz << 2)
 								//   (0 = off/exact, 1 = lattice, 2 = full-rect refine), y = stride S,
 								//   z = C2 spread epsilon, w = C3 width-floor beta. Mirrors sub[4].
+	int4	g_wedge;			// HYBRID WHITELIST (r_softShadowWedgeWhitelist): x = wedge-block float4
+								// element base into t_SoftEdges (< 0 = none this light), y = record count
+								// (float4 pairs), z/w reserved. Caster order == the caster table's.
+								// Mirrors wedge[4] in SoftTermCB.
 };
 // *INDENT-ON*
 
@@ -557,13 +561,68 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 {
 	const float3 swP = swPos.xyz;
 
+	// dn-clamp BEFORE any coverage math (census included): the census must classify casters under the
+	// SHIPPED projection - it previously ran at the static default 0 and measured the wrong geometry.
+	g_swMinDnR = g_misc.x;			// projection dn-clamp (r_softShadowMinDnRatio): grazing-grain fix; 0 = exact
+
 #if SW_GPU_WALK_COUNTERS
 	InterlockedAdd( u_WalkCnt[ 7 ], 1u );	// this pixel survived the early-outs and runs the walk
+	// HYBRID-WHITELIST CENSUS (counting permutation only - shipped codegen untouched): scan the whitelist
+	// block CASTER BY CASTER (headers carry the span) and tally, TRIANGLE-WEIGHTED via the caster table,
+	// what a per-caster dispatch would offload. SPARSE 16x16 LATTICE: 1/256 of walked fragments - keeps
+	// every count EXACT in uint32 (the dense sums reached ~1.6e10/frame and WRAPPED, printing impossible
+	// >100% shares). cut and clean accumulate SEPARATELY, so share = cut/(cut+clean) sums to 100% by
+	// construction. 30 = SAMPLED frags, 31 = SUM cut-caster tris, 32 = SUM clean-caster tris, 33 = SUM cut casters.
+	if( g_wedge.x >= 0 && g_wedge.y > 0 && ( ( px.x & 15 ) == 0 ) && ( ( px.y & 15 ) == 0 ) )
+	{
+		InterlockedAdd( u_WalkCnt[ 30 ], 1u );
+		int  swWlSe = 0;
+		int  swWlCas = 0;
+		uint swWlCutTris = 0;
+		uint swWlCleanTris = 0;
+		uint swWlNCut = 0;
+		while( swWlSe < g_wedge.y && swWlCas < g_range.y )
+		{
+			const float4 swWlH0 = t_SoftEdges[ g_wedge.x + swWlSe * 2 + 0 ];
+			const float4 swWlH1 = t_SoftEdges[ g_wedge.x + swWlSe * 2 + 1 ];
+			if( swWlH0.w < 0.0 )
+			{
+				const int swWlCnt = ( int )swWlH1.y;					// this caster's edge-record count
+				float swWlGapC = 0.0;
+				int   swWlNCC = 0;
+				int   swWlClipC = 0;
+				// walk ONE caster's span (header + its edges) so the cut verdict is per caster
+				SoftShadow_WedgeOcclusionEx( swPos.xyz, g_lightR.xyz, max( g_lightR.w, 1e-2 ),
+											 g_wedge.x + swWlSe * 2, swWlCnt + 1, 0.0,
+											 swWlGapC, swWlNCC, swWlClipC );
+				// caster table (order-aligned by the emit contract): |c1.y| = triangle count (neg = box).
+				// Every caster lands in EXACTLY ONE bucket, so cut% + clean% = 100% by construction.
+				const int swWlTris = abs( ( int )t_SoftEdges[ g_flags.y + swWlCas * 2 + 1 ].y );
+				if( ( swWlClipC >> 3 ) > 0 )
+				{
+					swWlNCut++;
+					swWlCutTris += ( uint )swWlTris;
+				}
+				else
+				{
+					swWlCleanTris += ( uint )swWlTris;
+				}
+				swWlCas++;
+				swWlSe += swWlCnt + 1;
+			}
+			else
+			{
+				swWlSe++;		// malformed record guard: resync on the next header
+			}
+		}
+		InterlockedAdd( u_WalkCnt[ 31 ], swWlCutTris );
+		InterlockedAdd( u_WalkCnt[ 32 ], swWlCleanTris );
+		InterlockedAdd( u_WalkCnt[ 33 ], swWlNCut );
+	}
 #endif
 
 	const float3 swL = g_lightR.xyz;
 	const float  swR = max( g_lightR.w, 1e-2 );
-	g_swMinDnR = g_misc.x;			// projection dn-clamp (r_softShadowMinDnRatio): grazing-grain fix; 0 = exact
 
 
 
@@ -931,6 +990,14 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 						const int pn = min( ( int )( -bslot0.w ), SW_POLY_MAX_VERTS );
 						float3 bloop[SW_POLY_MAX_VERTS];
 						for( int pk = 0; pk < SW_POLY_MAX_VERTS; pk++ ) { bloop[pk] = t_SoftEdges[ bb + min( pk, pn - 1 ) ].xyz; }
+						// per-fragment cone/slab reject (SoftScan_HullConeReject): skip the fill when the hull's
+						// bounding sphere cannot shadow this fragment's disk - bit-exact, caps the hull walk floor
+						float3 shc = float3( 0.0f, 0.0f, 0.0f );
+						for( int shk = 0; shk < pn; shk++ ) { shc += bloop[shk]; }
+						shc /= ( float )pn;
+						float shr2 = 0.0f;
+						for( int shj = 0; shj < pn; shj++ ) { float3 shd = bloop[shj] - shc; shr2 = max( shr2, dot( shd, shd ) ); }
+						if( SoftScan_HullConeReject( shc, sqrt( shr2 ), swP, swFC.nrm, swFC.distPL, swRC, SW_NEAR_EPS ) ) { continue; }
 						SoftScan_FillHull( swGrid, swEnv, bloop, pn, swP, swFC, swRC, SW_NEAR_EPS );
 					}
 					else
@@ -940,6 +1007,12 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 					bcorner[2] = t_SoftEdges[ bb + 2 ].xyz; bcorner[3] = t_SoftEdges[ bb + 3 ].xyz;
 					bcorner[4] = t_SoftEdges[ bb + 4 ].xyz; bcorner[5] = t_SoftEdges[ bb + 5 ].xyz;
 					bcorner[6] = t_SoftEdges[ bb + 6 ].xyz; bcorner[7] = t_SoftEdges[ bb + 7 ].xyz;
+					float3 sbc = float3( 0.0f, 0.0f, 0.0f );
+					for( int sck = 0; sck < 8; sck++ ) { sbc += bcorner[sck]; }
+					sbc *= 0.125f;
+					float sbr2 = 0.0f;
+					for( int scj = 0; scj < 8; scj++ ) { float3 sbd = bcorner[scj] - sbc; sbr2 = max( sbr2, dot( sbd, sbd ) ); }
+					if( SoftScan_HullConeReject( sbc, sqrt( sbr2 ), swP, swFC.nrm, swFC.distPL, swRC, SW_NEAR_EPS ) ) { continue; }
 					SoftScan_FillBox( swGrid, swEnv, bcorner, swP, swFC, swRC, SW_NEAR_EPS );
 					}
 					int swCovB = 0;

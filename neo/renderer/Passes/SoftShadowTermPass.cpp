@@ -51,6 +51,10 @@ struct SoftTermCB
 	float	sub[4];			// ADAPTIVE SUB-SAMPLING (SW_SUBSAMPLE): x = phase | (viz << 2), y = stride
 							// S, z = C2 spread epsilon, w = C3 width-floor beta. Zeros on every other
 							// pipeline. Mirrors g_sub in softterm.cs.hlsl.
+	int		wedge[4];		// HYBRID WHITELIST (r_softShadowWedgeWhitelist): x = wedge-block float4 element
+							// base into t_SoftEdges (< 0 = no block this light), y = record count (float4
+							// pairs), z/w reserved (gap tol / mode knobs). Caster order == the caster
+							// table's. Mirrors g_wedge in softterm.cs.hlsl.
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -245,7 +249,7 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineCnt = m_Device->createComputePipeline( pc );
 
 			nvrhi::BufferDesc wc;
-			wc.byteSize = 30 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106), 27 lit-early-out, 28 adaptive-chord N sum (task #85), 29 classifier-umbra skip
+			wc.byteSize = 34 * sizeof( uint32_t );	// 0-7 attrib, 8-13 buckets, 14-15 hit/miss, 16-19 tile-class census, 20-26 scanline FillTri attribution (task #106), 27 lit-early-out, 28 adaptive-chord N sum (task #85), 29 classifier-umbra skip, 30-33 hybrid-whitelist census (wedge frags / cut-caster sum / caster sum / fully-serveable frags)
 			wc.structStride = sizeof( uint32_t );		// RWStructuredBuffer<uint> (matches u_SpillCnt pattern)
 			wc.canHaveUAVs = true;
 			wc.initialState = nvrhi::ResourceStates::UnorderedAccess;
@@ -941,6 +945,19 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		cb.classDims[2] = vLight->softClassifyDims[2];	cb.classDims[3] = ( int )( clsOfs / 16u );	// float4 element base
 	}
 
+	// HYBRID WHITELIST wedge block (r_softShadowWedgeWhitelist): published by the flatten into the joint
+	// buffer alongside the face stream; base < 0 = none this light (cvar off / budget-dropped / mismatch).
+	cb.wedge[0] = -1;
+	cb.wedge[1] = 0;
+	cb.wedge[2] = 0;
+	cb.wedge[3] = 0;
+	if( vLight->softWedgeCount > 0 && vLight->softWedgeCache != 0 )
+	{
+		const uint wedgeOfs = ( uint )( ( vLight->softWedgeCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+		cb.wedge[0] = ( int )( wedgeOfs / 16u );		// float4 element base into t_SoftEdges
+		cb.wedge[1] = vLight->softWedgeCount;			// records (float4 pairs)
+	}
+
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.
 	nvrhi::IBuffer* tiles = ( tileBuffer != nullptr ) ? tileBuffer : edgeBuffer;
@@ -1181,20 +1198,20 @@ bool R_SoftShadowSubSampleStats( uint32_t out[4] )
 	return true;
 }
 
-bool SoftShadowTermPass::GetWalkStats( uint32_t out[30] )
+bool SoftShadowTermPass::GetWalkStats( uint32_t out[34] )
 {
 	if( !m_WalkCntEnabled || m_WalkCntBuffer == nullptr )
 	{
 		return false;
 	}
 	nvrhi::BufferDesc sbd;
-	sbd.byteSize = 30 * sizeof( uint32_t );
+	sbd.byteSize = 34 * sizeof( uint32_t );
 	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
 	sbd.debugName = "SoftShadowTerm/WalkCountersReadback";
 	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
 	nvrhi::CommandListHandle cl = m_Device->createCommandList();
 	cl->open();
-	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 30 * sizeof( uint32_t ) );
+	cl->copyBuffer( staging, 0, m_WalkCntBuffer, 0, 34 * sizeof( uint32_t ) );
 	cl->close();
 	m_Device->executeCommandList( cl );
 	m_Device->waitForIdle();
@@ -1203,7 +1220,7 @@ bool SoftShadowTermPass::GetWalkStats( uint32_t out[30] )
 	{
 		return false;
 	}
-	memcpy( out, p, 30 * sizeof( uint32_t ) );
+	memcpy( out, p, 34 * sizeof( uint32_t ) );
 	m_Device->unmapBuffer( staging );
 	return true;
 }

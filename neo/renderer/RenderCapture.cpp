@@ -2491,8 +2491,13 @@ void GateSetup( const gateCap_t& cap, const capLight_t& light )
 	// culled by a software occlusion raster would silently thin the casters. Normal gameplay never
 	// sees the reconstructed models, so the game keeps MOC.
 	cvarSystem->SetCVarInteger( "r_useMaskedOcclusionCulling", 0 );
-	cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", light.penumbraSize );
-	cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", light.penumbraSize );
+	// DIAGNOSTIC radius scale (com_softShadowGateRadiusScale, default 1 = capture-exact): scales the
+	// disk radius for the ANALYTIC AND the RT reference TOGETHER, so the comparison stays fair while
+	// R-dependent error families (parallax ~ depth x sinA) shrink with it - an attribution knob, not
+	// a quality setting.
+	const float swRadScale = cvarSystem->GetCVarFloat( "com_softShadowGateRadiusScale" );
+	cvarSystem->SetCVarFloat( "r_shadowPenumbraSize", light.penumbraSize * swRadScale );
+	cvarSystem->SetCVarFloat( "r_rtShadowSoftRadius", light.penumbraSize * swRadScale );
 }
 
 } // namespace
@@ -2609,9 +2614,14 @@ int R_SoftShadowGate( const char* arg )
 	// The cache-OFF exact walk is still rendered per light (the R4 seam probe) and compared. Restored
 	// after the run via the `touched` list.
 	extern idCVar com_softShadowGateSurfCache;
-	const int swGateCache = com_softShadowGateSurfCache.GetInteger();
-	cvarSystem->SetCVarInteger( "r_softShadowCompute", 1 );
-	cvarSystem->SetCVarInteger( "r_softShadowFaceCoverage", 1 );
+	extern idCVar com_softShadowGateWedge;
+	// PHASE-A: score the analytic WEDGE (interaction-PS integral on silhouette edge chains) vs RT, instead of
+	// the compute scanline face-coverage. compute 0 = interaction PS (where SoftShadow_WedgeOcclusion lives),
+	// faceCoverage 0 = the frontend emits edge chains (R_CollectPenumbraEdges) the PS dispatches to the wedge.
+	const bool swGateWedge = com_softShadowGateWedge.GetInteger() != 0;
+	const int swGateCache = swGateWedge ? 0 : com_softShadowGateSurfCache.GetInteger();
+	cvarSystem->SetCVarInteger( "r_softShadowCompute", swGateWedge ? 0 : 1 );
+	cvarSystem->SetCVarInteger( "r_softShadowFaceCoverage", swGateWedge ? 0 : 1 );
 	cvarSystem->SetCVarInteger( "r_softShadowSurfCache", swGateCache );
 
 	GateCfg cfg;
@@ -3140,6 +3150,9 @@ int R_SoftShadowGate( const char* arg )
 			}
 
 			std::vector<uint8_t> valid( ( size_t )W * H, 0 );
+			// kind-coded per-pixel defect map (1=dark-in-lit 2=lit-in-umbra 3=step 4=continuity), filled by
+			// the detectors below; hoisted to this scope so the wedge-whitelist recall correlation can read it
+			std::vector<uint8_t> defectPx( ( size_t )W * H, 0 );
 			long validN = 0;
 			for( size_t i = 0; i < valid.size(); i++ )
 			{
@@ -3207,7 +3220,6 @@ int R_SoftShadowGate( const char* arg )
 
 				// ---- probes -------------------------------------------------------------------
 				GateTemporal( anaA, anaB, valid, cfg, defects );
-				std::vector<uint8_t> defectPx( ( size_t )W * H, 0 );
 				std::vector<uint8_t> crease = GateCreaseMask( depthA, cfg.guard );
 				// cross-texel SEAM: cached still vs its own exact field (reference-free self-consistency)
 				if( swSurfSeam && anaOff.Valid() && anaOff.W == W && anaOff.H == H )
@@ -3406,6 +3418,106 @@ int R_SoftShadowGate( const char* arg )
 						common->Printf( "[softgate]   %s area=%d bbox=(%d,%d)-(%d,%d)\n",
 										GateKindName( d.kind ), d.area, d.x0, d.y0, d.x1, d.y1 );
 					}
+				}
+			}
+			// ---- WEDGE-WHITELIST recall/selectivity (Phase A instrument, wedge gate only) ----
+			// Re-render with the swDbg 16 verdict shader (R = 1 where the whitelist says the wedge is NOT
+			// safe) and correlate per pixel against the kind-coded defect map just scored. Recall = every
+			// defect pixel must be flagged unsafe (a false negative = the predicate misses a real wedge
+			// error); selectivity = the safe fraction of valid pixels = the offload headroom. Raw data only.
+			if( swGateWedge )
+			{
+				const int wlPrevDbg = cvarSystem->GetCVarInteger( "r_softShadowDebugShader" );
+				cvarSystem->SetCVarInteger( "r_softShadowDebugShader", 16 );
+				GateRenderFrame( rw, &rv );
+				swgate::GateImg wl;
+				GateReadR32F( globalImages->currentRenderHDRImage, wl );
+				// full float readback of the same verdict image: G = union gap, B = nContrib/8. Feeds the
+				// per-kind (nContrib, gap) histograms that NAME the mechanism at defect pixels instead of
+				// guessing it (blit converts the RGBA16F HDR target to RGBA32F).
+				std::vector<float> wlF;
+				{
+					float* wlPtr = NULL;
+					if( R_ReadPixelsRGBA32F( deviceManager->GetDevice(), &backEnd.GetCommonPasses(),
+											 globalImages->currentRenderHDRImage->GetTextureHandle(),
+											 nvrhi::ResourceStates::RenderTarget, &wlPtr, W, H ) && wlPtr != NULL )
+					{
+						wlF.assign( wlPtr, wlPtr + ( size_t )W * H * 4 );
+						R_StaticFree( wlPtr );
+					}
+				}
+				cvarSystem->SetCVarInteger( "r_softShadowDebugShader", wlPrevDbg );
+				if( wl.W == W && wl.H == H )
+				{
+					long wlKindTot[5] = { 0, 0, 0, 0, 0 }, wlKindFlag[5] = { 0, 0, 0, 0, 0 };
+					long wlSafe = 0, wlValid = 0;
+					// SILHOUETTE-DIVERGENCE curve (A channel = worst (1-cos kappa)/2 over cull-passed casters):
+					// histogram at ANT/STEP defect px vs ALL valid px -> the recall-vs-fire-rate curve for the
+					// candidate third predicate term, from ONE run. Bins of A: <.5, then .05-wide to .9, >= .9.
+					long wlDivDef[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };	// at darkInLit/step defect px (kinds 1+3)
+					long wlDivAll[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };	// over all valid px
+					for( size_t i = 0; i < wl.t.size() && i < valid.size(); i++ )
+					{
+						if( !valid[i] )
+						{
+							continue;
+						}
+						wlValid++;
+						// R packs bit0 = unsafe verdict, bits1-3 = slab-clip/bridge activity (dbg 16 shader)
+						const int  wlR      = ( int )( wl.t[i] + 0.5f );
+						const bool wlUnsafe = ( wlR & 1 ) != 0;
+						if( !wlUnsafe )
+						{
+							wlSafe++;
+						}
+						int wlDivBin = 0;
+						if( wlF.size() == ( size_t )W * H * 4 )
+						{
+							const float wlA = wlF[i * 4 + 3];
+							wlDivBin = ( wlA < 0.5f ) ? 0 : Min( 7, 1 + ( int )( ( wlA - 0.5f ) / 0.05f ) );
+							if( wlA >= 0.9f )
+							{
+								wlDivBin = 7;
+							}
+							wlDivAll[wlDivBin]++;
+						}
+						const int wk = ( i < defectPx.size() ) ? defectPx[i] : 0;
+						if( wk >= 1 && wk <= 4 )
+						{
+							wlKindTot[wk]++;
+							if( wlUnsafe )
+							{
+								wlKindFlag[wk]++;
+							}
+							if( wk == 1 || wk == 3 )
+							{
+								wlDivDef[wlDivBin]++;
+							}
+						}
+					}
+					common->Printf( "[wlrecall] %-14s L%d: safe %.1f%% of %ld valid px | flagged/defect px: darkInLit %ld/%ld litInUmbra %ld/%ld step %ld/%ld cont %ld/%ld\n",
+									cap.name.c_str(), li, wlValid > 0 ? 100.0f * wlSafe / wlValid : 0.0f, wlValid,
+									wlKindFlag[1], wlKindTot[1], wlKindFlag[2], wlKindTot[2],
+									wlKindFlag[3], wlKindTot[3], wlKindFlag[4], wlKindTot[4] );
+					// divergence histograms: bins <.5 / .5-.55 / .55-.6 / .6-.65 / .65-.7 / .7-.75 / .75-.8 / >=.8
+					// of A = (1 - cos kappa)/2. Only lights with ANT/STEP defect px print the defect row.
+					if( wlKindTot[1] + wlKindTot[3] > 0 )
+					{
+						common->Printf( "[wldiv]    %-14s L%d: DEFECT px  %ld %ld %ld %ld %ld %ld %ld %ld\n",
+										cap.name.c_str(), li,
+										wlDivDef[0], wlDivDef[1], wlDivDef[2], wlDivDef[3], wlDivDef[4], wlDivDef[5], wlDivDef[6], wlDivDef[7] );
+					}
+					if( wlValid > 0 )
+					{
+						common->Printf( "[wldiv]    %-14s L%d: ALL px     %ld %ld %ld %ld %ld %ld %ld %ld\n",
+										cap.name.c_str(), li,
+										wlDivAll[0], wlDivAll[1], wlDivAll[2], wlDivAll[3], wlDivAll[4], wlDivAll[5], wlDivAll[6], wlDivAll[7] );
+					}
+				}
+				else
+				{
+					common->Printf( "[wlrecall] %-14s L%d: verdict readback size mismatch (%dx%d vs %dx%d) - skipped\n",
+									cap.name.c_str(), li, wl.W, wl.H, W, H );
 				}
 			}
 			int counts[GATE_KIND_COUNT];
@@ -3921,7 +4033,7 @@ int R_SoftShadowGate( const char* arg )
 			// below attributes the PLAIN walk (tile-list, spill/cluster, unbinned-full paths - all
 			// instrumented). Slots: [0/1] caster+cluster sphere tests/culls, [2/3] coarse v0, [4/5]
 			// tight cone, [6] survivors reaching FillTri, [7] fragments walked.
-			uint32_t walk[30] = {};
+			uint32_t walk[34] = {};
 			if( backEnd.GetSoftShadowTermPass() != NULL && backEnd.GetSoftShadowTermPass()->GetWalkStats( walk ) && walk[7] > 0 )
 			{
 				// SCANLINE FillTri attribution (task #106, slots 20-26): where the chord-sweep walk spends
@@ -3943,6 +4055,18 @@ int R_SoftShadowGate( const char* arg )
 					common->Printf( "[softgate] BENCH %-14s adaptive chords: mean N %.1f (of %u frags; claw-back %.0f%% vs fixed-32)\n",
 									cap.name.c_str(), walk[28] / ( double )walk[7], walk[7],
 									100.0 * ( 1.0 - ( walk[28] / ( double )walk[7] ) / 32.0 ) );
+				}
+				// HYBRID-WHITELIST census (slots 30-33), TRIANGLE-WEIGHTED, sparse 16x16 lattice sample.
+				// cut and clean accumulate SEPARATELY in the shader, so the two shares sum to 100% by
+				// construction; tris/frag is printed as the plausibility check (a wrap or misread shows
+				// up as an absurd absolute, not a silent ratio).
+				if( walk[30] > 0 && ( walk[31] + walk[32] ) > 0 )
+				{
+					const double wlTot = ( double )walk[31] + ( double )walk[32];
+					common->Printf( "[softgate] BENCH %-14s wedge-whitelist: %u sampled frags | cut casters/frag %.2f | cut-TRI %.1f%% + clean-TRI %.1f%% = 100 | tris/frag %.1f\n",
+									cap.name.c_str(), walk[30], walk[33] / ( double )walk[30],
+									100.0 * walk[31] / wlTot, 100.0 * walk[32] / wlTot,
+									wlTot / walk[30] );
 				}
 				// LIT-EARLY-OUT execution proof (slot 27): fragments the intensity cut skipped at T > 0.
 				// Nonzero = the r_softShadowLitEarlyOut path actually ran under this config (a 0-defect
@@ -4036,7 +4160,15 @@ int R_SoftShadowGate( const char* arg )
 			{
 				const idVec3   ffBaseOrg = rv.vieworg;
 				const idAngles ffBaseAng = rv.viewaxis.ToAngles();
-				const int ffPrevContrib = cvarSystem->GetCVarInteger( "r_softShadowContribCache" );
+				// GENERALIZED A/B (the uncategorized-defect net): flip com_softShadowGateFullFrameCvar
+				// between value A (reference config) and value B (test config) per pose. Defaults preserve
+				// the original contributor-cache A/B; point it at any integer cvar to referee a change the
+				// classified probes cannot taxonomize (e.g. r_softShadowWedgeWhitelist 1 vs 2).
+				extern idCVar com_softShadowGateFullFrameCvar, com_softShadowGateFullFrameA, com_softShadowGateFullFrameB;
+				const char* ffCvar = com_softShadowGateFullFrameCvar.GetString();
+				const int   ffValA = com_softShadowGateFullFrameA.GetInteger();
+				const int   ffValB = com_softShadowGateFullFrameB.GetInteger();
+				const int ffPrevContrib = cvarSystem->GetCVarInteger( ffCvar );
 				swgate::GateImg ffA, ffB;
 				std::vector<unsigned char> ffMask;
 				uint64_t ffLo = 0, ffHi = 0, ffAnts = 0, ffSteps = 0, ffCmp = 0;
@@ -4047,13 +4179,13 @@ int R_SoftShadowGate( const char* arg )
 				for( int ffp = 0; ffp < ffPoses; ffp++ )
 				{
 					R_SoftShadowBenchMotionPose( ffBaseOrg, ffBaseAng, ffp, ffPoses, &rv );
-					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 0 );
+					cvarSystem->SetCVarInteger( ffCvar, ffValA );
 					GateRenderFrame( rw, &rv );
 					if( !GateReadR32F( globalImages->currentRenderHDRImage, ffA ) )
 					{
 						continue;
 					}
-					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 1 );
+					cvarSystem->SetCVarInteger( ffCvar, ffValB );
 					// inline render (not GateRenderFrame): the light-path provenance counters must be
 					// sampled BETWEEN RenderCommandBuffers and the draining swap, which resets them
 					{
@@ -4146,11 +4278,11 @@ int R_SoftShadowGate( const char* arg )
 				if( ffWorstPose >= 0 )
 				{
 					R_SoftShadowBenchMotionPose( ffBaseOrg, ffBaseAng, ffWorstPose, ffPoses, &rv );
-					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 0 );
+					cvarSystem->SetCVarInteger( ffCvar, ffValA );
 					GateRenderFrame( rw, &rv );
 					R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
 									  nvrhi::ResourceStates::ShaderResource, va( "dumps/fullframe_%s_off.png", cap.name.c_str() ) );
-					cvarSystem->SetCVarInteger( "r_softShadowContribCache", 1 );
+					cvarSystem->SetCVarInteger( ffCvar, ffValB );
 					GateRenderFrame( rw, &rv );
 					R_ReadPixelsRGB8( deviceManager->GetDevice(), &backEnd.GetCommonPasses(), globalImages->currentRenderHDRImage->GetTextureHandle(),
 									  nvrhi::ResourceStates::ShaderResource, va( "dumps/fullframe_%s_on.png", cap.name.c_str() ) );
@@ -4163,7 +4295,7 @@ int R_SoftShadowGate( const char* arg )
 				common->Printf( "[softgate] FULLFRAME %-10s provenance (ON frames): lights term-path min %d of %d total | worst fallback count %d%s\n",
 								cap.name.c_str(), ffTermMin == INT_MAX ? 0 : ffTermMin, ffTotMax, ffFallbackMax,
 								ffFallbackMax > 0 ? "  <-- lights OFF the cached/binned path (contention: sampled-quality risk pre-scanline-port, uncached perf)" : "" );
-				cvarSystem->SetCVarInteger( "r_softShadowContribCache", ffPrevContrib );
+				cvarSystem->SetCVarInteger( ffCvar, ffPrevContrib );
 				// restore the base pose for any later block
 				rv.vieworg  = ffBaseOrg;
 				rv.viewaxis = ffBaseAng.ToMat3();

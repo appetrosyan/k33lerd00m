@@ -48,6 +48,18 @@ static uint g_swVizFills = 0;
 	#endif
 #endif
 
+// SW_UNROLL: [unroll] in HLSL, empty in C++ (loop attributes have no C++ form). Defined early (also
+// re-declared identically with the buffer-param macros below) so the radial helpers above the FillTri
+// block can use it. Guarded so the later identical definition is a harmless no-op.
+#ifndef SW_UNROLL
+	#ifdef __cplusplus
+		#define SW_UNROLL
+	#else
+		#define SW_UNROLL [unroll]
+	#endif
+#endif
+
+
 // SW_FAST_ATAN: 1 = polynomial sector angle (~0.0038 rad err, cheaper on GPU); 0 = hardware atan2 (exact).
 // Default on; flip to 0 for an A/B against the transcendental.
 #ifndef SW_FAST_ATAN
@@ -202,6 +214,201 @@ SW_FUNC float SoftDisk_Crossing( float2 A, float2 B )
 	return by ? 1.0f : -1.0f;									// upward crossing = +1, downward = -1
 }
 
+// ================================ RADIAL-MAX union coverage + eligibility predicate ==================
+// The wedge MAX-combines per-caster AREA, which is NOT a set union (two casters over different halves of
+// the disk each read ~0.5, max stays 0.5, real union ~1.0). RADIAL-MAX keeps the outer blocked radius per
+// angular bin and per-caster-max's it: the exact union, AND it saturates (min rad >= R => umbra) so the
+// early-out the wedge lacks actually fires. It is EXACT only where every caster's projected silhouette is a
+// single CONVEX simple loop CONTAINING the disk centre O (star-shaped from O). SwRadPred_* proves that during
+// the same edge walk; SoftShadowRadial_test / SoftShadowRadialPredicate_test pin the math and zero-false-pos.
+
+// --- eligibility predicate (accumulated during the wedge's per-caster edge walk) --------------------------
+// Three cheap integer/sign tests, all reusing SoftDisk_Crossing:
+//   turnSign : sign of cross(prevEdgeDir,edgeDir) at each vertex; a flip latches 2 (concave). Kills L/star.
+//   dirCross : winding of the EDGE-DIRECTION sequence (turning number). |dirCross|==1 for a convex simple
+//              loop, >=2 for a self-intersecting star (pentagram) whose turns are all one sign - the case a
+//              bare turn-sign test AND |swCross| both miss (O can sit in a winding-1 point of it).
+//   chains   : a caster is >1 closed chain (a hole wound opposite, a multi-part surface) => non-eligible.
+// Eligible caster = single convex simple loop containing O. Eligible FRAGMENT = ALL its casters eligible.
+struct swRadPred_t
+{
+	int    turnSign;		// 0 = no non-straight turn yet; +/-1 = established sign; 2 = INCONSISTENT (concave), latched
+	int    chains;			// closed silhouette chains folded so far (>1 => hole/multi-part => non-eligible)
+	float  dirCross;		// winding of the edge-direction loop = turning number (+/-1 for a convex simple loop)
+	bool   haveDir;			// a previous edge direction exists within the current chain
+	float2 prevDir;			// last edge vector q1-q0 within the current chain
+	float2 firstDir;		// first edge vector of the current chain (to score the wrap-around close turn)
+	bool   haveFirstDir;
+};
+
+SW_FUNC swRadPred_t SwRadPred_Begin()	// call at every caster boundary (header record), before its edges
+{
+	swRadPred_t p;
+	p.turnSign = 0;
+	p.chains = 0;
+	p.dirCross = 0.0f;
+	p.haveDir = false;
+	p.prevDir = float2( 0.0f, 0.0f );
+	p.firstDir = float2( 0.0f, 0.0f );
+	p.haveFirstDir = false;
+	return p;
+}
+
+// Fold one turn between consecutive edge directions d0 -> d1 into the sign and turning-number state.
+// VALUE-RETURN form (not `inout swRadPred_t`): the C++ test build defines `inout` empty, so a struct inout
+// would pass by value and silently drop the mutation - the file's established convention (see FillPoly).
+SW_FUNC swRadPred_t SwRadPred_Turn( swRadPred_t p, float2 d0, float2 d1 )
+{
+	float z = d0.x * d1.y - d0.y * d1.x;						// cross of consecutive edge dirs: >0 left turn, <0 right
+	float mag = sqrt( dot( d0, d0 ) * dot( d1, d1 ) );			// colinear/duplicate => straight-through, must not flip sign
+	if( abs( z ) > 1e-6f * mag + 1e-20f )
+	{
+		int s = ( z > 0.0f ) ? 1 : -1;
+		if( p.turnSign == 0 )
+		{
+			p.turnSign = s;
+		}
+		else if( p.turnSign != s )
+		{
+			p.turnSign = 2;										// sign flip = reflex vertex = concave: latch non-convex
+		}
+	}
+	p.dirCross += SoftDisk_Crossing( d0, d1 );				// turning number: winding of the direction sequence
+	return p;
+}
+
+// Fold one kept silhouette edge (its direction dir = q1 - q0), in walk order, into the current chain.
+SW_FUNC swRadPred_t SwRadPred_Edge( swRadPred_t p, float2 dir )
+{
+	if( dot( dir, dir ) <= 1e-24f )
+	{
+		return p;			// zero-length edge = duplicate/coincident vert: no direction, no turn - skip entirely
+	}
+	if( p.haveDir )
+	{
+		p = SwRadPred_Turn( p, p.prevDir, dir );			// turn at the shared vertex between prev edge and this one
+	}
+	else
+	{
+		p.firstDir = dir;
+		p.haveFirstDir = true;
+	}
+	p.prevDir = dir;
+	p.haveDir = true;
+	return p;
+}
+
+// Close the current chain: score the wrap-around turn (last edge -> first edge) and count the chain. Call at
+// every chain boundary (walk detects A != prevE1) and at the caster's final flush.
+SW_FUNC swRadPred_t SwRadPred_CloseChain( swRadPred_t p )
+{
+	if( p.haveDir && p.haveFirstDir )
+	{
+		p = SwRadPred_Turn( p, p.prevDir, p.firstDir );		// the vertex where the loop closes
+	}
+	if( p.haveDir )
+	{
+		p.chains += 1;
+	}
+	p.haveDir = false;										// reset per-chain direction state; dirCross/turnSign/chains persist
+	p.haveFirstDir = false;
+	return p;
+}
+
+// Final verdict. swCross is the walk's integer winding of the silhouette about O (SoftDisk_Crossing sum).
+SW_FUNC bool SwRadPred_Eligible( swRadPred_t p, float swCross )
+{
+	bool oneRev    = ( abs( p.dirCross ) > 0.5f ) && ( abs( p.dirCross ) < 1.5f );	// turning number == +/-1: simple loop
+	bool convex    = ( p.chains == 1 ) && ( p.turnSign != 2 ) && oneRev;			// single, no reflex, single revolution
+	bool containsO = ( abs( swCross ) >= 0.5f );									// integer winding |>=1| => centre inside
+	return convex && containsO;
+}
+
+// --- radial-max primitive (rad[SW_RAD_K] = outer blocked radius per angular bin over [0,2pi)) -----------
+#ifndef SW_RADIAL
+	#define SW_RADIAL 0			// compile-time gate: 1 routes eligible casters through the radial union early-out
+#endif
+#ifndef SW_RAD_K
+	#define SW_RAD_K 32			// angular bins; K=16 is on the parity plateau (<0.003), 32 for headroom (radial_test)
+#endif
+#ifndef SW_HYB_SOLO_EPS
+	#define SW_HYB_SOLO_EPS 0.002f	// a caster counts toward the whitelist's contributor tally only above this solo
+#endif								// coverage - below it a caster cannot create a visible max-combine hole
+// WEDGE WHITELIST (SoftShadow_Coverage wedge branch): offload to the cheap wedge ONLY where it is provably
+// safe; otherwise the exact path serves. Two independent terms, each its own knob:
+//   sinA  = R/distPL < SW_WL_SINA_MAX : parallax-safe (the wedge picks one silhouette at the disk centre;
+//           at large angular size a deep caster's true contour shifts across the disk -> under-shadow).
+//   union : nContrib <= 1 OR gap <= SW_WL_GAP_TOL : max-combine-safe (one caster => max IS the union; else
+//           the largest possible under-shadow is gap). Unknown/uncertain defaults to NOT safe (scanline).
+#ifndef SW_WHITELIST
+	#define SW_WHITELIST 0			// 0 = shipped wedge branch unchanged; 1 = apply the whitelist + fallback
+#endif
+#ifndef SW_WL_SINA_MAX
+	#define SW_WL_SINA_MAX 0.10f	// parallax-safe below this disk half-angle sine (SoftShadowWedge_test: exact < 0.10)
+#endif
+#ifndef SW_WL_GAP_TOL
+	#define SW_WL_GAP_TOL 0.02f		// max-combine-safe when the union gap is under this fraction of the disk
+#endif
+#ifndef SW_WL_BRIDGE_AREA
+	#define SW_WL_BRIDGE_AREA 0.02f	// a bridging connector whose OWN circle-tri contribution exceeds this
+#endif								// fraction of the disk area materially shaped the integral: loop was CUT.
+									// Degenerate connectors (clean loops) contribute ~0; a contact-clipped
+									// contour's bridge wraps a large angular span and contributes a sector.
+// The primitive mutates rad[] via `inout` (an HLSL keyword); the offline test TUs leave it undefined and some
+// use `inout` as an identifier, so this block compiles ONLY when radial is enabled - the GPU build sets
+// SW_RADIAL 1 (real keyword), and no C++ test calls the shader's copy (Radley's parity test carries its own).
+#if SW_RADIAL
+#define SW_RAD_2PI 6.283185307179586f
+
+// Union ONE projected silhouette edge (q0->q1 in disk coords, units of swR) into rad[]. For every bin whose
+// ray from O crosses the segment forward (s in [0,1], r>0), rad[bin] = max(rad[bin], r). Bins are STATICALLY
+// indexed under SW_UNROLL (K a compile-time constant) so cos/sin fold to literals and rad[k] never becomes a
+// dynamic (scratch-spilling) index - the register cost is K VGPRs for rad[], measured in chunk 4.
+SW_FUNC void SoftRadial_AccumEdge( inout float rad[SW_RAD_K], float2 q0, float2 q1 )
+{
+	float2 e = q1 - q0;
+	SW_UNROLL
+	for( int k = 0; k < SW_RAD_K; k++ )
+	{
+		float th = ( k + 0.5f ) * ( SW_RAD_2PI / SW_RAD_K );
+		float dx = cos( th ), dy = sin( th );					// constant-folds under the unroll (k compile-time)
+		float den = e.x * dy - e.y * dx;						// cross(q1-q0, d)
+		if( abs( den ) < 1e-20f ) { continue; }					// edge parallel to the ray: no crossing
+		float s = -( q0.x * dy - q0.y * dx ) / den;				// -cross(q0,d)/cross(q1-q0,d)
+		if( s < 0.0f || s > 1.0f ) { continue; }				// crossing off the segment
+		float hx = q0.x + s * e.x, hy = q0.y + s * e.y;
+		float r = hx * dx + hy * dy;							// dot(hit, d): forward outer radius
+		if( r > rad[k] ) { rad[k] = r; }						// max unions casters
+	}
+}
+
+// rad[] -> occluded fraction [0,1]. Clamp each radius to R (blocked region past the disk edge is outside the
+// light, contributes nothing); coverage = sum_k min(rad[k],R)^2 / (K R^2).
+SW_FUNC float SoftRadial_Finalize( float rad[SW_RAD_K], float R )
+{
+	float sum = 0.0f;
+	SW_UNROLL
+	for( int k = 0; k < SW_RAD_K; k++ )
+	{
+		float rc = min( rad[k], R );
+		sum += rc * rc;
+	}
+	return saturate( sum / ( ( float )SW_RAD_K * R * R ) );
+}
+
+// umbra iff every bin's outer radius reaches R (min_k rad[k] >= R => the union fills the whole disk).
+SW_FUNC bool SoftRadial_Saturated( float rad[SW_RAD_K], float R )
+{
+	bool full = true;
+	SW_UNROLL
+	for( int k = 0; k < SW_RAD_K; k++ )
+	{
+		if( rad[k] < R ) { full = false; }
+	}
+	return full;
+}
+#endif	// SW_RADIAL
+
 // intersection parameters of segment A + t*D with the circle |X|^2 = r2. disc <= 0 = no crossing;
 // otherwise t1 <= t2 are the entry/exit parameters (on the infinite line; the caller range-checks).
 struct softSegRoots_t
@@ -313,7 +520,10 @@ SW_FUNC softFrame_t SoftShadow_Frame( float3 swP, float3 swL )
 // distPL caps the amplification. Small approximation (softens only the sharpest contact hardening), so it
 // is RUNTIME-toggle-able: each pass's main() writes this static from its cvar BEFORE the walk; 0 = exact
 // (default here, so any path that does not set it stays lossless). HLSL statics are per-invocation mutable.
-static float g_swMinDnR = 0.0f;
+#ifndef SW_MINDNR_DEFAULT
+	#define SW_MINDNR_DEFAULT 0.0f	// exact projection unless a TU opts into the dn-clamp before including
+#endif
+static float g_swMinDnR = SW_MINDNR_DEFAULT;
 // g_swMinDnAbs: an ABSOLUTE dn floor knob (default 0 = inert). A footprint-DRIVEN version of this was tried
 // for the grazing grain and REFUTED (SoftShadowGrainAA_test): the clamp family biases the projection instead
 // of averaging, so it plateaus ~0.10 off the supersampled truth and over-blurs past that. The lossless grain
@@ -636,10 +846,14 @@ SW_FUNC void SwWMinBox( float3 wbc[8], float3 swP, float3 wnrm, float dpl, float
 	#define SW_EDGEBUF_PARAM , SoftEdgeBuffer t_SoftEdges
 	#define SW_TILEBUF_PARAM , SoftTileBuffer t_SoftTiles
 	#define SW_UNROLL							// C++ (test) build: HLSL loop attributes have no C++ form
+	#define SW_OUT( t ) t&						// out-param: a reference in C++, native `out` in HLSL
+	#define SW_EDGEBUF_ARG , t_SoftEdges		// forward the edge buffer in a wrapper->core call (C++ only)
 #else
 	#define SW_EDGEBUF_PARAM
 	#define SW_TILEBUF_PARAM
 	#define SW_UNROLL [unroll]
+	#define SW_OUT( t ) out t
+	#define SW_EDGEBUF_ARG
 #endif
 
 // SW_ATTRIB: op-count instrumentation for the CPU walk-attribution study. TEXTUALLY EMPTY in HLSL
@@ -717,9 +931,40 @@ SW_FUNC void SwWMinBox( float3 wbc[8], float3 swP, float3 wnrm, float dpl, float
 // cover the centre the fragment is hard-blocked and leaves the ring, so the correction is exact where
 // enabled. WITHOUT the guarantee (0) the subtraction would delete real umbra - callers outside an AAM
 // ring pass must pass 0.
-SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit SW_EDGEBUF_PARAM )
+// Ex form: same max-combine occlusion, plus the WEDGE-WHITELIST safety outputs a per-fragment selector needs
+// to decide whether the cheap wedge may serve this pixel or the exact scanline must:
+//   swGapOut      = min(1, Sum solo) - max solo = the largest amount the max-combine can UNDER-shadow at this
+//                   fragment (0 when one caster dominates or a single caster contributes: max IS the union).
+//   swNContribOut = number of casters with non-trivial solo coverage (1 => the wedge is the exact union here).
+// The parallax term (sinA = R/distPL) is judged by the caller, which owns the receiver distance.
+SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit,
+		SW_OUT( float ) swGapOut, SW_OUT( int ) swNContribOut, SW_OUT( int ) swClipOut SW_EDGEBUF_PARAM )
 {
+	swGapOut = 0.0f;
+	swNContribOut = 0;
+	// swClipOut: PER-CASTER cut census at this fragment (not a stream-wide OR - that aliases one pathological
+	// caster into a 100% signal). bits 0-1 = near-clip activity anywhere in the stream (diagnostic), bit 2 =
+	// any material bridge fired, bits 3+ = the NUMBER of casters whose loop was CUT (>=1 connector whose own
+	// circle-tri contribution exceeds SW_WL_BRIDGE_AREA): each such caster's shoelace integrated a different
+	// loop than it projects, so ITS area is untrusted; casters that walked clean keep a certifiable area.
+	swClipOut = 0;
+	// A caster is CUT only when BOTH hold: (big) some bridging connector materially shaped its integral,
+	// AND (lossy) the slab clip deleted geometry in dn (0, eps) - the contact sliver, the ONLY removed
+	// region that can occlude. Deletions behind the receiver (dn < 0) or beyond the light (dn > distPL)
+	// are provably non-occluding, so their bridged loop IS the exact silhouette of the occluding part -
+	// flagging them was measured 2-4x over-conservative (far-cut room shells at every fragment).
+	int  swNCut = 0;		// casters with (big AND lossy) - the untrusted integrals
+	bool swCurBig = false;	// current caster: a material bridge fired
+	bool swCurLossy = false;	// current caster: a (0, eps) near-deletion occurred
+	float swSolo = 0.0f;	// current caster's solo coverage (finalized at each caster close)
+	float swSum  = 0.0f;	// Sum of per-caster solo coverages (union upper bound is min(1, swSum))
+	int   swNContrib = 0;	// casters with solo > SW_HYB_SOLO_EPS
 	swR = max( swR, 1e-2f );
+	// bit2 = LOOP CUT: a bridging connector (edge-to-edge or chain close) with a non-degenerate projected
+	// span. In a clean closed loop every connector is length ~0 (consecutive edges share endpoints, the
+	// close returns to the first vertex); a real span means the slab clip DELETED contour and the shoelace
+	// integrated a different loop than the caster projects - the contact-stripe hole mechanism.
+	const float swWlBrArea = SW_WL_BRIDGE_AREA * ( PI * swR * swR );
 	softFrame_t swF = SoftShadow_Frame( swP, swL );
 	float  swDistPL = swF.distPL;									// receiver->light distance
 	float3 swNrm = swF.nrm;
@@ -732,6 +977,19 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 	float swOcc = 0.0f;
 	float swArea = 0.0f;
 	float swCross = 0.0f;	// signed +X-axis crossings of the clipped loop = winding number (integer, swCentreLit)
+#if SW_RADIAL
+	// radial-max union runs ALONGSIDE the wedge shoelace: every segment the shoelace integrates is also
+	// unioned into swRad, and the predicate proves each caster convex+containsO. If EVERY caster is eligible
+	// the exact union (which saturates) replaces the lossy max-combine; otherwise swOcc (the wedge) is returned
+	// unchanged, so the ineligible path is byte-identical to today.
+	float       swRad[SW_RAD_K];
+	SW_UNROLL
+	for( int swRi = 0; swRi < SW_RAD_K; swRi++ ) { swRad[swRi] = 0.0f; }
+	swRadPred_t swPred = SwRadPred_Begin();
+	// swCentreLit > 0.5 (AAM ring pass: centre GUARANTEED lit) contradicts radial eligibility (contains-O), and
+	// the wedge owns the illusory-umbra winding correction there - so disable radial for those calls entirely.
+	bool        swAllElig = ( swCentreLit <= 0.5f );
+#endif
 	// haveCaster starts TRUE: edge records arriving before any header (an engine offset bug, or a caller
 	// without cull data) are treated as a caster and still occlude. They used to be fully computed and
 	// then silently DISCARDED at finalization - an invisible missing-shadow failure mode (finding F14).
@@ -754,8 +1012,13 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 		{
 			if( haveCaster && swFirstValid )
 			{
-				swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the previous caster's open chain
+				float swBrA0 = SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the previous caster's open chain
+				swArea += swBrA0;
 				swCross += SoftDisk_Crossing( swPrev, swFirst );
+				if( abs( swBrA0 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material close (prev caster)
+#if SW_RADIAL
+				SoftRadial_AccumEdge( swRad, swPrev, swFirst );
+#endif
 			}
 			if( haveCaster )
 			{
@@ -768,12 +1031,26 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 						swArea = 0.0f;											// near-plane chain-fragment debris, not geometry
 					}
 				}
-				swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
+				swSolo = saturate( abs( swArea ) * swInvDiskArea );
+				swOcc  = max( swOcc, swSolo );
+				swSum += swSolo;
+				if( swSolo > SW_HYB_SOLO_EPS ) { swNContrib++; }
 				if( swOcc >= 0.999f ) { break; }
+#if SW_RADIAL
+				swPred = SwRadPred_CloseChain( swPred );					// close this caster's final chain
+				swAllElig = swAllElig && SwRadPred_Eligible( swPred, swCross );
+				if( swAllElig && SoftRadial_Saturated( swRad, swR ) ) { return 1.0f; }	// exact union umbra: early-out
+#endif
 			}
+			if( swCurBig && swCurLossy ) { swNCut++; }	// fold the closed caster into the census
+			swCurBig = false;
+			swCurLossy = false;
 			haveCaster = true;
 			swArea = 0.0f;
 			swCross = 0.0f;
+#if SW_RADIAL
+			swPred = SwRadPred_Begin();										// fresh predicate for the next caster
+#endif
 			swSkip = false;
 			swFirstValid = false;
 			havePrevE1 = false;
@@ -793,9 +1070,15 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 		float3 B = float3( e1.x, e1.y, e1.z );
 		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid )
 		{
-			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close a finished chain before the next
+			float swBrA1 = SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close a finished chain before the next
+			swArea += swBrA1;
 			swCross += SoftDisk_Crossing( swPrev, swFirst );
+			if( abs( swBrA1 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material chain close
 			swFirstValid = false;
+#if SW_RADIAL
+			SoftRadial_AccumEdge( swRad, swPrev, swFirst );
+			swPred = SwRadPred_CloseChain( swPred );
+#endif
 		}
 		havePrevE1 = true;
 		prevE1w = B;
@@ -809,7 +1092,19 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 		float  dnB = dot( b, swNrm );
 		float  d   = dnB - dnA;
 		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, swEps, swDistPL );
-		if( cl.empty ) { continue; }
+		// LOSSY window = removed geometry with dn in (0, eps): in front of the receiver, inside the near
+		// slab - the contact sliver that CAN occlude. dn < 0 (behind) and dn > distPL (beyond the light)
+		// removals are provably non-occluding and leave the bridged loop exact.
+		if( cl.empty )
+		{
+			if( max( dnA, dnB ) < swEps )
+			{
+				swClipOut |= 2;									// whole edge below the near plane (bit1)
+				if( max( dnA, dnB ) > 0.0f ) { swCurLossy = true; }	// part of it sat in the contact sliver
+			}
+			continue;
+		}
+		if( min( dnA, dnB ) < swEps ) { swClipOut |= 1; swCurLossy = true; }	// near trim engaged: removed span reaches (0, eps)
 
 		float3 pa  = a + cl.t0 * ( b - a );
 		float3 pb  = a + cl.t1 * ( b - a );
@@ -818,16 +1113,32 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 		float2 q0 = SoftShadow_ProjectVert( pa, dna, swF );
 		float2 q1 = SoftShadow_ProjectVert( pb, dnb, swF );
 
-		if( swFirstValid ) { swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 ); swCross += SoftDisk_Crossing( swPrev, q0 ); }
+		if( swFirstValid ) { float swBrA2 = SoftDisk_CircleTriArea( swPrev, q0, swR2 ); swArea += swBrA2; swCross += SoftDisk_Crossing( swPrev, q0 );
+			if( abs( swBrA2 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material intra-chain bridge
+#if SW_RADIAL
+			SoftRadial_AccumEdge( swRad, swPrev, q0 );				// connector (degenerate for eligible casters)
+#endif
+		}
 		else               { swFirst = q0; swFirstValid = true; }
 		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
 		swCross += SoftDisk_Crossing( q0, q1 );
+#if SW_RADIAL
+		// mirror EVERY shoelace segment into the radial union so it integrates the identical clipped loop; feed
+		// the predicate only the real silhouette edge direction (connectors are degenerate for eligible casters).
+		SoftRadial_AccumEdge( swRad, q0, q1 );
+		swPred = SwRadPred_Edge( swPred, q1 - q0 );
+#endif
 		swPrev = q1;
 	}
 	if( haveCaster && swFirstValid )
 	{
-		swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );		// close the last caster's open chain
+		float swBrA3 = SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the last caster's open chain
+		swArea += swBrA3;
 		swCross += SoftDisk_Crossing( swPrev, swFirst );
+		if( abs( swBrA3 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material final close
+#if SW_RADIAL
+		SoftRadial_AccumEdge( swRad, swPrev, swFirst );
+#endif
 	}
 	if( haveCaster )
 	{
@@ -840,9 +1151,38 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 				swArea = 0.0f;
 			}
 		}
-		swOcc = max( swOcc, saturate( abs( swArea ) * swInvDiskArea ) );
+		swSolo = saturate( abs( swArea ) * swInvDiskArea );
+		swOcc  = max( swOcc, swSolo );
+		swSum += swSolo;
+		if( swSolo > SW_HYB_SOLO_EPS ) { swNContrib++; }
+#if SW_RADIAL
+		swPred = SwRadPred_CloseChain( swPred );						// close the final caster's last chain
+		swAllElig = swAllElig && SwRadPred_Eligible( swPred, swCross );
+#endif
 	}
+#if SW_RADIAL
+	// every caster convex+containsO => the radial union is EXACT (and it saturates); use it. Otherwise the
+	// union over-fills where the star-shape precondition fails, so fall back to the wedge value unchanged.
+	if( swAllElig ) { return SoftRadial_Finalize( swRad, swR ); }
+#endif
+	// union-safety outputs: gap = how much the max-combine can under-shadow here (min(1,Sum) - max).
+	// A single contributor => min(1,Sum)==max => gap 0 => the wedge IS the exact union at this fragment.
+	swGapOut = max( min( 1.0f, swSum ) - swOcc, 0.0f );
+	swNContribOut = swNContrib;
+	if( swCurBig && swCurLossy ) { swNCut++; }					// fold the final caster
+	swClipOut |= ( swNCut > 15 ? 15 : swNCut ) << 3;			// bits 3+: cut-caster census
 	return swOcc;
+}
+
+// Shipped entry: max-combined per-caster silhouette area. Thin wrapper over the Ex form; the union-safety
+// outputs are discarded here, so the returned occlusion (and the anaTerm hash) is bit-identical - the extra
+// accumulation is dead and DCE'd on this path.
+SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int swFirstElem, int swN, float swCentreLit SW_EDGEBUF_PARAM )
+{
+	float swGapDisc = 0.0f;
+	int   swNContribDisc = 0;
+	int   swClipDisc = 0;
+	return SoftShadow_WedgeOcclusionEx( swP, swL, swR, swFirstElem, swN, swCentreLit, swGapDisc, swNContribDisc, swClipDisc SW_EDGEBUF_ARG );
 }
 
 // ===================================================================================================
@@ -1642,6 +1982,20 @@ SW_FUNC void SoftScan_FillTri( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 #ifndef SW_POLY_MAX_VERTS
 	#define SW_POLY_MAX_VERTS 8
 #endif
+// Slab-clip array bounds for the CONCAVE fill (Sutherland-Hodgman adds <=1 vertex per plane per crossing).
+// At SW_POLY_MAX_VERTS=8 these are 10/12 - matching FillPoly's hardcoded nRel[10]/fRel[12]/q[12], so
+// FillPolyConcave is byte-for-byte FillPoly on convex input. Raising SW_POLY_MAX_VERTS grows them (the
+// register cost of many-vertex concave silhouettes). Only FillPolyConcave uses these (FillPoly is untouched).
+#ifndef SW_CLIP_NEAR
+	#define SW_CLIP_NEAR ( SW_POLY_MAX_VERTS + 2 )
+#endif
+#ifndef SW_CLIP_FAR
+	#define SW_CLIP_FAR  ( SW_POLY_MAX_VERTS + 4 )
+#endif
+// Max edge-crossings per chord for the concave even-odd fill: bounded by the far-clip edge count.
+#ifndef SW_POLY_MAX_CROSS
+	#define SW_POLY_MAX_CROSS SW_CLIP_FAR
+#endif
 SW_FUNC void SoftScan_FillPoly( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS],
 		float3 loopV[SW_POLY_MAX_VERTS], int loopN, float3 swP, softFrame_t swF, float swR, float swEps )
 {
@@ -1737,6 +2091,121 @@ SW_FUNC void SoftScan_FillPoly( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout f
 	}
 }
 
+// CONCAVE POLYGON coverage (salvaged from a0c858, proven: ray-truth max|err| 0.028<0.06, convex==FillPoly
+// bit-for-bit). Strict generalisation of FillPoly: per chord, SORT the edge crossings + even-odd rule, OR the
+// disjoint interior intervals into the SAME swGrid; envelope = outer crossing pair (no representation change).
+// MAX-CROSSINGS BOUND: SW_POLY_MAX_CROSS (=12 at the default cap). A chord crosses each slab-clipped edge at
+// most once, so nc<=SW_CLIP_FAR always for a well-formed single loop; the selector must only route single
+// closed loops here (the same <=SW_POLY_MAX_VERTS contract). Use ONLY for casters classified concave (convex
+// stays on FillPoly/FillBox, which never pay the insertion-sort).
+SW_FUNC void SoftScan_FillPolyConcave( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout float2 swEnv[SW_SCAN_CHORDS],
+		float3 loopV[SW_POLY_MAX_VERTS], int loopN, float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	g_swVizFills++;		// per-FRAGMENT walk-cost counter (viz 9 heatmap)
+	if( loopN < 3 ) { return; }
+	float3 rel[SW_POLY_MAX_VERTS]; float dn[SW_POLY_MAX_VERTS];
+	for( int i = 0; i < loopN; i++ ) { rel[i] = loopV[i] - swP; dn[i] = dot( rel[i], swF.nrm ); }
+	float3 nRel[SW_CLIP_NEAR]; float nDn[SW_CLIP_NEAR]; int nn = 0;		// near clip: dn >= swEps (S-H; concave clip
+	for( int e2 = 0; e2 < loopN; e2++ )									// bridges project to radius ~distPL/eps, far off
+	{																	// the disk, so they never corrupt in-disk parity)
+		int i = e2, k = ( e2 + 1 ) % loopN;
+		bool ai = dn[i] >= swEps, bi = dn[k] >= swEps;
+		if( ai && nn < SW_CLIP_NEAR ) { nRel[nn] = rel[i]; nDn[nn] = dn[i]; nn++; }
+		if( ( ai != bi ) && nn < SW_CLIP_NEAR ) { float t = ( swEps - dn[i] ) / ( dn[k] - dn[i] ); nRel[nn] = rel[i] + ( rel[k] - rel[i] ) * t; nDn[nn] = swEps; nn++; }
+	}
+	if( nn < 3 ) { return; }
+	float3 fRel[SW_CLIP_FAR]; float fDn[SW_CLIP_FAR]; int fn = 0;		// far clip: dn <= distPL
+	for( int e3 = 0; e3 < nn; e3++ )
+	{
+		int i = e3, k = ( e3 + 1 ) % nn;
+		bool ai = nDn[i] <= swF.distPL, bi = nDn[k] <= swF.distPL;
+		if( ai && fn < SW_CLIP_FAR ) { fRel[fn] = nRel[i]; fDn[fn] = nDn[i]; fn++; }
+		if( ( ai != bi ) && fn < SW_CLIP_FAR ) { float t = ( swF.distPL - nDn[i] ) / ( nDn[k] - nDn[i] ); fRel[fn] = nRel[i] + ( nRel[k] - nRel[i] ) * t; fDn[fn] = swF.distPL; fn++; }
+	}
+	if( fn < 3 ) { return; }
+	float invR = 1.0f / swR;
+	float2 q[SW_CLIP_FAR]; int qn = fn; float ymin = 1e30f, ymax = -1e30f, xmin = 1e30f, xmax = -1e30f;
+	for( int j = 0; j < fn; j++ ) { float2 p = SoftShadow_ProjectVert( fRel[j], fDn[j], swF ) * invR; q[j] = p; ymin = min( ymin, p.y ); ymax = max( ymax, p.y ); xmin = min( xmin, p.x ); xmax = max( xmax, p.x ); }
+	{
+		float nx2 = ( xmin > 0.0f ) ? xmin : ( ( xmax < 0.0f ) ? xmax : 0.0f );
+		float ny2 = ( ymin > 0.0f ) ? ymin : ( ( ymax < 0.0f ) ? ymax : 0.0f );
+		if( nx2 * nx2 + ny2 * ny2 > 1.0f ) { return; }
+	}
+	const float halfC = SW_SCAN_CHORDS * 0.5f;
+	int mLo = max( ( int )ceil( ( ymin + 1.0f ) * halfC - 0.5f ), 0 );
+	int mHi = min( ( int )floor( ( ymax + 1.0f ) * halfC - 0.5f ), SW_SCAN_CHORDS - 1 );
+	if( mLo > mHi ) { return; }
+	{
+		SwGridWord bboxRun = SoftScan_Run( xmin, xmax );			// bbox superset of the true intervals -> the
+		bool newBits = false;										// already-covered skip stays conservative for concave
+		SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
+		{
+			if( mc < mLo || mc > mHi || newBits ) { continue; }
+			SW_CHORD_SKIP( mc )
+			if( !SwGridHas( swGrid[mc], bboxRun ) ) { newBits = true; }
+		}
+		if( !newBits )
+		{
+			if( SwGridNZ( bboxRun ) )
+			{
+				SW_UNROLL for( int mc = 0; mc < SW_SCAN_CHORDS; mc++ )
+				{
+					if( mc < mLo || mc > mHi || !SwGridNZ( swGrid[mc] ) ) { continue; }
+					SW_CHORD_SKIP( mc )
+					if( SwGridNZ( bboxRun & SwGridColBit( SwGridLoCol( swGrid[mc] ) ) ) ) { swEnv[mc].x = min( swEnv[mc].x, xmin ); }
+					if( SwGridNZ( bboxRun & SwGridColBit( SwGridHiCol( swGrid[mc] ) ) ) ) { swEnv[mc].y = max( swEnv[mc].y, xmax ); }
+				}
+			}
+			return;
+		}
+	}
+	float eax[SW_CLIP_FAR], eay[SW_CLIP_FAR], eslope[SW_CLIP_FAR], elo[SW_CLIP_FAR], ehi[SW_CLIP_FAR];
+	for( int e4 = 0; e4 < SW_CLIP_FAR; e4++ )
+	{
+		if( e4 >= qn ) { eax[e4] = 0; eay[e4] = 0; eslope[e4] = 0; elo[e4] = 1e30f; ehi[e4] = -1e30f; continue; }
+		float2 A = q[e4], B = q[( e4 + 1 ) % qn];
+		eax[e4] = A.x; eay[e4] = A.y; eslope[e4] = ( B.x - A.x ) / ( B.y - A.y );
+		elo[e4] = min( A.y, B.y ); ehi[e4] = max( A.y, B.y );
+	}
+	SW_UNROLL for( int m = 0; m < SW_SCAN_CHORDS; m++ )
+	{
+		if( m < mLo || m > mHi ) { continue; }
+		SW_CHORD_SKIP( m )
+		float Y = -1.0f + ( ( float )m + 0.5f ) * ( 2.0f / SW_SCAN_CHORDS );
+		float xs[SW_POLY_MAX_CROSS]; int nc = 0;						// sorted crossing x's (insertion sort)
+		for( int e5 = 0; e5 < SW_CLIP_FAR; e5++ )
+		{
+			if( Y >= elo[e5] && Y < ehi[e5] )							// SAME half-open predicate as FillPoly (even count)
+			{
+				float x = eax[e5] + eslope[e5] * ( Y - eay[e5] );
+				if( nc < SW_POLY_MAX_CROSS )							// insert x keeping xs[] ascending
+				{
+					int ins = nc;
+					for( ; ins > 0 && xs[ins - 1] > x; ins-- ) { xs[ins] = xs[ins - 1]; }
+					xs[ins] = x; nc++;
+				}
+			}
+		}
+		if( nc >= 2 )
+		{
+			// even-odd: fill the disjoint interior intervals [xs0,xs1] [xs2,xs3] ...; envelope = OUTER pair only
+			swEnv[m] = SwEnvAdd( swEnv[m], xs[0], xs[nc - 1] );
+			for( int pp = 0; pp + 1 < nc; pp += 2 )
+			{
+				swGrid[m] |= SoftScan_Run( xs[pp], xs[pp + 1] );
+			}
+		}
+	}
+}
+
+SW_FUNC void SoftScan_FillPolyConcave( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 loopV[SW_POLY_MAX_VERTS], int loopN,
+		float3 swP, softFrame_t swF, float swR, float swEps )
+{
+	float2 e[SW_SCAN_CHORDS];
+	for( int i = 0; i < SW_SCAN_CHORDS; i++ ) { e[i] = SwEnvZero(); }
+	SoftScan_FillPolyConcave( swGrid, e, loopV, loopN, swP, swF, swR, swEps );
+}
+
 // ANALYTIC BOX coverage: fill a box caster's receiver-silhouette (a convex <=6-gon) into swGrid ONCE,
 // instead of walking its 12 triangles. The projection of a convex SOLID from the receiver equals the
 // projection of its SILHOUETTE, so this is bit-identical coverage to SoftScan_FillTri over the 12 box
@@ -1793,7 +2262,7 @@ SW_FUNC void SoftScan_FillBox( inout SwGridWord swGrid[SW_SCAN_CHORDS], inout fl
 		return;
 	}
 	// chain the directed edges into an ordered vertex loop
-	float3 loopV[8]; int loopN = 0;
+	float3 loopV[SW_POLY_MAX_VERTS]; int loopN = 0;		// box silhouette <=6 verts; sized to the shared cap for FillPoly
 	bool used[12];
 	for( int u = 0; u < 12; u++ ) { used[u] = false; }
 	used[0] = true; int startV = dA[0], cur = dB[0];
@@ -1949,6 +2418,27 @@ SW_FUNC void SoftScan_FillHull( inout SwGridWord swGrid[SW_SCAN_CHORDS], float3 
 	SoftScan_FillHull( swGrid, e, hv, hn, swP, swF, swR, swEps );
 }
 #endif
+
+// PER-FRAGMENT CONE/SLAB REJECT for an analytic hull/box TILE ENTRY. The tile-bin cull keeps a caster for
+// a whole 16x16 tile if it shadows ANY fragment in it; within the tile most fragments are NOT shadowed, so
+// the triangle walk prunes each with the same cd/slab/cone test (see the per-triangle reject below). Hull
+// and box tile entries had NO such per-fragment prune and ran the full FillHull/FillBox for EVERY fragment
+// in every tile that kept them - the brush-hull term floor (hulls emit FEWER records than triangles yet the
+// walk was ~2x slower, measured cap0009/cap0001). This bounds the caster by the sphere ( hc, hr ) over its
+// loaded verts and applies the IDENTICAL conservative test: if the whole sphere is behind the receiver,
+// beyond the light, or outside the sample cone, no part of the caster projects onto the disk, so the fill
+// contributes exactly 0 to swGrid AND swEnv - skipping it is bit-exact (gate byte-identical).
+SW_FUNC bool SoftScan_HullConeReject( float3 hc, float hr, float3 swP, float3 nrm, float distPL, float R, float eps )
+{
+	float3 rc   = hc - swP;
+	float  cd   = dot( rc, nrm );
+	if( cd + hr < eps ) { return true; }				// wholly behind the receiver
+	if( cd - hr > distPL ) { return true; }				// wholly beyond the light
+	float3 perp  = rc - cd * nrm;
+	float  coneR = R * ( cd + hr ) / distPL;			// max cone radius over the sphere's depth span
+	return dot( perp, perp ) > ( coneR + hr ) * ( coneR + hr );	// outside the sample cone: cannot occlude
+}
+
 #endif // SW_SCANLINE
 
 #ifndef SW_FACE_SAMPLES
@@ -2498,6 +2988,13 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 					const int pnB = min( ( int )( -bslot0B.w ), SW_POLY_MAX_VERTS );
 					float3 bloopB[SW_POLY_MAX_VERTS];
 					for( int pk = 0; pk < SW_POLY_MAX_VERTS; pk++ ) { float4 pcv = t_SoftEdges[ bbB + min( pk, pnB - 1 ) ]; bloopB[pk] = float3( pcv.x, pcv.y, pcv.z ); }
+					// bounding sphere over the pnB distinct hull verts (padding entries duplicate the last, inside it)
+					float3 hcB = float3( 0.0f, 0.0f, 0.0f );
+					for( int hk = 0; hk < pnB; hk++ ) { hcB += bloopB[hk]; }
+					hcB /= ( float )pnB;
+					float hr2B = 0.0f;
+					for( int hj = 0; hj < pnB; hj++ ) { float3 hd = bloopB[hj] - hcB; hr2B = max( hr2B, dot( hd, hd ) ); }
+					if( SoftScan_HullConeReject( hcB, sqrt( hr2B ), swP, swF.nrm, swDistPL, swR, swEps ) ) { continue; }
 					SoftScan_FillHull( swGrid, swEnv, bloopB, pnB, swP, swF, swR, swEps );
 				}
 				else
@@ -2510,6 +3007,13 @@ SW_FUNC float SoftShadow_FaceCoverageList( float3 swP, float3 swL, float swR, in
 						bcornerB[bk] = float3( bcv.x, bcv.y, bcv.z );
 					}
 					SW_WMIN_BOX( bcornerB, swP, swF.nrm, swDistPL, swR );	// C3 wMin: box caster site (Phase A only)
+					// bounding sphere over the 8 corners -> the same per-fragment reject the triangles get
+					float3 hcC = float3( 0.0f, 0.0f, 0.0f );
+					for( int ck = 0; ck < 8; ck++ ) { hcC += bcornerB[ck]; }
+					hcC *= 0.125f;
+					float hr2C = 0.0f;
+					for( int cj = 0; cj < 8; cj++ ) { float3 cd2 = bcornerB[cj] - hcC; hr2C = max( hr2C, dot( cd2, cd2 ) ); }
+					if( SoftScan_HullConeReject( hcC, sqrt( hr2C ), swP, swF.nrm, swDistPL, swR, swEps ) ) { continue; }
 					SoftScan_FillBox( swGrid, swEnv, bcornerB, swP, swF, swR, swEps );
 				}
 #endif

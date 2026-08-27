@@ -194,6 +194,35 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 		float3 perp = rc - cd * nrm;
 		float  coneR = swR * ( cd + R ) / max( distPL - tR, 1e-4f );
 		if( dot( perp, perp ) > ( coneR + R ) * ( coneR + R ) ) { continue; }
+		// SUPPORT-SLAB HULL CULL (frontend tag): a thin brush hull's AABB-diagonal bounding sphere bulges far
+		// off the brush plane, so the sphere test above keeps whole tiles the hull cannot shadow (the open-cap
+		// regression). The frontend tags axis-thin hulls with a slab: record slot0.w<0 (analytic hull) AND
+		// slot1.w = -(axis+1) < 0 (marker; coplanar-poly records share the .w<0 tag but only ever carry
+		// non-negative radii in slot1.w, so a negative marker never collides), slot2.w = the slab half-extent
+		// along that world axis. The caster sphere centre (c0 = the vertex AABB midpoint) is the slab centre,
+		// so no offset needs storing. Reject when the tile receiver ball AND the light disk lie wholly on one
+		// side of the slab: no receiver->disk ray can then cross the brush plane, so the hull occludes nothing
+		// here. Placed in STAGE 1 so the reject gates gsCasterKeep and thus BOTH the tag path (stage 2) AND the
+		// spill cluster path. Strictly ADDS rejections on top of the sphere cull (conservative) -> coverage
+		// byte-identical (gate 0). The common triangle caster pays one extra c1 fetch and the c1.y>=0 skip.
+		float4 c1s = t_Edges[ g_range.w + c * 2 + 1 ];
+		if( c1s.y < 0.0f )
+		{
+			const int   hbb = g_range.x + ( int )c1s.x * 3;
+			const float h0w = t_Edges[ hbb + 0 ].w;
+			const float h1w = t_Edges[ hbb + 1 ].w;
+			if( h0w < 0.0f && h1w < 0.0f )
+			{
+				const int   ax = ( int )( -h1w ) - 1;					// world axis of minimal extent (0,1,2)
+				const float he = t_Edges[ hbb + 2 ].w;					// slab half-extent along ax
+				const float sC = ( ax == 0 ) ? c0.x : ( ( ax == 1 ) ? c0.y : c0.z );
+				const float pC = ( ax == 0 ) ? Pc.x : ( ( ax == 1 ) ? Pc.y : Pc.z );
+				const float pL = ( ax == 0 ) ? g_lightR.x : ( ( ax == 1 ) ? g_lightR.y : g_lightR.z );
+				const float lo = min( pC - tR, pL - swR );				// s-range low over the tile ball + light disk
+				const float hi = max( pC + tR, pL + swR );				// s-range high
+				if( lo > sC + he || hi < sC - he ) { continue; }		// wholly on one side of the slab -> skip
+			}
+		}
 		InterlockedOr( gsCasterKeep[c >> 5], 1u << ( c & 31 ) );
 	}
 	GroupMemoryBarrierWithGroupSync();
