@@ -1081,7 +1081,10 @@ void main( PS_IN fragment, out PS_OUT result )
 			result.color = float4( ( ( swSinOK && swUnionOK ) ? 0.0 : 1.0 ) + 2.0 * float( swWlClip & 7 ), swWlGap, float( swWlNC ) / 8.0, ( 1.0 - swWlMinCos ) * 0.5 );
 		}
 	}
-		else if( swDbg == 8 ) { result.color = float4( shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
+		// DIAG (session 2026-08-28, REMOVE with the rcv diagnostics): R = 0.303 when the term slot is
+		// MISSING (rpUser6.x <= 0.5 -> the PS computed in-shader, atlas never consulted) - the gate's
+		// per-defect ana dump then names the term's true source in one run.
+		else if( swDbg == 8 ) { result.color = float4( ( swFace && pc.rpUser6.x <= 0.5 && shadow > 0.995 && shadow < 0.9999 ) ? 0.303 : shadow, shadow, shadow, 1.0 ); }	// isolated shadow visibility (1 = lit, 0 = shadowed); same convention as rtShadowMaskImage -> RT-vs-analytic term diff
 		else if( swDbg == 10 ) { result.color = ( swLocFr < 0.0 ) ? float4( 0.0, 0.0, 0.4, 1.0 ) : float4( swLocFr, 1.0 - swLocFr, 0.0, 1.0 ); }	// LOCATOR: green = lit (frac 0), red = umbra (frac 1), blue = pcss off / outside face
 		else if( swDbg == 11 ) { result.color = float4( swLocRecv, swLocRecv, swLocRecv, 1.0 ); }	// receiver depth [0,1] (smooth gradient => projection sane)
 		else if( swDbg == 12 ) { result.color = float4( swLocSamp, swLocSamp, swLocSamp, 1.0 ); }	// shadow-map depth at the receiver's texel (should track receiver depth in lit regions)

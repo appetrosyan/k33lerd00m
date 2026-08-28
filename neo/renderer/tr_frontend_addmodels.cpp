@@ -54,7 +54,7 @@ srfTriangles_t* R_CreateInteractionShadowVolume( const idRenderEntityLocal* ent,
 // analytic soft shadows: per-silhouette-edge world-space edges for per-fragment coverage (Interaction.cpp).
 void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
 							 float penumbraSize, const float* modelToWorld,
-							 softShadowEdge_t** outEdges, int* outNumEdges );
+							 softShadowEdge_t** outEdges, int* outNumEdges, softShadowEdge_t** outNrms = NULL );
 // analytic soft shadows: FRONT-FACE coverage stream v2 (3 float4 per caster triangle) - accurate receiver-disk
 // coverage, temporally stable; the light-silhouette path above undershoots off-axis (Interaction.cpp).
 void R_CollectPenumbraFaces( const idRenderEntityLocal* ent, const srfTriangles_t* tri, const idRenderLightLocal* light,
@@ -2526,6 +2526,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 					// representations of this caster coexist and the term CS can serve clean casters via the wedge
 					softShadowEdge_t* wSedges = NULL;
 					int wNedges = 0;
+					softShadowEdge_t* wSNrms = NULL;	// receiver-apex reselect: per-record adjacent normals
 					// FRONT-FACE coverage streams the caster's triangles (accurate + stable); the default streams
 					// the light silhouette (undershoots off-axis). Face mode uses the v2 float4-triple layout,
 					// stored through the same drawSurf fields (count in FLOAT4 elements; see drawSurf_t).
@@ -2576,7 +2577,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 						if( r_softShadowWedgeWhitelist.GetInteger() > 0 )
 						{
 							R_CollectPenumbraEdges( entityDef, tri, lightDef, R_SoftPenumbraRadius( lightDef ),
-													vEntity->modelMatrix, &wSedges, &wNedges );
+													vEntity->modelMatrix, &wSedges, &wNedges, &wSNrms );
 						}
 					}
 					else
@@ -2601,6 +2602,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 						edgeSurf->softIsBox = swFaceIsBox;	// analytic box: flatten tags numTris<0 for the walk's FillBox
 						edgeSurf->softWedgeEdges = wSedges;	// hybrid whitelist: wedge form riding beside the face stream
 						edgeSurf->numSoftWedgeEdges = wNedges;
+						edgeSurf->softWedgeNrms = wSNrms;	// receiver-apex reselect normals (may be NULL)
 						edgeSurf->scissorRect = vLight->scissorRect;
 
 						edgeSurf->linkChain = &vLight->softShadowWedges;
@@ -3700,6 +3702,10 @@ void R_AddModels()
 						{
 							edgesUsed += wRecords;
 							softShadowEdge_t* wFlat = ( softShadowEdge_t* )R_FrameAlloc( wRecords * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
+							// RECEIVER-APEX RESELECT: per-record adjacent-normal stream, 1:1 with wFlat
+							// (headers carry zero pairs; surfs without collected normals emit zeros, which
+							// the reselect reads as "drop every edge" -> pass2 returns 0 -> harmless).
+							softShadowEdge_t* wNrmFlat = ( softShadowEdge_t* )R_FrameAlloc( wRecords * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN );
 							int wN = 0;
 							int wCas = 0;
 							int wHeaderIdx = -1;
@@ -3714,16 +3720,28 @@ void R_AddModels()
 									{
 										wFlat[wHeaderIdx].e1.y = ( float )( wN - wHeaderIdx - 1 );	// backfill edgeCount
 									}
-									wHeaderIdx = wN++;
+									wHeaderIdx = wN;
 									// header sphere = the caster table's (bit-identical cull between the walks)
 									const idVec4& wc0 = casFlat[wCas * 2 + 0];
 									wFlat[wHeaderIdx].e0 = idVec4( wc0.x, wc0.y, wc0.z, -1.0f );
 									wFlat[wHeaderIdx].e1 = idVec4( wc0.w, 0.0f, 0.0f, ( float )wCas );
+									wNrmFlat[wHeaderIdx].e0.Zero();
+									wNrmFlat[wHeaderIdx].e1.Zero();
+									wN++;
 									wCas++;
 									wCurSpace = s->space;
 								}
 								for( int i = 0; i < s->numSoftWedgeEdges; i++ )
 								{
+									if( s->softWedgeNrms != NULL )
+									{
+										wNrmFlat[wN] = s->softWedgeNrms[i];
+									}
+									else
+									{
+										wNrmFlat[wN].e0.Zero();
+										wNrmFlat[wN].e1.Zero();
+									}
 									wFlat[wN++] = s->softWedgeEdges[i];
 								}
 							}
@@ -3735,6 +3753,7 @@ void R_AddModels()
 							{
 								vLight->softWedgeCache = vertexCache.AllocJoint( wFlat, wN, sizeof( softShadowEdge_t ) );
 								vLight->softWedgeCount = wN;
+								vLight->softWedgeNrmCache = vertexCache.AllocJoint( wNrmFlat, wN, sizeof( softShadowEdge_t ) );
 
 								// WEDGE TILE-BIN caster table (2 float4/caster): ( centre.xyz, radius ),
 								// ( wedgeHeaderRec, -edgeCount, 0, 0 ). The -edgeCount<0 tag makes softtile_bin

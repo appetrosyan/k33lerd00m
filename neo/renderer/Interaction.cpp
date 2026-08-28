@@ -553,10 +553,14 @@ them, not just a boundary subset. Frame-allocated; outputs NULL/0 if the caster 
 */
 void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_t* tri,
 		const idRenderLightLocal* light, float penumbraSize, const float* modelToWorld,
-		softShadowEdge_t** outEdges, int* outNumEdges )
+		softShadowEdge_t** outEdges, int* outNumEdges, softShadowEdge_t** outNrms )
 {
 	*outEdges = NULL;
 	*outNumEdges = 0;
+	if( outNrms != NULL )
+	{
+		*outNrms = NULL;
+	}
 
 	if( tri->silEdges == NULL || tri->numSilEdges == 0 || penumbraSize <= 0.0f )
 	{
@@ -597,6 +601,18 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 	int*    ev1 = ( int* )R_FrameAlloc( numSil * sizeof( int ), FRAME_ALLOC_UNKNOWN );
 	idVec3* ew0 = ( idVec3* )R_FrameAlloc( numSil * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
 	idVec3* ew1 = ( idVec3* )R_FrameAlloc( numSil * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
+	// RECEIVER-APEX RESELECT (mechanism A2): per gathered edge the WORLD normals of its two adjacent
+	// faces, oriented so enA fronts the LIGHT (matching the e0->e1 orientation choice below). A dangling
+	// edge (p >= numFaces, the facing[numFaces]=1 sentinel) has one real face: enA = its light-fronting
+	// direction, enB = -enA, which makes the per-fragment silhouette-from-P test always pass for it.
+	const int numFaces = tri->numIndexes / 3;
+	idVec3* enA = NULL;
+	idVec3* enB = NULL;
+	if( outNrms != NULL )
+	{
+		enA = ( idVec3* )R_FrameAlloc( numSil * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
+		enB = ( idVec3* )R_FrameAlloc( numSil * sizeof( idVec3 ), FRAME_ALLOC_UNKNOWN );
+	}
 
 	int ne = 0;
 	for( int i = 0; i < tri->numSilEdges; i++ )
@@ -611,6 +627,36 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 		{
 			a = sil.v2;
 			b = sil.v1;
+		}
+		if( outNrms != NULL )
+		{
+			const int p1 = ( int )sil.p1, p2 = ( int )sil.p2;
+			const bool dangling = ( p1 >= numFaces || p2 >= numFaces );
+			if( dangling )
+			{
+				const int f = ( p1 < numFaces ) ? p1 : p2;
+				const idPlane pl( verts[tri->indexes[f * 3 + 0]].xyz, verts[tri->indexes[f * 3 + 1]].xyz,
+								  verts[tri->indexes[f * 3 + 2]].xyz );
+				idVec3 nw;
+				R_LocalVectorToGlobal( modelToWorld, pl.Normal(), nw );
+				if( !facing[f] )
+				{
+					nw = -nw;								// enA fronts the light
+				}
+				enA[ne] = nw;
+				enB[ne] = -nw;
+			}
+			else
+			{
+				const int fFront = facing[p1] ? p1 : p2;	// the light-fronting face
+				const int fBack  = facing[p1] ? p2 : p1;
+				const idPlane plF( verts[tri->indexes[fFront * 3 + 0]].xyz, verts[tri->indexes[fFront * 3 + 1]].xyz,
+								   verts[tri->indexes[fFront * 3 + 2]].xyz );
+				const idPlane plB( verts[tri->indexes[fBack * 3 + 0]].xyz, verts[tri->indexes[fBack * 3 + 1]].xyz,
+								   verts[tri->indexes[fBack * 3 + 2]].xyz );
+				R_LocalVectorToGlobal( modelToWorld, plF.Normal(), enA[ne] );
+				R_LocalVectorToGlobal( modelToWorld, plB.Normal(), enB[ne] );
+			}
 		}
 		ev0[ne] = a;
 		ev1[ne] = b;
@@ -643,6 +689,13 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 	extern idCVar r_softShadowColinearTol;
 	const float colTol = Max( r_softShadowColinearTol.GetFloat(), 0.0f );
 
+	// reselect normals ride 1:1 with the EMITTED records; a merged colinear run keeps its first
+	// sub-edge's face pair (colinear sub-edges of one straight silhouette run border coplanar faces
+	// in practice; the reselect only reads facing SIGNS, so this is the right grain).
+	softShadowEdge_t* nrms = ( outNrms != NULL )
+							 ? ( softShadowEdge_t* )R_FrameAlloc( numSil * sizeof( softShadowEdge_t ), FRAME_ALLOC_UNKNOWN )
+							 : NULL;
+
 	int n = 0;
 	for( int s = 0; s < ne; s++ )
 	{
@@ -652,6 +705,7 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 		}
 		used[s] = true;
 		int    e = s;
+		int    nrmIdx = s;								// gathered edge whose face pair labels the current segment
 		idVec3 segA = ew0[s], segB = ew1[s];			// current (possibly extended) edge of the chain
 		while( true )
 		{
@@ -683,14 +737,25 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 			{
 				edges[n].e0 = idVec4( segA.x, segA.y, segA.z, 0.0f );
 				edges[n].e1 = idVec4( segB.x, segB.y, segB.z, 0.0f );
+				if( nrms != NULL )
+				{
+					nrms[n].e0 = idVec4( enA[nrmIdx].x, enA[nrmIdx].y, enA[nrmIdx].z, 0.0f );
+					nrms[n].e1 = idVec4( enB[nrmIdx].x, enB[nrmIdx].y, enB[nrmIdx].z, 0.0f );
+				}
 				n++;
 				segA = segB;
 				segB = nextC;
+				nrmIdx = nx;
 			}
 			e = nx;
 		}
 		edges[n].e0 = idVec4( segA.x, segA.y, segA.z, 0.0f );
 		edges[n].e1 = idVec4( segB.x, segB.y, segB.z, 0.0f );
+		if( nrms != NULL )
+		{
+			nrms[n].e0 = idVec4( enA[nrmIdx].x, enA[nrmIdx].y, enA[nrmIdx].z, 0.0f );
+			nrms[n].e1 = idVec4( enB[nrmIdx].x, enB[nrmIdx].y, enB[nrmIdx].z, 0.0f );
+		}
 		n++;
 	}
 
@@ -698,6 +763,10 @@ void R_CollectPenumbraEdges( const idRenderEntityLocal* ent, const srfTriangles_
 
 	*outEdges = edges;
 	*outNumEdges = n;
+	if( outNrms != NULL )
+	{
+		*outNrms = nrms;
+	}
 }
 
 /*

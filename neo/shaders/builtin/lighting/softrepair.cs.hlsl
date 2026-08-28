@@ -42,6 +42,26 @@ StructuredBuffer<uint>		t_SoftTiles	: register( t1 );	// (unused here; declared 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
 RWTexture2D<float>			u_Term		: register( u0 );	// R32F term atlas, one screen-size slot per light
 
+// DENSITY / ARBITER ATTRIBUTION (r_softShadowRepairStats, SW_REPAIR_STATS): 16-uint accumulator
+// buffer covering the two blob-repair phases. Slots (base = (REPAIR_PHASE-1)*8):
+//   +0 groupsDispatched   +1 groupsBailed(g_rpMaybe==0)   +2 candPixels(RP_IS_CAND)
+//   +3 groupsRingSurvive(g_rpCount>0)   +4 arbiterListedBin   +5 arbiterCluster(SPILL)
+//   +6 arbiterFallback(whole-stream)    +7 arbiterAgreed(RP_EXACT_AGREES fired)
+// Base offset 0 for phase 1 (turds), 8 for phase 2 (holes). Ants (phase 0) don't populate.
+// The buffer is bound only when the stats pipeline runs, so the shipped pipeline stays byte-identical.
+#ifndef SW_REPAIR_STATS
+	#define SW_REPAIR_STATS 0
+#endif
+#if SW_REPAIR_STATS && ( REPAIR_PHASE == 1 || REPAIR_PHASE == 2 )
+	RWStructuredBuffer<uint>	u_RepStats	: register( u1 );
+	#define REP_STATS_BASE				( ( REPAIR_PHASE - 1 ) * 8 )
+	#define REP_STATS_BUMP( slot )		{ uint _u; InterlockedAdd( u_RepStats[REP_STATS_BASE + (slot)], 1u, _u ); }
+	#define REP_STATS_BUMP_N( slot, n )	{ uint _u; InterlockedAdd( u_RepStats[REP_STATS_BASE + (slot)], (uint)(n), _u ); }
+#else
+	#define REP_STATS_BUMP( slot )		do {} while (0)
+	#define REP_STATS_BUMP_N( slot, n )	do {} while (0)
+#endif
+
 cbuffer c_Term : register( b0 )
 {
 	float4	g_lightR;	// light origin xyz, disk radius w
@@ -161,6 +181,7 @@ groupshared uint g_rpCount;
 groupshared uint g_rpSumX;
 groupshared uint g_rpSumY;
 groupshared uint g_rpAgree;
+groupshared uint g_rpMaybe;		// group-wide OR of the cheap RP_IS_CAND pre-gate (task A, 2026-08-28)
 
 [numthreads( 16, 16, 1 )]
 void main( uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID )
@@ -171,21 +192,47 @@ void main( uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID )
 		g_rpSumX = 0u;
 		g_rpSumY = 0u;
 		g_rpAgree = 0u;
+		g_rpMaybe = 0u;
+		REP_STATS_BUMP( 0 );				// +0 groupsDispatched
 	}
 	GroupMemoryBarrierWithGroupSync();
 
+	// GROUP-WIDE CAND PRE-GATE (task A, 2026-08-28): a 16x16 group with zero RP_IS_CAND pixels
+	// pays 9 tex/px x 256 threads = 2304 unnecessary reads on the 3x3 pre-filter, plus more on the
+	// ring. Cand density is spatially sparse (most tiles have no turds/holes), so hoisting one
+	// tex read + one LDS OR + one barrier bails those groups before ANY of the phase's work runs.
+	// The hoisted read is the SAME read the existing gate does, so the surviving-group cost is
+	// unchanged. Race on g_rpMaybe = 1u is same-value across threads => well-defined (D3D LDS
+	// semantics). Lossless: the survivor path below still gates on the same predicate.
 	const int2 rp = int2( tid.xy );
-	bool cand = false;
-	if( rp.x < g_rect.z && rp.y < g_rect.w && RP_IS_CAND( SwRpTerm( rp ) ) )
+	const bool inRect = ( rp.x < g_rect.z && rp.y < g_rect.w );
+	const bool maybeCand = inRect && RP_IS_CAND( SwRpTerm( rp ) );
+	if( maybeCand )
 	{
-		// TIGHTENED PRE-FILTER (repair-perf lever, session 2026-08-28): a REAL turd/hole is a small
-		// blob completely SURROUNDED by the opposite state - so the 3x3 opposite-neighbour count is
-		// HIGH (7-8). A shadow BOUNDARY pixel (the ring-test's expensive false-positive) has only
-		// 3-4 opposite neighbours. Requiring >= 5 opposite neighbours (out of 8) kills the boundary
-		// majority BEFORE the 16-sample ring pays its texture reads, while every real turd small
-		// enough for a 24-px ring to reach outside it still qualifies. Bit-lossy on edge-adjacent
-		// turds; refuted by the wedge's turd MAY-be-adjacent-to-shadow-boundary case not appearing
-		// in the current corpus. Falls back to any-opposite-neighbour if the tighter count fires 0.
+		g_rpMaybe = 1u;
+		REP_STATS_BUMP( 2 );				// +2 candPixels (RP_IS_CAND hits, group total)
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if( g_rpMaybe == 0u )
+	{
+		if( all( gtid.xy == uint2( 0, 0 ) ) )
+		{
+			REP_STATS_BUMP( 1 );			// +1 groupsBailed (task-A LDS early-return fired)
+		}
+		return;					// whole group has no candidate: skip 3x3 + ring + arbiter
+	}
+
+	bool cand = false;
+	if( maybeCand )
+	{
+		// TIGHTENED PRE-FILTER v2 (repair-perf lever, session 2026-08-28-b, census-guided): the v1
+		// >= 5 threshold left 35,285 turd-arbiter walks over 240 RoE frames and ZERO real turds
+		// confirmed (holes-phase agree rate 53% for comparison). Tighten to = 8 (all 8 neighbours
+		// strictly opposite) so only fully-isolated single/two-px blobs survive. Real turds ARE
+		// isolated by construction (the wedge sliver artifact is 1-2 px), so tightening keeps
+		// coverage while cutting the arbiter-call rate ~100x. Gate: any new "STEP" defect surface
+		// = back off to >= 7 or >= 5. Lossy in the strict sense (a 3-4-px turd with 5-6 opposite
+		// neighbours slips) but the wedge doesn't produce such blobs on the current corpus.
 		int nOpp = 0;
 		SW_UNROLL
 		for( int ny = -1; ny <= 1; ny++ )
@@ -199,7 +246,7 @@ void main( uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID )
 				}
 			}
 		}
-		if( nOpp >= 5 )
+		if( nOpp == 8 )
 		{
 			// 16-sample ring at SW_RP_RING - offsets are compile-time constants (angle = k*2pi/16 with fixed
 			// radius 24), so precomputing the int2 offsets kills 16 sincos+round per candidate. The values
@@ -233,6 +280,7 @@ void main( uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID )
 
 	if( all( gtid.xy == uint2( 0, 0 ) ) && g_rpCount > 0u )
 	{
+		REP_STATS_BUMP( 3 );					// +3 groupsRingSurvive (arbiter fires)
 		// ONE exact walk at the candidates' midpoint decides for the whole group.
 		// TILE-BINNED ARBITER (mode 3): drop from ~1000-tri whole-stream FaceCoverage (measured 6ms/frame
 		// on RoE) to ~20-tri FaceCoverageList via the FACE tile bin at g_repairBin.x. The face bin covers
@@ -272,12 +320,14 @@ void main( uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID )
 					occ = SoftShadow_FaceCoverageClusterList( wp.xyz, g_lightR.xyz, max( g_lightR.w, 1e-2 ),
 														g_range.x, ( int )spillOfs, ( int )spillN, 0.0f );
 					arbiterRan = true;
+					REP_STATS_BUMP( 5 );				// +5 arbiterCluster (SPILL cluster walk)
 				}
 				else if( cnt != 0xFFFFFFFFu && cnt <= ( uint )g_flags.w )
 				{
 					occ = SoftShadow_FaceCoverageList( wp.xyz, g_lightR.xyz, max( g_lightR.w, 1e-2 ),
 													g_range.x, slot + 1, ( int )cnt, 0.0f );
 					arbiterRan = true;
+					REP_STATS_BUMP( 4 );				// +4 arbiterListedBin (fast path)
 				}
 			}
 			if( !arbiterRan )
@@ -285,10 +335,12 @@ void main( uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID )
 				// degrade / no-bin fallback: whole-stream walk (the original arbiter)
 				occ = SoftShadow_FaceCoverage( wp.xyz, g_lightR.xyz, max( g_lightR.w, 1e-2 ),
 										g_range.x, g_flags.y, g_range.y, 0.0f );
+				REP_STATS_BUMP( 6 );					// +6 arbiterFallback (whole-stream O(N))
 			}
 			if( RP_EXACT_AGREES( occ ) )				// exact confirms the ring: the blob is the artifact
 			{
 				g_rpAgree = 1u;
+				REP_STATS_BUMP( 7 );					// +7 arbiterAgreed (RP_EXACT_AGREES fired)
 			}
 		}
 	}

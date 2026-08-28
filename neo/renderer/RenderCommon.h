@@ -112,6 +112,9 @@ struct drawSurf_t
 												// LIGHT-SILHOUETTE edge records collected ALONGSIDE the face stream,
 												// so the term CS can serve clean casters via the cheap wedge integral.
 	int						numSoftWedgeEdges;	// record count in softWedgeEdges (0 = none collected)
+	const softShadowEdge_t*	softWedgeNrms;		// RECEIVER-APEX RESELECT: per-edge adjacent face normals, one record
+												// pair per softWedgeEdges record - e0=(nA.xyz,0) e1=(nB.xyz,0), nA
+												// fronts the LIGHT; boundary edges carry nB=-nA. NULL = none.
 	int						numIndexes;
 	vertCacheHandle_t		indexCache;			// triIndex_t
 	vertCacheHandle_t		ambientCache;		// idDrawVert
@@ -424,6 +427,9 @@ struct viewLight_t
 													// tag makes the binner append one tile entry per surviving caster (its wedge
 													// header rec); the term walks only the tile's casters' spans. 0 = not emitted.
 	int						softWedgeCasterCount;		// casters in softWedgeCasterCache (== softWedgeCount's caster count)
+	vertCacheHandle_t		softWedgeNrmCache;			// RECEIVER-APEX RESELECT: per-record adjacent-normal pairs aligned
+														// 1:1 with softWedgeCache records (headers carry dummy pairs).
+														// 0 = not emitted; the term CS then skips the reselect pass.
 	vertCacheHandle_t		softClassifyCache;			// world-cell lit/penumbra classifier grid (packed 16 class bytes/float4), rides the joint buffer
 	float					softClassifyAabbCell[4];	// grid origin xyz + cellSize
 	int						softClassifyDims[4];		// cells per axis xyz + valid (0 = no classifier -> full walk)

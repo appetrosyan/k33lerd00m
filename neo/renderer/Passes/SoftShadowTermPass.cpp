@@ -193,6 +193,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		macros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 	macros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );		// shipped path is not scanline; never adapts
 	macros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );				// new axis: explicit on every list (order matches shaders.cfg: last)
+	macros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );				// TG axis: 0 = shipped 8x4 SRV path (m_PipelineTG is the =1 variant)
 	m_Shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, sfx.c_str(), macros, true, LAYOUT_DRAW_VERT ) );
 	if( m_Shader == nullptr )
 	{
@@ -223,6 +224,32 @@ void SoftShadowTermPass::EnsurePipeline()
 	pd.CS = m_Shader;
 	m_Pipeline = m_Device->createComputePipeline( pd );
 
+	// TILE-GROUP permutation (task #124): SW_TILE_GROUP=1 selects the 16x16 dispatch + groupshared
+	// wedge edge cache. Same binding layout as m_Pipeline; nameOutSuffix "tg" so FindShader dedups
+	// distinctly (the "dedup by name+suffix, ignores macros" trap - see r_softShadowSamples).
+	{
+		idList<shaderMacro_t> tgMacros;
+		tgMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );
+		tgMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+		tgMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
+		tgMacros.Append( shaderMacro_t( "SW_SCANLINE", "0" ) );
+		tgMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
+		tgMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", samplesStr ) );
+		tgMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		tgMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );
+		tgMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
+		tgMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "1" ) );	// distinguishes the TG blob from the SRV base
+		const idStr tgSfx = idStr( "tg-s" ) + samplesStr + "c" + chordsStr;
+		m_ShaderTG = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, tgSfx.c_str(), tgMacros, true, LAYOUT_DRAW_VERT ) );
+		if( m_ShaderTG != nullptr )
+		{
+			nvrhi::ComputePipelineDesc tgpd;
+			tgpd.bindingLayouts = { m_Layout };
+			tgpd.CS = m_ShaderTG;
+			m_PipelineTG = m_Device->createComputePipeline( tgpd );
+		}
+	}
+
 	// WALK-ATTRIBUTION counting permutation: same shader with -D SW_GPU_WALK_COUNTERS=1 (adds a u1
 	// counter UAV). Separate layout+pipeline so the shipped pipeline stays byte-identical; used only
 	// when r_softShadowWalkCounters is set. Failure here is non-fatal (counters just unavailable).
@@ -240,6 +267,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		cntMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		cntMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", adaptStr ) );	// counting instrument measures adaptive mean-N (slot 28)
 		cntMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );			// counting stays exact single-dispatch
+		cntMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );
 		// DISTINCT nameOutSuffix: FindShader dedups by name+stage+suffix and IGNORES macros, so without a
 		// distinct suffix the counting call returns the shipped (=0) entry. The suffix does not change the
 		// blob path (LoadShader keys the .bin on shader.name only) - it forces a separate entry whose
@@ -285,6 +313,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		surfMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		surfMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );	// surf-cache path out of scope for the first cut
 		surfMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );		// non-subsample surf pipeline (the subsample surf variant is separate)
+		surfMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );
 		m_ShaderSurf = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfcache" ) + sfx ).c_str(), surfMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderSurf != nullptr )
 		{
@@ -321,6 +350,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		gridMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		gridMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );	// grid-serve path out of scope for the first cut
 		gridMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );		// grid mode stays exact (subsample wraps non-grid only)
+		gridMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );
 		swTermGrid().shader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "surfgrid" ) + sfx ).c_str(), gridMacros, true, LAYOUT_DRAW_VERT ) );
 		if( swTermGrid().shader != nullptr && m_LayoutSurf != nullptr )
 		{
@@ -348,6 +378,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		scanMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		scanMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", adaptStr ) );	// THE adaptive path (plain scalar walk, cache off)
 		scanMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );			// the base scanline pipeline stays exact single-dispatch
+		scanMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );
 		m_ShaderScan = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "scanline" ) + sfx ).c_str(), scanMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderScan != nullptr )
 		{
@@ -371,6 +402,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		repairMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		repairMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );
 		repairMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
+		repairMacros.Append( shaderMacro_t( "SW_REPAIR_STATS", "0" ) );	// shipped path: no stats UAV, byte-identical
 		repairMacros.Append( shaderMacro_t( "REPAIR_PHASE", "0" ) );
 		m_ShaderRepairAnts = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair", SHADER_STAGE_COMPUTE, "ants", repairMacros, true, LAYOUT_DRAW_VERT ) );
 		repairMacros[ repairMacros.Num() - 1 ] = shaderMacro_t( "REPAIR_PHASE", "1" );
@@ -387,6 +419,76 @@ void SoftShadowTermPass::EnsurePipeline()
 			m_PipelineRepairTurds = m_Device->createComputePipeline( pr );
 			pr.CS = m_ShaderRepairHoles;
 			m_PipelineRepairHoles = m_Device->createComputePipeline( pr );
+		}
+
+		// REPAIR STATS pipelines (r_softShadowRepairStats): SW_REPAIR_STATS=1 adds a u1 UAV that
+		// InterlockedAdd's a per-phase 8-uint counter block. Distinct nameOutSuffix - FindShader dedups
+		// by name+suffix and IGNORES macros, so without a distinct suffix the =0 shipped entry returns.
+		// Failure here is non-fatal (census just unavailable). Own layout adds only u1 to the base.
+		{
+			idList<shaderMacro_t> rsMacros = repairMacros;			// same axes; only two flip
+			rsMacros[ rsMacros.Num() - 2 ] = shaderMacro_t( "SW_REPAIR_STATS", "1" );
+			rsMacros[ rsMacros.Num() - 1 ] = shaderMacro_t( "REPAIR_PHASE", "0" );
+			m_ShaderRepairAntsStats  = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair", SHADER_STAGE_COMPUTE, "ants-stats", rsMacros, true, LAYOUT_DRAW_VERT ) );
+			rsMacros[ rsMacros.Num() - 1 ] = shaderMacro_t( "REPAIR_PHASE", "1" );
+			m_ShaderRepairTurdsStats = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair", SHADER_STAGE_COMPUTE, "turds-stats", rsMacros, true, LAYOUT_DRAW_VERT ) );
+			rsMacros[ rsMacros.Num() - 1 ] = shaderMacro_t( "REPAIR_PHASE", "2" );
+			m_ShaderRepairHolesStats = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair", SHADER_STAGE_COMPUTE, "holes-stats", rsMacros, true, LAYOUT_DRAW_VERT ) );
+			if( m_ShaderRepairAntsStats != nullptr && m_ShaderRepairTurdsStats != nullptr && m_ShaderRepairHolesStats != nullptr )
+			{
+				nvrhi::BindingLayoutDesc lrs = ld;
+				lrs.bindings.push_back( nvrhi::BindingLayoutItem::StructuredBuffer_UAV( 1 ) );	// u1 : repair stats
+				m_LayoutRepStats = m_Device->createBindingLayout( lrs );
+				nvrhi::ComputePipelineDesc prs;
+				prs.bindingLayouts = { m_LayoutRepStats };
+				prs.CS = m_ShaderRepairAntsStats;	m_PipelineRepairAntsStats  = m_Device->createComputePipeline( prs );
+				prs.CS = m_ShaderRepairTurdsStats;	m_PipelineRepairTurdsStats = m_Device->createComputePipeline( prs );
+				prs.CS = m_ShaderRepairHolesStats;	m_PipelineRepairHolesStats = m_Device->createComputePipeline( prs );
+
+				nvrhi::BufferDesc rsBuf;
+				rsBuf.byteSize = 16 * sizeof( uint32_t );		// 8 slots x 2 phases
+				rsBuf.structStride = sizeof( uint32_t );
+				rsBuf.canHaveUAVs = true;
+				rsBuf.initialState = nvrhi::ResourceStates::UnorderedAccess;
+				rsBuf.keepInitialState = true;
+				rsBuf.debugName = "SoftShadowTerm/RepairStats";
+				m_RepairStatsBuffer = m_Device->createBuffer( rsBuf );
+			}
+		}
+
+		// FUSED REPAIR pipelines (r_softShadowRepairFused, softrepair_fused.cs.hlsl): all three
+		// repair stages in one 16x16 dispatch. Same axes as the split path, minus REPAIR_PHASE
+		// (the fused shader does not use it). Two permutations (stats off / on) mirror the split
+		// path so the census cvar switches shaders atomically.
+		{
+			idList<shaderMacro_t> fMacros;
+			fMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );
+			fMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+			fMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
+			fMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+			fMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
+			fMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", "8" ) );
+			fMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+			fMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );
+			fMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
+			fMacros.Append( shaderMacro_t( "SW_REPAIR_STATS", "0" ) );
+			m_ShaderRepairFused = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair_fused", SHADER_STAGE_COMPUTE, "fused", fMacros, true, LAYOUT_DRAW_VERT ) );
+			fMacros[ fMacros.Num() - 1 ] = shaderMacro_t( "SW_REPAIR_STATS", "1" );
+			m_ShaderRepairFusedStats = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair_fused", SHADER_STAGE_COMPUTE, "fused-stats", fMacros, true, LAYOUT_DRAW_VERT ) );
+			if( m_ShaderRepairFused != nullptr )
+			{
+				nvrhi::ComputePipelineDesc prf;
+				prf.bindingLayouts = { m_Layout };
+				prf.CS = m_ShaderRepairFused;
+				m_PipelineRepairFused = m_Device->createComputePipeline( prf );
+			}
+			if( m_ShaderRepairFusedStats != nullptr && m_LayoutRepStats != nullptr )
+			{
+				nvrhi::ComputePipelineDesc prf;
+				prf.bindingLayouts = { m_LayoutRepStats };
+				prf.CS = m_ShaderRepairFusedStats;
+				m_PipelineRepairFusedStats = m_Device->createComputePipeline( prf );
+			}
 		}
 	}
 
@@ -408,6 +510,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		ssMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		ssMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );		// subsample path does not adapt chords (both axes required on every perm)
 		ssMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "1" ) );
+		ssMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );
 		// distinct nameOutSuffix per FindShader dedup (dedups by name+stage+suffix, IGNORES macros)
 		swTermGrid().subsScanShader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "subsscan" ) + sfx ).c_str(), ssMacros, true, LAYOUT_DRAW_VERT ) );
 		if( swTermGrid().subsScanShader != nullptr )
@@ -432,6 +535,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		suMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		suMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );		// subsample path does not adapt chords (both axes required on every perm)
 		suMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "1" ) );
+		suMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );
 		swTermGrid().subsSurfShader = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "subssurf" ) + sfx ).c_str(), suMacros, true, LAYOUT_DRAW_VERT ) );
 		if( swTermGrid().subsSurfShader != nullptr )
 		{
@@ -465,6 +569,7 @@ void SoftShadowTermPass::EnsurePipeline()
 		conMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
 		conMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );		// contrib-cache path out of scope for the first cut
 		conMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );		// contrib mode stays exact single-dispatch
+		conMacros.Append( shaderMacro_t( "SW_TILE_GROUP", "0" ) );
 		m_ShaderContrib = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softterm", SHADER_STAGE_COMPUTE, ( idStr( "contrib" ) + sfx ).c_str(), conMacros, true, LAYOUT_DRAW_VERT ) );
 		if( m_ShaderContrib != nullptr )
 		{
@@ -543,6 +648,18 @@ bool SoftShadowTermPass::BeginView( nvrhi::ICommandList* commandList, const view
 	if( m_WalkCntEnabled )
 	{
 		commandList->clearBufferUInt( m_WalkCntBuffer, 0 );		// same as the spill counter's proven clear
+	}
+	// REPAIR STATS census (r_softShadowRepairStats): don't clear per view - the buffer accumulates
+	// across the whole probe/session, so one readback at probe end gives cumulative totals. Clear
+	// ONCE when the cvar transitions from off to on (m_RepairStatsCleared=false); GetRepairStats
+	// (drain) resets the cleared flag so a fresh census enable starts from zero.
+	extern idCVar r_softShadowRepairStats;
+	m_RepairStatsEnabled = r_softShadowRepairStats.GetBool() && m_RepairStatsBuffer != nullptr
+			&& m_PipelineRepairTurdsStats != nullptr && m_PipelineRepairHolesStats != nullptr;
+	if( m_RepairStatsEnabled && !m_RepairStatsCleared )
+	{
+		commandList->clearBufferUInt( m_RepairStatsBuffer, 0 );
+		m_RepairStatsCleared = true;
 	}
 	m_WorldNormal = worldNormalTexture;
 	// r_softShadowSamples changed -> rebuild the pipelines at the new SW_FACE_SAMPLES count (rare; a tuning
@@ -771,6 +888,29 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.rect[1] = py1;
 	cb.rect[2] = px2 - px1 + 1;
 	cb.rect[3] = py2 - py1 + 1;
+	// TILE-GROUP ALIGNMENT (task #124, r_softShadowTileGroup): the 16x16 group cache needs the group's
+	// origin to be 16-pixel-aligned so all 256 threads resolve to ONE tile-bin slot. Snap cb.rect[0/1]
+	// DOWN to the nearest 16 and grow cb.rect[2/3] correspondingly; the padded margin fails the world-
+	// pos check (wp.w == 0) and early-outs. Only meaningful when whitelist == 3 + the pipeline was built;
+	// the other paths are unaffected by a slightly-wider dispatch (their bounds check clamps to rect).
+	{
+		extern idCVar r_softShadowWedgeWhitelist;
+		extern idCVar r_softShadowTileGroup;
+		if( r_softShadowWedgeWhitelist.GetInteger() == 3 && r_softShadowTileGroup.GetBool()
+				&& m_PipelineTG != nullptr )
+		{
+			const int newX = px1 & ~15;
+			const int newY = py1 & ~15;
+			cb.rect[2] += px1 - newX;
+			cb.rect[3] += py1 - newY;
+			cb.rect[0] = newX;
+			cb.rect[1] = newY;
+			// padX / padY are re-set into cb.repairBin[1/2] AFTER the repairBin[0..3] block below (line
+			// ~1085 resets them to 0). The shader skips the atlas write for tid.x<padX or tid.y<padY so
+			// those padded threads (which still participate in SwLdsLoad's barrier) do not stomp a
+			// neighbouring atlas slot with a false term.
+		}
+	}
 	// WORLD-space light planes for the coverage early-out (the VS folds these into model space
 	// per surface; plane . worldPos reproduces the PS's idtex2Dproj coordinates)
 	for( int i = 0; i < 4; i++ )
@@ -915,11 +1055,15 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.sub[0] = cb.sub[1] = cb.sub[2] = cb.sub[3] = 0.0f;	// sub-sampling off (phase 0) unless the subs dispatch below fills it
 	cb.surfA[0] = 0;
 	cb.surfA[1] = cb.surfA[2] = cb.surfA[3] = 0;
+	{
+		// viz mode must reach the shader with the cache OFF too: mode 11 (path provenance) is a
+		// plain-permutation diagnostic, not a cache instrument.
+		extern idCVar r_softShadowSurfCacheViz;
+		cb.surfParams[1] = ( float )r_softShadowSurfCacheViz.GetInteger();
+	}
 	if( surf )
 	{
-		extern idCVar r_softShadowSurfCacheViz;
 		cb.surfParams[0] = surfCache->GetTexel();
-		cb.surfParams[1] = ( float )r_softShadowSurfCacheViz.GetInteger();
 		cb.surfA[0] = ( vLight->softStaticCasterCount > 0 && vLight->softSurfHash != 0 ) ? surfCache->GetTableCap() : 0;
 		cb.surfA[1] = surfCache->GetQueueWords();
 		cb.surfA[2] = vLight->softStaticCasterCount;
@@ -1026,7 +1170,45 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	cb.repairBin[0] = tileFaceBase;
 	cb.repairBin[1] = 0;
 	cb.repairBin[2] = 0;
-	cb.repairBin[3] = 0;
+	// RECEIVER-APEX RESELECT (mechanism A2): float4-element base of the per-record adjacent-normal
+	// stream (1:1 with the wedge block's records, same joint buffer). -1 = absent / cvar off -> the
+	// term's conditional second pass never fires and the walk is byte-identical to the shipped one.
+	cb.repairBin[3] = -1;
+	{
+		extern idCVar r_softShadowWedgeRcv;
+		if( r_softShadowWedgeRcv.GetBool() && vLight->softWedgeNrmCache != 0 && vLight->softWedgeCount > 0 )
+		{
+			const uint nrmOfs = ( uint )( ( vLight->softWedgeNrmCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+			cb.repairBin[3] = ( int )( nrmOfs / 16u );
+		}
+		// DIAG (session 2026-08-28, remove after rcv fire-rate verified): first-20 print of the reselect
+		// plumbing per dispatch - wedge count/base, nrm handle presence, and the value the shader sees.
+		static int swRcvDiagN = 0;
+		static int swRcvDiagLastCnt = -1;
+		if( swRcvDiagN < 400 && vLight->softWedgeCount != swRcvDiagLastCnt )		// one line per light change
+		{
+			swRcvDiagN++;
+			swRcvDiagLastCnt = vLight->softWedgeCount;
+			common->Printf( "[rcvdiag] wedgeCount=%d wedgeBase=%d nrmCache=%d repairBin3=%d tileBase=%d\n",
+							vLight->softWedgeCount, cb.wedge[0], vLight->softWedgeNrmCache != 0 ? 1 : 0,
+							cb.repairBin[3], tileBase );
+		}
+	}
+	// TILE-GROUP ALIGNMENT (task #124): after the alignment snap above grew cb.rect[0/1/2/3] to a
+	// 16-pixel boundary, encode the extra padded margin so the shader can early-out at write time.
+	// The shader path treats (tid.x < g_repairBin.y || tid.y < g_repairBin.z) as "outside the light's
+	// true rect, do not write the atlas". Zero out otherwise so the SRV path is bit-identical.
+	{
+		extern idCVar r_softShadowWedgeWhitelist;
+		extern idCVar r_softShadowTileGroup;
+		if( r_softShadowWedgeWhitelist.GetInteger() == 3 && r_softShadowTileGroup.GetBool()
+				&& m_PipelineTG != nullptr )
+		{
+			// px1 / py1 were the ORIGINAL scissor origins (pre-snap); cb.rect[0/1] hold the snapped ones.
+			cb.repairBin[1] = px1 - cb.rect[0];
+			cb.repairBin[2] = py1 - cb.rect[1];
+		}
+	}
 
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.
@@ -1152,10 +1334,24 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	}
 	else
 	{
-		cs.pipeline = cnt ? m_PipelineCnt : ( surfGrid ? swTermGrid().pipeline : ( surf ? m_PipelineSurf : ( contrib ? m_PipelineContrib : ( scan ? m_PipelineScan : m_Pipeline ) ) ) );
+		// TILE-GROUP LDS path (task #124): whitelist 3 wedge term + r_softShadowTileGroup + pipeline built.
+		// Dispatches 16x16 groups aligned with the tile grid; the shader's groupshared cache captures
+		// the tile's wedge edges before the walk. Only selected when the (already-alignment-snapped)
+		// rect works out; other permutations keep the 8x4 SRV path unchanged.
+		extern idCVar r_softShadowTileGroup;
+		const bool swTG = swWedgeTermSel && r_softShadowTileGroup.GetBool() && m_PipelineTG != nullptr;
+		cs.pipeline = swTG ? m_PipelineTG
+					: ( cnt ? m_PipelineCnt : ( surfGrid ? swTermGrid().pipeline : ( surf ? m_PipelineSurf : ( contrib ? m_PipelineContrib : ( scan ? m_PipelineScan : m_Pipeline ) ) ) ) );
 		commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 		commandList->setComputeState( cs );
-		commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
+		if( swTG )
+		{
+			commandList->dispatch( ( cb.rect[2] + 15 ) / 16, ( cb.rect[3] + 15 ) / 16, 1 );
+		}
+		else
+		{
+			commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
+		}
 	}
 
 	// WEDGE-REPAIR (r_softShadowWedgeWhitelist 3): the raw wedge term this light just wrote gets its
@@ -1168,20 +1364,56 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 	const int swRepair = r_softShadowRepair.GetInteger();
 	if( cb.wedge[2] == 3 && swRepair > 0 && m_PipelineRepairAnts != nullptr && m_PipelineRepairTurds != nullptr && m_PipelineRepairHoles != nullptr )
 	{
-		cs.pipeline = m_PipelineRepairAnts;
-		commandList->setComputeState( cs );
-		commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 7 ) / 8, 1 );
-		if( swRepair >= 2 )
+		// STATS CENSUS variant (r_softShadowRepairStats): swap in the SW_REPAIR_STATS=1 pipelines +
+		// a binding set that adds u1 = m_RepairStatsBuffer. The stats pipelines' layout differs from
+		// the shipped one only by the extra UAV, so we mint a second binding set for this dispatch.
+		nvrhi::BindingSetHandle repairSet = set;
+		nvrhi::ComputePipelineHandle pAnts = m_PipelineRepairAnts;
+		nvrhi::ComputePipelineHandle pTurds = m_PipelineRepairTurds;
+		nvrhi::ComputePipelineHandle pHoles = m_PipelineRepairHoles;
+		nvrhi::ComputePipelineHandle pFused = m_PipelineRepairFused;
+		if( m_RepairStatsEnabled && m_LayoutRepStats != nullptr && m_RepairStatsBuffer != nullptr
+				&& m_PipelineRepairTurdsStats != nullptr && m_PipelineRepairHolesStats != nullptr )
 		{
-			cs.pipeline = m_PipelineRepairTurds;
-			commandList->setComputeState( cs );
+			nvrhi::BindingSetDesc rsd = sd;
+			rsd.bindings.push_back( nvrhi::BindingSetItem::StructuredBuffer_UAV( 1, m_RepairStatsBuffer ) );
+			repairSet = m_Device->createBindingSet( rsd, m_LayoutRepStats );
+			pAnts  = ( m_PipelineRepairAntsStats  != nullptr ) ? m_PipelineRepairAntsStats  : pAnts;
+			pTurds = m_PipelineRepairTurdsStats;
+			pHoles = m_PipelineRepairHolesStats;
+			pFused = ( m_PipelineRepairFusedStats != nullptr ) ? m_PipelineRepairFusedStats : pFused;
+		}
+		// FUSED path (r_softShadowRepairFused): one 16x16 dispatch replaces the three-dispatch chain.
+		// The fused kernel runs all three stages with LDS barriers between them and shares the per-
+		// pixel term reads across stages. Predicate for turds is tightened (nOpp==8) inside that
+		// shader; holes stay at the shipped >=5 threshold (census: holes agree 53%, turds 0.003%).
+		extern idCVar r_softShadowRepairFused;
+		const bool swFused = r_softShadowRepairFused.GetBool() && pFused != nullptr && swRepair >= 3;
+		nvrhi::ComputeState csR;
+		csR.bindings = { repairSet };
+		if( swFused )
+		{
+			csR.pipeline = pFused;
+			commandList->setComputeState( csR );
 			commandList->dispatch( ( cb.rect[2] + 15 ) / 16, ( cb.rect[3] + 15 ) / 16, 1 );
 		}
-		if( swRepair >= 3 )
+		else
 		{
-			cs.pipeline = m_PipelineRepairHoles;		// lit-in-umbra: mirror of the turd probe
-			commandList->setComputeState( cs );
-			commandList->dispatch( ( cb.rect[2] + 15 ) / 16, ( cb.rect[3] + 15 ) / 16, 1 );
+			csR.pipeline = pAnts;
+			commandList->setComputeState( csR );
+			commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 7 ) / 8, 1 );
+			if( swRepair >= 2 )
+			{
+				csR.pipeline = pTurds;
+				commandList->setComputeState( csR );
+				commandList->dispatch( ( cb.rect[2] + 15 ) / 16, ( cb.rect[3] + 15 ) / 16, 1 );
+			}
+			if( swRepair >= 3 )
+			{
+				csR.pipeline = pHoles;		// lit-in-umbra: mirror of the turd probe
+				commandList->setComputeState( csR );
+				commandList->dispatch( ( cb.rect[2] + 15 ) / 16, ( cb.rect[3] + 15 ) / 16, 1 );
+			}
 		}
 	}
 
@@ -1231,6 +1463,37 @@ void SoftShadowTermPass::BlurView( nvrhi::ICommandList* commandList )
 	// hand the blur atlas to the interaction pass as an SRV.
 	commandList->setTextureState( m_BlurTexture, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource );
 	commandList->commitBarriers();
+}
+
+// REPAIR STATS drain (r_softShadowRepairStats): blocking readback of the 16-uint accumulator, cleared
+// once at BeginView when the cvar toggled on. Callers (softprobe end) print the two 8-uint blocks.
+// Resets m_RepairStatsCleared so the next probe run clears fresh (drain is one-shot per census).
+bool SoftShadowTermPass::GetRepairStats( uint32_t out[16] )
+{
+	if( m_RepairStatsBuffer == nullptr || !m_RepairStatsCleared )
+	{
+		return false;
+	}
+	nvrhi::BufferDesc sbd;
+	sbd.byteSize = 16 * sizeof( uint32_t );
+	sbd.cpuAccess = nvrhi::CpuAccessMode::Read;
+	sbd.debugName = "SoftShadowTerm/RepairStatsReadback";
+	nvrhi::BufferHandle staging = m_Device->createBuffer( sbd );
+	nvrhi::CommandListHandle cl = m_Device->createCommandList();
+	cl->open();
+	cl->copyBuffer( staging, 0, m_RepairStatsBuffer, 0, 16 * sizeof( uint32_t ) );
+	cl->close();
+	m_Device->executeCommandList( cl );
+	m_Device->waitForIdle();
+	void* p = m_Device->mapBuffer( staging, nvrhi::CpuAccessMode::Read );
+	if( p == nullptr )
+	{
+		return false;
+	}
+	memcpy( out, p, 16 * sizeof( uint32_t ) );
+	m_Device->unmapBuffer( staging );
+	m_RepairStatsCleared = false;		// next enable clears fresh
+	return true;
 }
 
 bool SoftShadowTermPass::GetContribStats( uint32_t out[20] )

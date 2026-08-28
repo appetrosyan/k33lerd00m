@@ -239,10 +239,38 @@ void SwContribDiagSum( uint word, uint v )
 // evals), then latW*latH entries of ( asuint(term), asuint(wMin) ) written by Phase A.
 RWStructuredBuffer<uint2>	u_SubLattice	: register( u3 );
 #endif
+
+// SW_TILE_GROUP (task #124, wedge-term structural lever). 1 = 16x16 thread groups + a groupshared
+// cache of the tile's wedge edge stream, so all 256 threads walk from LDS instead of SRV. Aligns
+// naturally with SW_TILE_SIZE=16 tile grid and mirrors softrepair.cs (16,16,1)/(16,16) dispatch.
+// Compile-time gated so the shipped 8x4 SRV path stays byte-identical when SW_TILE_GROUP=0.
+#ifndef SW_TILE_GROUP
+	#define SW_TILE_GROUP 0
+#endif
+#if SW_TILE_GROUP
+	#define SW_LG_MAX_CASTERS	32			// upper bound on tile-listed casters (observed peak 27)
+	#define SW_LG_POOL_F4		3072		// 48 KB LDS pool: bounds sum-of-per-caster-edges*2 across a tile
+groupshared int  g_lgCasterN;					// tile-listed caster count actually cached (0 if UMBRA/lit/fallback path)
+groupshared int  g_lgCasterStart[SW_LG_MAX_CASTERS];	// pool offset (float4 index) of caster k's first edge in g_lgEdges
+groupshared int  g_lgCasterCnt[SW_LG_MAX_CASTERS];		// edge count for caster k (in edge records = float4 pairs)
+groupshared int  g_lgCasterSrc[SW_LG_MAX_CASTERS];		// t_SoftEdges float4 index of caster k's first edge (used during the parallel edge load)
+groupshared uint g_lgSlot;						// tile-bin slot content (SW_TILE_UMBRA / SPILL / count / degrade); read by the walk
+groupshared uint g_lgFallback;					// 1 = pool overflow or unaligned rect => run the SRV walk instead
+groupshared float4 g_lgEdges[SW_LG_POOL_F4];	// linear pool of edge records (2 float4 per edge); caster k's span at [start .. start+cnt*2)
+#endif
 // SW_RADIAL 1 was tested here as an umbra early-out for the wedge term (task #122). REFUTED (RoE intro
 // 1080p, com_fixedTic, r_softShadowWedgeAblate 4 / 0): whole-block 22ms->101ms, tile-binned 19ms->87ms.
 // The K=32 per-edge radial-bin update (32 sin/cos + cross tests) burned any saturation-early-out win by
 // ~4x. Kept at 0 here so the include default (0) drives the wedge term.
+// SW_NO_WINDING 1: every WedgeOcclusion(Ex) call in softterm passes swCentreLit = 0, so the illusory-
+// umbra winding correction never fires. Compile the swCross accumulation and its finalize block OUT.
+// Est. savings on RoE ~2ms/frame (300 edges * ~2 crossings per edge, each cheap but the loop total is
+// meaningful). Interaction PS passes runtime jitter for swCentreLit and keeps the default 0.
+#define SW_NO_WINDING 1
+// FP16 disk math for the mode-3 wedge walk (task #124). SoftDisk_CircleTriArea_H16 packs the per-
+// edge arithmetic into RDNA3's v_pk_* ops. Not bit-exact vs the fp32 walk; defect gate + repair
+// judge acceptance.
+#define SW_WEDGE_FP16 1
 #include "softwedge_coverage.inc.hlsl"
 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
@@ -364,6 +392,17 @@ float SwHoistTerm( float swTerm, float swHoist )
 #define SWVC_WALK		0.16f
 float SwVizCostTerm( float v, float band )
 {
+	// PATH-PROVENANCE (viz 11, session 2026-08-28 diagnostics): near-lit terms (> 0.995) are replaced
+	// by 1.0 - band, so the gate's LIT_IN_UMBRA probe dump NAMES the return class that produced each
+	// defect pixel: 0.96 = early-out, 0.92 = umbra sentinel (impossible), 0.88 = wedge/serve (HIT),
+	// 0.84 = other (classifier-lit / empty-tile / face walks). Ana staying at the raw 0.9995 rung
+	// means the write bypassed this wrapper entirely. Diagnostic only.
+	if( ( int )g_surfParams.y == 11 )
+	{
+		// open window: EXACT 1.0 must pass untouched - the gate's mask1 render (r_skipShadows) and the
+		// candidate-light validity test key on |v - 1| <= 1e-3, and the defect rung is strictly below 1.
+		return ( v > 0.995f && v < 0.9999f ) ? ( 1.0f - band ) : v;
+	}
 	if( ( int )g_surfParams.y != 9 )
 	{
 		return v;		// viz off: bit-identical passthrough
@@ -489,6 +528,163 @@ bool SwWlTryServe( float3 swP, float3 swL, float swR, float swRotAng, float swHo
 // (headerRec + 2 float4s past the header pair) and N = edgeCount, not headerRec + (ec+1). The walk's entry state
 // (haveCaster=true, swArea=0, swFirstValid=false, havePrevE1=false) is exactly what the header would have set,
 // so skipping the header is bit-exact. Saves 1 sqrt + ~14 flops + 32 B load per listed caster per fragment.
+#if SW_WEDGE_FP16 && defined(__HLSL_ENABLE_16_BIT)
+// FP16 per-caster solo wedge (task #124): mirrors SwWedgeSoloLDS but reads from t_SoftEdges and
+// runs the disk math in fp16 through SoftDisk_CircleTriArea_H16 (normalized coords). Setup +
+// accumulator stay fp32 so long-cancellation sums do not decay. Reserved for the mode-3 walk;
+// interaction PS keeps the shipped fp32 SoftShadow_WedgeOcclusion.
+float SwWedgeSoloFP16( float3 swP, float3 swL, float swR, int firstElem, int ec )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	const float  swDistPL     = swF.distPL;
+	const float3 swNrm        = swF.nrm;
+	const float  invR         = 1.0f / swR;
+	const float  invPI        = 1.0f / PI;			// r2 = 1 in normalized coords => invDiskArea = 1/pi
+	const float  swEps        = SW_NEAR_EPS;
+
+	float      swArea       = 0.0f;					// fp32 accumulator (cancellation-sensitive)
+	bool       swFirstValid = false;
+	float16_t2 swFirst      = float16_t2( 0.0, 0.0 );
+	float16_t2 swPrev       = float16_t2( 0.0, 0.0 );
+	bool       havePrevE1   = false;
+	float3     prevE1w      = float3( 0.0f, 0.0f, 0.0f );
+
+	for( int se = 0; se < ec; se++ )
+	{
+		const float4 e0 = t_SoftEdges[ firstElem + se * 2 + 0 ];
+		const float4 e1 = t_SoftEdges[ firstElem + se * 2 + 1 ];
+
+		const float3 A = float3( e0.x, e0.y, e0.z );
+		const float3 B = float3( e1.x, e1.y, e1.z );
+		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea_H16( swPrev, swFirst );
+			swFirstValid = false;
+		}
+		havePrevE1 = true;
+		prevE1w = B;
+
+		const float3 a = A - swP;
+		const float3 b = B - swP;
+		const float  dnA = dot( a, swNrm );
+		const float  dnB = dot( b, swNrm );
+		const float  d   = dnB - dnA;
+		softClip_t   cl  = SoftShadow_ClipSlab( dnA, dnB, swEps, swDistPL );
+		if( cl.empty ) { continue; }
+
+		const float3 pa  = a + cl.t0 * ( b - a );
+		const float3 pb  = a + cl.t1 * ( b - a );
+		const float  dna = dnA + cl.t0 * d;
+		const float  dnb = dnA + cl.t1 * d;
+		// Normalize on cast: q = ProjectVertWedge(...) / swR, then to fp16.
+		const float16_t2 q0 = float16_t2( SoftShadow_ProjectVertWedge( pa, dna, swF ) * invR );
+		const float16_t2 q1 = float16_t2( SoftShadow_ProjectVertWedge( pb, dnb, swF ) * invR );
+
+		if( swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea_H16( swPrev, q0 );
+		}
+		else
+		{
+			swFirst = q0;
+			swFirstValid = true;
+		}
+		swArea += SoftDisk_CircleTriArea_H16( q0, q1 );
+		swPrev = q1;
+	}
+	if( swFirstValid )
+	{
+		swArea += SoftDisk_CircleTriArea_H16( swPrev, swFirst );
+	}
+	return saturate( abs( swArea ) * invPI );
+}
+#endif	// SW_WEDGE_FP16
+
+// RECEIVER-APEX RESELECT second pass (mechanism A2, session 2026-08-28). The light-apex silhouette is a
+// physically WRONG coverage contour for open/non-manifold world-brush casters seen from inside their own
+// shadow: its chained loops enclose nothing and the solo collapses to ~0 where the caster blocks the whole
+// disk (the gate's entire LIT_IN_UMBRA class). This walk keeps the emitted edge SET but per fragment
+// (a) DROPS edges that are not a silhouette from swP - both adjacent faces same-facing - bridging the gap
+// by the connector chord, and (b) NEGATES the contribution of edges whose stored orientation (nA fronts
+// the LIGHT) backs the receiver. Adjacent normals live in a parallel record stream at g_repairBin.w
+// (float4-element base, record-aligned with the wedge block). Fired CONDITIONALLY by SwWedgeTileOcc only
+// on casters whose normal walk collapsed with broken-chain evidence, so healthy casters never pay it.
+// Offline validation (real walker, 359 gate defect fragments): 341 recover, monotone vs off per light.
+float SwWedgeSoloRcv( float3 swP, float3 swL, float swR, int firstElem, int ec, int nrmElem )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	const float  swDistPL = swF.distPL;
+	const float3 swFNrm   = swF.nrm;
+	const float  swR2     = swR * swR;
+	const float  swEps    = SW_NEAR_EPS;
+
+	float  swArea       = 0.0f;
+	bool   swFirstValid = false;
+	float2 swFirst      = float2( 0.0f, 0.0f );
+	float2 swPrev       = float2( 0.0f, 0.0f );
+	bool   havePrevE1   = false;
+	float3 prevE1w      = float3( 0.0f, 0.0f, 0.0f );
+
+	for( int se = 0; se < ec; se++ )
+	{
+		const float4 e0 = t_SoftEdges[ firstElem + se * 2 + 0 ];
+		const float4 e1 = t_SoftEdges[ firstElem + se * 2 + 1 ];
+		float3 A = float3( e0.x, e0.y, e0.z );
+		float3 B = float3( e1.x, e1.y, e1.z );
+		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close a finished chain
+			swFirstValid = false;
+		}
+		havePrevE1 = true;
+		prevE1w = B;
+
+		const float3 rnA = t_SoftEdges[ nrmElem + se * 2 + 0 ].xyz;
+		const float3 rnB = t_SoftEdges[ nrmElem + se * 2 + 1 ].xyz;
+		const bool rfa = dot( rnA, swP - A ) > 0.0f;
+		const bool rfb = dot( rnB, swP - A ) > 0.0f;
+		if( rfa == rfb )
+		{
+			continue;			// DROP: not a silhouette from the receiver; connector bridges the chord
+		}
+		const float swSign = rfa ? 1.0f : -1.0f;	// NEGATE when the stored orientation backs the receiver
+
+		const float3 a = A - swP;
+		const float3 b = B - swP;
+		const float  dnA = dot( a, swFNrm );
+		const float  dnB = dot( b, swFNrm );
+		const float  d   = dnB - dnA;
+		softClip_t cl = SoftShadow_ClipSlab( dnA, dnB, swEps, swDistPL );
+		if( cl.empty ) { continue; }
+
+		const float3 pa  = a + cl.t0 * ( b - a );
+		const float3 pb  = a + cl.t1 * ( b - a );
+		const float  dna = dnA + cl.t0 * d;
+		const float  dnb = dnA + cl.t1 * d;
+		const float2 q0 = SoftShadow_ProjectVertWedge( pa, dna, swF );
+		const float2 q1 = SoftShadow_ProjectVertWedge( pb, dnb, swF );
+
+		if( swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 );		// connector (chord over drops/breaks)
+		}
+		else
+		{
+			swFirst = q0;
+			swFirstValid = true;
+		}
+		swArea += swSign * SoftDisk_CircleTriArea( q0, q1, swR2 );
+		swPrev = q1;
+	}
+	if( swFirstValid )
+	{
+		swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );
+	}
+	return saturate( abs( swArea ) / ( PI * swR2 ) );
+}
+
 float SwWedgeTileOcc( float3 swP, float3 swL, float swR, int listBase, int listCnt )
 {
 	float occ = 0.0f;
@@ -498,11 +694,219 @@ float SwWedgeTileOcc( float3 swP, float3 swL, float swR, int listBase, int listC
 		const int  base = g_wedge.x + ( int )he * 2;					// float4 base of this caster's header pair
 		const int  ec   = ( int )t_SoftEdges[ base + 1 ].y;			// edgeCount (header e1.y)
 		// L1: skip the header record - jump base past its 2 float4s, walk only ec edges. Header cull redundant.
-		occ = max( occ, SoftShadow_WedgeOcclusion( swP, swL, swR, base + 2, ec, 0.0 ) );
+#if SW_WEDGE_FP16 && defined(__HLSL_ENABLE_16_BIT)
+		occ = max( occ, SwWedgeSoloFP16( swP, swL, swR, base + 2, ec ) );
+#else
+		// Ex form: same occlusion bit-for-bit (WedgeOcclusion is a thin wrapper over it); the clip out
+		// carries the material-bridge bit the conditional reselect needs, at zero extra walk cost.
+		float swWlGap; int swWlNC, swWlClip;
+		float solo = SoftShadow_WedgeOcclusionEx( swP, swL, swR, base + 2, ec, 0.0, swWlGap, swWlNC, swWlClip );
+		// CONDITIONAL receiver-apex reselect: collapsed solo + broken-chain evidence (material bridge).
+		// g_repairBin.w = record-aligned normal-stream base, -1 when absent (cvar off / not emitted).
+		// DIAG (session 2026-08-28): clip-bit gate temporarily dropped - engine chains may bridge in
+		// many small connectors each below SW_WL_BRIDGE_AREA. Re-tighten once the fire rate is known.
+		if( g_repairBin.w >= 0 && solo < 0.02f )
+		{
+			solo = max( solo, SwWedgeSoloRcv( swP, swL, swR, base + 2, ec, g_repairBin.w + ( ( int )he + 1 ) * 2 ) );
+		}
+		occ = max( occ, saturate( solo ) );
+#endif
 		if( occ >= 0.999f ) { break; }								// saturated umbra: no further caster can raise it
 	}
 	return occ;
 }
+
+// WHOLE-STREAM wedge walk with the conditional receiver-apex reselect: per-caster spans walked via the
+// Ex core (header included, so the caster sphere cull is identical), then the same collapsed-solo
+// trigger as SwWedgeTileOcc. This is the reselect-capable form of the DEGRADE / unbinned-light legs -
+// the path-reach probe showed the gate's defect lights walk HERE, not through the tile lists.
+float SwWedgeStreamRcv( float3 swP, float3 swL, float swR )
+{
+	float occ = 0.0f;
+	int rec = 0;
+	while( rec < g_wedge.y )
+	{
+		const int base = g_wedge.x + rec * 2;
+		const int ec   = ( int )t_SoftEdges[ base + 1 ].y;			// header e1.y = edgeCount
+		float swWlGap; int swWlNC, swWlClip;
+		float solo = SoftShadow_WedgeOcclusionEx( swP, swL, swR, base, 1 + ec, 0.0, swWlGap, swWlNC, swWlClip );
+		if( g_repairBin.w >= 0 && solo < 0.02f )
+		{
+			solo = max( solo, SwWedgeSoloRcv( swP, swL, swR, base + 2, ec, g_repairBin.w + ( rec + 1 ) * 2 ) );
+		}
+		occ = max( occ, saturate( solo ) );
+		if( occ >= 0.999f ) { break; }
+		rec += 1 + ec;
+	}
+	return occ;
+}
+
+#if SW_TILE_GROUP
+// LDS COOPERATIVE LOAD (task #124): populate g_lgEdges + per-caster metadata for this 16x16 tile's
+// wedge caster list. Runs at the top of main() before the per-fragment walk; all 256 threads
+// participate. Only fires for the wedge term (g_wedge.z == 3); other modes leave g_lgCasterN=0 and
+// route back to the SRV path. The tile grid alignment assumption (g_rect.xy is a multiple of 16) is
+// enforced backend-side by snapping cb.rect[0/1] down; here we trust it and each group's gid maps
+// deterministically to one bin slot.
+void SwLdsLoad( uint3 gid, uint gidx )
+{
+	if( gidx == 0 )
+	{
+		g_lgCasterN = 0;
+		g_lgFallback = 0;
+		g_lgSlot = 0u;
+		if( g_range.z >= 0 && g_wedge.x >= 0 && g_wedge.z == 3 )
+		{
+			// Compute this group's tile in the bin grid. g_rect.xy is 16-aligned per the backend snap,
+			// so all 256 threads share the same tile - any thread's screen pixel gives the same swTx/swTy.
+			const int swTx = ( g_rect.x + ( int )gid.x * 16 ) / SW_TILE_SIZE - g_tile.x;
+			const int swTy = ( g_rect.y + ( int )gid.y * 16 ) / SW_TILE_SIZE - g_tile.y;
+			if( swTx >= 0 && swTy >= 0 )
+			{
+				const int swSlot = g_range.z + ( swTy * g_range.w + swTx ) * ( g_flags.w + 1 );
+				const uint swCnt = t_SoftTiles[ swSlot ];
+				g_lgSlot = swCnt;
+				// Populate the caster table for the "normal" case: swCnt <= K, not a sentinel. Sentinels
+				// (UMBRA/EMPTY/SPILL/degrade 0xFFFFFFFF) leave g_lgCasterN=0; the walker checks g_lgSlot to
+				// decide how to respond (umbra tile => term 0, empty => term 1, spill/degrade => SRV walk).
+				if( swCnt > 0u && swCnt <= ( uint )g_flags.w )
+				{
+					int poolCursor = 0;
+					int nCas = 0;
+					for( uint i = 0u; i < swCnt && nCas < SW_LG_MAX_CASTERS; i++ )
+					{
+						const uint tileEntry = t_SoftTiles[ swSlot + 1 + ( int )i ];
+						const uint he   = tileEntry & 0x7FFFFFFFu;
+						const int  base = g_wedge.x + ( int )he * 2;
+						const int  ec   = ( int )t_SoftEdges[ base + 1 ].y;
+						// pool guard: ec*2 float4 must fit; overflow => fallback to SRV walk (which is correct,
+						// just slower). Setting g_lgFallback aborts the subsequent parallel load.
+						if( poolCursor + ec * 2 > SW_LG_POOL_F4 )
+						{
+							g_lgFallback = 1u;
+							nCas = 0;
+							break;
+						}
+						g_lgCasterStart[nCas] = poolCursor;
+						g_lgCasterCnt[nCas]   = ec;
+						g_lgCasterSrc[nCas]   = base + 2;	// SKIP the header float4 pair (mirrors L1)
+						poolCursor += ec * 2;
+						nCas++;
+					}
+					// Casters beyond SW_LG_MAX_CASTERS are lossy to drop; fall back to SRV instead.
+					if( ( int )swCnt > nCas ) { g_lgFallback = 1u; nCas = 0; }
+					g_lgCasterN = nCas;
+				}
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// Parallel edge load: all 256 threads cooperatively fill g_lgEdges. Serial-over-casters,
+	// parallel-within-caster - simple and coherent (each stride copies one float4 with good cache
+	// locality since consecutive threads read consecutive t_SoftEdges elements).
+	if( g_lgFallback == 0u && g_lgCasterN > 0 )
+	{
+		for( int c = 0; c < g_lgCasterN; c++ )
+		{
+			const int src = g_lgCasterSrc[c];
+			const int dst = g_lgCasterStart[c];
+			const int cnt = g_lgCasterCnt[c] * 2;		// float4 count for this caster's edges
+			for( uint i = gidx; i < ( uint )cnt; i += 256u )
+			{
+				g_lgEdges[ dst + ( int )i ] = t_SoftEdges[ src + ( int )i ];
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+}
+
+// LDS WALK (task #124): per-caster solo shoelace on g_lgEdges. Bit-identical to the SRV wedge walk
+// with L1's header-skip (no headers in the pool). No census: mode 3 discards swClipOut / swGap /
+// swNContrib, so we drop all of that machinery. Also no SW_RADIAL (refuted). swCentreLit always 0
+// here (mode 3), so no winding correction (matches SW_NO_WINDING=1 in this TU).
+float SwWedgeSoloLDS( float3 swP, float3 swL, float swR, int poolStart, int ec )
+{
+	// per-fragment setup (hoisted per solo call, same shape as SoftShadow_WedgeOcclusionEx)
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	const float  swDistPL = swF.distPL;
+	const float3 swNrm    = swF.nrm;
+	const float  swR2     = swR * swR;
+	const float  swInvDiskArea = 1.0f / ( PI * swR2 );
+	const float  swEps    = SW_NEAR_EPS;
+
+	float  swArea       = 0.0f;
+	bool   swFirstValid = false;
+	float2 swFirst      = float2( 0.0f, 0.0f );
+	float2 swPrev       = float2( 0.0f, 0.0f );
+	bool   havePrevE1   = false;
+	float3 prevE1w      = float3( 0.0f, 0.0f, 0.0f );
+
+	for( int se = 0; se < ec; se++ )
+	{
+		const float4 e0 = g_lgEdges[ poolStart + se * 2 + 0 ];
+		const float4 e1 = g_lgEdges[ poolStart + se * 2 + 1 ];
+		// The pool contains only edges (SwLdsLoad skips headers). e0.w<0 header records will never occur.
+
+		const float3 A = float3( e0.x, e0.y, e0.z );
+		const float3 B = float3( e1.x, e1.y, e1.z );
+		if( havePrevE1 && ( A.x != prevE1w.x || A.y != prevE1w.y || A.z != prevE1w.z ) && swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close a finished chain
+			swFirstValid = false;
+		}
+		havePrevE1 = true;
+		prevE1w = B;
+
+		const float3 a = A - swP;
+		const float3 b = B - swP;
+		const float  dnA = dot( a, swNrm );
+		const float  dnB = dot( b, swNrm );
+		const float  d   = dnB - dnA;
+		softClip_t   cl  = SoftShadow_ClipSlab( dnA, dnB, swEps, swDistPL );
+		if( cl.empty ) { continue; }
+
+		const float3 pa  = a + cl.t0 * ( b - a );
+		const float3 pb  = a + cl.t1 * ( b - a );
+		const float  dna = dnA + cl.t0 * d;
+		const float  dnb = dnA + cl.t1 * d;
+		const float2 q0  = SoftShadow_ProjectVertWedge( pa, dna, swF );
+		const float2 q1  = SoftShadow_ProjectVertWedge( pb, dnb, swF );
+
+		if( swFirstValid )
+		{
+			swArea += SoftDisk_CircleTriArea( swPrev, q0, swR2 );		// intra-chain bridge
+		}
+		else
+		{
+			swFirst = q0;
+			swFirstValid = true;
+		}
+		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
+		swPrev = q1;
+	}
+	if( swFirstValid )
+	{
+		swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );		// close the last open chain
+	}
+	return saturate( abs( swArea ) * swInvDiskArea );
+}
+
+// LDS tile walk: iterate cached casters, max-combine per-caster solos. Same semantics as
+// SwWedgeTileOcc but with LDS reads. Assumes g_lgCasterN, g_lgCasterStart, g_lgCasterCnt, g_lgEdges
+// have been populated by SwLdsLoad and the barrier has already fired.
+float SwWedgeTileOcc_LDS( float3 swP, float3 swL, float swR )
+{
+	float occ = 0.0f;
+	for( int c = 0; c < g_lgCasterN; c++ )
+	{
+		occ = max( occ, SwWedgeSoloLDS( swP, swL, swR, g_lgCasterStart[c], g_lgCasterCnt[c] ) );
+		if( occ >= 0.999f ) { break; }
+	}
+	return occ;
+}
+#endif	// SW_TILE_GROUP
 
 #if SW_SUBSAMPLE
 // wave-aggregated path counter into u_SubLattice[word].x (SwSurfStat pattern): one atomic per wave
@@ -2162,21 +2566,42 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 			if( g_wedge.z == 3 )
 			{
 				float swWlOcc;
+#if SW_TILE_GROUP
+				// LDS PATH (task #124): the group's shared edge cache has already been populated by SwLdsLoad,
+				// with fallback flagged for pool overflow / spill / degrade. SPILL and 0xFFFFFFFF degrade
+				// left g_lgCasterN=0 in the load phase (they need a different span walked), so the fallback
+				// SRV path covers them here. Umbra + empty tiles were caught earlier in this branch.
+				if( g_lgFallback == 0u && g_lgCasterN > 0 )
+				{
+					swWlOcc = SwWedgeTileOcc_LDS( swP, swL, swR );
+					return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlOcc ), swHoist ) ), SWVC_HIT );
+				}
+				// fall through to the SRV path below for SPILL / degrade / overflow
+#endif
+				// PROVENANCE bands (viz 11 only; SWVC_HIT otherwise so shipped viz-9 is unchanged):
+				// binned 0.30 / spill 0.28 / degrade 0.26, +0.10 when the reselect base was ABSENT
+				// (g_repairBin.w < 0) - dump ana 0.70/0.72/0.74 = leg with reselect armed, 0.60/0.62/
+				// 0.64 = leg with reselect unarmed (the CB variance suspect).
+				float swLegBand = SWVC_HIT;
 				if( swCnt == SW_TILE_SPILL )
 				{
 					const uint swOfs = t_SoftTiles[ swSlot + 1 ];
 					const uint swSpN = min( t_SoftTiles[ swSlot + 2 ], 65536u );
 					swWlOcc = SwWedgeTileOcc( swP, swL, swR, ( int )swOfs, ( int )swSpN );
+					if( ( int )g_surfParams.y == 11 ) { swLegBand = 0.28f; }
 				}
 				else if( swCnt != 0xFFFFFFFFu )
 				{
 					swWlOcc = SwWedgeTileOcc( swP, swL, swR, swSlot + 1, ( int )swCnt );
+					if( ( int )g_surfParams.y == 11 ) { swLegBand = 0.30f; }
 				}
 				else
 				{
-					swWlOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, g_wedge.x, g_wedge.y, 0.0 );	// degrade: whole block
+					swWlOcc = SwWedgeStreamRcv( swP, swL, swR );	// degrade: whole block (reselect-capable)
+					if( ( int )g_surfParams.y == 11 ) { swLegBand = 0.26f; }
 				}
-				return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlOcc ), swHoist ) ), SWVC_HIT );
+				if( ( int )g_surfParams.y == 11 && g_repairBin.w < 0 ) { swLegBand += 0.10f; }
+				return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlOcc ), swHoist ) ), swLegBand );
 			}
 			// ABLATION (r_softShadowWedgeAblate, z = 30 + step): whole-stream record-count scaling to linear-fit
 			// the term cost - tile-independent by design (N=0 z30 = pure overhead ... N z33 = full walk).
@@ -2236,8 +2661,14 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 			}
 			int swAblN = g_wedge.y;
 			if( g_wedge.z >= 30 ) { swAblN = ( g_wedge.y * ( g_wedge.z - 30 ) ) / 3; }	// ablation (see binned leg)
-			const float swWlOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, g_wedge.x, swAblN, 0.0 );
-			return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlOcc ), swHoist ) ), SWVC_HIT );
+			// mode 3 proper takes the reselect-capable per-caster stream walk (the path-reach probe put
+			// the gate's defect lights on THIS leg); ablation modes keep the raw whole-stream walk.
+			const float swWlOcc = ( g_wedge.z == 3 ) ? SwWedgeStreamRcv( swP, swL, swR )
+								  : SoftShadow_WedgeOcclusion( swP, swL, swR, g_wedge.x, swAblN, 0.0 );
+			// PROVENANCE (viz 11): unbinned-stream leg 0.24 (+0.10 when the reselect base was absent)
+			float swUlBand = SWVC_HIT;
+			if( ( int )g_surfParams.y == 11 ) { swUlBand = 0.24f + ( ( g_repairBin.w < 0 ) ? 0.10f : 0.0f ); }
+			return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlOcc ), swHoist ) ), swUlBand );
 		}
 		if( g_wedge.x >= 0 && g_wedge.z == 2 )
 		{
@@ -2274,9 +2705,21 @@ float SwTermFinal( int2 px )
 	return SwTermWalk( px, swPos, swHoist );
 }
 
+#if SW_TILE_GROUP
+[numthreads( 16, 16, 1 )]
+void main( uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gidx : SV_GroupIndex )
+{
+	// Cooperative load of the tile's wedge edge stream into groupshared BEFORE any per-fragment work.
+	// SwLdsLoad barriers internally; on return g_lgCasterN / g_lgFallback / g_lgSlot / g_lgEdges are set.
+	SwLdsLoad( gid, gidx );
+	// Reconstruct dispatch-relative tid so the SW_SUBSAMPLE math (unused when SW_TILE_GROUP=1, but
+	// kept in the compiled body via the shared code path) sees the same coordinates it always did.
+	const uint3 tid = uint3( gid.x * 16u + gtid.x, gid.y * 16u + gtid.y, 0u );
+#else
 [numthreads( 8, 4, 1 )]
 void main( uint3 tid : SV_DispatchThreadID )
 {
+#endif
 #if SW_SUBSAMPLE
 	// g_sub: x = phase | (viz << 2), y = lattice stride S, z = C2 spread epsilon, w = C3 beta
 	const int sPh  = ( ( int )g_sub.x ) & 3;
@@ -2455,6 +2898,17 @@ void main( uint3 tid : SV_DispatchThreadID )
 	{
 		return;
 	}
+#if SW_TILE_GROUP
+	// PADDED-MARGIN SKIP (task #124): the backend snapped cb.rect[0/1] DOWN to 16-pixel boundaries to
+	// align 16x16 groups with the tile grid, encoding the extra padded margin in g_repairBin.y/z.
+	// These threads DID participate in SwLdsLoad's barrier (that's why the check happens here, not
+	// at the top of main), but must NOT write the atlas - the target texel belongs to a NEIGHBOURING
+	// light's slot. g_repairBin.y/z are 0 on the SRV pipeline, so this is a no-op there.
+	if( ( int )tid.x < g_repairBin.y || ( int )tid.y < g_repairBin.z )
+	{
+		return;
+	}
+#endif
 	const int2 px = int2( g_rect.x + ( int )tid.x, g_rect.y + ( int )tid.y );
 	u_Term[ uint2( px + g_tile.zw ) ] = SwTermFinal( px );
 }

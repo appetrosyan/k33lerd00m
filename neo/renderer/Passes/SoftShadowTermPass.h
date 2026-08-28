@@ -82,6 +82,7 @@ public:
 	// bench-only. Returns false when counters were not enabled / buffer absent.
 	bool GetWalkStats( uint32_t out[34] );	// 0..7 attrib, 8-13 buckets by FINAL COVERAGE (lit cov==0 / penumbra / umbra cov>=0.99 incl. umbra-sentinel tiles; frags + FillTri survivors each), 14/15 MT hit/miss (SAMPLED walk only - stay 0 under scanline, the bench prints the FillTri outcome split instead), 16..19 tile-class census (umbra-sentinel / empty-list / spill / listed threads), 20..26 scanline FillTri attribution (fill/reject/skip/skipIter/foldIter/sweepTri/sweepIter), 27 lit-early-out skips at T>0 (path-execution proof), 28 SUM of adaptive chord count N over walked frags (task #85; mean N = slot28/slot7; 0 when r_softShadowAdaptiveChords off), 29 classifier-UMBRA skips (frags the world-cell umbra class skipped before the walk), 30..33 hybrid-whitelist census (frags with a wedge block / SUM cut casters / SUM table casters / fully-serveable frags)
 	bool GetContribStats( uint32_t out[20] );	// contrib-cache header: [0] recording pool [1] serves [2] recording evals [3] claimed cells [4] verify compares [5] verify mismatches [6] max |diff| (float bits) [7] budget-blocked [8] probe-exhausted [9] BUILT-unservable [10] refinement records
+	bool GetRepairStats( uint32_t out[16] );	// repair census (r_softShadowRepairStats): [0..7] phase 1 (turds), [8..15] phase 2 (holes). Slots per phase: 0 groupsDispatched / 1 groupsBailed / 2 candPixels / 3 groupsRingSurvive / 4 arbiterListedBin / 5 arbiterCluster / 6 arbiterFallback / 7 arbiterAgreed. Blocking readback.
 
 	// once per rendered VIEW, before the AddLight loop: advances the contributor cache's own frame
 	// tick (tr.frameCount is dead in minimal-init paths) for the flip-defer stamp + claim budget
@@ -120,6 +121,12 @@ private:
 	nvrhi::ShaderHandle				m_Shader;
 	nvrhi::BindingLayoutHandle		m_Layout;
 	nvrhi::ComputePipelineHandle	m_Pipeline;
+	// TILE-GROUP permutation (SW_TILE_GROUP=1, task #124, r_softShadowTileGroup): 16x16 thread groups
+	// + groupshared cache of the tile's wedge edge stream, selected when whitelist == 3 so the wedge
+	// term walks LDS instead of SRV. Reuses m_Layout (same bindings). Byte-identical output vs the
+	// SRV path when losslessness holds (fallback for pool overflow / spill / degrade).
+	nvrhi::ShaderHandle				m_ShaderTG;
+	nvrhi::ComputePipelineHandle	m_PipelineTG;
 	// COUNTING permutation (SW_GPU_WALK_COUNTERS=1): a separate shader/layout/pipeline with an extra
 	// u1 counter UAV, used only when r_softShadowWalkCounters is set so the shipped pipeline above is
 	// byte-identical. m_WalkCntEnabled snapshots the cvar per view.
@@ -148,6 +155,25 @@ private:
 	nvrhi::ComputePipelineHandle	m_PipelineRepairTurds;
 	nvrhi::ShaderHandle				m_ShaderRepairHoles;	// REPAIR_PHASE 2: lit-in-umbra (a hole in the shadow)
 	nvrhi::ComputePipelineHandle	m_PipelineRepairHoles;
+	// REPAIR STATS permutation (SW_REPAIR_STATS=1, r_softShadowRepairStats): same three phases +
+	// a u1 UAV that InterlockedAdd's 8 density/arbiter counters per phase (16 uints total). Own layout
+	// (base + u1 UAV). Used only when the census cvar is set so the shipped pipeline stays byte-identical.
+	nvrhi::ShaderHandle				m_ShaderRepairAntsStats;
+	nvrhi::ShaderHandle				m_ShaderRepairTurdsStats;
+	nvrhi::ShaderHandle				m_ShaderRepairHolesStats;
+	nvrhi::BindingLayoutHandle		m_LayoutRepStats;
+	nvrhi::ComputePipelineHandle	m_PipelineRepairAntsStats;
+	nvrhi::ComputePipelineHandle	m_PipelineRepairTurdsStats;
+	nvrhi::ComputePipelineHandle	m_PipelineRepairHolesStats;
+	nvrhi::BufferHandle				m_RepairStatsBuffer;	// 16 uints (8 per phase, phases 1 & 2)
+	bool							m_RepairStatsEnabled = false;
+	bool							m_RepairStatsCleared = false;
+	// FUSED REPAIR (r_softShadowRepairFused, softrepair_fused.cs.hlsl): single 16x16 dispatch that
+	// runs ants + turds + holes with LDS barriers between stages. Shipped path stays untouched.
+	nvrhi::ShaderHandle				m_ShaderRepairFused;
+	nvrhi::ComputePipelineHandle	m_PipelineRepairFused;
+	nvrhi::ShaderHandle				m_ShaderRepairFusedStats;
+	nvrhi::ComputePipelineHandle	m_PipelineRepairFusedStats;
 	// CONTRIBUTOR CACHE permutation (SW_CONTRIB_CACHE=1, scanline forced): evaluate-once union of
 	// observed contributors per (world cell, light). Own layout (base + u2 table UAV); own buffer.
 	nvrhi::ShaderHandle				m_ShaderContrib;

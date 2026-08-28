@@ -120,6 +120,8 @@ struct GateCfg
 	//								   BOTH images but displaced a pixel or two (point-sampled analytic onset vs the
 	//								   ray-threshold + median-eroded RT onset) is registration error, not grain -
 	//								   the same misregistration immunity GateAgreement gets from its dilated guards.
+	int   dumpLitInUmbra = 0;		// PROBE: dump per-component (x,y,area,box,ana,rt) for first N LIT_IN_UMBRA
+	//								   defects (0 = quiet). Populated from com_softShadowGateDumpLitInUmbra.
 	int   ResScale( int at1080, int W, int H ) const
 	{
 		double s = ( double )W * H / ( 1920.0 * 1080.0 );
@@ -632,10 +634,27 @@ inline void GateAgreement( const GateImg& ana, const GateImg& rt, const std::vec
 		std::vector<int> litLabels;
 		std::vector<GateComp> litComps = GateLabel( lit, W, H, false, &litLabels );
 		std::vector<bool> keep = arbitrate( lit, litLabels, ( int )litComps.size(), false );
+		// VERBOSE LIT_IN_UMBRA PROBE (session 2026-08-28-d, gate-driven diagnosis of the wedge
+		// mechanism): per surviving component, print centre (x,y) + wedge term + RT term. Bounded to
+		// a first N entries via caller-provided cfg.dumpLitInUmbra (default 0 = quiet).
+		int probeBudget = cfg.dumpLitInUmbra;
 		for( size_t cI = 0; cI < litComps.size(); cI++ )
 		{
 			if( keep[cI] )
 			{
+				if( probeBudget > 0 )
+				{
+					const GateComp& c = litComps[cI];
+					const int cx = ( c.x0 + c.x1 ) / 2;
+					const int cy = ( c.y0 + c.y1 ) / 2;
+					const size_t idx = ( size_t )cy * W + cx;
+					if( idx < ana.t.size() )
+					{
+						std::printf( "[softgate-probe] LIT_IN_UMBRA @(%d,%d) area=%d box=(%d,%d)-(%d,%d) ana=%.4f rt=%.4f\n",
+									cx, cy, c.area, c.x0, c.y0, c.x1, c.y1, ana.t[idx], rt.t[idx] );
+						probeBudget--;
+					}
+				}
 				GateEmit( { litComps[cI] }, GATE_LIT_IN_UMBRA, out );
 			}
 		}

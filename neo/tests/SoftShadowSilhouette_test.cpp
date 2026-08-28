@@ -32,6 +32,8 @@ namespace swsil
 #include "softwedge_coverage.inc.hlsl"
 swAttrib_t g_swAttrib = {};
 bool       g_swAttribOn = false;
+const float4* g_swEdgeNrm = NULL;
+int           g_swRcvStyle = 0;
 }
 using namespace swsil;			// bring the shader symbols into scope BEFORE SoftShadowBox.h parses its callers
 

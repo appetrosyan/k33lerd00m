@@ -138,6 +138,20 @@ static uint g_swVizFills = 0;
 #else
 	#define SW_FP16_LOOP 0
 #endif
+// SW_WEDGE_FP16 (task #124): reroute the wedge shoelace's per-edge disk math through fp16 so the
+// v_pk_* packed ops on RDNA3 retire two operations per cycle. Same numerics discipline as the face
+// coverage fp16 loop (comment block above): keep the accumulator (swArea) in fp32 so cancellation
+// stays crisp across the ~300-edge sum, but drop into half where the per-edge work happens (dot,
+// cross, sector angle). The projected coords are normalized by swR so their magnitudes fit fp16
+// cleanly. NOT bit-exact vs fp32 - defect gate + repair budget are the acceptance judges. TU-scoped
+// so the interaction PS (uses the same include) keeps its fp32 path unchanged.
+#if !defined(__cplusplus) && defined(__HLSL_ENABLE_16_BIT)
+	#ifndef SW_WEDGE_FP16
+		#define SW_WEDGE_FP16 0
+	#endif
+#else
+	#define SW_WEDGE_FP16 0
+#endif
 
 #if SW_FP16_LOOP
 // largest absolute component - the normalization denominator for the fp16 rescale
@@ -328,6 +342,16 @@ SW_FUNC bool SwRadPred_Eligible( swRadPred_t p, float swCross )
 #ifndef SW_RADIAL
 	#define SW_RADIAL 0			// compile-time gate: 1 routes eligible casters through the radial union early-out
 #endif
+// COMPILE-TIME WINDING GATE (perf lever, task #124): the shoelace loop accumulates a WINDING NUMBER
+// (swCross) that is ONLY used inside the `if(swCentreLit > 0.5f)` illusory-umbra correction. When the
+// caller passes swCentreLit = 0 (softterm.cs.hlsl's whitelist paths), that block never fires, so the
+// crossing sum is dead work. Wrapping each `swCross += SoftDisk_Crossing(...)` in `#if !SW_NO_WINDING`
+// lets the TU that never needs winding (softterm) compile the accumulation OUT. Interaction PS passes
+// a runtime swCentreLit and must keep SW_NO_WINDING=0. Measured savings on RoE ~2ms/frame (estimate
+// per audit; empirical to confirm).
+#ifndef SW_NO_WINDING
+	#define SW_NO_WINDING 0
+#endif
 #ifndef SW_RAD_K
 	#define SW_RAD_K 32			// angular bins; K=16 is on the parity plateau (<0.003), 32 for headroom (radial_test)
 #endif
@@ -508,6 +532,78 @@ SW_FUNC float SoftDisk_CircleTriArea( float2 A, float2 B, float r2 )		// r2 = di
 	return SoftDisk_Sector( A, B, r2 );							// both outside, no crossing: sector
 }
 
+#if !defined(__cplusplus) && defined(__HLSL_ENABLE_16_BIT)
+// FP16 disk math (task #124, SW_WEDGE_FP16): parallels the fp32 primitives above but operates on
+// normalized-disk coords (|q| <= ~2 by construction, fp16-safe) and returns fp32 for the caller's
+// accumulator. RDNA3 packs the arithmetic (v_pk_add/mul_f16). Not bit-exact vs fp32; defect gate
+// judges. r2 is passed as fp16, always 1.0 in the normalized use.
+float SoftDisk_Tri_H16( float16_t2 A, float16_t2 B )
+{
+	return 0.5f * ( float )( A.x * B.y - A.y * B.x );
+}
+float SoftDisk_Sector_H16( float16_t2 A, float16_t2 B )
+{
+	// r2 = 1.0 (normalized), so sector area = 0.5 * angle(A,B). fast-atan uses fp32 for precision;
+	// the cross+dot inputs are fp16 (packed) and cast to fp32 before the atan polynomial.
+	const float cx = ( float )( A.x * B.y - A.y * B.x );
+	const float cy = ( float )( A.x * B.x + A.y * B.y );
+	return 0.5f * SoftFastAtan2( cx, cy );
+}
+float SoftDisk_CircleTriArea_H16( float16_t2 A, float16_t2 B )
+{
+	// Normalized r2 = 1.0. |q0|, |q1| bounded near [0, 2] by construction (we clip to disk edge in
+	// the fp32 caller before normalization; residual out-of-disk pieces flow through Sector).
+	const float16_t a2 = A.x * A.x + A.y * A.y;
+	const float16_t b2 = B.x * B.x + B.y * B.y;
+	const float16_t one = ( float16_t )1.0;
+	if( a2 <= one && b2 <= one )
+	{
+		return SoftDisk_Tri_H16( A, B );			// both inside: plain triangle
+	}
+	const float16_t2 D  = B - A;
+	const float16_t  qa = D.x * D.x + D.y * D.y;
+	if( qa < ( float16_t )1e-4 )
+	{
+		return 0.0f;
+	}
+	// Segment-circle intersection in fp16: qb, qc, disc, sqrt(disc). |A|<=2, so |qb|<=8, |qc|<=3,
+	// disc bounded ~64. fp16 sqrt is packed on RDNA3.
+	const float16_t qb   = ( float16_t )2.0 * ( A.x * D.x + A.y * D.y );
+	const float16_t qc   = a2 - one;
+	const float16_t disc = qb * qb - ( float16_t )4.0 * qa * qc;
+
+	if( disc <= ( float16_t )0.0 )
+	{
+		return SoftDisk_Sector_H16( A, B );
+	}
+	const float16_t sq = sqrt( disc );
+	const float16_t inv2qa = ( float16_t )1.0 / ( ( float16_t )2.0 * qa );
+	const float16_t t1  = ( -qb - sq ) * inv2qa;
+	const float16_t t2  = ( -qb + sq ) * inv2qa;
+	const bool ain = ( a2 <= one );
+	const bool bin = ( b2 <= one );
+	if( ain && !bin )
+	{
+		const float16_t t = clamp( t2, ( float16_t )0.0, ( float16_t )1.0 );
+		const float16_t2 X = A + t * D;
+		return SoftDisk_Tri_H16( A, X ) + SoftDisk_Sector_H16( X, B );
+	}
+	if( !ain && bin )
+	{
+		const float16_t t = clamp( t1, ( float16_t )0.0, ( float16_t )1.0 );
+		const float16_t2 X = A + t * D;
+		return SoftDisk_Sector_H16( A, X ) + SoftDisk_Tri_H16( X, B );
+	}
+	if( t1 >= ( float16_t )0.0 && t1 <= ( float16_t )1.0 && t2 >= ( float16_t )0.0 && t2 <= ( float16_t )1.0 )
+	{
+		const float16_t2 P1 = A + t1 * D;
+		const float16_t2 P2 = A + t2 * D;
+		return SoftDisk_Sector_H16( A, P1 ) + SoftDisk_Tri_H16( P1, P2 ) + SoftDisk_Sector_H16( P2, B );
+	}
+	return SoftDisk_Sector_H16( A, B );
+}
+#endif	// __HLSL_ENABLE_16_BIT
+
 // receiver-centred shading frame: nrm points at the light; (u,v) span the disk plane.
 struct softFrame_t
 {
@@ -600,27 +696,28 @@ SW_FUNC softClip_t SoftShadow_ClipSlab( float dnA, float dnB, float eps, float d
 	c.t1 = 1.0f;
 	c.empty = false;
 	float d = dnB - dnA;
+	// HOIST the reciprocal: BOTH slab planes divide by d, so one rcp + two muls beats two divs (rcp is
+	// ~1/3 the cost of a full div on RDNA). Compiler should CSE these, but writing it explicitly makes
+	// sure. The |d| < eps degenerate stays a compare, not a div.
 	if( abs( d ) < 1e-12f )
 	{
 		if( dnA < eps ) { c.empty = true; }
+		if( !c.empty && dnA > distPL ) { c.empty = true; }
 	}
 	else
 	{
-		float tc = ( eps - dnA ) / d;
-		if( d > 0.0f ) { c.t0 = max( c.t0, tc ); }
-		else           { c.t1 = min( c.t1, tc ); }
-	}
-	if( !c.empty )
-	{
-		if( abs( d ) < 1e-12f )
+		float rd = 1.0f / d;
+		float tc0 = ( eps - dnA ) * rd;
+		float tc1 = ( distPL - dnA ) * rd;
+		if( d > 0.0f )
 		{
-			if( dnA > distPL ) { c.empty = true; }
+			c.t0 = max( c.t0, tc0 );
+			c.t1 = min( c.t1, tc1 );
 		}
 		else
 		{
-			float tc = ( distPL - dnA ) / d;
-			if( d > 0.0f ) { c.t1 = min( c.t1, tc ); }
-			else           { c.t0 = max( c.t0, tc ); }
+			c.t1 = min( c.t1, tc0 );
+			c.t0 = max( c.t0, tc1 );
 		}
 	}
 	if( c.t0 > c.t1 ) { c.empty = true; }
@@ -955,6 +1052,24 @@ SW_FUNC void SwWMinBox( float3 wbc[8], float3 swP, float3 wnrm, float dpl, float
 	#define SW_BKT_FLUSH_COV( c )
 #endif
 
+// RECEIVER-APEX RESELECT (mechanism A2, session 2026-08-28): the light-apex silhouette is a physically
+// WRONG contour for open/non-manifold world-brush casters seen from inside their own shadow - the gate's
+// entire LIT_IN_UMBRA class (956, one erebus1 light) is its collapse (per-caster solo ~5e-5 where the RT
+// solo is 1.0; offline receiver-apex contour recovers 97.1% of 373 defect fragments). The reselect keeps
+// the emitted light-apex edge SET and, per fragment, (a) DROPS edges that are not a silhouette from swP
+// (both adjacent faces same-facing), and (b) FLIPS edges whose receiver-front face is the stored back.
+// Requires a per-record adjacent-normal stream aligned with the wedge records; stored orientation
+// convention: nA is the face fronting the LIGHT (boundary edges store their single face as nA and
+// nB = -nA, making them always-silhouette). C++ (test) validation first: the hooks are compiled ONLY in
+// the test build until the semantics are gate-proven, so shipped HLSL codegen stays byte-identical.
+//   g_swRcvStyle: 0 = off; drop semantics: +0 = CHORD (chain persists, connector bridges the gap),
+//   +1 = SPLIT (close the chain, restart after); flip semantics: 1/2 = SWAP endpoints post-chain,
+//   3/4 = NEGATE the edge's own contribution keeping stored geometry.
+#if defined( __cplusplus )
+	extern const float4* g_swEdgeNrm;	// 2 float4 per RECORD: [2i]=(nA.xyz,0) [2i+1]=(nB.xyz,boundary?1:0); NULL = off
+	extern int           g_swRcvStyle;
+#endif
+
 // swCentreLit > 0.5: the caller GUARANTEES the light-disk centre is visible from swP (AAM penumbra-ring
 // pass: the fragment is outside every hard shadow). Under that guarantee any nonzero winding of a
 // caster's projected silhouette around the disk centre is geometrically impossible - it is the
@@ -1046,7 +1161,9 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 			{
 				float swBrA0 = SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the previous caster's open chain
 				swArea += swBrA0;
+#if !SW_NO_WINDING
 				swCross += SoftDisk_Crossing( swPrev, swFirst );
+#endif
 				if( abs( swBrA0 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material close (prev caster)
 #if SW_RADIAL
 				SoftRadial_AccumEdge( swRad, swPrev, swFirst );
@@ -1054,6 +1171,7 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 			}
 			if( haveCaster )
 			{
+#if !SW_NO_WINDING
 				if( swCentreLit > 0.5f )
 				{
 					float swWind = swCross;										// crossing count IS the integer winding
@@ -1063,6 +1181,7 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 						swArea = 0.0f;											// near-plane chain-fragment debris, not geometry
 					}
 				}
+#endif
 				swSolo = saturate( abs( swArea ) * swInvDiskArea );
 				swOcc  = max( swOcc, swSolo );
 				swSum += swSolo;
@@ -1104,7 +1223,9 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 		{
 			float swBrA1 = SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close a finished chain before the next
 			swArea += swBrA1;
+#if !SW_NO_WINDING
 			swCross += SoftDisk_Crossing( swPrev, swFirst );
+#endif
 			if( abs( swBrA1 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material chain close
 			swFirstValid = false;
 #if SW_RADIAL
@@ -1114,6 +1235,54 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 		}
 		havePrevE1 = true;
 		prevE1w = B;
+
+		// receiver-apex reselect (see block comment above SoftShadow_WedgeOcclusionEx). Test build only.
+#if defined( __cplusplus )
+		float swRcvSign = 1.0f;
+		if( g_swRcvStyle != 0 && g_swEdgeNrm != NULL )
+		{
+			const float3 rnA = float3( g_swEdgeNrm[( swFirstElem / 2 + se ) * 2 + 0].x,
+									   g_swEdgeNrm[( swFirstElem / 2 + se ) * 2 + 0].y,
+									   g_swEdgeNrm[( swFirstElem / 2 + se ) * 2 + 0].z );
+			const float3 rnB = float3( g_swEdgeNrm[( swFirstElem / 2 + se ) * 2 + 1].x,
+									   g_swEdgeNrm[( swFirstElem / 2 + se ) * 2 + 1].y,
+									   g_swEdgeNrm[( swFirstElem / 2 + se ) * 2 + 1].z );
+			const bool rfa = dot( rnA, swP - A ) > 0.0f;
+			const bool rfb = dot( rnB, swP - A ) > 0.0f;
+			if( rfa == rfb )
+			{
+				// DROP: not a silhouette from the receiver
+				if( g_swRcvStyle == 2 || g_swRcvStyle == 4 )
+				{
+					// SPLIT: close the running chain now; restart cleanly after the gap
+					if( swFirstValid )
+					{
+						swArea += SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );
+#if !SW_NO_WINDING
+						swCross += SoftDisk_Crossing( swPrev, swFirst );
+#endif
+						swFirstValid = false;
+					}
+					havePrevE1 = false;
+				}
+				// CHORD (styles 1/3): chain state already advanced (prevE1w = B); the next kept edge's
+				// connector bridges straight across this edge's projected span.
+				continue;
+			}
+			if( !rfa )
+			{
+				// FLIP: the stored orientation fronts the light, the receiver sees the back face
+				if( g_swRcvStyle <= 2 )
+				{
+					const float3 swT = A; A = B; B = swT;		// SWAP: traverse the edge backwards
+				}
+				else
+				{
+					swRcvSign = -1.0f;							// NEGATE: keep geometry, flip the sign
+				}
+			}
+		}
+#endif
 
 		// clip the edge's parameter interval to the depth slab [swEps, swDistPL]; an empty interval = the
 		// whole edge is behind the receiver or beyond the light, contributes no vertex, and its span is
@@ -1145,15 +1314,31 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 		float2 q0 = SoftShadow_ProjectVertWedge( pa, dna, swF );
 		float2 q1 = SoftShadow_ProjectVertWedge( pb, dnb, swF );
 
-		if( swFirstValid ) { float swBrA2 = SoftDisk_CircleTriArea( swPrev, q0, swR2 ); swArea += swBrA2; swCross += SoftDisk_Crossing( swPrev, q0 );
+		if( swFirstValid )
+		{
+			float swBrA2 = SoftDisk_CircleTriArea( swPrev, q0, swR2 );
+			swArea += swBrA2;
+#if !SW_NO_WINDING
+			swCross += SoftDisk_Crossing( swPrev, q0 );
+#endif
 			if( abs( swBrA2 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material intra-chain bridge
 #if SW_RADIAL
 			SoftRadial_AccumEdge( swRad, swPrev, q0 );				// connector (degenerate for eligible casters)
 #endif
 		}
 		else               { swFirst = q0; swFirstValid = true; }
+#if defined( __cplusplus )
+		swArea += swRcvSign * SoftDisk_CircleTriArea( q0, q1, swR2 );	// NEGATE-style reselect flips only the edge's own term
+#else
 		swArea += SoftDisk_CircleTriArea( q0, q1, swR2 );
+#endif
+#if !SW_NO_WINDING
+#if defined( __cplusplus )
+		swCross += swRcvSign * SoftDisk_Crossing( q0, q1 );
+#else
 		swCross += SoftDisk_Crossing( q0, q1 );
+#endif
+#endif
 #if SW_RADIAL
 		// mirror EVERY shoelace segment into the radial union so it integrates the identical clipped loop; feed
 		// the predicate only the real silhouette edge direction (connectors are degenerate for eligible casters).
@@ -1166,7 +1351,9 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 	{
 		float swBrA3 = SoftDisk_CircleTriArea( swPrev, swFirst, swR2 );	// close the last caster's open chain
 		swArea += swBrA3;
+#if !SW_NO_WINDING
 		swCross += SoftDisk_Crossing( swPrev, swFirst );
+#endif
 		if( abs( swBrA3 ) > swWlBrArea ) { swClipOut |= 4; swCurBig = true; }	// material final close
 #if SW_RADIAL
 		SoftRadial_AccumEdge( swRad, swPrev, swFirst );
@@ -1174,6 +1361,7 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 	}
 	if( haveCaster )
 	{
+#if !SW_NO_WINDING
 		if( swCentreLit > 0.5f )
 		{
 			float swWind = swCross;										// crossing count IS the integer winding
@@ -1183,6 +1371,7 @@ SW_FUNC float SoftShadow_WedgeOcclusionEx( float3 swP, float3 swL, float swR, in
 				swArea = 0.0f;
 			}
 		}
+#endif
 		swSolo = saturate( abs( swArea ) * swInvDiskArea );
 		swOcc  = max( swOcc, swSolo );
 		swSum += swSolo;

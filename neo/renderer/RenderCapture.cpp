@@ -2640,6 +2640,9 @@ int R_SoftShadowGate( const char* arg )
 	cvarSystem->SetCVarInteger( "r_softShadowSurfCache", swGateCache );
 
 	GateCfg cfg;
+	// PROBE (com_softShadowGateDumpLitInUmbra): per LIT_IN_UMBRA defect emit-site, dump centre-pixel
+	// (x,y,area,box,ana,rt) - enough to locate the failing wedge fragment for offline root-cause work.
+	cfg.dumpLitInUmbra = cvarSystem->GetCVarInteger( "com_softShadowGateDumpLitInUmbra" );
 	std::vector<GateDefect> all;
 	int capsRun = 0, lightsRun = 0;
 
@@ -2662,8 +2665,13 @@ int R_SoftShadowGate( const char* arg )
 	std::vector<renderLight_t> mapLights;
 	std::vector<renderEntity_t> mapModels;		// static model entities (func_static etc.) - the live game's casters
 
+	// WALL-CLOCK instrument (2026-08-28): per-cap and total gate latency, printed so a gate
+	// pessimisation is visible in every log without file-mtime archaeology. Over-estimates (map
+	// reload + readbacks + CPU detectors all included) - that is the point: the number a user waits.
+	const int swGateWall0 = Sys_Milliseconds();
 	for( int fi = 0; fi < files.Num(); fi++ )
 	{
+		const int swCapWall0 = Sys_Milliseconds();
 		gateCap_t cap;
 		idStr full = dir + "/" + files[fi];
 		if( !GateLoadCap( full.c_str(), cap ) )
@@ -3286,7 +3294,34 @@ int R_SoftShadowGate( const char* arg )
 						GateUnproject( invArb.ToFloatPtr(), x, y, W, H, dep, wp );
 						return GateTruthVisibility( idVec3( wp[0], wp[1], wp[2] ), gLightOrg, diskR, cap, li );
 					};
+					const size_t defectsBefore = defects.size();
 					GateAgreement( anaA, rt, valid, cfg, defects, &defectPx, &crease, truthAt );
+					// LIT_IN_UMBRA WORLD-POSITION DUMP (session 2026-08-28-d): for the defects
+					// GateAgreement added, print each LIT_IN_UMBRA centre's world pos + light origin +
+					// disk radius + edgeCount. Combined with the shader-side probe (x,y,ana,rt), a fix
+					// author can locate the failing wedge-fragment rays offline.
+					int probeBudget = cvarSystem->GetCVarInteger( "com_softShadowGateDumpLitInUmbra" );
+					if( probeBudget > 0 && !posBuf.empty() )
+					{
+						for( size_t di = defectsBefore; di < defects.size() && probeBudget > 0; di++ )
+						{
+							const swgate::GateDefect& d = defects[di];
+							if( d.kind != swgate::GATE_LIT_IN_UMBRA )
+							{
+								continue;
+							}
+							const int cx = ( d.x0 + d.x1 ) / 2;
+							const int cy = ( d.y0 + d.y1 ) / 2;
+							const size_t i = ( size_t )cy * W + cx;
+							const float wx = posBuf[i * 4 + 0], wy = posBuf[i * 4 + 1], wz = posBuf[i * 4 + 2], wv = posBuf[i * 4 + 3];
+							const int edgeCount = ( int )s_edges.size();
+							common->Printf( "[softgate-wpos] LIT_IN_UMBRA @(%d,%d) area=%d wp=(%.1f,%.1f,%.1f,%.0f) L=(%.1f,%.1f,%.1f) R=%.1f nEdges=%d cap=%s L%d\n",
+										cx, cy, d.area, wx, wy, wz, wv,
+										gLightOrg.x, gLightOrg.y, gLightOrg.z, diskR, edgeCount,
+										cap.name.c_str(), li );
+							probeBudget--;
+						}
+					}
 					// HIGH-FREQUENCY GRAIN ("ants"): a frequency test, not a value diff - flag analytic
 					// high-pass energy where the denoised (high-ray-equivalent) RT is flat. Catches the
 					// spatially-stable scanline speckle the value-based agreement judge is blind to.
@@ -4460,6 +4495,9 @@ int R_SoftShadowGate( const char* arg )
 			rw = NULL;
 			loadedMap.Clear();
 		}
+		common->Printf( "[softgate] %s: wall %.1f s (cumulative %.1f s)\n", files[fi].c_str(),
+						( Sys_Milliseconds() - swCapWall0 ) * 0.001f,
+						( Sys_Milliseconds() - swGateWall0 ) * 0.001f );
 	}
 
 	if( rw != NULL )
@@ -4506,6 +4544,8 @@ int R_SoftShadowGate( const char* arg )
 							cs[7], cs[8], cs[9], cs[10] );
 		}
 	}
+	common->Printf( "[softgate] TOTAL WALL: %.1f s (%d captures, %d lights)\n",
+					( Sys_Milliseconds() - swGateWall0 ) * 0.001f, capsRun, lightsRun );
 	common->Printf( "[softgate] TOTAL DEFECTS: %d across %d captures, %d lights -> %s\n",
 					( int )all.size(), capsRun, lightsRun, all.empty() ? "PASS" : "FAIL" );
 	return ( int )all.size();

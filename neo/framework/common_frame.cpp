@@ -1189,8 +1189,15 @@ void idCommonLocal::Frame()
 						std::sort( ss.Ptr(), ss.Ptr() + sn );
 						double ssum = 0.0;
 						for( int i = 0; i < sn; i++ ) { ssum += s_probeSoft[i]; }
-						common->Printf( "[softprobe] SOFT-SHADOW term GPU: mean %.2f med %.2f p99 %.2f max %.2f ms (this is the number the cache moves - compare ON vs OFF)\n",
-										ssum / sn, ss[sn / 2], ss[Min( sn - 1, ( sn * 99 ) / 100 )], ss[sn - 1] );
+						const double smean = ssum / sn;
+						// Per-frame stdev over the N=sn samples: sqrt( sum((x-mean)^2) / (n-1) ).
+						// (n-1) not n so 95% CI = ~2*stdev/sqrt(n) reads directly as a sample-mean CI.
+						double ssq = 0.0;
+						for( int i = 0; i < sn; i++ ) { const double d = s_probeSoft[i] - smean; ssq += d * d; }
+						const double sstd = ( sn > 1 ) ? ( double )idMath::Sqrt( ( float )( ssq / ( double )( sn - 1 ) ) ) : 0.0;
+						const double sci95 = ( sn > 1 ) ? ( 2.0 * sstd / ( double )idMath::Sqrt( ( float )sn ) ) : 0.0;
+						common->Printf( "[softprobe] SOFT-SHADOW term GPU: mean %.2f med %.2f p99 %.2f max %.2f ms | stdev %.2f  95%%CI(mean) +/-%.2f  n=%d (this is the number the cache moves - compare ON vs OFF)\n",
+										smean, ss[sn / 2], ss[Min( sn - 1, ( sn * 99 ) / 100 )], ss[sn - 1], sstd, sci95, sn );
 						s_probeSoft.Clear();
 					}
 					// contributor-cache health (r_softShadowContribCache): cumulative serve/record volumes -
@@ -1211,6 +1218,30 @@ void idCommonLocal::Frame()
 							common->Printf( "[softprobe] CONTRIB diag: budget-blocked %u | probe-exhausted %u | built-unservable %u | refine records %u | active lights %llu\n",
 											ccs[7], ccs[8], ccs[9], ccs[10],
 											( unsigned long long )backEnd.GetSoftShadowTermPass()->m_ContribActiveLights );
+						}
+					}
+					// REPAIR-PHASE census (r_softShadowRepairStats): drain the 16-uint accumulator + print
+					// per-phase attribution. Bail-rate, arbiter-branch mix, ring-survivor rate - answers WHY
+					// task A did/did not move mean latency without another A/B round-trip.
+					if( cvarSystem->GetCVarInteger( "r_softShadowRepairStats" ) > 0
+							&& backEnd.GetSoftShadowTermPass() != NULL )
+					{
+						uint32_t rs[16] = {};
+						if( backEnd.GetSoftShadowTermPass()->GetRepairStats( rs ) )
+						{
+							for( int ph = 0; ph < 2; ph++ )
+							{
+								const uint32_t* r = rs + ph * 8;
+								const uint32_t disp = r[0], bail = r[1];
+								const double bailPct = disp > 0 ? 100.0 * ( double )bail / ( double )disp : 0.0;
+								const double runPct  = disp > 0 ? 100.0 * ( double )( disp - bail ) / ( double )disp : 0.0;
+								const uint32_t arb = r[3];
+								const uint32_t bin = r[4], cluster = r[5], fallback = r[6], agree = r[7];
+								const double agreePct = arb > 0 ? 100.0 * ( double )agree / ( double )arb : 0.0;
+								common->Printf( "[softprobe] REPAIR phase %d: groups %u  bail %u (%.1f%%)  ran %.1f%%  candPixels %u  arbiter %u (bin %u / cluster %u / fallback %u) agree %u (%.1f%%)\n",
+										ph + 1, disp, bail, bailPct, runPct,
+										r[2], arb, bin, cluster, fallback, agree, agreePct );
+							}
 						}
 					}
 					// WEDGE-SELECTOR eligibility census (r_softShadowWedgeCensus): report the LAST fully-collected

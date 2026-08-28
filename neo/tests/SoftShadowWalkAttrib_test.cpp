@@ -46,6 +46,9 @@ version. See <http://www.gnu.org/licenses/>.
 // softwedge_coverage.inc.hlsl). Every test TU that includes the walker references these; defining them
 // here (and nowhere else) keeps the inline walker bodies identical across TUs -> no ODR divergence.
 swAttrib_t g_swAttrib = {};
+// receiver-apex reselect hooks (mechanism A2, SoftShadowUnionAttrib study) - same ODR rule as g_swAttrib
+const float4* g_swEdgeNrm = NULL;
+int           g_swRcvStyle = 0;
 bool       g_swAttribOn = false;
 
 using namespace swtest;
