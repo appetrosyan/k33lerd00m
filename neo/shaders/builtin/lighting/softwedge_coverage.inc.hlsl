@@ -456,6 +456,21 @@ SW_FUNC float SoftDisk_CircleTriArea( float2 A, float2 B, float r2 )		// r2 = di
 		return 0.0f;											// degenerate edge (endpoints coincide): no area, avoids /0
 	}
 
+	// L2 (task #123): cheap closest-point-on-segment reject before the roots. Fires only when BOTH endpoints are
+	// outside AND the interior of the segment is monotone away from the origin (t* = -dot(A,D)/qa is <=0 or >=1),
+	// which means the closest point is an endpoint. Both endpoints outside + endpoint-closest => segment cannot
+	// reach the disk => the correct area is exactly SoftDisk_Sector. Cost: 1 dot (2 muls + add), 3 cmps. Skips
+	// SegCircleRoots (4 dots + 4 muls + cmp, plus the sqrt when disc > 0). Lossless: identical output for the
+	// cases the original code would have hit via `rt.disc <= 0 -> Sector` (line outside disk).
+	if( a2 > r2 && b2 > r2 )
+	{
+		float dAD = dot( A, D );
+		if( dAD >= 0.0f || dAD + qa <= 0.0f )
+		{
+			return SoftDisk_Sector( A, B, r2 );					// both outside, endpoint-closest => no crossing
+		}
+	}
+
 	softSegRoots_t rt = SoftDisk_SegCircleRoots( A, D, r2 );
 
 	bool ain = ( a2 <= r2 );
@@ -1200,6 +1215,42 @@ SW_FUNC float SoftShadow_WedgeOcclusion( float3 swP, float3 swL, float swR, int 
 	int   swNContribDisc = 0;
 	int   swClipDisc = 0;
 	return SoftShadow_WedgeOcclusionEx( swP, swL, swR, swFirstElem, swN, swCentreLit, swGapDisc, swNContribDisc, swClipDisc SW_EDGEBUF_ARG );
+}
+
+// ATTRIBUTION probe (r_softShadowWedgeAblate 5, mode 34): walk the record stream EXACTLY like the wedge
+// but do ZERO edge math - only per-header sphere-cull + SW_JUMP_SKIP span-skip. Returns a tiny non-const
+// value so the whole walk cannot DCE. mode-4 minus mode-5 = the surviving-caster EDGE cost; mode-5 minus
+// the 5.74ms fixed overhead = the per-caster CULL cost.
+SW_FUNC float SoftShadow_WedgeCullCost( float3 swP, float3 swL, float swR, int swFirstElem, int swN SW_EDGEBUF_PARAM )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float  swDistPL = swF.distPL;
+	float  swSinA = saturate( swR / swDistPL );
+	float  swCosA = sqrt( 1.0f - swSinA * swSinA );
+	const float swEps = SW_NEAR_EPS;
+
+	uint  swAcc = 0;
+	bool  swSkip = false;
+	for( int se = 0; se < swN; se++ )
+	{
+		float4 e0 = t_SoftEdges[ swFirstElem + se * 2 + 0 ];
+		float4 e1 = t_SoftEdges[ swFirstElem + se * 2 + 1 ];
+		if( e0.w < 0.0f )
+		{
+			swSkip = false;
+			float3 dCv = float3( e0.x, e0.y, e0.z ) - swP;
+			swSkip = SoftShadow_CullCaster( dCv, e1.x, swF, swSinA, swCosA, swEps );
+			swAcc += swSkip ? 1u : 0u;
+#if SW_JUMP_SKIP
+			if( swSkip ) { se += ( int )e1.y; }
+#endif
+			continue;
+		}
+		if( swSkip ) { continue; }
+		swAcc += 1u;
+	}
+	return saturate( ( float )swAcc * 1e-6f );
 }
 
 // ===================================================================================================
@@ -2856,6 +2907,252 @@ SW_FUNC float SoftShadow_FaceCoverage( float3 swP, float3 swL, float swR, int sw
 }
 
 // ---------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------
+// MASKED caster-table walk - the WEDGE-WHITELIST HYBRID's cut-caster walk (r_softShadowWedgeWhitelist
+// 2). A minimal clone of SoftShadow_FaceCoverage above (which must stay byte-identical on the shipped
+// path) that walks ONLY the casters whose bit is set in swWalkMask: bit k of the 64-bit mask (x = bits
+// 0-31, y = 32-63) set = WALK caster k; clear = that caster is served by its clean wedge area instead.
+// Casters with index >= 64 are ALWAYS walked - conservative (the mask cannot certify them). Bit ops
+// only: dynamic indexing of local arrays is a register hazard. With an all-set mask the walk is
+// bit-exact vs SoftShadow_FaceCoverage (SoftShadowWedge_test holds the two together); the instrument
+// macros (SW_ATTRIB/SW_BKT/wMin/profile) are deliberately absent so the shipped walk's conservation
+// counters never double-count a serve-then-fallback fragment.
+SW_FUNC float SoftShadow_FaceCoverageMasked( float3 swP, float3 swL, float swR, int swTriBase, int swCasterBase, int swCasterCount, float swRotAng, uint2 swWalkMask SW_EDGEBUF_PARAM )
+{
+	swR = max( swR, 1e-2f );
+	softFrame_t swF = SoftShadow_Frame( swP, swL );
+	float  swDistPL = swF.distPL;
+	float  swSinA = saturate( swR / swDistPL );
+	float  swCosA = sqrt( 1.0f - swSinA * swSinA );
+	const float swEps = SW_NEAR_EPS;
+
+	// unit-disk sample coords + packed neighbours: identical tables to SoftShadow_FaceCoverage.
+#if SW_FACE_SAMPLES == 8
+	const float2 swDisk[8] =
+	{
+		float2( 0.250000f, 0.000000f), float2(-0.319290f, 0.292496f),
+		float2( 0.048872f,-0.556877f), float2( 0.402444f, 0.524918f),
+		float2(-0.738535f,-0.130636f), float2( 0.699605f,-0.445031f),
+		float2(-0.234004f, 0.870484f), float2(-0.446271f,-0.859268f),
+	};
+	const uint swNbr[8] =
+	{
+		0x08609443u, 0x0e218086u, 0x06121407u, 0x082284c0u,
+		0x066008e1u, 0x08138c40u, 0x0a220061u, 0x06508082u,
+	};
+#elif SW_FACE_SAMPLES == 16
+	const float2 swDisk[16] =
+	{
+		float2( 0.176777f, 0.000000f), float2(-0.225772f, 0.206826f),
+		float2( 0.034558f,-0.393771f), float2( 0.284571f, 0.371173f),
+		float2(-0.522223f,-0.092374f), float2( 0.494695f,-0.314685f),
+		float2(-0.165466f, 0.615525f), float2(-0.315561f,-0.607594f),
+		float2( 0.684642f, 0.250030f), float2(-0.712256f, 0.294009f),
+		float2( 0.343354f,-0.733729f), float2( 0.253730f, 0.808932f),
+		float2(-0.764746f,-0.443186f), float2( 0.897134f,-0.197232f),
+		float2(-0.547507f, 0.778772f), float2(-0.126487f,-0.976090f),
+	};
+	const uint swNbr[16] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x0a132d00u,
+		0x0023a581u, 0x0681014du, 0x0091adc1u, 0x00a231e2u,
+		0x02b281a3u, 0x00c33824u, 0x1a03bc45u, 0x00e0a0c3u,
+		0x02f124e4u, 0x04350105u, 0x06458526u, 0x08560947u,
+	};
+#else
+	const float2 swDisk[32] =
+	{
+		float2( 0.125000f, 0.000000f), float2(-0.159645f, 0.146248f),
+		float2( 0.024436f,-0.278438f), float2( 0.201222f, 0.262459f),
+		float2(-0.369268f,-0.065318f), float2( 0.349802f,-0.222516f),
+		float2(-0.117002f, 0.435242f), float2(-0.223136f,-0.429634f),
+		float2( 0.484115f, 0.176798f), float2(-0.503641f, 0.207896f),
+		float2( 0.242788f,-0.518824f), float2( 0.179414f, 0.572001f),
+		float2(-0.540757f,-0.313380f), float2( 0.634370f,-0.139464f),
+		float2(-0.387146f, 0.550675f), float2(-0.089440f,-0.690200f),
+		float2( 0.549072f, 0.462758f), float2(-0.738878f, 0.030555f),
+		float2( 0.538955f,-0.536332f), float2(-0.036058f, 0.779792f),
+		float2(-0.512818f,-0.614527f), float2( 0.812360f, 0.109302f),
+		float2(-0.688311f, 0.478909f), float2( 0.188086f,-0.836061f),
+		float2( 0.435033f, 0.759191f), float2(-0.850448f,-0.271316f),
+		float2( 0.826102f,-0.381680f), float2(-0.357888f, 0.855156f),
+		float2(-0.319407f,-0.888034f), float2( 0.849909f, 0.446688f),
+		float2(-0.944035f, 0.248845f), float2( 0.536596f,-0.834530f),
+	};
+	const uint swNbr[32] =
+	{
+		0x0c809443u, 0x04348086u, 0x08f2a807u, 0x20132d00u,
+		0x0478a581u, 0x1121014du, 0x1239adc1u, 0x384a31e2u,
+		0x0a06d470u, 0x3ce0d891u, 0x3ef15cb2u, 0x11036073u,
+		0x1313e684u, 0x01246aa5u, 0x0334db66u, 0x28255f87u,
+		0x2a35e3a8u, 0x2cc267c9u, 0x2ed2ebeau, 0x07871b6bu,
+		0x09979f8cu, 0x0ba8750du, 0x0db8f92eu, 0x0fc97d4fu,
+		0x103ece0bu, 0x13e2522cu, 0x15f2d64du, 0x12bb1a6eu,
+		0x14cb9e8fu, 0x06dc22b0u, 0x08eca6d1u, 0x1e5d2af2u,
+	};
+#endif
+	// ray to disk sample i = swBase + swSu*rot(swDisk[i]) (t=1 lands on the light plane)
+	float3 swBase = swL - swP;
+	float3 swSu = swF.u * swR;
+	float3 swSv = swF.v * swR;
+	float  swCa = cos( swRotAng );
+	float  swSa = sin( swRotAng );
+
+#if SW_FP16_LOOP
+	float  swMD = SoftMaxComp3( swBase ) + SoftMaxComp3( swSu ) + SoftMaxComp3( swSv );
+	float  swKD = 1.0f / max( swMD, 1e-19f );
+	float3 swU2 = swSu * swCa + swSv * swSa;
+	float3 swV2 = swSv * swCa - swSu * swSa;
+#endif
+
+#if !SW_FACE_LEGACY && SW_FACE_HOIST_DIRS
+	float3 swDir[SW_FACE_SAMPLES];
+	for( int di = 0; di < SW_FACE_SAMPLES; di++ )
+	{
+		float2 s0 = swDisk[di];
+		float2 sc = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+		swDir[di] = swBase + swSu * sc.x + swSv * sc.y;
+	}
+#endif
+
+	uint swMask = 0u;						// bit i set once sample i's ray is blocked by any triangle (union)
+	const uint swAll = 0xffffffffu >> ( 32 - SW_FACE_SAMPLES );
+#if SW_SCANLINE
+	SwGridWord swGrid[SW_SCAN_CHORDS];
+	const int swDiskBits = SW_SCAN_DISKBITS;
+	float2 swEnv[SW_SCAN_CHORDS];
+	SW_UNROLL for( int gi = 0; gi < SW_SCAN_CHORDS; gi++ ) { swGrid[gi] = SwGridZero(); swEnv[gi] = SwEnvZero(); }
+#endif
+	for( int sc = 0; sc < swCasterCount; sc++ )
+	{
+		// the ONE divergence from SoftShadow_FaceCoverage: skip casters whose walk bit is clear. The
+		// serve's per-caster wedge scan set bit k for every CUT caster; a clear bit certifies caster
+		// k's clean wedge area serves it instead. Indices past the mask always walk (conservative).
+		if( sc < 64 )
+		{
+			const uint swWlBit = ( sc < 32 ) ? ( ( swWalkMask.x >> ( uint )sc ) & 1u )
+							   : ( ( swWalkMask.y >> ( uint )( sc - 32 ) ) & 1u );
+			if( swWlBit == 0u )
+			{
+				continue;
+			}
+		}
+		float4 c0 = t_SoftEdges[ swCasterBase + sc * 2 + 0 ];		// ( centre.xyz, radius )
+		float4 c1 = t_SoftEdges[ swCasterBase + sc * 2 + 1 ];		// ( firstTri, numTris, 0, 0 )
+		float3 dCv = float3( c0.x, c0.y, c0.z ) - swP;
+		if( SoftShadow_CullCaster( dCv, c0.w, swF, swSinA, swCosA, swEps ) )
+		{
+			continue;
+		}
+		const int swTriFirst = ( int )c1.x;
+		const int swTriEnd   = swTriFirst + ( int )c1.y;
+		for( int t = swTriFirst; t < swTriEnd; t++ )
+		{
+			const int b = swTriBase + t * 3;
+			float4 r0 = t_SoftEdges[ b + 0 ];						// ( v0.xyz, v0-radius ) - coarse reject reads ONLY this
+			// COARSE v0-CENTERED REJECT (bit-exact defer, see SoftShadow_FaceCoverage)
+			{
+				float3 rc0 = float3( r0.x, r0.y, r0.z ) - swP;
+				float  cd0 = dot( rc0, swF.nrm );
+				float  vr0 = r0.w;
+				if( cd0 + vr0 < swEps ) { continue; }
+				if( cd0 - vr0 > swDistPL ) { continue; }
+				float3 pp0 = rc0 - cd0 * swF.nrm;
+				float  cr0 = swR * ( cd0 + vr0 ) / swDistPL;
+				if( dot( pp0, pp0 ) > ( cr0 + vr0 ) * ( cr0 + vr0 ) ) { continue; }
+			}
+			float4 r1 = t_SoftEdges[ b + 1 ];						// ( v1.xyz, centroid-radius ) - lazy: survivors only
+			float4 r2 = t_SoftEdges[ b + 2 ];						// ( v2.xyz, 0 )
+			float3 v0 = float3( r0.x, r0.y, r0.z );
+			float3 v1 = float3( r1.x, r1.y, r1.z );
+			float3 v2 = float3( r2.x, r2.y, r2.z );
+			// PER-TRIANGLE CONE/SLAB REJECT (conservative => bit-exact; see SoftShadow_FaceCoverage)
+			float3 tcen = ( v0 + v1 + v2 ) * ( 1.0f / 3.0f );
+			float3 rc   = tcen - swP;
+			float  cd   = dot( rc, swF.nrm );						// centroid depth along the cone axis
+			float  triRad = r1.w;
+			if( cd + triRad < swEps ) { continue; }					// wholly behind the receiver
+			if( cd - triRad > swDistPL ) { continue; }				// wholly beyond the light
+			float3 perp = rc - cd * swF.nrm;
+			float  coneR = swR * ( cd + triRad ) / swDistPL;
+			if( dot( perp, perp ) > ( coneR + triRad ) * ( coneR + triRad ) ) { continue; }
+#if SW_SCANLINE
+			SoftScan_FillTri( swGrid, swEnv, v0, v1, v2, swP, swF, swR, swEps );	// Fubini interval union
+			{
+				// UMBRA EARLY-OUT + rounding, identical to SoftShadow_FaceCoverage
+				int swCovE = 0;
+				SW_UNROLL for( int fm = 0; fm < SW_SCAN_CHORDS; fm++ ) { SW_CHORD_SKIP( fm ) swCovE += SoftScan_PC( swGrid[fm] & SW_SCAN_MASK[fm] ); }
+				if( swCovE * 100 >= swDiskBits * 99 ) { return 1.0f; }
+			}
+#else
+			float3 edge1 = v1 - v0;
+			float3 edge2 = v2 - v0;
+			float3 sp = swP - v0;
+			float3 qq   = cross( sp, edge1 );
+			float  e2qq = dot( edge2, qq );
+#if SW_FP16_LOOP
+			swMask = SoftShadow_FaceTriHitsFP16( swMask, edge1, edge2, sp, qq, e2qq,
+												 swBase, swU2, swV2, swMD, swKD, swDisk );
+#else
+			for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+			{
+				if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }	// sample already blocked: skip
+#if !SW_FACE_HOIST_DIRS
+				float2 s0  = swDisk[i];
+				float2 sc2 = float2( s0.x * swCa - s0.y * swSa, s0.x * swSa + s0.y * swCa );
+				float3 dir = swBase + swSu * sc2.x + swSv * sc2.y;
+#else
+				float3 dir = swDir[i];								// precomputed once per fragment (hoisted)
+#endif
+				float3 h   = cross( dir, edge2 );
+				float  aa  = dot( edge1, h );
+				if( abs( aa ) < 1e-12f ) { continue; }				// ray parallel to triangle
+				float  inv = 1.0f / aa;
+				float  u   = inv * dot( sp, h );
+				if( u < 0.0f || u > 1.0f ) { continue; }
+				float  vv  = inv * dot( dir, qq );
+				if( vv < 0.0f || u + vv > 1.0f ) { continue; }
+				float  tt  = inv * e2qq;
+				if( tt > 1e-4f && tt <= 1.0f ) { swMask |= ( 1u << i ); }
+			}
+#endif	// SW_FP16_LOOP
+			if( swMask == swAll ) { break; }	// every sample blocked: fully in umbra
+#endif	// SW_SCANLINE
+		}
+#if !SW_SCANLINE
+		if( swMask == swAll ) { break; }		// umbra: no caster can add anything
+#endif
+	}
+#if SW_SCANLINE
+	{
+		float swCov = SoftScan_ReduceCov( swGrid, swEnv, SW_SCAN_MASK );	// fractional endpoints on single-run chords
+		return swDiskBits > 0 ? swCov / ( float )swDiskBits : 0.0f;
+	}
+#else
+	// Morphological CLOSE, identical to SoftShadow_FaceCoverage (seals interior tessellation cracks)
+#if !SW_FACE_LEGACY
+	if( swMask != 0u && swMask != swAll )
+#endif
+	{
+		uint filled = swMask;
+		for( int i = 0; i < SW_FACE_SAMPLES; i++ )
+		{
+			if( ( swMask & ( 1u << i ) ) != 0u ) { continue; }
+			uint nb = swNbr[i];
+			int blocked = 0;
+			for( int k = 0; k < 6; k++ )
+			{
+				int j = ( int )( ( nb >> ( 5 * k ) ) & 31u );
+				if( ( swMask & ( 1u << j ) ) != 0u ) { blocked++; }
+			}
+			if( blocked >= 5 ) { filled |= ( 1u << i ); }
+		}
+		swMask = filled;
+	}
+	return ( float )SoftPopcount32( swMask ) / ( float )SW_FACE_SAMPLES;
+#endif	// SW_SCANLINE
+}
+
 // TILE-BINNED face coverage (r_softShadowTileBin). A per-light compute prepass (softtile_bin.cs.hlsl)
 // tests every triangle record against each 16x16 screen tile's depth-bounded receiver volume with the
 // SAME cone/slab cull the full walk runs per fragment - conservatively inflated by the tile's world

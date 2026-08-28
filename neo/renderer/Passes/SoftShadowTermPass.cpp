@@ -53,8 +53,15 @@ struct SoftTermCB
 							// pipeline. Mirrors g_sub in softterm.cs.hlsl.
 	int		wedge[4];		// HYBRID WHITELIST (r_softShadowWedgeWhitelist): x = wedge-block float4 element
 							// base into t_SoftEdges (< 0 = no block this light), y = record count (float4
-							// pairs), z/w reserved (gap tol / mode knobs). Caster order == the caster
-							// table's. Mirrors g_wedge in softterm.cs.hlsl.
+							// pairs), z = cvar mode (2 = serve), w = bound-gap tolerance x10000
+							// (r_softShadowWLGapTol). Caster order == the caster table's. Mirrors g_wedge
+							// in softterm.cs.hlsl.
+	int		repairBin[4];	// REPAIR ARBITER (r_softShadowWedgeWhitelist 3, softrepair): x = FACE tile-bin
+							// base (float4 elements into t_SoftTiles) so the exact-walk arbiter runs
+							// SoftShadow_FaceCoverageList (tile-binned, ~20 tris) instead of walking the
+							// whole face tri stream (~1000 tris, 6ms/frame). Shares tilesX/tileOx/tileOy
+							// with g_range.w/g_tile.x/g_tile.y (same view, same tile grid). < 0 = no face
+							// bin this light (arbiter falls back to whole-stream FaceCoverage). yzw reserved.
 };
 
 // mirrors c_Blur in softblur.cs.hlsl
@@ -349,6 +356,38 @@ void SoftShadowTermPass::EnsurePipeline()
 			pn.CS = m_ShaderScan;
 			m_PipelineScan = m_Device->createComputePipeline( pn );
 		}
+
+		// WEDGE-REPAIR pipelines (r_softShadowWedgeWhitelist 3): ant kill + turd probe over the raw
+		// wedge term. Same binding layout (the repair shader's registers are a subset of the term's).
+		idList<shaderMacro_t> repairMacros;
+		repairMacros.Append( shaderMacro_t( "SW_GPU_WALK_COUNTERS", "0" ) );
+		repairMacros.Append( shaderMacro_t( "SW_SURF_CACHE", "0" ) );
+		repairMacros.Append( shaderMacro_t( "SW_SURF_GRID", "0" ) );
+		repairMacros.Append( shaderMacro_t( "SW_SCANLINE", "1" ) );
+		repairMacros.Append( shaderMacro_t( "SW_CONTRIB_CACHE", "0" ) );
+		repairMacros.Append( shaderMacro_t( "SW_FACE_SAMPLES", "8" ) );	// arbiter needs only a lit/not-lit
+															// verdict (RP_EXACT_AGREES), not a precise coverage;
+															// 8 rays halves the per-call arbiter cost vs 16.
+		repairMacros.Append( shaderMacro_t( "SW_SCAN_CHORDS", chordsStr ) );
+		repairMacros.Append( shaderMacro_t( "SW_ADAPT_CHORDS", "0" ) );
+		repairMacros.Append( shaderMacro_t( "SW_SUBSAMPLE", "0" ) );
+		repairMacros.Append( shaderMacro_t( "REPAIR_PHASE", "0" ) );
+		m_ShaderRepairAnts = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair", SHADER_STAGE_COMPUTE, "ants", repairMacros, true, LAYOUT_DRAW_VERT ) );
+		repairMacros[ repairMacros.Num() - 1 ] = shaderMacro_t( "REPAIR_PHASE", "1" );
+		m_ShaderRepairTurds = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair", SHADER_STAGE_COMPUTE, "turds", repairMacros, true, LAYOUT_DRAW_VERT ) );
+		repairMacros[ repairMacros.Num() - 1 ] = shaderMacro_t( "REPAIR_PHASE", "2" );
+		m_ShaderRepairHoles = renderProgManager.GetShader( renderProgManager.FindShader( "builtin/lighting/softrepair", SHADER_STAGE_COMPUTE, "holes", repairMacros, true, LAYOUT_DRAW_VERT ) );
+		if( m_ShaderRepairAnts != nullptr && m_ShaderRepairTurds != nullptr && m_ShaderRepairHoles != nullptr )
+		{
+			nvrhi::ComputePipelineDesc pr;
+			pr.bindingLayouts = { m_Layout };
+			pr.CS = m_ShaderRepairAnts;
+			m_PipelineRepairAnts = m_Device->createComputePipeline( pr );
+			pr.CS = m_ShaderRepairTurds;
+			m_PipelineRepairTurds = m_Device->createComputePipeline( pr );
+			pr.CS = m_ShaderRepairHoles;
+			m_PipelineRepairHoles = m_Device->createComputePipeline( pr );
+		}
 	}
 
 	// ADAPTIVE SUB-SAMPLING permutations (SW_SUBSAMPLE=1, r_softShadowSubSample): two-phase lattice +
@@ -642,6 +681,7 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 								   uint32_t casterFirstElem, int casterCount,
 								   float penumbraRadius,
 								   int tileBase, int tileOx, int tileOy, int tilesX,
+								   int tileFaceBase,
 								   nvrhi::IBuffer* tileBuffer,
 								   nvrhi::IBuffer* tileCullBuffer,
 								   nvrhi::ITexture* falloffTex, nvrhi::ISampler* falloffSamp,
@@ -766,13 +806,19 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 							( ( vLight->globalLightOrigin - viewDef->renderView.vieworg ).LengthSqr() <= swNearR * swNearR );
 	extern idCVar r_softShadowSurfCacheMinLight;
 	const int swLightStatic = ( vLight != NULL ) ? vLight->softStaticCasterCount : 0;
+	extern idCVar r_softShadowWedgeWhitelist;
+	const bool swWedgeTermSel = ( r_softShadowWedgeWhitelist.GetInteger() == 3 );	// wedge term: never the scanline caches
 	const bool surf = ( surfCache != NULL ) && surfCache->IsActive() && m_PipelineSurf != nullptr && !m_WalkCntEnabled
-					  && !nearPlayer
+					  && !nearPlayer && !swWedgeTermSel
 					  && swLightStatic >= r_softShadowSurfCacheMinLight.GetInteger();
 	// FUBINI SCANLINE (r_softShadowScanline): replaces the sampled walk with the interval bit-grid. Loses to
 	// the counting (measurement) and surf-cache permutations; A/B lever against the shipped 16-sample path.
 	extern idCVar r_softShadowScanline;
-	const bool scan = r_softShadowScanline.GetBool() && m_PipelineScan != nullptr && !m_WalkCntEnabled && !surf;
+	// WEDGE TERM (r_softShadowWedgeWhitelist 3): the whole-stream wedge is the term; it never touches the
+	// Fubini grid, so force the LEAN base pipeline (SW_SCANLINE 0) - the scanline permutation carries the
+	// grid state that spills VGPR and cripples occupancy for the wedge walk (measured RoE: 39.9ms on the
+	// scanline pipeline -> 26.9ms lean, the grid was ~13ms of dead occupancy cost).
+	const bool scan = r_softShadowScanline.GetBool() && m_PipelineScan != nullptr && !m_WalkCntEnabled && !surf && !swWedgeTermSel;
 	// CONTRIBUTOR CACHE (r_softShadowContribCache): scanline-only (the record/serve paths fill the
 	// Fubini grid; the sampled walk's skip-on-hit loop cannot observe solo contributions). Loses to
 	// the counting and surf permutations; requires a static prefix (something to cache) and a light
@@ -947,16 +993,40 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 
 	// HYBRID WHITELIST wedge block (r_softShadowWedgeWhitelist): published by the flatten into the joint
 	// buffer alongside the face stream; base < 0 = none this light (cvar off / budget-dropped / mismatch).
-	cb.wedge[0] = -1;
-	cb.wedge[1] = 0;
-	cb.wedge[2] = 0;
-	cb.wedge[3] = 0;
+	// z = the cvar mode (>= 2 arms the SERVE branch in SwTermWalk; 0/1 keep the shader byte-identical to
+	// today); w = the serve's bound-gap tolerance (r_softShadowWLGapTol) fixed-point x10000.
+	{
+		extern idCVar r_softShadowWedgeWhitelist;
+		extern idCVar r_softShadowWLGapTol;
+		extern idCVar r_softShadowWedgeAblate;
+		cb.wedge[0] = -1;
+		cb.wedge[1] = 0;
+		cb.wedge[2] = r_softShadowWedgeWhitelist.GetInteger();
+		// ABLATION probe: with the wedge term (mode 3) active, r_softShadowWedgeAblate 1..3 rewrites the
+		// shader mode to 30+step so it walks step/3 of the record stream (0 = pure term overhead). Off (0)
+		// leaves mode 3 untouched. Pipeline-select above already read the raw cvar, so this only reaches
+		// the shader branch, never the pipeline choice.
+		if( cb.wedge[2] == 3 )
+		{
+			const int abl = r_softShadowWedgeAblate.GetInteger();
+			if( abl == 5 )     { cb.wedge[2] = 34; }		// cull-only (see softwedge_coverage.inc SoftShadow_WedgeCullCost)
+			else if( abl > 0 ) { cb.wedge[2] = 30 + idMath::ClampInt( 0, 3, abl - 1 ); }
+		}
+		cb.wedge[3] = ( int )( r_softShadowWLGapTol.GetFloat() * 10000.0f );
+	}
 	if( vLight->softWedgeCount > 0 && vLight->softWedgeCache != 0 )
 	{
 		const uint wedgeOfs = ( uint )( ( vLight->softWedgeCache >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
 		cb.wedge[0] = ( int )( wedgeOfs / 16u );		// float4 element base into t_SoftEdges
 		cb.wedge[1] = vLight->softWedgeCount;			// records (float4 pairs)
 	}
+	// REPAIR ARBITER bin base (mode 3): the second tile-bin dispatch's base for softrepair's
+	// FaceCoverageList arbiter lookup. -1 = no face bin this light => arbiter falls back to
+	// whole-stream FaceCoverage.
+	cb.repairBin[0] = tileFaceBase;
+	cb.repairBin[1] = 0;
+	cb.repairBin[2] = 0;
+	cb.repairBin[3] = 0;
 
 	// t1 must bind SOMETHING even when this light was not binned (layout demands a resource);
 	// tileBase -1 keeps the shader from reading it - mirrors the pixel-shader t13 handling.
@@ -1086,6 +1156,33 @@ bool SoftShadowTermPass::AddLight( nvrhi::ICommandList* commandList, const viewD
 		commandList->writeBuffer( m_ConstantBuffer, &cb, sizeof( cb ) );
 		commandList->setComputeState( cs );
 		commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 3 ) / 4, 1 );
+	}
+
+	// WEDGE-REPAIR (r_softShadowWedgeWhitelist 3): the raw wedge term this light just wrote gets its
+	// two artifact classes removed image-space - ants by the isolation filter, turds by one exact
+	// walk per candidate group (softrepair.cs.hlsl). nvrhi's automatic UAV barriers order the three
+	// dispatches on u_Term. Modes 0-2 never enter; the term output there is untouched.
+	// IMAGE-SPACE REPAIR (experimental, opt-in via r_softShadowRepair; superseded by stencil artifact
+	// removal): mode 3 alone is the CLEAN wedge term. The repair passes only run when explicitly enabled.
+	extern idCVar r_softShadowRepair;
+	const int swRepair = r_softShadowRepair.GetInteger();
+	if( cb.wedge[2] == 3 && swRepair > 0 && m_PipelineRepairAnts != nullptr && m_PipelineRepairTurds != nullptr && m_PipelineRepairHoles != nullptr )
+	{
+		cs.pipeline = m_PipelineRepairAnts;
+		commandList->setComputeState( cs );
+		commandList->dispatch( ( cb.rect[2] + 7 ) / 8, ( cb.rect[3] + 7 ) / 8, 1 );
+		if( swRepair >= 2 )
+		{
+			cs.pipeline = m_PipelineRepairTurds;
+			commandList->setComputeState( cs );
+			commandList->dispatch( ( cb.rect[2] + 15 ) / 16, ( cb.rect[3] + 15 ) / 16, 1 );
+		}
+		if( swRepair >= 3 )
+		{
+			cs.pipeline = m_PipelineRepairHoles;		// lit-in-umbra: mirror of the turd probe
+			commandList->setComputeState( cs );
+			commandList->dispatch( ( cb.rect[2] + 15 ) / 16, ( cb.rect[3] + 15 ) / 16, 1 );
+		}
 	}
 
 	outOfsX = slotOfsX;

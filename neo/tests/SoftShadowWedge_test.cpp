@@ -426,3 +426,53 @@ TEST( SoftShadowWedge, whitelist_gap_and_contrib )
 	CHECK_NEAR( gB, expGap, 1e-4f );						// gap == min(1,sum) - max: the whitelist identity
 	CHECK( gB > 0.02f );									// disjoint casters => a genuine under-shadow the wedge misses
 }
+
+// ===================================================================================================
+// MASKED caster-table walk (SoftShadow_FaceCoverageMasked) - the serving dispatch's cut-caster walk.
+// The clone's contract: with EVERY walk bit set it must reproduce SoftShadow_FaceCoverage BIT-EXACTLY
+// (same casters, same culls, same integral - the only divergence is the skip), and with an empty mask
+// it walks nothing (occlusion 0). Sweeps a receiver grid under a 3-box multi-caster stream so caster
+// culls, partial penumbra and umbra fragments are all exercised.
+TEST( SoftShadowWedge, face_coverage_masked_parity )
+{
+	const float3 L( 0, 0, 60 );
+	const float  R = 6.0f;
+	FaceStreamCPU fs;
+	fs.Append( BuildFaceCasterUnit( MakeBox( float3( 0, 0, 10 ), float3( 4, 4, 2 ), 0.3f, 0.2f ) ) );
+	fs.Append( BuildFaceCasterUnit( MakeBox( float3( 12, -6, 20 ), float3( 3, 5, 3 ), 0.0f, 0.5f ) ) );
+	fs.Append( BuildFaceCasterUnit( MakeBox( float3( -10, 8, 32 ), float3( 6, 2, 4 ), 1.1f, 0.0f ) ) );
+	SoftEdgeBuffer buf{ fs.buf.data(), ( int )fs.buf.size() };
+
+	const uint2 allBits( 0xffffffffu, 0xffffffffu );
+	const uint2 noBits( 0u, 0u );
+	int nDiff = 0, nOccluded = 0;
+	for( int gy = -3; gy <= 3; gy++ )
+	{
+		for( int gx = -3; gx <= 3; gx++ )
+		{
+			const float3 P( ( float )gx * 6.0f, ( float )gy * 6.0f, -30.0f );
+			const float rot = SoftRotAngle( P );
+			const float full = SoftShadow_FaceCoverage( P, L, R, fs.triBase(), 0, fs.nCasters, rot, buf );
+			const float mAll = SoftShadow_FaceCoverageMasked( P, L, R, fs.triBase(), 0, fs.nCasters, rot, allBits, buf );
+			const float mNone = SoftShadow_FaceCoverageMasked( P, L, R, fs.triBase(), 0, fs.nCasters, rot, noBits, buf );
+			if( full != mAll ) { nDiff++; }					// bit-exact demand: float equality, no epsilon
+			CHECK( mNone == 0.0f );							// nothing walked => nothing occludes
+			if( full > 0.0f ) { nOccluded++; }
+		}
+	}
+	std::printf( "  [masked] all-bits parity: %d/49 mismatches, %d receivers occluded\n", nDiff, nOccluded );
+	CHECK( nDiff == 0 );									// all-bits mask == the unmasked walk, bit-exact
+	CHECK( nOccluded > 0 );									// the sweep actually exercised occluded fragments
+
+	// single-caster masks: walking ONLY caster k must equal a stream holding only caster k's bit set
+	// contributions - i.e. the masked walk's per-caster split unions back to at most the full walk.
+	for( int k = 0; k < fs.nCasters; k++ )
+	{
+		const uint2 oneBit( ( k < 32 ) ? ( 1u << k ) : 0u, ( k >= 32 ) ? ( 1u << ( k - 32 ) ) : 0u );
+		const float3 P( 2.0f, -3.0f, -30.0f );
+		const float rot = SoftRotAngle( P );
+		const float solo = SoftShadow_FaceCoverageMasked( P, L, R, fs.triBase(), 0, fs.nCasters, rot, oneBit, buf );
+		const float full = SoftShadow_FaceCoverage( P, L, R, fs.triBase(), 0, fs.nCasters, rot, buf );
+		CHECK( solo <= full + 1e-6f );						// a subset walk can never occlude more than the union
+	}
+}

@@ -64,6 +64,7 @@ public:
 				   uint32_t casterFirstElem, int casterCount,
 				   float penumbraRadius,
 				   int tileBase, int tileOx, int tileOy, int tilesX,
+				   int tileFaceBase,			// mode-3 face bin for the softrepair arbiter (-1 = none)
 				   nvrhi::IBuffer* tileBuffer,
 				   nvrhi::IBuffer* tileCullBuffer,
 				   nvrhi::ITexture* falloffTex, nvrhi::ISampler* falloffSamp,
@@ -139,6 +140,14 @@ private:
 	// shipped path, so it reuses m_Layout; separate pipeline keeps the shipped one byte-identical.
 	nvrhi::ShaderHandle				m_ShaderScan;
 	nvrhi::ComputePipelineHandle	m_PipelineScan;
+	// WEDGE-REPAIR (r_softShadowWedgeWhitelist 3): image-space ant/turd removal over the raw wedge
+	// term (softrepair.cs.hlsl, REPAIR_PHASE 0 = ants / 1 = turds), dispatched after the term write.
+	nvrhi::ShaderHandle				m_ShaderRepairAnts;
+	nvrhi::ComputePipelineHandle	m_PipelineRepairAnts;
+	nvrhi::ShaderHandle				m_ShaderRepairTurds;
+	nvrhi::ComputePipelineHandle	m_PipelineRepairTurds;
+	nvrhi::ShaderHandle				m_ShaderRepairHoles;	// REPAIR_PHASE 2: lit-in-umbra (a hole in the shadow)
+	nvrhi::ComputePipelineHandle	m_PipelineRepairHoles;
 	// CONTRIBUTOR CACHE permutation (SW_CONTRIB_CACHE=1, scanline forced): evaluate-once union of
 	// observed contributors per (world cell, light). Own layout (base + u2 table UAV); own buffer.
 	nvrhi::ShaderHandle				m_ShaderContrib;

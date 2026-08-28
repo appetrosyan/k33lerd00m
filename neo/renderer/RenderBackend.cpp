@@ -2186,11 +2186,31 @@ void idRenderBackend::RenderInteractions( const drawSurf_t* surfList, const view
 	else if( softBandStencilRef >= 0 )
 	{
 		// Analytic soft shadows, penumbra-band pass. Stencil is read-only here (ops KEEP).
-		// Prepass encoding (AAM): core z-fail volumes at weight 4 -> umbra = stencil >= 4; shell rings
-		// count 1 each -> ring = 1..3 (up to three overlapping penumbras stay penumbra); lit = 0.
+		//
+		// ============================================================================================
+		// !!! THE STENCIL VOLUME IS *NOT* THE UMBRA. Read this before touching the "solid umbra" stamp. !!!
+		// The core z-fail volume is the POINT-light (disk-CENTRE) hard shadow. For an AREA light its
+		// boundary is the ~50%-COVERAGE contour, i.e. the MIDDLE of the penumbra - NOT the umbra edge:
+		//   - inside the volume  : centre ray blocked => coverage in [~0.5, 1] = INNER penumbra .. umbra
+		//   - outside the volume : centre ray clear   => coverage in [0, ~0.5] = OUTER penumbra .. lit
+		// So the true umbra (coverage == 1) is a DEEP SUBSET of the volume interior, and the penumbra
+		// STRADDLES the boundary. Stamping the whole interior solid black (stencil >= 4 drawn by NO pass)
+		// therefore OVER-HARDENS: it crushes the inner-penumbra half (coverage 0.5 -> 1) to black that
+		// should be a gradient - the "blur around a stencil shadow" (measured contact-hardening width
+		// ratio 0.50 vs 1.0 truth). It is a deliberate, KNOWN-LOSSY shortcut kept only because the bare
+		// disk-coverage wedge under-fills the umbra worse; r_softShadowEmergentUmbra 1 replaces it by
+		// running coverage across the whole cone and letting the umbra EMERGE where coverage saturates.
+		// Symmetrically, gating coverage to stencil>0 (non-AAM band below) CLIPS the outer penumbra
+		// (outside the volume) to lit - the other half of the same misconception. Use the stencil as a
+		// CLASSIFIER at half-coverage (and an artifact-removal / flood-fill seed), never as the umbra.
+		// ============================================================================================
+		//
+		// Prepass encoding (AAM): core z-fail volumes at weight 4 -> stencil >= 4 = the >=50% region
+		// (inner penumbra + umbra), stamped solid by the shortcut above; shell rings count 1 each ->
+		// ring = 1..3 (up to three overlapping penumbras stay penumbra); lit = 0.
 		// The interaction runs the coverage variant once per ring ref (softBandStencilRef = 1, 2, 3,
 		// EQUAL - each pixel matches at most one) and the cheap unshadowed variant at ref 0; stencil
-		// >= 4 is drawn by NO pass and stays solid umbra by construction.
+		// >= 4 is drawn by NO pass (solid) - see the over-hardening warning above.
 		// Non-AAM band keeps the old scheme: coverage where stencil > 0 (ref 0 LESS), lit at ==0.
 		// Sign-agnostic encoding (SoftShadowBand.h): lit = exactly LIT_REF (low bits untouched, parity
 		// clear), ring = exactly RING_REF (parity set, low bits untouched), umbra = anything else (low
@@ -5000,7 +5020,19 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 			{
 				continue;
 			}
-			if( vLight->softEdgeCount <= 0 || vLight->softCasterCount <= 0 || softTileBins.Num() >= 256 )
+			// WEDGE TILE-BIN (r_softShadowWedgeWhitelist 3): bin the WEDGE caster table + wedge block instead
+			// of the face tri stream, so the analytic append lists one wedge header rec per surviving caster
+			// and the term (softterm mode 3) walks only the tile's casters' spans. Scanline/face consumers are
+			// off in mode 3, so the tile list is read only by the wedge walk.
+			extern idCVar r_softShadowWedgeWhitelist;
+			const bool swWedgeBin = ( r_softShadowWedgeWhitelist.GetInteger() == 3 )
+									&& vLight->softWedgeCount > 0 && vLight->softWedgeCasterCount > 0;
+			const int  swCasCount = swWedgeBin ? vLight->softWedgeCasterCount : vLight->softCasterCount;
+			if( swWedgeBin )
+			{
+				if( softTileBins.Num() >= 256 ) { continue; }
+			}
+			else if( vLight->softEdgeCount <= 0 || vLight->softCasterCount <= 0 || softTileBins.Num() >= 256 )
 			{
 				continue;
 			}
@@ -5008,21 +5040,46 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 			{
 				continue;	// warm cache: cached fragments skip the tile lists; misses take the bounded full walk
 			}
-			const vertCacheHandle_t eh = vLight->softEdgeCache;
-			const vertCacheHandle_t ch = vLight->softCasterCache;
+			const vertCacheHandle_t eh = swWedgeBin ? vLight->softWedgeCache : vLight->softEdgeCache;
+			const vertCacheHandle_t ch = swWedgeBin ? vLight->softWedgeCasterCache : vLight->softCasterCache;
 			const uint edgeOfs = ( uint )( ( eh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
 			const uint casOfs = ( uint )( ( ch >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
 			nvrhi::IBuffer* joint = vertexCache.frameData[vertexCache.drawListNum].jointBuffer.GetAPIObject();
 			softTileBinResult_t r;
 			r.vLight = vLight;
 			r.ox = r.oy = r.tilesX = 0;
+			r.faceBase = -1;
 			r.base = softTileBinPass->BinLight(
 						 target, viewDef, vLight,
-						 joint, edgeOfs / 16u,		// tri stream base in float4 elements
+						 joint, edgeOfs / 16u,		// stream base in float4 elements (wedge block or tri stream)
 						 casOfs / 16u,				// caster table base in float4 elements
-						 vLight->softCasterCount,
+						 swCasCount,
 						 R_SoftPenumbraRadius( vLight->lightDef ),
 						 r.ox, r.oy, r.tilesX );
+			// WEDGE-MODE SECOND BIN: mode 3 uses the wedge bin for the term. The softrepair arbiter still
+			// needs a FACE tile-bin so its FaceCoverageList lookup is cheap (~20 tris vs ~1000 whole-stream).
+			// Only dispatched when r_softShadowRepair > 0 - otherwise repair is off and the second bin would
+			// be dead work (measured: +1.94ms/frame in RoE when repair=0). Same tile grid as the wedge bin
+			// (same view), so the extra tilesX/ox/oy are discarded.
+			// Only phases 2 (turds) and 3 (lit-in-umbra) use the arbiter; phase 1 (ants) doesn't need
+			// a face bin. So gate on repair >= 2 - saves the ~1.5ms 2nd-bin dispatch when only ants runs.
+			extern idCVar r_softShadowRepair;
+			if( swWedgeBin && r.base >= 0 && r_softShadowRepair.GetInteger() >= 2
+					&& vLight->softEdgeCount > 0 && vLight->softCasterCount > 0 )
+			{
+				const vertCacheHandle_t fEh = vLight->softEdgeCache;
+				const vertCacheHandle_t fCh = vLight->softCasterCache;
+				const uint fEdgeOfs = ( uint )( ( fEh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				const uint fCasOfs  = ( uint )( ( fCh >> VERTCACHE_OFFSET_SHIFT ) & VERTCACHE_OFFSET_MASK );
+				int fOx = 0, fOy = 0, fTilesX = 0;
+				r.faceBase = softTileBinPass->BinLight(
+									target, viewDef, vLight,
+									joint, fEdgeOfs / 16u, fCasOfs / 16u,
+									vLight->softCasterCount,
+									R_SoftPenumbraRadius( vLight->lightDef ),
+									fOx, fOy, fTilesX );
+				// faceBase < 0 = buffer full for this second bin -> arbiter falls back to whole-stream FaceCoverage
+			}
 			if( r.base >= 0 )
 			{
 				softTileBins.Append( r );
@@ -5090,15 +5147,16 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 		{
 			const viewLight_t* vLight = swTermOrder[swLi];
 			// this light's tile-binning result from the phase above; base -1 = full walk in-shader
-			int tileBase = -1, tileOx = 0, tileOy = 0, tileTilesX = 0;
+			int tileBase = -1, tileOx = 0, tileOy = 0, tileTilesX = 0, tileFaceBase = -1;
 			for( int sb = 0; sb < softTileBins.Num(); sb++ )
 			{
 				if( softTileBins[sb].vLight == vLight )
 				{
-					tileBase   = softTileBins[sb].base;
-					tileOx     = softTileBins[sb].ox;
-					tileOy     = softTileBins[sb].oy;
-					tileTilesX = softTileBins[sb].tilesX;
+					tileBase     = softTileBins[sb].base;
+					tileOx       = softTileBins[sb].ox;
+					tileOy       = softTileBins[sb].oy;
+					tileTilesX   = softTileBins[sb].tilesX;
+					tileFaceBase = softTileBins[sb].faceBase;	// mode-3 second bin for the softrepair arbiter (-1 = none)
 					break;
 				}
 			}
@@ -5144,6 +5202,7 @@ void idRenderBackend::DispatchSoftShadowComputePhases()
 						vLight->softCasterCount,
 						R_SoftPenumbraRadius( vLight->lightDef ),
 						tileBase, tileOx, tileOy, tileTilesX,
+						tileFaceBase,
 						( softTileBinPass != NULL ) ? softTileBinPass->GetTileBuffer() : NULL,
 						( softTileBinPass != NULL ) ? softTileBinPass->GetTileCullBuffer() : NULL,
 						swEarly ? ( nvrhi::ITexture* )vLight->falloffImage->GetTextureID() : ( nvrhi::ITexture* )globalImages->blackImage->GetTextureID(),

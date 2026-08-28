@@ -206,9 +206,9 @@ void main( uint3 groupId : SV_GroupID, uint tid : SV_GroupThreadID )
 		// spill cluster path. Strictly ADDS rejections on top of the sphere cull (conservative) -> coverage
 		// byte-identical (gate 0). The common triangle caster pays one extra c1 fetch and the c1.y>=0 skip.
 		float4 c1s = t_Edges[ g_range.w + c * 2 + 1 ];
-		if( c1s.y < 0.0f )
-		{
-			const int   hbb = g_range.x + ( int )c1s.x * 3;
+		if( c1s.y < 0.0f && c1s.z == 0.0f )		// analytic HULL only (z==0); WEDGE casters (z==1) skip this
+		{										// cull - their records are 2 float4, so the *3 tri-stride read below
+			const int   hbb = g_range.x + ( int )c1s.x * 3;	// would misindex the wedge block (missing-shadow risk)
 			const float h0w = t_Edges[ hbb + 0 ].w;
 			const float h1w = t_Edges[ hbb + 1 ].w;
 			if( h0w < 0.0f && h1w < 0.0f )

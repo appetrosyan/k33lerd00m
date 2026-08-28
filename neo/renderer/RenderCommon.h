@@ -419,6 +419,11 @@ struct viewLight_t
 														// edge pairs per caster), caster order == the caster table's, so
 														// wedge caster k IS caster-table entry k. 0 = not emitted this frame.
 	int						softWedgeCount;				// records in softWedgeCache
+	vertCacheHandle_t		softWedgeCasterCache;		// WEDGE TILE-BIN: per-caster analytic table for softtile_bin, 2 float4 each -
+													// ( centre.xyz, radius ) ( wedgeHeaderRec, -edgeCount, 0, 0 ). The -edgeCount<0
+													// tag makes the binner append one tile entry per surviving caster (its wedge
+													// header rec); the term walks only the tile's casters' spans. 0 = not emitted.
+	int						softWedgeCasterCount;		// casters in softWedgeCasterCache (== softWedgeCount's caster count)
 	vertCacheHandle_t		softClassifyCache;			// world-cell lit/penumbra classifier grid (packed 16 class bytes/float4), rides the joint buffer
 	float					softClassifyAabbCell[4];	// grid origin xyz + cellSize
 	int						softClassifyDims[4];		// cells per axis xyz + valid (0 = no classifier -> full walk)

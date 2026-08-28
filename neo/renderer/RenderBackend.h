@@ -442,7 +442,12 @@ private:
 	struct softTileBinResult_t
 	{
 		const viewLight_t* vLight;
-		int base, ox, oy, tilesX;
+		int base, ox, oy, tilesX;		// primary bin (wedge in mode 3, face otherwise)
+		int faceBase;					// SECOND bin for mode-3 REPAIR arbiter: face tri stream tile-bin
+										// base (float4 elements into u_Tiles) - dispatched alongside the
+										// primary when whitelist==3 so softrepair's FaceCoverageList lookup
+										// stays cheap (~20 tris vs the ~1000-tri whole-stream walk). -1 = no
+										// second bin this light (arbiter falls back to whole-stream).
 	};
 	struct softTermResult_t
 	{

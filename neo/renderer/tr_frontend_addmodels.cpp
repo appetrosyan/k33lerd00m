@@ -2573,7 +2573,7 @@ void R_AddSingleModel( viewEntity_t* vEntity )
 												vEntity->modelMatrix, &faceElems, &nedges, &faceClusters, &nClusters, &swFaceIsBox );
 						sedges = ( softShadowEdge_t* )faceElems;
 						extern idCVar r_softShadowWedgeWhitelist;
-						if( r_softShadowWedgeWhitelist.GetBool() )
+						if( r_softShadowWedgeWhitelist.GetInteger() > 0 )
 						{
 							R_CollectPenumbraEdges( entityDef, tri, lightDef, R_SoftPenumbraRadius( lightDef ),
 													vEntity->modelMatrix, &wSedges, &wNedges );
@@ -3689,7 +3689,7 @@ void R_AddModels()
 				// alignment holds and the term CS treats them as scanline-only.
 				{
 					extern idCVar r_softShadowWedgeWhitelist;
-					if( r_softShadowWedgeWhitelist.GetBool() && nCas > 0 )
+					if( r_softShadowWedgeWhitelist.GetInteger() > 0 && nCas > 0 )
 					{
 						int wRecords = nCas;						// one header pair per caster
 						for( const drawSurf_t* s = vLight->softShadowWedges; s != NULL; s = s->nextOnLight )
@@ -3735,6 +3735,40 @@ void R_AddModels()
 							{
 								vLight->softWedgeCache = vertexCache.AllocJoint( wFlat, wN, sizeof( softShadowEdge_t ) );
 								vLight->softWedgeCount = wN;
+
+								// WEDGE TILE-BIN caster table (2 float4/caster): ( centre.xyz, radius ),
+								// ( wedgeHeaderRec, -edgeCount, 0, 0 ). The -edgeCount<0 tag makes softtile_bin
+								// (analytic branch, softtile_bin.cs.hlsl:249) append ONE tile entry per surviving
+								// caster - its wedge header record - reusing the screen-footprint sphere-cone cull
+								// verbatim; the term (softterm mode 3) then walks only the tile's casters' spans.
+								// Built as a decoupled post-pass over the wedge headers so it reads EXACTLY what the
+								// shader reads: header pair at record r, edges at r+1..r+edgeCount.
+								std::vector<idVec4> wCasTbl;
+								wCasTbl.reserve( ( size_t )nCas * 2 );
+								for( int r = 0; r < wN; )
+								{
+									if( wFlat[r].e0.w < 0.0f )		// header record
+									{
+										const idVec4& h0 = wFlat[r].e0;
+										const idVec4& h1 = wFlat[r].e1;	// ( radius, edgeCount, 0, casterId )
+										wCasTbl.push_back( idVec4( h0.x, h0.y, h0.z, h1.x ) );		// c0 = ( centre, radius )
+										// c1 = ( headerRec, -edgeCount, 1=WEDGE marker, 0 ). z=1 tells softtile_bin's
+										// slab-hull cull to SKIP this caster (its records are 2 float4, not the 3-float4
+										// tri stride the slab read assumes - a x3 misindex would spuriously cull it). The
+										// analytic APPEND path (softtile_bin.cs:249) reads c1.x directly, so it is unaffected.
+										wCasTbl.push_back( idVec4( ( float )r, -h1.y, 1.0f, 0.0f ) );
+										r += 1 + ( int )h1.y;										// skip this caster's edges
+									}
+									else
+									{
+										r++;	// defensive: stream is header-first, edges never lead
+									}
+								}
+								if( !wCasTbl.empty() )
+								{
+									vLight->softWedgeCasterCache = vertexCache.AllocJoint( wCasTbl.data(), ( int )wCasTbl.size(), sizeof( idVec4 ) );
+									vLight->softWedgeCasterCount = ( int )( wCasTbl.size() / 2 );
+								}
 							}
 							else
 							{

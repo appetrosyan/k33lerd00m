@@ -105,6 +105,21 @@ void R_SoftShadowPinTestConfig( bool verbose )
 		if( diff ) { overridden++; }
 		cvarSystem->SetCVarString( s_softTestConfig[i].name, s_softTestConfig[i].value );
 	}
+	// WEDGE + AAM STENCIL (com_softShadowGateWedge 2, diagnostic): the pins above disable AAM/stencil to
+	// score the RAW coverage integral. Value 2 re-enables the Carmack's-reverse band gate (umbra=2 solid /
+	// penumbra=1 / lit=0) so the WEDGE is scored WITH its stencil discriminator - the composite the wedge
+	// would actually ship behind. Reapplied here so per-cap pin refreshes keep it.
+	extern idCVar com_softShadowGateWedge;
+	const int swGw = com_softShadowGateWedge.GetInteger();
+	if( swGw >= 2 )
+	{
+		cvarSystem->SetCVarInteger( "r_useStencilShadows", 1 );
+		cvarSystem->SetCVarInteger( "r_softShadowBandMask", 1 );
+		cvarSystem->SetCVarInteger( "r_shadowMapPCSS", 0 );		// isolate the wedge+stencil, not PCSS
+		// 2 = full AAM (multi-pass); 3 = plain stencil GATE only (single coverage pass in stencil>0) -
+		// the 0.26ms config, testing whether the cheap gate is also correct.
+		cvarSystem->SetCVarInteger( "r_softShadowAAM", swGw >= 3 ? 0 : 1 );
+	}
 	if( verbose ) { common->Printf( "[softtest] ==== %d archived cvar(s) overridden ====\n", overridden ); }
 }
 

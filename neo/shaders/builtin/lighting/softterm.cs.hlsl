@@ -239,6 +239,10 @@ void SwContribDiagSum( uint word, uint v )
 // evals), then latW*latH entries of ( asuint(term), asuint(wMin) ) written by Phase A.
 RWStructuredBuffer<uint2>	u_SubLattice	: register( u3 );
 #endif
+// SW_RADIAL 1 was tested here as an umbra early-out for the wedge term (task #122). REFUTED (RoE intro
+// 1080p, com_fixedTic, r_softShadowWedgeAblate 4 / 0): whole-block 22ms->101ms, tile-binned 19ms->87ms.
+// The K=32 per-edge radial-bin update (32 sin/cos + cross tests) burned any saturation-early-out win by
+// ~4x. Kept at 0 here so the include default (0) drives the wedge term.
 #include "softwedge_coverage.inc.hlsl"
 
 Texture2D<float4>			t_WorldPos	: register( t2 );	// exact receiver world position (softShadowPosImage)
@@ -301,8 +305,14 @@ cbuffer c_Term : register( b0 )
 								//   z = C2 spread epsilon, w = C3 width-floor beta. Mirrors sub[4].
 	int4	g_wedge;			// HYBRID WHITELIST (r_softShadowWedgeWhitelist): x = wedge-block float4
 								// element base into t_SoftEdges (< 0 = none this light), y = record count
-								// (float4 pairs), z/w reserved. Caster order == the caster table's.
-								// Mirrors wedge[4] in SoftTermCB.
+								// (float4 pairs), z = cvar mode (>= 2 arms SwWlTryServe), w = bound-gap
+								// tolerance x10000 (r_softShadowWLGapTol). Caster order == the caster
+								// table's. Mirrors wedge[4] in SoftTermCB.
+	int4	g_repairBin;		// REPAIR ARBITER (mode 3): x = FACE tile-bin base (float4 elements into
+								// t_SoftTiles) for the softrepair arbiter's FaceCoverageList lookup.
+								// Shares tilesX / tileOx / tileOy with g_range.w / g_tile.x / g_tile.y.
+								// Softterm does not read this; it exists here to keep the CB layout in
+								// lockstep with softrepair.cs.hlsl. yzw reserved.
 };
 // *INDENT-ON*
 
@@ -361,6 +371,137 @@ float SwVizCostTerm( float v, float band )
 	return ( g_swVizFills > 0u )
 		   ? saturate( 0.25f + 0.75f * log2( 1.0f + ( float )g_swVizFills ) * ( 1.0f / log2( 1.0f + SWVC_MAX_FILLS ) ) )
 		   : band;
+}
+
+// ---- WEDGE-WHITELIST SERVE (r_softShadowWedgeWhitelist 2 -> g_wedge.z >= 2) -----------------------
+// The HYBRID's serving dispatch: serve CLEAN casters by their exact per-caster wedge areas and walk
+// ONLY the CUT casters through the scanline, guarded by rigorous bounds. Per fragment:
+//   solo_k  = caster k's solo occlusion from ITS wedge span (header + edges; exact when the loop
+//             walked CLEAN, i.e. no material bridging connector: (clipOut >> 3) == 0).
+//   scanOcc = the EXACT union of the CUT casters (masked caster-table walk).
+// The true union U over ALL casters obeys
+//   lo = max( scanOcc, max_k clean solo_k ) <= U <= min( 1, scanOcc + Sum_k clean solo_k ) = hi
+// (lower bound: each term is the measure of a subset of the union; upper bound: subadditivity).
+// Serving lo therefore UNDER-shadows by at most hi - lo, and the fragment is served only when
+// hi - lo <= gapTol (r_softShadowWLGapTol, carried as g_wedge.w x10000). Everything uncertain -
+// parallax-unsafe fragment, malformed/truncated wedge block, bound gap over tolerance - returns
+// false and the caller falls through to the existing walk paths untouched. Wave-coherence: the
+// entry conditions are CB-uniform and sinA varies smoothly with receiver depth, so waves branch
+// together; only the final serve/fallback verdict diverges per lane.
+bool SwWlTryServe( float3 swP, float3 swL, float swR, float swRotAng, float swHoist, out float swTermOut )
+{
+	swTermOut = 1.0f;
+	// (a) PARALLAX GUARD: the wedge picks ONE silhouette at the disk centre; at large disk half-angle
+	// (sinA = R / distPL) a deep caster's true contour shifts across the disk and the wedge area is no
+	// longer certifiable (measured exact below 0.10 in SoftShadowWedge_test). Full walk instead.
+	const float swWlDistPL = length( swL - swP );
+	if( swR >= SW_WL_SINA_MAX * swWlDistPL )
+	{
+		return false;
+	}
+	// (b) PER-CASTER WEDGE SCAN (the census loop's shape, run unconditionally): caster k's span = its
+	// inline header pair (e0.w < 0; e1.y = edgeCount) + edgeCount edge pairs, and the wedge block's
+	// caster order EQUALS the caster table's (emit contract), so k indexes both streams.
+	float swWlWedgeOcc = 0.0f;					// max over CLEAN casters' solo occlusion (lower-bound term)
+	float swWlSumClean = 0.0f;					// Sum over CLEAN casters' solo occlusion (upper-bound term)
+	uint2 swWlCutMask = uint2( 0u, 0u );		// bit k set = caster k must WALK (cut / uncertifiable)
+	int swWlSe  = 0;
+	int swWlCas = 0;
+	while( swWlSe < g_wedge.y && swWlCas < g_range.y )
+	{
+		const float4 swWlH0 = t_SoftEdges[ g_wedge.x + swWlSe * 2 + 0 ];
+		const float4 swWlH1 = t_SoftEdges[ g_wedge.x + swWlSe * 2 + 1 ];
+		if( swWlH0.w >= 0.0 )
+		{
+			return false;						// malformed block (a header was due here): never serve from it
+		}
+		const int swWlCnt = ( int )swWlH1.y;	// this caster's edge-record count
+		if( swWlCas >= 64 )
+		{
+			// past the walk mask's 64 bits: the masked walk ALWAYS walks these casters, so their
+			// contribution lands in scanOcc exactly - treat as cut, skip the wedge integral.
+			swWlCas++;
+			swWlSe += swWlCnt + 1;
+			continue;
+		}
+		if( swWlCnt <= 0 )
+		{
+			// NO WEDGE FORM (hull/box casters emit an edgeCount-0 header purely for order alignment):
+			// an empty span walks to solo 0 WITHOUT a cut flag, which would classify a real occluder
+			// as "clean with zero coverage" and erase its shadow (measured: cap0006 L2's box-proxied
+			// fixtures, 8 LIT_IN_UMBRA). No wedge form = the scanline must walk it: mark CUT.
+			if( swWlCas < 32 ) { swWlCutMask.x |= 1u << ( uint )swWlCas; }
+			else               { swWlCutMask.y |= 1u << ( uint )( swWlCas - 32 ); }
+			swWlCas++;
+			swWlSe += 1;
+			continue;
+		}
+		float swWlGapC = 0.0f;
+		int   swWlNCC  = 0;
+		int   swWlClipC = 0;
+		// walk ONE caster's span so the return IS that caster's solo occlusion and the cut verdict is per caster
+		const float swWlSolo = SoftShadow_WedgeOcclusionEx( swP, swL, swR,
+										g_wedge.x + swWlSe * 2, swWlCnt + 1, 0.0,
+										swWlGapC, swWlNCC, swWlClipC );
+		if( ( swWlClipC >> 3 ) > 0 )
+		{
+			// CUT: a material bridging connector shaped this caster's integral - its area is
+			// untrusted (contact-clipped open surface), so the exact scanline walks it instead
+			if( swWlCas < 32 ) { swWlCutMask.x |= 1u << ( uint )swWlCas; }
+			else               { swWlCutMask.y |= 1u << ( uint )( swWlCas - 32 ); }
+		}
+		else
+		{
+			swWlWedgeOcc = max( swWlWedgeOcc, saturate( swWlSolo ) );
+			swWlSumClean += saturate( swWlSolo );
+		}
+		swWlCas++;
+		swWlSe += swWlCnt + 1;
+	}
+	if( swWlCas < g_range.y )
+	{
+		return false;							// fewer wedge headers than casters: malformed/truncated block
+	}
+	// (c) EXACT SCANLINE of ONLY the cut casters: the unbinned caster-table walk with the cut mask
+	const float swWlScanOcc = SoftShadow_FaceCoverageMasked( swP, swL, swR, g_range.x, g_flags.y,
+									g_range.y, swRotAng, swWlCutMask );
+	// (d) BOUNDS: true union in [lo, hi]; serve lo (under-shadows by <= gapTol) iff the gap is tight
+	const float swWlLo = max( swWlScanOcc, swWlWedgeOcc );
+	const float swWlHi = min( 1.0f, swWlScanOcc + swWlSumClean );
+	if( swWlHi - swWlLo > ( float )g_wedge.w * ( 1.0f / 10000.0f ) )
+	{
+		return false;							// bounds too far apart: the full walk must arbitrate
+	}
+	// served: the same term shape the plain walk returns for a coverage value of lo
+	swTermOut = SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlLo ), swHoist ) ), SWVC_HIT );	// wedge-whitelist serve
+	return true;
+}
+
+// WEDGE TILE-BIN walk (r_softShadowWedgeWhitelist 3): the tile list holds one entry per caster whose shadow
+// reaches THIS tile (softtile_bin's analytic append: 0x80000000 | wedgeHeaderRec, screen-footprint sphere-cone
+// culled). Walk ONLY those casters' wedge spans and max-combine - identical to the whole-stream wedge's internal
+// max-combine, restricted to the screen-footprint survivors. Lossless: a binner-culled caster's shadow does not
+// reach this tile, so it contributed 0 here anyway. listBase/listCnt index t_SoftTiles (inline slots or a spill span).
+//
+// L1 (task #123): SKIP the caster's header record entirely. The binner already vetted this caster against the
+// tile receiver AABB (a strictly tighter cull than the per-fragment sphere test the header would run), so the
+// per-fragment SoftShadow_CullCaster call is provably redundant on a listed caster. Pass base at the FIRST EDGE
+// (headerRec + 2 float4s past the header pair) and N = edgeCount, not headerRec + (ec+1). The walk's entry state
+// (haveCaster=true, swArea=0, swFirstValid=false, havePrevE1=false) is exactly what the header would have set,
+// so skipping the header is bit-exact. Saves 1 sqrt + ~14 flops + 32 B load per listed caster per fragment.
+float SwWedgeTileOcc( float3 swP, float3 swL, float swR, int listBase, int listCnt )
+{
+	float occ = 0.0f;
+	for( int i = 0; i < listCnt; i++ )
+	{
+		const uint he   = t_SoftTiles[ listBase + i ] & 0x7FFFFFFFu;	// wedge header record (strip the analytic hi bit)
+		const int  base = g_wedge.x + ( int )he * 2;					// float4 base of this caster's header pair
+		const int  ec   = ( int )t_SoftEdges[ base + 1 ].y;			// edgeCount (header e1.y)
+		// L1: skip the header record - jump base past its 2 float4s, walk only ec edges. Header cull redundant.
+		occ = max( occ, SoftShadow_WedgeOcclusion( swP, swL, swR, base + 2, ec, 0.0 ) );
+		if( occ >= 0.999f ) { break; }								// saturated umbra: no further caster can raise it
+	}
+	return occ;
 }
 
 #if SW_SUBSAMPLE
@@ -1993,6 +2134,69 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 			// whole tile provably in umbra: the integral saturates to 1 for every receiver here
 			return SwVizCostTerm( SwHoistTerm( 0.0f, swHoist ), SWVC_UMBRA );
 		}
+		// WEDGE TERM (r_softShadowWedgeWhitelist 3): the whole-stream wedge coverage is the term. EMPTY-TILE
+		// SKIP is the perf lever: an empty face-caster tile (swCnt==0) has no caster near this tile => the
+		// wedge is provably 0 there too (lit), so short-circuit WITHOUT walking the block. The face-caster
+		// bins the scanline builds are shared truth (same casters, both representations), so tile emptiness
+		// applies to the wedge. Only tiles with casters (and the spill/degrade fallbacks) pay the walk -
+		// the fully-lit scissor majority is skipped, the way the scanline's FaceCoverageList(0) skips it.
+		if( g_wedge.x >= 0 && ( g_wedge.z == 3 || g_wedge.z >= 30 ) )
+		{
+			if( swCnt == 0u )
+			{
+#if SW_GPU_WALK_COUNTERS
+				InterlockedAdd( u_WalkCnt[ 17 ], 1u );	// empty-list (provably lit, zero iterations)
+#endif
+				return SwVizCostTerm( SwHoistTerm( 1.0f, swHoist ), SWVC_OTHER );	// provably lit: no wedge walk
+			}
+			// CULL-ONLY (z==34, r_softShadowWedgeAblate 5): full-N walk, sphere-cull only, ZERO edge math.
+			// This subtracts from the mode-4 (whole-block) baseline to split cull-cost vs edge-cost.
+			if( g_wedge.z == 34 )
+			{
+				const float swClOcc = SoftShadow_WedgeCullCost( swP, swL, swR, g_wedge.x, g_wedge.y );
+				return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swClOcc ), swHoist ) ), SWVC_HIT );
+			}
+			// TILE-BINNED WEDGE (z==3): walk only the casters the binner listed for this tile (screen-footprint
+			// culled), not the whole ~19-caster stream. The tile list is the wedge caster bin (analytic append);
+			// SPILL = a bump-allocated span, 0xFFFFFFFF (degrade) = fall back to the whole block.
+			if( g_wedge.z == 3 )
+			{
+				float swWlOcc;
+				if( swCnt == SW_TILE_SPILL )
+				{
+					const uint swOfs = t_SoftTiles[ swSlot + 1 ];
+					const uint swSpN = min( t_SoftTiles[ swSlot + 2 ], 65536u );
+					swWlOcc = SwWedgeTileOcc( swP, swL, swR, ( int )swOfs, ( int )swSpN );
+				}
+				else if( swCnt != 0xFFFFFFFFu )
+				{
+					swWlOcc = SwWedgeTileOcc( swP, swL, swR, swSlot + 1, ( int )swCnt );
+				}
+				else
+				{
+					swWlOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, g_wedge.x, g_wedge.y, 0.0 );	// degrade: whole block
+				}
+				return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlOcc ), swHoist ) ), SWVC_HIT );
+			}
+			// ABLATION (r_softShadowWedgeAblate, z = 30 + step): whole-stream record-count scaling to linear-fit
+			// the term cost - tile-independent by design (N=0 z30 = pure overhead ... N z33 = full walk).
+			const int   swAblN  = ( g_wedge.y * ( g_wedge.z - 30 ) ) / 3;
+			const float swAblOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, g_wedge.x, swAblN, 0.0 );
+			return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swAblOcc ), swHoist ) ), SWVC_HIT );
+		}
+		// WEDGE-WHITELIST SERVE (r_softShadowWedgeWhitelist 2): this fragment passed every early-out
+		// and the tile umbra sentinel, so it WOULD pay a walk (spill/list/full) - try serving it from
+		// the clean-caster wedge areas + cut-caster scanline first (see SwWlTryServe for the bounds
+		// argument). A failed attempt falls through to the existing walk paths completely unchanged;
+		// modes 0/1 never enter (g_wedge.z < 2), keeping their output byte-identical to today.
+		if( g_wedge.x >= 0 && g_wedge.z == 2 )
+		{
+			float swWlTerm;
+			if( SwWlTryServe( swP, swL, swR, swRotAng, swHoist, swWlTerm ) )
+			{
+				return swWlTerm;
+			}
+		}
 		if( swCnt == SW_TILE_SPILL )
 		{
 #if SW_GPU_WALK_COUNTERS
@@ -2020,6 +2224,29 @@ float SwTermWalk( int2 px, float4 swPos, float swHoist )
 	}
 	else
 	{
+		// WEDGE-REPAIR / WEDGE-WHITELIST SERVE, unbinned-light leg (no tile grid this light - the
+		// contention fallback): same modes as the binned leg above; there is no umbra sentinel to
+		// consult here, so every fragment on this leg would pay the full walk regardless.
+		if( g_wedge.x >= 0 && ( g_wedge.z == 3 || g_wedge.z >= 30 ) )
+		{
+			if( g_wedge.z == 34 )	// mode 34 = cull-only, full N (unbinned leg mirrors the binned leg)
+			{
+				const float swClOcc = SoftShadow_WedgeCullCost( swP, swL, swR, g_wedge.x, g_wedge.y );
+				return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swClOcc ), swHoist ) ), SWVC_HIT );
+			}
+			int swAblN = g_wedge.y;
+			if( g_wedge.z >= 30 ) { swAblN = ( g_wedge.y * ( g_wedge.z - 30 ) ) / 3; }	// ablation (see binned leg)
+			const float swWlOcc = SoftShadow_WedgeOcclusion( swP, swL, swR, g_wedge.x, swAblN, 0.0 );
+			return SwVizCostTerm( SwTermQuant( SwHoistTerm( 1.0f - saturate( swWlOcc ), swHoist ) ), SWVC_HIT );
+		}
+		if( g_wedge.x >= 0 && g_wedge.z == 2 )
+		{
+			float swWlTerm;
+			if( SwWlTryServe( swP, swL, swR, swRotAng, swHoist, swWlTerm ) )
+			{
+				return swWlTerm;
+			}
+		}
 		swOcc = SoftShadow_Coverage( swP, swL, swR, g_range.x, g_flags.y, g_range.y, 0.0, true, swRotAng );
 	}
 
