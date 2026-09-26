@@ -41,6 +41,48 @@ This file contains the following sections:
 
 
 ---
+---
+# About k33lerd00m <a name="k33lerd00m"></a>
+
+`k33lerd00m` is a fork of RBDOOM-3-BFG that exists to answer one
+question: how good can shadows get on commodity hardware, with **no
+ray-tracing extensions** and **no temporal accumulation**?
+
+The current answer is soft stencil shadow volumes:
+
+* **Assarsson & Akenine-Möller's inner-penumbra-wedge construction**
+  (2003), ported into the engine's SPIR-V compute path.  The per-tile
+  umbra test ships as a gate-validated sentinel in
+  `softtile_bin.cs.hlsl` (`SW_TILE_UMBRA`); the C++ twin lives in
+  `neo/renderer/Passes/SoftShadowClassify.cpp`.
+* Casters are **per-brush convex hulls**: `dmap` emits them into the
+  `.proc` file (`shadowHulls`), so the volume geometry is derived from
+  the BSP data instead of being reconstructed at run time.
+* The umbra/penumbra decision is **per-tile and gate-validated** ---
+  receiver-apex reselection, fused repair passes, and a tile-binned
+  repair arbiter keep wedges from self-shadowing their receivers.
+* Shadows are **temporally stable by construction**: no TAA, no
+  per-frame noise dithering, no accumulation.  The in-tree
+  hardware-RT shadow path is retained as a comparison point.
+
+Tuning is exposed through the `r_softShadow*` console variables
+(`r_softShadowClassify`, `r_softShadowBrushHulls`,
+`r_softShadowBandWedges`, ...).  The technique survey that drove these
+choices is [SHADOW_TECHNIQUES_SURVEY.md](SHADOW_TECHNIQUES_SURVEY.md);
+the honest list of what does not yet work is
+[known-problems.org](known-problems.org).
+
+## Provenance
+
+This fork was built by **directing AI coding agents**.  The work was
+partitioned into small, independently verifiable tasks, gated by builds
+and in-engine validation, and audited after the fact; the branch
+history is left unfiltered on purpose.  The author is a professional
+systems engineer --- the agents were the workforce, not the designers.
+Expect production-grade renderer passes alongside rough edges: that is
+what an honest agentic codebase looks like in 2026.
+
+---
 # About the Port <a name="about"></a>
 
 `RBDOOM-3-BFG is a modernization effort of DOOM-3-BFG.`
