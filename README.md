@@ -61,6 +61,14 @@ The current answer is soft stencil shadow volumes:
 * The umbra/penumbra decision is **per-tile and gate-validated** ---
   receiver-apex reselection, fused repair passes, and a tile-binned
   repair arbiter keep wedges from self-shadowing their receivers.
+* The penumbra integral is evaluated **analytically**: the
+  Fubini-scanline construction applies a Fubini identity on scanlines
+  over a bounded chord set (~8--16 per receiver), so the planar result
+  is exact --- `docs/softshadow/` carries the derivations.  There is
+  nothing sampled, hence nothing to denoise: hardware ray tracing at
+  practically achievable ray counts requires a denoiser, and every
+  denoiser distorts, temporally (accumulation) or spatially
+  (filtering).  Here neither happens.
 * Shadows are **temporally stable by construction**: no TAA, no
   per-frame noise dithering, no accumulation.  The in-tree
   hardware-RT shadow path is retained as a comparison point.
